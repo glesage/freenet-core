@@ -368,6 +368,13 @@ async fn do_subscribe(
             Some(if *subscribed {
                 Ok(())
             } else {
+                // Unreachable from this client for an unknown key in local
+                // mode: verified by running `subscribe` against one, and the
+                // local request loop answers with a generic client error
+                // (the same shape `do_get` sees for a missing contract), not
+                // this `SubscribeResponse { subscribed: false }` shape. Left
+                // in place for whatever peer answer or mode this client has
+                // not yet been tested against that DOES produce a refusal.
                 Err(MobileError::Request(format!(
                     "subscription to {key} refused"
                 )))
