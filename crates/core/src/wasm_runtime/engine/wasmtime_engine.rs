@@ -2573,6 +2573,32 @@ mod tests {
         assert!(result.is_ok(), "Failed to create wasmtime engine");
     }
 
+    /// `RuntimeConfig::use_pulley` without the `pulley` cargo feature must
+    /// refuse to build an engine, not silently keep the Cranelift JIT — that
+    /// refusal is what stops an iOS build from crashing on its first
+    /// contract call if the feature is ever left out of a release build.
+    /// The only code that sets `use_pulley: true` today
+    /// (`pulley_conformance.rs`) is itself gated on the feature, so nothing
+    /// else in the tree can ever exercise this arm; hence its own test here,
+    /// built with `-p freenet` alone (never `--workspace`, where feature
+    /// unification from `freenet-mobile`'s dependency would compile this
+    /// arm out — see M2.1 / M3 in TEST-PLAN-mobile-phase1.md).
+    #[cfg(not(feature = "pulley"))]
+    #[test]
+    fn use_pulley_without_the_feature_is_a_hard_error() {
+        let config = RuntimeConfig {
+            use_pulley: true,
+            ..RuntimeConfig::default()
+        };
+        let err = WasmtimeEngine::create_backend_engine(&config)
+            .expect_err("use_pulley without the feature must refuse, not silently JIT");
+        let message = err.to_string();
+        assert!(
+            message.contains("pulley") && message.contains("feature"),
+            "error must name the missing feature: {message}"
+        );
+    }
+
     #[test]
     fn test_module_compilation() {
         let config = RuntimeConfig::default();
