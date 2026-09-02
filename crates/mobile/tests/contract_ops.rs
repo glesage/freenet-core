@@ -58,6 +58,35 @@ async fn invalid_key_is_rejected_before_hitting_the_node() -> Result<(), MobileE
     node.stop().await
 }
 
+/// `do_update` (client.rs) falls back to a GET when the contract key is not
+/// in its `known` cache, because UPDATE needs the full key (code hash
+/// included). Every other test in this file publishes and updates within the
+/// same client session, so that cache always hits and the fallback never
+/// runs. A restart gives a fresh client with an empty cache — the realistic
+/// way this path gets exercised, since an app relaunch is exactly that.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn update_delta_learns_the_key_after_a_restart() -> Result<(), MobileError> {
+    init_test_logging();
+    let root = tempfile::tempdir().expect("tempdir");
+    let node = start_node(local_profile(root.path(), reserve_port())).await?;
+    let (wasm, params) = test_contract();
+    let key = node.put(wasm, params, empty_todo_list(), false).await?;
+    node.stop().await?;
+
+    // Restart: a new client actor, its `known` map starts empty.
+    node.start().await?;
+    node.update_delta(key.clone(), add_task_delta(1, "first"))
+        .await?;
+
+    let got = node.get(key.clone(), false).await?;
+    let text = String::from_utf8_lossy(&got.state);
+    assert!(
+        text.contains("first"),
+        "update after restart must have learned the key and applied: {text}"
+    );
+    node.stop().await
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn subscriber_receives_update_notifications() -> Result<(), MobileError> {
     init_test_logging();
