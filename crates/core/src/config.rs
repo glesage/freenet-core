@@ -1780,20 +1780,16 @@ pub struct Config {
     /// into a `RuntimeConfig` (`Executor::from_config*`) copies it into
     /// `RuntimeConfig::use_pulley`.
     ///
-    /// Defaults to [`default_use_pulley`]: `true` on iOS, which forbids JIT (no
-    /// writable-then-executable pages for third-party apps, so Cranelift's
-    /// native code generation fails at runtime), `false` everywhere else, so an
-    /// iOS embedding gets Pulley without remembering to ask. Setting it requires
-    /// the `pulley` cargo feature; without it, engine creation fails with an
-    /// explicit error rather than silently JIT-ing.
+    /// Defaults per target via [`default_use_pulley`] and requires the `pulley`
+    /// cargo feature; the rationale is the PULLEY block in
+    /// `WasmtimeEngine::create_engine`.
     #[serde(skip, default = "default_use_pulley")]
     pub use_pulley: bool,
 }
 
 /// Test-only: a Local-mode [`ConfigArgs`] with every path pinned under `dir`,
 /// for tests OUTSIDE this module that need a real, built [`Config`] rather than
-/// a `RuntimeConfig` (the node-config-to-runtime plumbing tests in
-/// `contract::executor::runtime` and `wasm_runtime::pulley_conformance`).
+/// a `RuntimeConfig` (`wasm_runtime::runtime::node_config_plumbing_tests`).
 /// Explicit paths matter: `ConfigPathsArgs::default_dirs` would point a debug
 /// build at `temp_dir()/freenet` and DELETE a stale one on startup.
 #[cfg(test)]
@@ -1810,13 +1806,9 @@ pub(crate) fn local_test_config_args(dir: &std::path::Path) -> ConfigArgs {
 }
 
 /// Default for [`Config::use_pulley`]: the Pulley interpreter on iOS, which
-/// forbids JIT, and the Cranelift JIT everywhere else.
+/// forbids JIT, the Cranelift JIT elsewhere.
 ///
-/// Note this is the freenet-side default only. wasmtime's own `build.rs`
-/// (`default_target_pulley = !has_host_compiler_backend || miri`) keeps the
-/// JIT on every architecture Cranelift can target, aarch64-apple-ios included,
-/// so an iOS build that does not set this would crash on its first contract
-/// call.
+/// Rationale: the PULLEY block in `WasmtimeEngine::create_engine`.
 pub fn default_use_pulley() -> bool {
     cfg!(target_os = "ios")
 }
@@ -7641,12 +7633,9 @@ shutdown-drain-secs = 42
         );
     }
 
-    /// `use_pulley` is the embedding switch for JIT-less targets (iOS). It has
-    /// no CLI flag on purpose: an embedder sets it on the built `Config` (the
-    /// `ws_api.webapp_cache_dir` pattern). So `build()` must seed it with the
-    /// per-target default and leave it a plain settable field — and it must
-    /// never reach `config.toml`: a config written on a JIT host and copied to
-    /// a JIT-less one must not pin the JIT, and vice versa.
+    /// `build()` seeds `use_pulley` with the per-target default; a flipped
+    /// value never reaches `config.toml`, and a re-read falls back to that
+    /// default.
     #[tokio::test]
     async fn use_pulley_defaults_per_target_and_never_persists() {
         let temp = tempfile::tempdir().unwrap();
@@ -7655,11 +7644,6 @@ shutdown-drain-secs = 42
             cfg.use_pulley,
             default_use_pulley(),
             "build() must seed use_pulley with the per-target default"
-        );
-        assert_eq!(
-            default_use_pulley(),
-            cfg!(target_os = "ios"),
-            "the default is Pulley on iOS (no JIT) and the JIT everywhere else"
         );
 
         // Embedder override: flip it, then prove the flip is NOT persisted and

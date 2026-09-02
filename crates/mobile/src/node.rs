@@ -57,10 +57,10 @@ struct Running {
 /// or the UniFFI constructor, then [`start`](Self::start).
 #[derive(uniffi::Object)]
 pub struct FreenetNode {
-    pub(crate) profile: MobileProfile,
+    profile: MobileProfile,
     running: tokio::sync::Mutex<Option<Running>>,
     status: RwLock<NodeStatus>,
-    pub(crate) listener: ListenerSlot,
+    listener: ListenerSlot,
 }
 
 impl FreenetNode {
@@ -86,7 +86,7 @@ impl FreenetNode {
         }
     }
 
-    pub(crate) fn current_status(&self) -> NodeStatus {
+    pub(crate) fn status_impl(&self) -> NodeStatus {
         self.status
             .read()
             .map(|s| s.clone())
@@ -95,7 +95,7 @@ impl FreenetNode {
             })
     }
 
-    pub(crate) fn set_listener(&self, listener: Arc<dyn ContractUpdateListener>) {
+    pub(crate) fn set_update_listener_impl(&self, listener: Arc<dyn ContractUpdateListener>) {
         if let Ok(mut slot) = self.listener.write() {
             *slot = Some(listener);
         }
@@ -108,43 +108,41 @@ impl FreenetNode {
             return Err(MobileError::InvalidState("node is already running".into()));
         }
         self.set_status(NodeStatus::Starting);
-        let handle = runtime().handle().clone();
-        let profile = self.profile.clone();
-        let mode = match handle.spawn(start_mode(profile)).await {
-            Ok(Ok(mode)) => mode,
-            Ok(Err(e)) => {
-                self.set_status(NodeStatus::Failed {
-                    message: e.to_string(),
-                });
-                return Err(e);
+        match self.launch().await {
+            Ok(r) => {
+                *running = Some(r);
+                self.set_status(NodeStatus::Running);
+                Ok(())
             }
             Err(e) => {
                 self.set_status(NodeStatus::Failed {
                     message: e.to_string(),
                 });
-                return Err(e.into());
+                Err(e)
             }
-        };
-        let client = match ClientHandle::connect(
-            &handle,
+        }
+    }
+
+    /// Launch the node on the crate runtime, then connect the in-process
+    /// client. A node whose client fails to connect is stopped again before
+    /// the error is returned.
+    async fn launch(&self) -> Result<Running, MobileError> {
+        let handle = runtime().handle();
+        let mode = handle.spawn(start_mode(self.profile.clone())).await??;
+        match ClientHandle::connect(
+            handle,
             self.profile.ws_port,
             self.listener.clone(),
             CLIENT_CONNECT_TIMEOUT,
         )
         .await
         {
-            Ok(client) => client,
+            Ok(client) => Ok(Running { mode, client }),
             Err(e) => {
-                stop_mode(&handle, mode).await;
-                self.set_status(NodeStatus::Failed {
-                    message: e.to_string(),
-                });
-                return Err(e);
+                stop_mode(handle, mode).await;
+                Err(e)
             }
-        };
-        *running = Some(Running { mode, client });
-        self.set_status(NodeStatus::Running);
-        Ok(())
+        }
     }
 
     /// Stop the node. A no-op when it is not running.
@@ -155,7 +153,7 @@ impl FreenetNode {
         };
         self.set_status(NodeStatus::Stopping);
         client.shutdown().await;
-        stop_mode(&runtime().handle().clone(), mode).await;
+        stop_mode(runtime().handle(), mode).await;
         self.set_status(NodeStatus::Stopped);
         Ok(())
     }

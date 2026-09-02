@@ -54,7 +54,6 @@ enum Command {
     ConnectedPeers {
         reply: oneshot::Sender<Result<u32, MobileError>>,
     },
-    Shutdown,
 }
 
 /// Handle to the running client actor.
@@ -83,14 +82,12 @@ impl ClientHandle {
         key: ContractInstanceId,
         subscribe: bool,
     ) -> Result<GetResult, MobileError> {
-        let (reply, rx) = oneshot::channel();
-        self.send(Command::Get {
+        self.request(|reply| Command::Get {
             key,
             subscribe,
             reply,
         })
-        .await?;
-        rx.await.map_err(|_| actor_gone())?
+        .await
     }
 
     pub(crate) async fn put(
@@ -99,15 +96,13 @@ impl ClientHandle {
         state: Vec<u8>,
         subscribe: bool,
     ) -> Result<String, MobileError> {
-        let (reply, rx) = oneshot::channel();
-        self.send(Command::Put {
+        self.request(|reply| Command::Put {
             contract,
             state,
             subscribe,
             reply,
         })
-        .await?;
-        rx.await.map_err(|_| actor_gone())?
+        .await
     }
 
     pub(crate) async fn update_delta(
@@ -115,37 +110,38 @@ impl ClientHandle {
         key: ContractInstanceId,
         delta: Vec<u8>,
     ) -> Result<(), MobileError> {
-        let (reply, rx) = oneshot::channel();
-        self.send(Command::UpdateDelta { key, delta, reply })
-            .await?;
-        rx.await.map_err(|_| actor_gone())?
+        self.request(|reply| Command::UpdateDelta { key, delta, reply })
+            .await
     }
 
     pub(crate) async fn subscribe(&self, key: ContractInstanceId) -> Result<(), MobileError> {
-        let (reply, rx) = oneshot::channel();
-        self.send(Command::Subscribe { key, reply }).await?;
-        rx.await.map_err(|_| actor_gone())?
+        self.request(|reply| Command::Subscribe { key, reply })
+            .await
     }
 
     pub(crate) async fn connected_peers(&self) -> Result<u32, MobileError> {
-        let (reply, rx) = oneshot::channel();
-        self.send(Command::ConnectedPeers { reply }).await?;
-        rx.await.map_err(|_| actor_gone())?
+        self.request(|reply| Command::ConnectedPeers { reply })
+            .await
     }
 
-    /// Close the connection and wait for the actor to finish.
+    /// Close the command channel and wait for the actor to finish; queued
+    /// commands are still handled first.
     pub(crate) async fn shutdown(self) {
-        if self.tx.send(Command::Shutdown).await.is_err() {
-            tracing::debug!("client actor already stopped");
-        }
-        drop(self.tx);
-        if let Err(e) = self.task.await {
+        let Self { tx, task } = self;
+        drop(tx);
+        if let Err(e) = task.await {
             tracing::warn!(%e, "client actor task ended abnormally");
         }
     }
 
-    async fn send(&self, cmd: Command) -> Result<(), MobileError> {
-        self.tx.send(cmd).await.map_err(|_| actor_gone())
+    /// Send one command to the actor and await its reply.
+    async fn request<T>(
+        &self,
+        make: impl FnOnce(oneshot::Sender<Result<T, MobileError>>) -> Command,
+    ) -> Result<T, MobileError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx.send(make(reply)).await.map_err(|_| actor_gone())?;
+        rx.await.map_err(|_| actor_gone())?
     }
 }
 
@@ -178,15 +174,11 @@ async fn actor(mut api: WebApi, mut rx: mpsc::Receiver<Command>, listener: Liste
     loop {
         tokio::select! {
             cmd = rx.recv() => match cmd {
-                None | Some(Command::Shutdown) => break,
+                None => break,
                 Some(cmd) => handle_command(&mut api, &mut known, &listener, cmd).await,
             },
             msg = api.recv() => match msg {
-                Ok(response) => {
-                    if !dispatch_notification(&response, &mut known, &listener) {
-                        tracing::debug!(?response, "ignoring unsolicited response");
-                    }
-                }
+                Ok(response) => dispatch_notification(&response, &mut known, &listener),
                 Err(e) => {
                     tracing::warn!(%e, "node client connection failed; stopping client actor");
                     break;
@@ -231,7 +223,6 @@ async fn handle_command(
         Command::ConnectedPeers { reply } => {
             reply_or_log(reply, do_connected_peers(api, known, listener).await);
         }
-        Command::Shutdown => {}
     }
 }
 
@@ -416,20 +407,12 @@ async fn wait_for<T>(
 ) -> Result<T, MobileError> {
     let deadline = tokio::time::Instant::now() + REQUEST_TIMEOUT;
     loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            return Err(MobileError::Timeout(format!(
-                "no response within {REQUEST_TIMEOUT:?}"
-            )));
-        }
-        match tokio::time::timeout(remaining, api.recv()).await {
+        match tokio::time::timeout_at(deadline, api.recv()).await {
             Ok(Ok(response)) => {
                 if let Some(outcome) = matcher(&response, known) {
                     return outcome;
                 }
-                if !dispatch_notification(&response, known, listener) {
-                    tracing::debug!(?response, "ignoring response while waiting");
-                }
+                dispatch_notification(&response, known, listener);
             }
             Ok(Err(e)) => return Err(MobileError::Request(e.to_string())),
             Err(_) => {
@@ -441,17 +424,14 @@ async fn wait_for<T>(
     }
 }
 
-/// Forward an `UpdateNotification` to the listener. Returns whether `response`
-/// was one.
-fn dispatch_notification(
-    response: &HostResponse,
-    known: &mut KnownKeys,
-    listener: &ListenerSlot,
-) -> bool {
+/// Forward an `UpdateNotification` to the listener. Any other response has no
+/// request waiting for it at this point and is logged and dropped.
+fn dispatch_notification(response: &HostResponse, known: &mut KnownKeys, listener: &ListenerSlot) {
     let HostResponse::ContractResponse(ContractResponse::UpdateNotification { key, update }) =
         response
     else {
-        return false;
+        tracing::debug!(?response, "ignoring unsolicited response");
+        return;
     };
     known.insert(*key.id(), *key);
     let (state, delta) = match update {
@@ -464,7 +444,7 @@ fn dispatch_notification(
         // no shape for them yet.
         _ => {
             tracing::debug!(%key, "ignoring related-contract update notification");
-            return true;
+            return;
         }
     };
     let listener = listener.read().ok().and_then(|slot| slot.clone());
@@ -472,5 +452,4 @@ fn dispatch_notification(
         Some(listener) => listener.on_update(key.encoded_contract_id(), state, delta),
         None => tracing::debug!(%key, "update notification with no listener registered"),
     }
-    true
 }

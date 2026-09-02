@@ -14,8 +14,9 @@ mod execution_handling;
 // `--features trace,...`).
 #[cfg(feature = "trace")]
 mod host_clock;
-// Cranelift-vs-Pulley conformance: needs the Pulley compiler backend
-// (`--features pulley`) to build a second engine in the same process.
+// Cranelift-vs-Pulley conformance: needs `--features pulley` (wasmtime's
+// interpreter plus `pulley64` target acceptance) to build a second engine in
+// the same process.
 #[cfg(feature = "pulley")]
 mod pulley_conformance;
 mod time;

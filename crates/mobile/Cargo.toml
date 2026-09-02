@@ -2,7 +2,7 @@
 name = "freenet-mobile"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 publish = false
 description = "Embeddable Freenet node with a UniFFI surface for mobile hosts"
 license-file = "../core/LICENSE.md"
@@ -30,12 +30,12 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "ti
 # is typed against (its `net` feature pins 0.27).
 tokio-tungstenite = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
 uniffi = { version = "0.32", features = ["tokio", "cli"] }
 
 [dev-dependencies]
 serde_json = { workspace = true }
 tempfile = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
 
 [lints.rust]
 # Mirrors crates/core: discarded Results/Options on #[must_use] are compile errors.

@@ -42,13 +42,10 @@ pub struct MobileProfile {
     /// Empty in network mode means: fetch the public gateway index. Ignored in
     /// local mode.
     pub gateways: Vec<String>,
-    /// Log to stderr (the Xcode console) instead of files under `log_dir`.
-    /// Only consulted by [`crate::init_logging`].
-    pub log_to_stderr: bool,
 }
 
 impl MobileProfile {
-    pub(crate) fn data_path(&self) -> PathBuf {
+    fn data_path(&self) -> PathBuf {
         PathBuf::from(&self.data_dir)
     }
 
@@ -186,7 +183,6 @@ mod tests {
             ws_port: 7509,
             network_port: None,
             gateways,
-            log_to_stderr: false,
         }
     }
 

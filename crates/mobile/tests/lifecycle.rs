@@ -2,6 +2,7 @@
 
 mod common;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use common::*;
@@ -11,7 +12,13 @@ use freenet_mobile::{FreenetNode, MobileError, NodeStatus};
 async fn local_node_starts_and_stops() -> Result<(), MobileError> {
     init_test_logging();
     let root = tempfile::tempdir().expect("tempdir");
-    let node = start_node(local_profile(root.path(), reserve_port())).await?;
+    let port = reserve_port();
+    let node = FreenetNode::new_plain(local_profile(root.path(), port))?;
+    // Registered before start so every transition is observed.
+    let listener = Arc::new(RecordingListener::default());
+    node.set_update_listener(listener.clone());
+    release_port(port);
+    node.start().await?;
     assert_eq!(node.status(), NodeStatus::Running);
     // The node lays its stores out under the explicit data dir, nowhere else.
     assert!(root.path().join("data").join("db").join("local").is_dir());
@@ -19,8 +26,17 @@ async fn local_node_starts_and_stops() -> Result<(), MobileError> {
     assert!(node.connected_peers().await.is_err());
     node.stop().await?;
     assert_eq!(node.status(), NodeStatus::Stopped);
-    // Stopping twice is a no-op, not an error.
+    // Stopping twice is a no-op, not an error, and emits no status.
     node.stop().await?;
+    assert_eq!(
+        listener.statuses.lock().expect("statuses lock").clone(),
+        vec![
+            NodeStatus::Starting,
+            NodeStatus::Running,
+            NodeStatus::Stopping,
+            NodeStatus::Stopped,
+        ]
+    );
     Ok(())
 }
 

@@ -4,15 +4,14 @@
 //! interpreter (`RuntimeConfig::use_pulley`). The contract ABI must not care
 //! which backend executed it: the same inputs have to produce byte-identical
 //! outputs on both, or a phone and a desktop would disagree about a contract's
-//! state. These tests build one runtime per backend in the same process and
-//! compare every contract entry point over the same vectors the backend-agnostic
-//! `tests::contract` suite uses.
-
-use std::time::Instant;
+//! state. The conformance test builds one runtime per backend in the same
+//! process and compares every contract entry point over the same vectors the
+//! backend-agnostic `tests::contract` suite uses.
 
 use freenet_stdlib::prelude::*;
 
 use super::{TestSetup, setup_test_contract};
+use crate::wasm_runtime::engine::Engine;
 use crate::wasm_runtime::runtime::RuntimeConfig;
 use crate::wasm_runtime::{ContractError, ContractRuntimeInterface, Runtime};
 
@@ -97,20 +96,21 @@ fn run_vectors(runtime: &mut Runtime, key: &ContractKey) -> Result<Outcomes, Con
 /// keeps the engine's target private, but a serialized module carries the
 /// compiler's target triple in its metadata header, so compile a trivial module
 /// on each engine and look for the triple there.
-#[tokio::test(flavor = "multi_thread")]
-async fn pulley_profile_targets_the_interpreter() -> Result<(), Box<dyn std::error::Error>> {
-    fn serialized_module(runtime: &Runtime) -> Vec<u8> {
-        let engine = runtime.clone_backend_engine();
+#[test]
+fn pulley_profile_targets_the_interpreter() -> Result<(), Box<dyn std::error::Error>> {
+    fn serialized_module(use_pulley: bool) -> Result<Vec<u8>, ContractError> {
+        let engine = Engine::create_backend_engine(&RuntimeConfig {
+            use_pulley,
+            ..RuntimeConfig::default()
+        })?;
         let module = wasmtime::Module::new(&engine, b"(module)").expect("trivial module compiles");
-        module.serialize().expect("module serializes")
+        Ok(module.serialize().expect("module serializes"))
     }
     fn mentions(bytes: &[u8], needle: &str) -> bool {
         bytes.windows(needle.len()).any(|w| w == needle.as_bytes())
     }
-    let (jit, _, _dir_a) = runtime_for(false).await?;
-    let (pulley, _, _dir_b) = runtime_for(true).await?;
-    let jit_bytes = serialized_module(&jit);
-    let pulley_bytes = serialized_module(&pulley);
+    let jit_bytes = serialized_module(false)?;
+    let pulley_bytes = serialized_module(true)?;
     assert!(
         mentions(&pulley_bytes, "pulley64"),
         "use_pulley must compile for the pulley64 target"
@@ -146,29 +146,5 @@ async fn cranelift_and_pulley_agree_on_contract_vectors() -> Result<(), Box<dyn 
     assert_eq!(expected.delta, vec![4]);
     assert!(expected.validate_valid.contains("Valid"));
     assert!(expected.validate_invalid.contains("RequestRelated"));
-    Ok(())
-}
-
-/// Numbers for the phase 1 budget: how much slower is the interpreter on the
-/// compile (first call) and steady-state paths? Ignored by default; run with
-/// `cargo test -p freenet --features pulley --lib pulley_conformance -- --ignored --nocapture`.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "timing report, run explicitly"]
-async fn report_backend_timings() -> Result<(), Box<dyn std::error::Error>> {
-    for (name, use_pulley) in [("cranelift", false), ("pulley64", true)] {
-        let (mut runtime, key, _dir) = runtime_for(use_pulley).await?;
-        let params = Parameters::from([].as_ref());
-        let state = WrappedState::new(vec![1, 2, 3, 4]);
-        let cold = Instant::now();
-        runtime.validate_state(&key, &params, &state, &Default::default())?;
-        let cold = cold.elapsed();
-        const CALLS: u32 = 50;
-        let warm = Instant::now();
-        for _ in 0..CALLS {
-            runtime.validate_state(&key, &params, &state, &Default::default())?;
-        }
-        let warm = warm.elapsed() / CALLS;
-        println!("{name}: first call (compile + run) {cold:?}, steady-state per call {warm:?}");
-    }
     Ok(())
 }

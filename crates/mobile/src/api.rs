@@ -34,7 +34,10 @@ pub struct GetResult {
 
 /// Host callbacks. Implemented by the app (Swift/Kotlin) or by Rust tests.
 ///
-/// Called from the node's runtime threads, never from the caller's thread.
+/// `on_update` is called from the crate runtime (the client actor task), never
+/// from the caller's thread. `on_status` is called inline by `start`/`stop`,
+/// on whichever executor polls them, before they return. Neither is guaranteed
+/// to arrive on the app's main thread.
 #[uniffi::export(with_foreign)]
 pub trait ContractUpdateListener: Send + Sync {
     /// A contract this node subscribed to changed. `state` and/or `delta` are
@@ -82,12 +85,12 @@ impl FreenetNode {
 
     /// Current lifecycle state.
     pub fn status(&self) -> NodeStatus {
-        self.current_status()
+        self.status_impl()
     }
 
     /// Register (or replace) the host callbacks. May be called before start.
     pub fn set_update_listener(&self, listener: Arc<dyn ContractUpdateListener>) {
-        self.set_listener(listener);
+        self.set_update_listener_impl(listener);
     }
 
     /// Fetch a contract's state by base58 instance id, optionally subscribing

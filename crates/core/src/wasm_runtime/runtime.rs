@@ -452,21 +452,13 @@ pub struct RuntimeConfig {
     /// the memory the node may use AND the disk actually free on the cache's
     /// mount, instead of pinning a flat constant or a RAM-only figure.
     pub wasmtime_cache_size_bytes: Option<u64>,
-    /// Compile contracts to wasmtime's Pulley bytecode and run them on its
-    /// interpreter instead of the Cranelift JIT.
-    ///
-    /// Exists for targets that forbid JIT: iOS denies third-party apps
-    /// writable-then-executable pages, so Cranelift's native code generation
-    /// fails at runtime, and wasmtime itself does NOT default to Pulley on
-    /// aarch64 (its `build.rs` only does so where Cranelift has no backend at
-    /// all). Default `false` so every existing `RuntimeConfig` site keeps the
-    /// JIT; the production `from_config*` constructors copy
-    /// `config::Config::use_pulley` here, which is where the per-target default
-    /// lives. A runtime flag rather than a `cfg(target_os)` so a host test can
-    /// build both backends in one process and compare contract outcomes
-    /// (`wasm_runtime::pulley_conformance`). Requires the `pulley` cargo
-    /// feature: without it, engine creation FAILS with an explicit error rather
-    /// than silently falling back to the JIT.
+    /// Compile contracts to Pulley bytecode and run them on wasmtime's
+    /// interpreter instead of the Cranelift JIT, for JIT-less targets (iOS).
+    /// Default `false` so every existing site keeps the JIT; `from_node_config`
+    /// copies `config::Config::use_pulley` here. A runtime flag rather than a
+    /// `cfg` so one process can build both backends
+    /// (`wasm_runtime::pulley_conformance`); requires the `pulley` cargo
+    /// feature. Rationale: the PULLEY block in `WasmtimeEngine::create_engine`.
     pub use_pulley: bool,
 }
 
@@ -978,19 +970,10 @@ impl Default for RuntimeConfig {
 }
 
 impl RuntimeConfig {
-    /// The `RuntimeConfig` every production `Runtime` built from a node
-    /// [`Config`](crate::config::Config) starts from: [`Self::default`] plus
-    /// the knobs that are the NODE config's to decide. Today that is exactly
-    /// one, [`Config::use_pulley`](crate::config::Config::use_pulley) — the
-    /// per-target JIT-or-interpreter switch — which has to reach
-    /// `create_engine` from BOTH production constructors
-    /// (`Executor::from_config`, the standalone/local-mode executor an
-    /// embedding uses, and `Executor::from_config_with_shared_modules`, the
-    /// pool) or an iOS node running in local mode would JIT and crash on its
-    /// first contract call. Both sites spread over this
-    /// (`..RuntimeConfig::from_node_config(&config)`), so the next
-    /// node-derived knob lands here once instead of drifting between them; the
-    /// pool layers its own cache-dir / offload / budget settings on top.
+    /// `RuntimeConfig::default()` plus the knobs the node `Config` owns (today
+    /// `use_pulley`). Both production constructors (`Executor::from_config` and
+    /// `Executor::from_config_with_shared_modules`) spread over this so the
+    /// next node-derived knob lands once.
     pub(crate) fn from_node_config(config: &crate::config::Config) -> Self {
         Self {
             use_pulley: config.use_pulley,

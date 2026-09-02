@@ -6,7 +6,7 @@
 #![allow(dead_code)]
 
 use std::path::Path;
-use std::sync::{Mutex, Once};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use freenet_mobile::{
@@ -20,22 +20,15 @@ pub const TEST_CONTRACT: &str = "test-contract-integration";
 
 /// Install a quiet test logger once per process. `RUST_LOG` still overrides.
 pub fn init_test_logging() {
-    static ONCE: Once = Once::new();
-    ONCE.call_once(|| {
-        use tracing_subscriber::filter::{EnvFilter, LevelFilter};
-        let filter = EnvFilter::builder()
-            .with_default_directive(LevelFilter::WARN.into())
-            .from_env_lossy();
-        // Another subscriber (e.g. from a harness) may already be installed.
-        if tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .with_test_writer()
-            .try_init()
-            .is_err()
-        {
-            eprintln!("test logger already installed");
-        }
-    });
+    use tracing_subscriber::filter::{EnvFilter, LevelFilter};
+    let filter = EnvFilter::builder()
+        .with_default_directive(LevelFilter::WARN.into())
+        .from_env_lossy();
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_test_writer()
+        .try_init()
+        .ok();
 }
 
 /// Reserve a loopback port. It stays bound until [`release_port`] so parallel
@@ -59,7 +52,6 @@ pub fn local_profile(root: &Path, ws_port: u16) -> MobileProfile {
         ws_port,
         network_port: None,
         gateways: Vec::new(),
-        log_to_stderr: true,
     }
 }
 
@@ -80,7 +72,6 @@ pub fn network_profile(
         ws_port,
         network_port: Some(network_port),
         gateways: vec![gateway],
-        log_to_stderr: true,
     }
 }
 
@@ -159,14 +150,13 @@ impl RecordingListener {
                     return updates.clone();
                 }
             }
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             assert!(
-                !remaining.is_zero(),
+                tokio::time::Instant::now() < deadline,
                 "expected {n} update notification(s) within {within:?}"
             );
             // Wake on the next notification or at the deadline; the loop head
             // decides which it was.
-            let _woke = tokio::time::timeout(remaining, self.notify.notified()).await;
+            let _woke = tokio::time::timeout_at(deadline, self.notify.notified()).await;
         }
     }
 }

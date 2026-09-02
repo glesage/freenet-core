@@ -260,15 +260,13 @@ nightly_tests = []
 jemalloc-prof = ["tikv-jemallocator/profiling", "dep:tikv-jemalloc-ctl"]
 # WASM runtime backend
 wasmtime-backend = ["dep:wasmtime"]
-# Pulley: wasmtime's portable-bytecode interpreter backend, for targets that
-# forbid JIT (iOS). `wasmtime/all-arch` brings the Cranelift *Pulley* backend
-# (compile wasm -> Pulley bytecode in-process) plus wasmtime's `pulley` marker
-# feature; the bare `wasmtime/pulley` feature would only allow DESERIALIZING
-# precompiled Pulley modules. Which backend an engine actually uses is a
-# separate runtime switch (`RuntimeConfig::use_pulley`, fed from
-# `config::Config::use_pulley`), so one binary can run both side by side —
-# see `wasm_runtime::pulley_conformance`.
-pulley = ["wasmtime-backend", "wasmtime/all-arch"]
+# Pulley: wasmtime's portable-bytecode interpreter, for targets that forbid JIT
+# (iOS). `wasmtime/pulley` gates the interpreter and lets an engine accept a
+# `pulley64` target; the Pulley compiler backend already comes with Cranelift
+# (wasmtime pins `pulley` on its `wasmtime-cranelift` dependency). Whether an
+# engine uses it is `RuntimeConfig::use_pulley`; see the PULLEY block in
+# `WasmtimeEngine::create_engine`.
+pulley = ["wasmtime-backend", "wasmtime/pulley"]
 
 # ==============================================================================
 # Lint Configuration
