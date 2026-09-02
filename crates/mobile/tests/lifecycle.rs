@@ -15,6 +15,8 @@ async fn local_node_starts_and_stops() -> Result<(), MobileError> {
     assert_eq!(node.status(), NodeStatus::Running);
     // The node lays its stores out under the explicit data dir, nowhere else.
     assert!(root.path().join("data").join("db").join("local").is_dir());
+    // Node queries are a network-mode feature; the local loop rejects them.
+    assert!(node.connected_peers().await.is_err());
     node.stop().await?;
     assert_eq!(node.status(), NodeStatus::Stopped);
     // Stopping twice is a no-op, not an error.
@@ -90,7 +92,14 @@ async fn network_node_starts_and_stops_without_joining() -> Result<(), MobileErr
     node.start().await?;
     assert_eq!(node.status(), NodeStatus::Running);
     assert!(root.path().join("data").join("db").is_dir());
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    // Nobody answers at the gateway, so the peer count stays at zero and a
+    // bounded wait times out instead of hanging.
+    assert_eq!(node.connected_peers().await?, 0);
+    let err = node
+        .wait_for_peers(1, 2)
+        .await
+        .expect_err("no peer can appear behind an unreachable gateway");
+    assert!(matches!(err, MobileError::Timeout(_)), "{err}");
     tokio::time::timeout(Duration::from_secs(45), node.stop())
         .await
         .expect("network stop must complete")?;

@@ -11,7 +11,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use freenet_stdlib::client_api::{
-    ClientRequest, ContractRequest, ContractResponse, HostResponse, WebApi,
+    ClientRequest, ContractRequest, ContractResponse, HostResponse, NodeQuery, QueryResponse,
+    WebApi,
 };
 use freenet_stdlib::prelude::*;
 use tokio::runtime::Handle;
@@ -49,6 +50,9 @@ enum Command {
     Subscribe {
         key: ContractInstanceId,
         reply: oneshot::Sender<Result<(), MobileError>>,
+    },
+    ConnectedPeers {
+        reply: oneshot::Sender<Result<u32, MobileError>>,
     },
     Shutdown,
 }
@@ -120,6 +124,12 @@ impl ClientHandle {
     pub(crate) async fn subscribe(&self, key: ContractInstanceId) -> Result<(), MobileError> {
         let (reply, rx) = oneshot::channel();
         self.send(Command::Subscribe { key, reply }).await?;
+        rx.await.map_err(|_| actor_gone())?
+    }
+
+    pub(crate) async fn connected_peers(&self) -> Result<u32, MobileError> {
+        let (reply, rx) = oneshot::channel();
+        self.send(Command::ConnectedPeers { reply }).await?;
         rx.await.map_err(|_| actor_gone())?
     }
 
@@ -217,6 +227,9 @@ async fn handle_command(
         }
         Command::Subscribe { key, reply } => {
             reply_or_log(reply, do_subscribe(api, known, listener, key).await);
+        }
+        Command::ConnectedPeers { reply } => {
+            reply_or_log(reply, do_connected_peers(api, known, listener).await);
         }
         Command::Shutdown => {}
     }
@@ -368,6 +381,25 @@ async fn do_subscribe(
                     "subscription to {key} refused"
                 )))
             })
+        }
+        _ => None,
+    })
+    .await
+}
+
+/// Number of peers this node holds a ring connection with. Network mode only:
+/// the local request loop answers node queries with an error.
+async fn do_connected_peers(
+    api: &mut WebApi,
+    known: &mut KnownKeys,
+    listener: &ListenerSlot,
+) -> Result<u32, MobileError> {
+    api.send(ClientRequest::NodeQueries(NodeQuery::ConnectedPeers))
+        .await
+        .map_err(send_err)?;
+    wait_for(api, known, listener, |response, _| match response {
+        HostResponse::QueryResponse(QueryResponse::ConnectedPeers { peers }) => {
+            Some(Ok(u32::try_from(peers.len()).unwrap_or(u32::MAX)))
         }
         _ => None,
     })

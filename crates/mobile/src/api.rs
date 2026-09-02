@@ -128,4 +128,37 @@ impl FreenetNode {
         self.with_client(async |client| client.subscribe(id).await)
             .await
     }
+
+    /// Peers this node is connected to. Network mode only; a local node answers
+    /// with an error. Contract requests are rejected until this is at least one
+    /// (the ring location comes from the first gateway connection).
+    pub async fn connected_peers(&self) -> Result<u32, MobileError> {
+        self.with_client(async |client| client.connected_peers().await)
+            .await
+    }
+
+    /// Poll [`connected_peers`](Self::connected_peers) once a second until it
+    /// reaches `min_peers` or `timeout_secs` elapse.
+    pub async fn wait_for_peers(
+        &self,
+        min_peers: u32,
+        timeout_secs: u64,
+    ) -> Result<u32, MobileError> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+        loop {
+            let peers = self.connected_peers().await?;
+            if peers >= min_peers {
+                return Ok(peers);
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(MobileError::Timeout(format!(
+                    "only {peers} peer(s) connected after {timeout_secs}s (wanted {min_peers})"
+                )));
+            }
+            // Sleep on the crate runtime so this works from any executor.
+            crate::node::runtime()
+                .spawn(tokio::time::sleep(std::time::Duration::from_secs(1)))
+                .await?;
+        }
+    }
 }

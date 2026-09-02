@@ -105,44 +105,126 @@ impl MobileProfile {
         Ok(cfg)
     }
 
-    /// `freenet` persists the effective config, absolute paths included, and
-    /// merges it back on the next build. On iOS the app container moves on
-    /// reinstall (and the files inside it move along), so a persisted
-    /// `config.toml` from another container points at paths that no longer
-    /// exist. The profile is the source of truth here: when the persisted
-    /// `data_dir` is not ours, drop `config.toml` and the cached
-    /// `gateways.toml` (which names key files by absolute path too) and let
-    /// `freenet` rebuild both from the profile.
+    /// `freenet` persists the effective config and merges parts of it back on
+    /// the next build: absolute paths, and `skip_load_from_network` whenever
+    /// the file says `true`. Two mobile realities break that: the app container
+    /// moves on reinstall (files included), so persisted paths point nowhere,
+    /// and one app switches between local and network mode, so a local run's
+    /// `skip_load_from_network = true` would stop the next network run from
+    /// fetching the public gateway index. The profile is the source of truth
+    /// here: when the persisted file is stale for this profile, drop it and the
+    /// cached `gateways.toml` (absolute key paths too) and let `freenet`
+    /// rebuild both.
     fn discard_relocated_config(&self) -> Result<(), MobileError> {
         let config_dir = Path::new(&self.config_dir);
         let config_file = config_dir.join("config.toml");
         let Ok(text) = std::fs::read_to_string(&config_file) else {
             return Ok(());
         };
-        let persisted_data_dir = toml::from_str::<toml::Value>(&text)
-            .ok()
-            .and_then(|v| v.get("data_dir")?.as_str().map(PathBuf::from));
-        match persisted_data_dir {
-            Some(dir) if dir == self.data_path() => Ok(()),
-            _ => {
-                tracing::info!(
-                    config = %config_file.display(),
-                    "persisted config names another data dir; discarding it"
-                );
-                for stale in [config_file, config_dir.join("gateways.toml")] {
-                    match std::fs::remove_file(&stale) {
-                        Ok(()) => {}
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(e) => {
-                            return Err(MobileError::Config(format!(
-                                "cannot remove stale {}: {e}",
-                                stale.display()
-                            )));
-                        }
-                    }
+        if !self.persisted_config_is_stale(&text) {
+            return Ok(());
+        }
+        tracing::info!(
+            config = %config_file.display(),
+            "persisted config is stale for this profile; discarding it"
+        );
+        for stale in [config_file, config_dir.join("gateways.toml")] {
+            match std::fs::remove_file(&stale) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(MobileError::Config(format!(
+                        "cannot remove stale {}: {e}",
+                        stale.display()
+                    )));
                 }
-                Ok(())
             }
         }
+        Ok(())
+    }
+
+    /// Whether a persisted `config.toml` would misconfigure a node built from
+    /// this profile: another data dir, another mode, or a persisted
+    /// `skip_load_from_network = true` when this profile needs the public
+    /// gateway index. Unparseable files count as stale.
+    fn persisted_config_is_stale(&self, text: &str) -> bool {
+        let Ok(value) = toml::from_str::<toml::Value>(text) else {
+            return true;
+        };
+        let other_data_dir = value
+            .get("data_dir")
+            .and_then(|v| v.as_str())
+            .is_none_or(|dir| Path::new(dir) != self.data_path());
+        let wanted_mode = match self.mode {
+            NodeMode::Local => "local",
+            NodeMode::Network => "network",
+        };
+        let other_mode = value
+            .get("mode")
+            .and_then(|v| v.as_str())
+            .is_some_and(|mode| !mode.eq_ignore_ascii_case(wanted_mode));
+        let wants_public_index = self.mode == NodeMode::Network && self.gateways.is_empty();
+        let blocks_public_index = wants_public_index
+            && value
+                .get("skip_load_from_network")
+                .and_then(|v| v.as_bool())
+                .is_some_and(|skip| skip);
+        other_data_dir || other_mode || blocks_public_index
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn profile(mode: NodeMode, gateways: Vec<String>) -> MobileProfile {
+        MobileProfile {
+            mode,
+            data_dir: "/app/freenet/data".into(),
+            config_dir: "/app/freenet/config".into(),
+            log_dir: "/app/freenet/logs".into(),
+            ws_port: 7509,
+            network_port: None,
+            gateways,
+            log_to_stderr: false,
+        }
+    }
+
+    #[test]
+    fn matching_persisted_config_is_kept() {
+        let p = profile(NodeMode::Local, vec![]);
+        let text =
+            "mode = \"local\"\ndata_dir = \"/app/freenet/data\"\nskip_load_from_network = true\n";
+        assert!(!p.persisted_config_is_stale(text));
+    }
+
+    #[test]
+    fn another_data_dir_is_stale() {
+        let p = profile(NodeMode::Local, vec![]);
+        let text = "mode = \"local\"\ndata_dir = \"/old-container/freenet/data\"\n";
+        assert!(p.persisted_config_is_stale(text));
+    }
+
+    #[test]
+    fn another_mode_is_stale() {
+        let p = profile(NodeMode::Network, vec!["{}".into()]);
+        let text = "mode = \"local\"\ndata_dir = \"/app/freenet/data\"\n";
+        assert!(p.persisted_config_is_stale(text));
+    }
+
+    #[test]
+    fn persisted_skip_blocks_public_index_and_is_stale() {
+        let p = profile(NodeMode::Network, vec![]);
+        let text =
+            "mode = \"network\"\ndata_dir = \"/app/freenet/data\"\nskip_load_from_network = true\n";
+        assert!(p.persisted_config_is_stale(text));
+        // With explicit gateways the profile wants the skip itself: not stale.
+        let p = profile(NodeMode::Network, vec!["{}".into()]);
+        assert!(!p.persisted_config_is_stale(text));
+    }
+
+    #[test]
+    fn unparseable_persisted_config_is_stale() {
+        assert!(profile(NodeMode::Local, vec![]).persisted_config_is_stale("not toml ["));
     }
 }
