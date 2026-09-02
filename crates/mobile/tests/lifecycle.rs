@@ -147,3 +147,34 @@ async fn twenty_five_start_stop_cycles_do_not_leak() -> Result<(), MobileError> 
 async fn one_hundred_start_stop_cycles_do_not_leak() -> Result<(), MobileError> {
     run_cycles(100).await
 }
+
+/// A `config.toml` persisted by another app container (iOS reinstall) names
+/// paths that no longer exist. The profile wins: the node must still start,
+/// and the rewritten file must name the profile's data dir.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_config_from_a_moved_container_is_replaced() -> Result<(), MobileError> {
+    init_test_logging();
+    let root = tempfile::tempdir().expect("tempdir");
+    let profile = local_profile(root.path(), reserve_port());
+    let config_dir = root.path().join("config");
+    std::fs::create_dir_all(&config_dir).expect("config dir");
+    std::fs::write(
+        config_dir.join("config.toml"),
+        "mode = \"local\"\ndata_dir = \"/nonexistent/old-container/data\"\n\
+         transport_keypair = \"/nonexistent/old-container/data/secrets/local/transport_keypair\"\n",
+    )
+    .expect("write stale config");
+
+    let node = start_node(profile.clone()).await?;
+    assert_eq!(node.status(), NodeStatus::Running);
+    let rewritten = std::fs::read_to_string(config_dir.join("config.toml")).expect("config.toml");
+    assert!(
+        rewritten.contains(&profile.data_dir),
+        "rewritten config must name the profile's data dir:\n{rewritten}"
+    );
+    assert!(
+        !rewritten.contains("old-container"),
+        "stale paths must be gone:\n{rewritten}"
+    );
+    node.stop().await
+}
