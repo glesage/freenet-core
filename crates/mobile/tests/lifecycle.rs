@@ -173,33 +173,68 @@ async fn one_hundred_start_stop_cycles_do_not_leak() -> Result<(), MobileError> 
     run_cycles(100).await
 }
 
-/// A `config.toml` persisted by another app container (iOS reinstall) names
-/// paths that no longer exist. The profile wins: the node must still start,
-/// and the rewritten file must name the profile's data dir.
+/// A `config.toml` persisted by another app container (iOS reinstall) names a
+/// transport keypair path under a data dir that no longer exists on this
+/// device. `freenet` reads that path eagerly while parsing the persisted
+/// file, before the profile's own data dir ever gets a chance to override it,
+/// so without the discard this fails at startup rather than merely naming the
+/// wrong directory. The fixture is a REAL config.toml from a real previous
+/// run (not a hand-truncated string), so this exercises exactly what an app
+/// container move produces.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn stale_config_from_a_moved_container_is_replaced() -> Result<(), MobileError> {
+async fn startup_survives_a_config_naming_a_dead_key_path() -> Result<(), MobileError> {
     init_test_logging();
+
+    // A real previous run, whose container is about to "vanish".
+    let old = tempfile::tempdir().expect("old container tempdir");
+    let persisted_by_old_run = persisted_config_from_a_real_run(old.path()).await?;
+    drop(old); // The container is gone: its transport_keypair path is now dead.
+
+    // The new container reuses that exact file, the way iOS would restore it
+    // from a backup, under directories of its own.
     let root = tempfile::tempdir().expect("tempdir");
     let profile = local_profile(root.path(), reserve_port());
     let config_dir = root.path().join("config");
     std::fs::create_dir_all(&config_dir).expect("config dir");
-    std::fs::write(
-        config_dir.join("config.toml"),
-        "mode = \"local\"\ndata_dir = \"/nonexistent/old-container/data\"\n\
-         transport_keypair = \"/nonexistent/old-container/data/secrets/local/transport_keypair\"\n",
-    )
-    .expect("write stale config");
+    std::fs::write(config_dir.join("config.toml"), &persisted_by_old_run)
+        .expect("write stale config");
 
-    let node = start_node(profile.clone()).await?;
+    let node = start_node(profile).await?;
     assert_eq!(node.status(), NodeStatus::Running);
-    let rewritten = std::fs::read_to_string(config_dir.join("config.toml")).expect("config.toml");
+    node.stop().await
+}
+
+/// A `config.toml` naming only a different (but still-valid) data dir must
+/// still be discarded, along with any cached `gateways.toml` sitting next to
+/// it — otherwise a device that switches between local and network mode
+/// could get stuck on a stale `skip_load_from_network` from the wrong mode.
+/// Unlike the dead-key-path case above, nothing here would make `start()`
+/// fail without the discard: the profile's own data dir always overrides the
+/// persisted one. The only observable effect is whether the cached gateway
+/// index survives, so that is what this test checks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_config_from_another_data_dir_is_discarded_with_its_gateways() -> Result<(), MobileError>
+{
+    init_test_logging();
+
+    // A real previous run under a different, still-existing data dir.
+    let old = tempfile::tempdir().expect("old container tempdir");
+    let persisted_by_old_run = persisted_config_from_a_real_run(old.path()).await?;
+
+    let root = tempfile::tempdir().expect("tempdir");
+    let profile = local_profile(root.path(), reserve_port());
+    let config_dir = root.path().join("config");
+    std::fs::create_dir_all(&config_dir).expect("config dir");
+    std::fs::write(config_dir.join("config.toml"), &persisted_by_old_run)
+        .expect("write stale config");
+    std::fs::write(config_dir.join("gateways.toml"), "# cached gateway index\n")
+        .expect("write cached gateways.toml");
+
+    let node = start_node(profile).await?;
+    assert_eq!(node.status(), NodeStatus::Running);
     assert!(
-        rewritten.contains(&profile.data_dir),
-        "rewritten config must name the profile's data dir:\n{rewritten}"
-    );
-    assert!(
-        !rewritten.contains("old-container"),
-        "stale paths must be gone:\n{rewritten}"
+        !config_dir.join("gateways.toml").exists(),
+        "a data-dir mismatch must discard the cached gateway index too"
     );
     node.stop().await
 }

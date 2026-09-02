@@ -100,6 +100,20 @@ pub async fn start_node(profile: MobileProfile) -> Result<FreenetNode, MobileErr
     Ok(node)
 }
 
+/// A real `config.toml` as a genuine previous run would have written it: a
+/// local-mode node is started under `root` and stopped, and its persisted
+/// file is returned. Callers plant this text under a DIFFERENT profile's
+/// config dir to simulate a moved or reused app container, since a
+/// hand-truncated TOML string is missing fields a real file always has.
+pub async fn persisted_config_from_a_real_run(root: &Path) -> Result<String, MobileError> {
+    let node = start_node(local_profile(root, reserve_port())).await?;
+    node.stop().await?;
+    Ok(
+        std::fs::read_to_string(root.join("config").join("config.toml"))
+            .expect("a run must have persisted a config.toml"),
+    )
+}
+
 /// Compile (once per process) and load the test contract, returning the raw
 /// wasm and the parameters the way a host would hand them to `put`.
 pub fn test_contract() -> (Vec<u8>, Vec<u8>) {
