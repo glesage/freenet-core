@@ -2695,6 +2695,77 @@ mod tests {
         });
     }
 
+    /// WAT for a contract-shaped export that stores far past its one-page
+    /// memory. Exists to check the property `signals_based_traps(false)` /
+    /// `memory_guard_size(0)` (the PULLEY block above) are actually for: a
+    /// guest reading or writing past its linear memory must still trap in a
+    /// controlled way rather than taking the process down, on either backend.
+    const OOB_STORE_WAT: &str = r#"
+        (module
+          (memory (export "memory") 1)
+          (func (export "oob_store")
+            i32.const 200000
+            i64.const 0
+            i64.store))
+    "#;
+
+    /// Out-of-bounds guest memory access must trap, on the default (Cranelift
+    /// JIT) profile.
+    #[test]
+    fn oob_access_traps() {
+        assert_oob_access_traps(RuntimeConfig::default());
+    }
+
+    /// Same guarantee on the Pulley interpreter profile. This is the one
+    /// property `signals_based_traps(false)` / `memory_guard_size(0)` exist
+    /// for; removing either line from the PULLEY block leaves every other
+    /// pulley test in this file green (verified), so this is the only test
+    /// that would catch it — though on a host with working signal handlers
+    /// it may not distinguish the two settings either, since the host
+    /// tolerates signal-based traps for an interpreter target regardless. A
+    /// device/simulator run is the complement (TEST-PLAN-mobile-phase1.md
+    /// M6.4).
+    #[cfg(feature = "pulley")]
+    #[test]
+    fn oob_access_traps_under_pulley() {
+        assert_oob_access_traps(RuntimeConfig {
+            use_pulley: true,
+            ..RuntimeConfig::default()
+        });
+    }
+
+    fn assert_oob_access_traps(config: RuntimeConfig) {
+        let engine = WasmtimeEngine::create_backend_engine(&config).unwrap();
+        let module =
+            Module::new(&engine, OOB_STORE_WAT.as_bytes()).expect("oob-store WAT must compile");
+
+        let mut store = Store::new(&engine, HostState::new(DEFAULT_MAX_MEMORY_PAGES));
+        store.limiter(|s| s);
+        // create_backend_engine enables epoch_interruption unconditionally
+        // (see assert_epoch_preempts_infinite_loop above), and an un-armed
+        // deadline defaults to 0 — the very first epoch check would trip an
+        // interrupt before the guest ever reaches the out-of-bounds store.
+        // Arm a deadline this fast test cannot reach.
+        arm_epoch_deadline(&mut store, 10_000);
+
+        let instance = block_on_async(Linker::new(&engine).instantiate_async(&mut store, &module))
+            .expect("instantiation must succeed");
+        let func = instance
+            .get_typed_func::<(), ()>(&mut store, "oob_store")
+            .expect("oob_store export must exist");
+
+        let err = block_on_async(func.call_async(&mut store, ()))
+            .expect_err("an out-of-bounds store must trap, not succeed");
+        // Must be a genuine memory-access trap, not the epoch interrupt this
+        // store never arms — conflating the two would let a broken guard
+        // setting hide behind an unrelated preemption path.
+        assert!(
+            err.downcast_ref::<wasmtime::Trap>()
+                .is_some_and(|t| !matches!(t, wasmtime::Trap::Interrupt)),
+            "out-of-bounds access must trap as a memory fault, got: {err:?}"
+        );
+    }
+
     fn assert_epoch_preempts_infinite_loop(config: RuntimeConfig) {
         // create_backend_engine enables epoch_interruption AND registers the
         // engine with the global epoch ticker (100ms period). Metering off.
