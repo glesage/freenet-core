@@ -223,4 +223,26 @@ mod tests {
     fn unparseable_persisted_config_is_stale() {
         assert!(profile(NodeMode::Local, vec![]).persisted_config_is_stale("not toml ["));
     }
+
+    /// The mobile crate never sets `Config::use_pulley` itself; it relies on
+    /// the per-target default (Pulley on iOS, the JIT elsewhere) that
+    /// `ConfigArgs::build` seeds. A future change that built a fresh config
+    /// some other way, or pinned the field, would silently put iOS back on
+    /// the JIT — this pins the default surviving the trip through
+    /// `build_config`.
+    #[tokio::test]
+    async fn build_config_keeps_the_per_target_pulley_default() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut p = profile(NodeMode::Local, vec![]);
+        p.data_dir = dir.path().join("data").to_string_lossy().into_owned();
+        p.config_dir = dir.path().join("config").to_string_lossy().into_owned();
+        p.log_dir = dir.path().join("logs").to_string_lossy().into_owned();
+
+        let cfg = p.build_config().await.expect("build_config");
+        assert_eq!(
+            cfg.use_pulley,
+            freenet::config::default_use_pulley(),
+            "build_config must not override the per-target pulley default"
+        );
+    }
 }
