@@ -452,6 +452,22 @@ pub struct RuntimeConfig {
     /// the memory the node may use AND the disk actually free on the cache's
     /// mount, instead of pinning a flat constant or a RAM-only figure.
     pub wasmtime_cache_size_bytes: Option<u64>,
+    /// Compile contracts to wasmtime's Pulley bytecode and run them on its
+    /// interpreter instead of the Cranelift JIT.
+    ///
+    /// Exists for targets that forbid JIT: iOS denies third-party apps
+    /// writable-then-executable pages, so Cranelift's native code generation
+    /// fails at runtime, and wasmtime itself does NOT default to Pulley on
+    /// aarch64 (its `build.rs` only does so where Cranelift has no backend at
+    /// all). Default `false` so every existing `RuntimeConfig` site keeps the
+    /// JIT; the production `from_config*` constructors copy
+    /// `config::Config::use_pulley` here, which is where the per-target default
+    /// lives. A runtime flag rather than a `cfg(target_os)` so a host test can
+    /// build both backends in one process and compare contract outcomes
+    /// (`wasm_runtime::pulley_conformance`). Requires the `pulley` cargo
+    /// feature: without it, engine creation FAILS with an explicit error rather
+    /// than silently falling back to the JIT.
+    pub use_pulley: bool,
 }
 
 /// Lower clamp for the node-relative wasmtime **on-disk compile cache** soft
@@ -954,6 +970,31 @@ impl Default for RuntimeConfig {
             // it, so tests and sims see unchanged wasmtime cache behavior.
             wasmtime_cache_dir: None,
             wasmtime_cache_size_bytes: None,
+            // Default: Cranelift JIT. Only `Config::use_pulley` (per-target
+            // default, embedder-settable) turns the interpreter on.
+            use_pulley: false,
+        }
+    }
+}
+
+impl RuntimeConfig {
+    /// The `RuntimeConfig` every production `Runtime` built from a node
+    /// [`Config`](crate::config::Config) starts from: [`Self::default`] plus
+    /// the knobs that are the NODE config's to decide. Today that is exactly
+    /// one, [`Config::use_pulley`](crate::config::Config::use_pulley) — the
+    /// per-target JIT-or-interpreter switch — which has to reach
+    /// `create_engine` from BOTH production constructors
+    /// (`Executor::from_config`, the standalone/local-mode executor an
+    /// embedding uses, and `Executor::from_config_with_shared_modules`, the
+    /// pool) or an iOS node running in local mode would JIT and crash on its
+    /// first contract call. Both sites spread over this
+    /// (`..RuntimeConfig::from_node_config(&config)`), so the next
+    /// node-derived knob lands here once instead of drifting between them; the
+    /// pool layers its own cache-dir / offload / budget settings on top.
+    pub(crate) fn from_node_config(config: &crate::config::Config) -> Self {
+        Self {
+            use_pulley: config.use_pulley,
+            ..Self::default()
         }
     }
 }
@@ -3059,5 +3100,31 @@ mod host_clock_warning_call_site_pin {
     #[should_panic(expected = "block comment")]
     fn a_block_comment_fails_closed() {
         blank_literals("{ /* } */ }");
+    }
+}
+
+#[cfg(test)]
+mod node_config_plumbing_tests {
+    use super::RuntimeConfig;
+
+    /// `Config::use_pulley` is the embedder's switch; it must be what
+    /// `from_node_config` hands to `create_engine`, in both directions.
+    #[tokio::test]
+    async fn from_node_config_copies_use_pulley() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = crate::config::local_test_config_args(dir.path())
+            .build()
+            .await
+            .unwrap();
+        cfg.use_pulley = true;
+        assert!(RuntimeConfig::from_node_config(&cfg).use_pulley);
+        cfg.use_pulley = false;
+        let rc = RuntimeConfig::from_node_config(&cfg);
+        assert!(!rc.use_pulley);
+        // Every other knob stays at its default on this path.
+        let default = RuntimeConfig::default();
+        assert_eq!(rc.enable_metering, default.enable_metering);
+        assert_eq!(rc.offload_compilation, default.offload_compilation);
+        assert_eq!(rc.wasmtime_cache_dir, default.wasmtime_cache_dir);
     }
 }

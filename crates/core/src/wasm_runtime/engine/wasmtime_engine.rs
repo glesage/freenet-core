@@ -1550,6 +1550,50 @@ impl WasmtimeEngine {
         wasmtime_config.memory_guard_size(WASM_MEMORY_GUARD_BYTES);
         wasmtime_config.memory_reservation_for_growth(0);
 
+        // ==================================================================
+        // PULLEY (interpreter) PROFILE for JIT-less targets
+        // ==================================================================
+        //
+        // iOS denies third-party processes writable-then-executable pages, so
+        // Cranelift's native code generation fails at runtime. wasmtime does
+        // NOT switch to its Pulley interpreter on its own there: its `build.rs`
+        // computes `default_target_pulley = !has_host_compiler_backend || miri`,
+        // and aarch64 (aarch64-apple-ios included) HAS a Cranelift backend, so
+        // the default stays the JIT. The embedder opts in through
+        // `RuntimeConfig::use_pulley` (fed from `config::Config::use_pulley`,
+        // which defaults to true on iOS).
+        //
+        // `Config::target` normally demands `precompile_module` + `deserialize`
+        // for a non-native target, but `Engine::_check_compatible_with_native_host`
+        // carves Pulley out (same pointer width and endianness as the host), so
+        // `Module::new` keeps working. Once a target is set wasmtime skips the
+        // `apply_tunables` auto-adjustment of signal-based traps and the guard
+        // size, so both are pinned explicitly: the interpreter bounds-checks
+        // every access itself, and a guard page is neither needed nor usable
+        // without signal handlers. The on-disk compile cache stays shared with
+        // the JIT profile safely: wasmtime hashes `compiler.triple()` into the
+        // cache key (`HashedEngineCompileEnv`), so `pulley64` and native
+        // artifacts never collide.
+        if config.use_pulley {
+            #[cfg(feature = "pulley")]
+            {
+                wasmtime_config
+                    .target("pulley64")
+                    .map_err(|e| WasmError::Other(anyhow::anyhow!(e)))?;
+                wasmtime_config.signals_based_traps(false);
+                // Overrides the JIT-oriented one-page guard configured above.
+                wasmtime_config.memory_guard_size(0);
+            }
+            #[cfg(not(feature = "pulley"))]
+            {
+                return Err(WasmError::Other(anyhow::anyhow!(
+                    "RuntimeConfig::use_pulley is set but the `pulley` cargo feature is \
+                     not compiled in; refusing to fall back to the Cranelift JIT silently"
+                ))
+                .into());
+            }
+        }
+
         // Use OptLevel::None for maximum security with untrusted code
         // Simpler compiler = smaller attack surface
         // Memory benefits come from pooling and proper cleanup, not optimizations
@@ -2606,12 +2650,28 @@ mod tests {
     /// failure).
     #[test]
     fn epoch_preemption_stops_infinite_loop() {
-        // create_backend_engine enables epoch_interruption AND registers the
-        // engine with the global epoch ticker (100ms period). Metering off.
-        let config = RuntimeConfig {
+        assert_epoch_preempts_infinite_loop(RuntimeConfig {
             enable_metering: false,
             ..RuntimeConfig::default()
-        };
+        });
+    }
+
+    /// Same guarantee on the Pulley interpreter profile (the iOS engine): with
+    /// no JIT and no signal-based traps, the armed epoch deadline must still be
+    /// the thing that stops a spinning guest.
+    #[cfg(feature = "pulley")]
+    #[test]
+    fn epoch_preemption_stops_infinite_loop_under_pulley() {
+        assert_epoch_preempts_infinite_loop(RuntimeConfig {
+            enable_metering: false,
+            use_pulley: true,
+            ..RuntimeConfig::default()
+        });
+    }
+
+    fn assert_epoch_preempts_infinite_loop(config: RuntimeConfig) {
+        // create_backend_engine enables epoch_interruption AND registers the
+        // engine with the global epoch ticker (100ms period). Metering off.
         let engine = WasmtimeEngine::create_backend_engine(&config).unwrap();
         let module = Module::new(&engine, INFINITE_LOOP_WAT.as_bytes())
             .expect("infinite-loop WAT must compile");

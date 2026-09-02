@@ -375,7 +375,17 @@ impl Executor<Runtime> {
     ) -> anyhow::Result<Self> {
         let (contract_store, delegate_store, secret_store, state_store) =
             Self::get_stores(&config).await?;
-        let mut rt = Runtime::build(contract_store, delegate_store, secret_store, false).unwrap();
+        // Node-derived runtime knobs (today: the JIT-or-Pulley switch) must reach
+        // the engine on this standalone/local-mode path too, or an iOS embedding
+        // running in local mode would JIT and crash on its first contract call.
+        let mut rt = Runtime::build_with_config(
+            contract_store,
+            delegate_store,
+            secret_store,
+            false,
+            RuntimeConfig::from_node_config(&config),
+        )
+        .map_err(|e| anyhow::anyhow!("building the contract runtime: {e}"))?;
         // Enable V2 delegate contract access by providing the state store DB
         rt.set_state_store_db(state_store.storage());
         // V2 delegate state writes (put/update_contract_state_sync) write
@@ -511,7 +521,7 @@ impl Executor<Runtime> {
             // `default_wasmtime_cache_size_bytes_for_dir`.
             wasmtime_cache_dir: Some(wasmtime_cache_dir),
             wasmtime_cache_size_bytes,
-            ..RuntimeConfig::default()
+            ..RuntimeConfig::from_node_config(&config)
         };
         let mut rt = Runtime::build_with_shared_module_caches(
             contract_store,
