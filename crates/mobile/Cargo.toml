@@ -21,6 +21,17 @@ anyhow = { workspace = true }
 # `pulley` compiles wasmtime's interpreter backend so contracts can run without
 # JIT (iOS forbids it). `Config::use_pulley` defaults to true on iOS and false
 # elsewhere, so host tests still exercise the Cranelift JIT.
+#
+# LOAD-BEARING beyond this crate's own build: this crate is a workspace
+# member, so a `--workspace` cargo/nextest invocation unifies features across
+# members and this line is what turns `pulley` on for `freenet` in that build
+# — it is how crates/core's pulley-gated tests have been running in CI at
+# all. `.github/workflows/ci.yml`'s `test_unit` job now also runs them
+# explicitly against `-p freenet` alone ("Test pulley" / "Test pulley
+# feature-off refusal"), so removing `features = ["pulley"]` from this line
+# no longer silently drops that coverage — but it would still change what the
+# main `--workspace` step above builds and tests, so treat this line as
+# read by that CI job, not just by this crate's own Cargo.toml.
 freenet = { path = "../core", features = ["pulley"] }
 freenet-stdlib = { features = ["net"], workspace = true }
 thiserror = { workspace = true }
