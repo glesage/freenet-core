@@ -25,8 +25,15 @@ async fn put_then_get_round_trips_state() -> Result<(), MobileError> {
     node.stop().await
 }
 
+/// `MobileError::NotFound` exists for `ContractResponse::NotFound`
+/// (`client.rs`'s `do_get` matcher), but a local peer's request loop answers
+/// a well-formed, unknown key with a generic client error instead — verified
+/// by running this test against the current code and reading the message.
+/// `NotFound` is unreachable from this client for a local GET; if that ever
+/// changes this assertion should narrow further, not widen back to accepting
+/// both, which would silently tolerate every GET failing generically again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn get_of_unknown_contract_is_not_found() -> Result<(), MobileError> {
+async fn get_of_unknown_contract_is_a_client_error() -> Result<(), MobileError> {
     init_test_logging();
     let root = tempfile::tempdir().expect("tempdir");
     let node = start_node(local_profile(root.path(), reserve_port())).await?;
@@ -34,10 +41,7 @@ async fn get_of_unknown_contract_is_not_found() -> Result<(), MobileError> {
         .get("6Sf2buCM1LzU5EhscNvjeNqPYbQbtvKSkzC6EFUy8Jjh".into(), false)
         .await
         .expect_err("unknown contract must not resolve");
-    assert!(
-        matches!(err, MobileError::NotFound(_) | MobileError::Request(_)),
-        "unexpected error kind: {err}"
-    );
+    assert!(matches!(err, MobileError::Request(_)), "{err}");
     node.stop().await
 }
 
