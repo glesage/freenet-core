@@ -1,0 +1,47 @@
+[package]
+name = "freenet-mobile"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+description = "Embeddable Freenet node with a UniFFI surface for mobile hosts"
+license-file = "../core/LICENSE.md"
+repository = "https://github.com/freenet/freenet-core"
+
+[lib]
+name = "freenet_mobile"
+crate-type = ["lib", "staticlib", "cdylib"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+# `pulley` compiles wasmtime's interpreter backend so contracts can run without
+# JIT (iOS forbids it). `Config::use_pulley` defaults to true on iOS and false
+# elsewhere, so host tests still exercise the Cranelift JIT.
+freenet = { path = "../core", features = ["pulley"] }
+freenet-stdlib = { features = ["net"], workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time", "net"] }
+# Must match the tokio-tungstenite that `freenet_stdlib::client_api::WebApi::start`
+# is typed against (its `net` feature pins 0.27).
+tokio-tungstenite = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
+uniffi = { version = "0.32", features = ["tokio", "cli"] }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+
+[lints.rust]
+# Mirrors crates/core: discarded Results/Options on #[must_use] are compile errors.
+unused_must_use = "deny"
+# Require `unsafe` blocks to carry a `// SAFETY: ...` comment.
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+let_underscore_must_use = "deny"
+undocumented_unsafe_blocks = "deny"
