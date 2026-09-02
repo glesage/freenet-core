@@ -136,3 +136,72 @@ async fn explicit_subscribe_then_update_notifies() -> Result<(), MobileError> {
     assert_eq!(updates[0].key, key);
     node.stop().await
 }
+
+/// Proves the API is safe to call concurrently from multiple tasks: fire
+/// overlapping requests for two distinct contracts plus a peer-count query
+/// from separate tasks and check each caller gets the answer for its own
+/// key.
+///
+/// It does NOT prove the stronger thing its name might suggest — that the
+/// by-key matcher in `do_get`'s `wait_for` closure arbitrates between two
+/// GENUINELY in-flight requests. Mutation-checked: stripping `if
+/// *full.id() == key` from that matcher left this test green across 15 runs.
+/// Reading `actor()` explains why: `handle_command(..).await` runs to
+/// completion — including its own `wait_for` loop — before the actor loop
+/// reads the next queued `Command`, so two `Get`s are never actually
+/// awaiting a reply at the same time; the mpsc channel serializes them
+/// before the key check ever gets a chance to matter. What this test DOES
+/// prove is that concurrent callers queue safely and each gets routed the
+/// right answer once its turn comes.
+///
+/// The key check's real job is different: a late response for an EARLIER
+/// command whose caller already gave up (a client-side timeout) arriving
+/// while a LATER, different command is waiting. That scenario is still
+/// untested (see TEST-PLAN-mobile-phase1.md M4.3).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_requests_are_routed_to_their_callers() -> Result<(), MobileError> {
+    init_test_logging();
+    let root = tempfile::tempdir().expect("tempdir");
+    let node = Arc::new(start_node(local_profile(root.path(), reserve_port())).await?);
+
+    // Same code, different params: distinct contract keys (the test contract
+    // ignores params in validate_state, so both PUTs succeed identically).
+    let (wasm, _) = test_contract();
+    let state_a = empty_todo_list();
+    let state_b = empty_todo_list();
+    let key_a = node
+        .put(wasm.clone(), vec![], state_a.clone(), false)
+        .await?;
+    let key_b = node.put(wasm, vec![1], state_b.clone(), false).await?;
+    assert_ne!(
+        key_a, key_b,
+        "different params must produce different contract keys"
+    );
+
+    let (na, ka) = (node.clone(), key_a.clone());
+    let get_a = tokio::spawn(async move { na.get(ka, false).await });
+    let (nb, kb) = (node.clone(), key_b.clone());
+    let get_b = tokio::spawn(async move { nb.get(kb, false).await });
+    let nc = node.clone();
+    let peers = tokio::spawn(async move { nc.connected_peers().await });
+
+    let (ra, rb, rc) = tokio::join!(get_a, get_b, peers);
+    let ra = ra.expect("task a join")?;
+    let rb = rb.expect("task b join")?;
+    assert_eq!(
+        ra.key, key_a,
+        "task a must get contract a's response, not b's"
+    );
+    assert_eq!(ra.state, state_a);
+    assert_eq!(
+        rb.key, key_b,
+        "task b must get contract b's response, not a's"
+    );
+    assert_eq!(rb.state, state_b);
+    assert!(
+        rc.expect("task c join").is_err(),
+        "local mode rejects peer queries regardless of ordering"
+    );
+
+    node.stop().await
+}
