@@ -1383,7 +1383,7 @@ fn windows_memory_status_to_ram_bytes(raw_bytes: Option<u64>) -> Option<usize> {
 /// host's real page size (`vm_stat`'s own "Mach Virtual Memory Statistics"
 /// header cites the same three categories as what a process can expect to
 /// obtain without swapping).
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 fn read_macos_available_bytes() -> Option<usize> {
     // `mach2` (workspace dep pinned at 0.4) does NOT export `mach_host`,
     // `HOST_VM_INFO64`, or a `vm_statistics64` struct at this version — `libc`
@@ -1444,10 +1444,12 @@ fn read_macos_available_bytes() -> Option<usize> {
 /// its `src/unix/apple/system.rs`). A `OnceLock` gives the same one-acquisition
 /// guarantee without restructuring this module's stateless-function shape
 /// into a persistent struct.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 fn macos_cached_host_port() -> libc::mach_port_t {
     static HOST_PORT: std::sync::OnceLock<libc::mach_port_t> = std::sync::OnceLock::new();
     #[allow(deprecated)]
+    // SAFETY: `mach_host_self` takes no arguments, has no preconditions and
+    // only returns a send right for the host port; calling it is always sound.
     *HOST_PORT.get_or_init(|| unsafe { libc::mach_host_self() })
 }
 
@@ -1458,7 +1460,7 @@ fn macos_cached_host_port() -> libc::mach_port_t {
 /// host/CI runner, but the arithmetic on its output can be exercised
 /// everywhere). `checked_mul` + `try_from` guard against overflow on an
 /// implausible page count rather than panicking or silently wrapping.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "ios", test))]
 fn macos_vm_stats_to_available_bytes(
     free_count: u64,
     inactive_count: u64,
@@ -1478,7 +1480,7 @@ fn macos_vm_stats_to_available_bytes(
 /// `VmRSS`: physical memory currently resident for this task. Backs the
 /// resident-overhead budget's `own_rss` term, which is never discounted by
 /// `mem_share` — see `ring::hosting::cache::resident_overhead_budget_for`.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 fn read_macos_own_rss_bytes() -> Option<usize> {
     // Same `mach2`-does-not-have-this-at-the-pinned-version situation as
     // `read_macos_available_bytes` above — `libc` has `task_info`,
@@ -1526,7 +1528,7 @@ fn read_macos_own_rss_bytes() -> Option<usize> {
 /// Pure narrowing behind [`read_macos_own_rss_bytes`], split out for the same
 /// reason as [`macos_vm_stats_to_available_bytes`] — testable on every CI
 /// platform even though the `task_info` FFI call itself only runs on macOS.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "ios", test))]
 fn macos_task_info_to_rss_bytes(resident_size: u64) -> Option<usize> {
     usize::try_from(resident_size).ok()
 }
@@ -1534,7 +1536,7 @@ fn macos_task_info_to_rss_bytes(resident_size: u64) -> Option<usize> {
 /// Host page size (bytes) via `sysconf(_SC_PAGESIZE)` — the same POSIX call
 /// [`read_total_ram_bytes`]'s non-Linux-unix branch already uses, reused here
 /// rather than pulling in a second, mach-specific page-size query.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 fn macos_page_size_bytes() -> Option<u64> {
     // SAFETY: `sysconf` is an FFI call that is always sound to invoke with a
     // valid name constant. It takes no pointers, has no preconditions for
@@ -1591,11 +1593,11 @@ pub(crate) fn read_available_memory_bytes() -> Option<usize> {
     {
         read_windows_avail_phys_bytes()
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     {
         read_macos_available_bytes()
     }
-    #[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
+    #[cfg(not(any(target_os = "linux", windows, target_os = "macos", target_os = "ios")))]
     {
         None
     }
@@ -1638,11 +1640,11 @@ pub(crate) fn read_own_rss_bytes() -> Option<usize> {
     {
         read_windows_own_rss_bytes()
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     {
         read_macos_own_rss_bytes()
     }
-    #[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
+    #[cfg(not(any(target_os = "linux", windows, target_os = "macos", target_os = "ios")))]
     {
         None
     }
@@ -2321,7 +2323,7 @@ mod tests {
     /// on a real Mac. The pure arithmetic above IS covered on every CI run;
     /// this additionally covers the FFI plumbing itself (struct layout,
     /// mach port validity, the real syscalls).
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     #[test]
     fn read_macos_available_and_own_rss_return_sane_values_on_macos() {
         let avail = read_macos_available_bytes();
