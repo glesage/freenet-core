@@ -2,11 +2,20 @@
 
 mod common;
 
+use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use common::*;
+use freenet::config::{ConfigArgs, ConfigPathsArgs, NetworkArgs, SecretArgs, WebsocketApiArgs};
+use freenet::local_node::NodeConfig;
+use freenet::server::serve_client_api;
 use freenet_mobile::{FreenetNode, MobileError, NodeStatus};
+use freenet_stdlib::client_api::{
+    ClientRequest, ContractRequest, ContractResponse, HostResponse, WebApi,
+};
+use freenet_stdlib::prelude::ContractInstanceId;
+use tokio_tungstenite::connect_async;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn local_node_starts_and_stops() -> Result<(), MobileError> {
@@ -165,16 +174,70 @@ async fn run_cycles(cycles: usize) -> Result<(), MobileError> {
     Ok(())
 }
 
+const LEAK_CHECK_CHILD_ENV: &str = "FREENET_MOBILE_LEAK_CHECK_CHILD";
+
+/// `settled_resource_counts` measures PROCESS-WIDE thread/fd counts
+/// (`.claude/rules/testing.md`'s cross-test-interference class): under plain
+/// `cargo test`, which runs every test in this binary in one shared process,
+/// a sibling test's own threads/sockets inflate `threads_before`/`fds_before`
+/// unpredictably and can trip a tight threshold with no real leak — this
+/// tripped intermittently under the full suite once the +4/+8 thresholds
+/// were tightened to +1/+2 (see git history). `cargo nextest` (CI's actual
+/// gate) already isolates each test into its own process and never saw
+/// this, but the documented local pre-commit command is plain `cargo test
+/// -p freenet-mobile`, so the measurement needs to be reliable there too.
+///
+/// Re-execs the test binary filtered to exactly `test_name`, so the
+/// measurement always runs alone regardless of what invoked it — mirrors
+/// `util::test_log_capture`'s re-exec pattern in crates/core, used there for
+/// the same class of process-global-state interference.
+async fn run_cycles_isolated(cycles: usize, test_name: &str) -> Result<(), MobileError> {
+    if std::env::var_os(LEAK_CHECK_CHILD_ENV).is_some() {
+        return run_cycles(cycles).await;
+    }
+    let exe = std::env::current_exe().expect("test binary path");
+    let owned_name = test_name.to_string();
+    let output = tokio::task::spawn_blocking(move || {
+        std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "--test-threads=1",
+                "--include-ignored",
+                &owned_name,
+            ])
+            .env(LEAK_CHECK_CHILD_ENV, "1")
+            .output()
+    })
+    .await
+    .expect("spawn_blocking join")
+    .expect("re-exec the test binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "child run of {test_name} failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    // Fail CLOSED on a rename: libtest exits 0 when its filter matches
+    // nothing, so without this the whole leak check would silently become
+    // vacuous the moment either function is renamed.
+    assert!(
+        stdout.contains("1 passed"),
+        "the child must actually have run {test_name} — if this function was \
+         renamed, update the name passed to run_cycles_isolated.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn twenty_five_start_stop_cycles_do_not_leak() -> Result<(), MobileError> {
-    run_cycles(25).await
+    run_cycles_isolated(25, "twenty_five_start_stop_cycles_do_not_leak").await
 }
 
 /// Phase 1 exit criterion. Slow; run with `cargo test -p freenet-mobile -- --ignored`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "slow: 100 start/stop cycles"]
 async fn one_hundred_start_stop_cycles_do_not_leak() -> Result<(), MobileError> {
-    run_cycles(100).await
+    run_cycles_isolated(100, "one_hundred_start_stop_cycles_do_not_leak").await
 }
 
 /// A `config.toml` persisted by another app container (iOS reinstall) names a
@@ -241,4 +304,201 @@ async fn a_config_from_another_data_dir_is_discarded_with_its_gateways() -> Resu
         "a data-dir mismatch must discard the cached gateway index too"
     );
     node.stop().await
+}
+
+/// Every network-mode assertion elsewhere in this suite is the FAILURE path:
+/// an unreachable gateway, zero peers, a bounded timeout
+/// (`network_node_starts_and_stops_without_joining`). Network mode's actual
+/// purpose — joining a peer and exchanging a contract with it — was
+/// untested. `MobileProfile` can only be a joiner, never a gateway (by
+/// design: a mobile peer is thin), so the gateway side here is a real
+/// `freenet` node built directly through `NodeConfig`, the same way
+/// `crates/core/tests/in_process_restart.rs` builds its nodes — the mobile
+/// `FreenetNode` only plays the joiner.
+///
+/// This is real UDP transport and a real ring join, run alongside every
+/// other test in this binary under plain `cargo test` (one shared process,
+/// concurrent by default). Its CPU/IO load, combined with
+/// `run_cycles_isolated`'s child-process spawn above, has been observed to
+/// push an unrelated sibling test's fixed timeout
+/// (`local_node_restarts_on_the_same_dirs`'s 30s GET-after-restart wait) past
+/// its budget under contention on a loaded machine — a `client API did not
+/// accept a connection within 15s` failure from `node.rs`'s
+/// `CLIENT_CONNECT_TIMEOUT`, not a logic bug in either test. `cargo nextest`
+/// (CI's actual gate, one process per test) saw none of this across 6
+/// repeated runs while diagnosing it. This is the plain-`cargo-test`-only
+/// cross-test-interference class `.claude/rules/testing.md` already
+/// documents and accepts; recorded here rather than papered over with a
+/// longer timeout, since the timeout itself is not what's wrong.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_peers_join_and_exchange_a_contract() -> Result<(), MobileError> {
+    init_test_logging();
+    freenet::test_utils::ensure_contract_compiled(TEST_CONTRACT)
+        .map_err(|e| MobileError::Other(e.to_string()))?;
+
+    let gw_dir = tempfile::tempdir().expect("gw tempdir");
+    let gw_ws_port = reserve_port();
+    let gw_net_port = reserve_port();
+    let gw_keypair_path = gw_dir.path().join("private.pem");
+    let gw_pub_path = gw_dir.path().join("public.pem");
+    let gw_key = freenet::dev_tool::TransportKeypair::new();
+    gw_key
+        .save(&gw_keypair_path)
+        .map_err(|e| MobileError::Other(format!("save gateway private key: {e}")))?;
+    gw_key
+        .public()
+        .save(&gw_pub_path)
+        .map_err(|e| MobileError::Other(format!("save gateway public key: {e}")))?;
+
+    let gw_cfg = ConfigArgs {
+        ws_api: WebsocketApiArgs {
+            address: Some(Ipv4Addr::LOCALHOST.into()),
+            ws_api_port: Some(gw_ws_port),
+            ..Default::default()
+        },
+        network_api: NetworkArgs {
+            public_address: Some(Ipv4Addr::LOCALHOST.into()),
+            public_port: Some(gw_net_port),
+            address: Some(Ipv4Addr::LOCALHOST.into()),
+            network_port: Some(gw_net_port),
+            is_gateway: true,
+            skip_load_from_network: true,
+            gateways: Some(vec![]),
+            location: Some(0.5),
+            ignore_protocol_checking: true,
+            ..Default::default()
+        },
+        config_paths: ConfigPathsArgs {
+            config_dir: Some(gw_dir.path().to_path_buf()),
+            data_dir: Some(gw_dir.path().to_path_buf()),
+            log_dir: Some(gw_dir.path().to_path_buf()),
+        },
+        secrets: SecretArgs {
+            transport_keypair: Some(gw_keypair_path.clone()),
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+    .build()
+    .await
+    .map_err(|e| MobileError::Other(format!("build gateway config: {e}")))?;
+    release_port(gw_ws_port);
+    release_port(gw_net_port);
+
+    let gw_ws_api = gw_cfg.ws_api.clone();
+    let gw_node = NodeConfig::new(gw_cfg)
+        .await
+        .map_err(|e| MobileError::Other(format!("gateway node config: {e}")))?
+        .build(
+            serve_client_api(gw_ws_api.clone())
+                .await
+                .map_err(|e| MobileError::Other(format!("gateway client api: {e}")))?,
+        )
+        .await
+        .map_err(|e| MobileError::Other(format!("build gateway node: {e}")))?;
+    let gw_shutdown = gw_node.shutdown_handle();
+    let gw_run = tokio::spawn(async move { gw_node.run().await });
+
+    // The joiner: an ordinary mobile peer, pointed at the gateway above.
+    let joiner_root = tempfile::tempdir().expect("joiner tempdir");
+    let gateway_entry = serde_json::json!({
+        "address": format!("127.0.0.1:{gw_net_port}"),
+        "public_key": gw_pub_path,
+        "location": 0.5,
+    })
+    .to_string();
+    // `start_node` only releases the ws port; a network-mode peer also binds
+    // its own network port, so both reservations must be released first (the
+    // same pattern `network_node_starts_and_stops_without_joining` uses).
+    let joiner_ws_port = reserve_port();
+    let joiner_net_port = reserve_port();
+    let joiner = FreenetNode::new_plain(network_profile(
+        joiner_root.path(),
+        joiner_ws_port,
+        joiner_net_port,
+        gateway_entry,
+    ))?;
+    release_port(joiner_ws_port);
+    release_port(joiner_net_port);
+    joiner.start().await?;
+
+    let peers = joiner.wait_for_peers(1, 30).await?;
+    assert!(peers >= 1, "joiner must connect to the gateway");
+
+    // Publish on the joiner, read back through the gateway's own client API —
+    // proving the contract actually crossed the wire, not just that both
+    // sides answer locally.
+    let (wasm, params) = test_contract();
+    let state = empty_todo_list();
+    let key = joiner.put(wasm, params, state.clone(), false).await?;
+
+    let mut gw_client = connect_gw_ws(gw_ws_api.port, Duration::from_secs(15)).await?;
+    let instance_id: ContractInstanceId = key
+        .parse()
+        .map_err(|e| MobileError::Other(format!("parse key: {e}")))?;
+    gw_client
+        .send(ClientRequest::ContractOp(ContractRequest::Get {
+            key: instance_id,
+            return_contract_code: false,
+            subscribe: false,
+            blocking_subscribe: false,
+        }))
+        .await
+        .map_err(|e| MobileError::Other(format!("gateway GET send: {e}")))?;
+    let got_state = recv_get_state(&mut gw_client, Duration::from_secs(30)).await?;
+    assert_eq!(
+        got_state, state,
+        "the gateway must serve the state the joiner published"
+    );
+
+    drop(gw_client);
+    joiner.stop().await?;
+    gw_shutdown.shutdown().await;
+    if tokio::time::timeout(Duration::from_secs(30), gw_run)
+        .await
+        .is_err()
+    {
+        tracing::info!("gateway run loop did not exit within 30s of shutdown (cleanup only)");
+    }
+    Ok(())
+}
+
+async fn connect_gw_ws(port: u16, within: Duration) -> Result<WebApi, MobileError> {
+    let url = format!("ws://127.0.0.1:{port}/v1/contract/command?encodingProtocol=native");
+    let deadline = tokio::time::Instant::now() + within;
+    loop {
+        match connect_async(&url).await {
+            Ok((stream, _)) => return Ok(WebApi::start(stream)),
+            Err(e) if tokio::time::Instant::now() >= deadline => {
+                return Err(MobileError::Timeout(format!(
+                    "gateway ws api on port {port} did not come up within {within:?}: {e}"
+                )));
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+        }
+    }
+}
+
+async fn recv_get_state(client: &mut WebApi, within: Duration) -> Result<Vec<u8>, MobileError> {
+    let deadline = tokio::time::Instant::now() + within;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(MobileError::Timeout(format!(
+                "no GetResponse within {within:?}"
+            )));
+        }
+        match tokio::time::timeout(remaining, client.recv()).await {
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
+                state, ..
+            }))) => return Ok(state.as_ref().to_vec()),
+            Ok(Ok(_)) => continue,
+            Ok(Err(e)) => return Err(MobileError::Request(e.to_string())),
+            Err(_) => {
+                return Err(MobileError::Timeout(format!(
+                    "no GetResponse within {within:?}"
+                )));
+            }
+        }
+    }
 }
