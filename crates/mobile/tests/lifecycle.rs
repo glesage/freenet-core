@@ -149,13 +149,17 @@ async fn run_cycles(cycles: usize) -> Result<(), MobileError> {
     }
 
     let (threads_after, fds_after) = settled_resource_counts();
-    // Blocking-pool threads come and go; a leak would grow with `cycles`.
+    // Measured (2026-09-02, this host, three runs of this exact test): 0
+    // growth in both threads and fds every time. The +4/+8 thresholds this
+    // replaced were loose enough that a leak of one descriptor every five
+    // cycles (5 over these 25) would pass; tightened to just above the
+    // measured noise floor so a slow leak has nowhere to hide.
     assert!(
-        threads_after <= threads_before + 4,
+        threads_after <= threads_before + 1,
         "thread count grew from {threads_before} to {threads_after} over {cycles} cycles"
     );
     assert!(
-        fds_after <= fds_before + 8,
+        fds_after <= fds_before + 2,
         "open fds grew from {fds_before} to {fds_after} over {cycles} cycles"
     );
     Ok(())
