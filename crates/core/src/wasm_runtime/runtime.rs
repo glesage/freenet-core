@@ -16,7 +16,6 @@ use freenet_stdlib::{
     prelude::*,
 };
 use std::path::Path;
-use std::sync::atomic::AtomicI64;
 use std::sync::{Arc, Mutex};
 
 use super::ModuleCache;
@@ -272,8 +271,6 @@ fn decide_host_clock_warning(
     true
 }
 
-static INSTANCE_ID: AtomicI64 = AtomicI64::new(0);
-
 /// A live WASM instance with RAII cleanup.
 ///
 /// On drop, removes the MEM_ADDR entry. The WASM `Instance` is cleaned
@@ -296,12 +293,16 @@ impl RunningInstance {
         key: Key,
         req_bytes: usize,
     ) -> RuntimeResult<Self> {
-        let id = INSTANCE_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         // Route the guest-entry call through classify_result so an epoch interrupt
         // during a runaway module start function normalizes to
         // MaxComputeTimeExceeded (Timeout class), not the generic "execution
         // timeout" that is_wasm_timeout misses (#4864 round-5).
-        let handle = super::classify_result(engine.create_instance(module, id, req_bytes))?;
+        //
+        // The engine issues the instance id from the single process-global
+        // allocator (`native_api::next_instance_id`) and hands it back in the
+        // handle. See that allocator's docs for why no caller may pick one.
+        let handle = super::classify_result(engine.create_instance(module, req_bytes))?;
+        let id = handle.id;
 
         // Record memory address and size for host function pointer arithmetic
         let (ptr, size) = engine.memory_info(&handle)?;
@@ -987,21 +988,45 @@ impl RuntimeConfig {
 ///
 /// V2 delegate writes go through `db.store_state_sync` / `db.update_state_sync`
 /// directly and bypass the executor's `state_store.{store,update}` chokepoints
-/// where the bump+refresh+report sites live. Without this callback those
-/// three side effects never fire on a V2 delegate write, leaving the
-/// EvictContract re-host race open AND undercounting StateBytesWritten in
-/// the topology meter for that path. The wiring lives outside `wasm_runtime/`
-/// (Ring lives in `crates/core/src/ring.rs`) so the callback is plumbed via
-/// a trait object owned by `Runtime` to keep `wasm_runtime` independent of
-/// the ring.
+/// where the bump+refresh+report sites live — and, until #5479, where the
+/// NETWORK PROPAGATION happened. Without this callback those side effects never
+/// fire on a V2 delegate write: the EvictContract re-host race stays open,
+/// StateBytesWritten is undercounted in the topology meter, and the write is
+/// never seen off this node even though the host function returned success. The
+/// wiring lives outside `wasm_runtime/` (Ring lives in `crates/core/src/ring.rs`)
+/// so the callback is plumbed via a trait object owned by `Runtime` to keep
+/// `wasm_runtime` independent of the ring.
 ///
-/// The closure SHOULD delegate to `Ring::commit_state_write(key, state_size)`
-/// — see `RuntimePool::contract_state_write_callback` for the production
-/// wiring. The `state_size` argument is the on-disk byte count of the
-/// newly-written state and is fed into the StateBytesWritten meter axis
-/// for governance scoring.
-pub type StateWriteCallback =
-    Arc<dyn Fn(&freenet_stdlib::prelude::ContractKey, usize) + Send + Sync + 'static>;
+/// The closure receives the newly-written state itself rather than a separately
+/// computed length, so the byte count it meters is measured from the value that
+/// was ACTUALLY written. A `usize` parameter can drift from the write it
+/// describes under refactoring — the failure mode `.claude/rules/
+/// bug-prevention-patterns.md` calls "manually-inlined originator side effects"
+/// — and that drift is silent, because an undercounted meter looks like light
+/// traffic. `WrappedState` is `Arc<Vec<u8>>` internally, so passing it is a
+/// refcount bump, not a state copy. The pins in `delegate_api.rs` assert the
+/// callback receives the exact bytes written, which is what makes this
+/// enforceable rather than merely intended.
+///
+/// (An earlier version of this note justified the wider parameter by the state
+/// VALUE being needed for the emitted `BroadcastStateChange`. That stopped
+/// being true when the propagation event became key-only; the reason above is
+/// the one that still holds.)
+///
+/// The `bool` is `content_changed`: whether the write altered the stored bytes.
+/// The callback runs on EVERY successful write, changed or not — a V2 write
+/// commits to storage before this hook, so the bookkeeping legs are owed
+/// regardless — and uses the flag to skip only the network fan-out, which is
+/// the one leg an idempotent rewrite genuinely does not need.
+///
+/// See `contract::executor::runtime::install_v2_delegate_state_write_hooks` for
+/// the single production installer.
+pub type StateWriteCallback = Arc<
+    dyn Fn(&freenet_stdlib::prelude::ContractKey, &freenet_stdlib::prelude::WrappedState, bool)
+        + Send
+        + Sync
+        + 'static,
+>;
 
 /// Pre-write admission gate for V2 delegate state writes (#4683, PR 3).
 ///
@@ -1067,10 +1092,11 @@ pub struct Runtime {
     /// Optional state storage backend for V2 delegate contract access.
     pub(crate) state_store_db: Option<crate::contract::storages::Storage>,
 
-    /// Optional callback invoked after a successful V2 delegate state write,
-    /// used to bump the per-contract generation token and refresh the
-    /// hosting-cache snapshot from the V2 path (which bypasses the executor
-    /// chokepoints). See `StateWriteCallback`.
+    /// Optional callback invoked after a successful V2 delegate state write.
+    /// Bumps the per-contract generation token, refreshes the hosting-cache
+    /// snapshot, and propagates the write to the network — all of which the
+    /// V2 path would otherwise skip, because it bypasses the executor
+    /// chokepoints where they normally happen. See `StateWriteCallback`.
     pub(crate) state_write_callback: Option<StateWriteCallback>,
 
     /// Optional pre-write disk-budget admission gate for V2 delegate state
@@ -1098,8 +1124,9 @@ impl Runtime {
 
     /// Install a callback invoked after each successful V2 delegate state
     /// write. See `StateWriteCallback`. Without this, V2 PUT/UPDATE bypass
-    /// the executor's bump+refresh chokepoints and the EvictContract
-    /// re-host race stays open for V2 delegate writes.
+    /// the executor's bump+refresh chokepoints — the EvictContract re-host
+    /// race stays open, and the write never propagates to the network
+    /// (#5479).
     pub fn set_state_write_callback(&mut self, cb: StateWriteCallback) {
         self.state_write_callback = Some(cb);
     }
@@ -1192,8 +1219,7 @@ impl Runtime {
     }
 
     /// One-shot, idempotent, Local-scope copy-forward of delegate secrets from
-    /// `predecessors` into `successor` (#4117), the node-side primitive behind
-    /// `DelegateRequest::RegisterDelegateWithPredecessors`. Another route to the
+    /// `predecessors` into `successor` (#4117). Another route to the
     /// `pub(super) secret_store` for a write from outside the `wasm_runtime`
     /// module (the executor lives in a different module tree and wraps secret
     /// access in `Runtime` methods, exactly as `register_delegate` /
@@ -1208,14 +1234,17 @@ impl Runtime {
     /// Runs ON the contract loop (serialized with delegate `store_secret`),
     /// mirroring the on-loop write discipline of `import_secret_bundle`.
     ///
-    /// UNREACHABLE as of GHSA-824h-7x5x-wfmf: the sole caller (the
-    /// `RegisterDelegateWithPredecessors` handler in
-    /// `crates/core/src/contract/executor/runtime/delegates.rs`) no longer
-    /// calls this, because the `origin_contract` this method's H1 gate relies
-    /// on is forgeable by any HTTP client — see GHSA-824h-7x5x-wfmf for the exploit chain.
+    /// HAS NO CALLER as of GHSA-824h-7x5x-wfmf. Its only one was the
+    /// `DelegateRequest::RegisterDelegateWithPredecessors` handler in
+    /// `crates/core/src/contract/executor/runtime/delegates.rs`: #5199 stopped
+    /// it calling this (the `origin_contract` the H1 gate relies on is forgeable
+    /// by any HTTP client — see GHSA-824h-7x5x-wfmf for the exploit chain), and
+    /// freenet-stdlib 0.9.0 then removed that request variant from the wire
+    /// altogether (freenet/freenet-stdlib#91), so the handler is gone too.
     /// Kept (not deleted) so the underlying `SecretsStore::migrate_secrets`
     /// mechanism, which is otherwise sound, is easy to re-wire once
-    /// `origin_contract` attestation is hardened.
+    /// `origin_contract` attestation is hardened. Re-wiring it needs a NEW,
+    /// properly-attested request path — do not restore the old variant.
     #[allow(dead_code)]
     pub(crate) fn migrate_delegate_secrets(
         &mut self,

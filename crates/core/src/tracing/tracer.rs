@@ -483,6 +483,35 @@ async fn periodic_log_prune(log_dir: PathBuf) {
     }
 }
 
+/// Environment variable that forces the console log layer on even when stdout
+/// is not a terminal.
+///
+/// Named and read like the neighbouring `FREENET_LOG_TO_STDERR`: presence is
+/// what counts, so any value (including `0`) enables it.
+pub(crate) const LOG_TO_CONSOLE_ENV_VAR: &str = "FREENET_LOG_TO_CONSOLE";
+
+/// Whether to attach the console layer, given whether stdout is a terminal and
+/// whether [`LOG_TO_CONSOLE_ENV_VAR`] is set.
+///
+/// The `is_terminal` probe alone is a proxy for "a human is watching", and it
+/// gets containers exactly backwards. A container's stdout is a pipe, so the
+/// probe reports "not interactive" for the one deployment where stdout is the
+/// ONLY log interface the operator has: `docker logs` shows nothing but the
+/// entrypoint banner, and the node looks wedged when it is running fine.
+///
+/// The obvious workaround, `FREENET_LOG_TO_STDERR`, is wrong here because it
+/// turns file logging OFF (see `use_file_logging`), and the log files are what
+/// `freenet service report` collects. That would make containerized nodes
+/// unsupportable in exchange for being readable. This flag is additive instead:
+/// console AND files.
+///
+/// Split out as a pure function for the same reason as [`error_log_directives`]
+/// — it can be tested without mutating process-global environment state, which
+/// would race across the test binary's threads.
+fn console_logging_enabled(stdout_is_terminal: bool, env_var_set: bool) -> bool {
+    stdout_is_terminal || env_var_set
+}
+
 /// The `RUST_LOG` directive string exactly as `EnvFilter` itself would
 /// read it: the variable's value, or the empty string when unset.
 ///
@@ -618,9 +647,15 @@ pub fn init_tracer(
 
     let filter_layer = build_filter(default_filter);
 
-    // Also output to console when running interactively (stdout is a terminal)
-    // This restores the expected console output while keeping file logging for diagnostic reports
-    let also_log_to_console = std::io::stdout().is_terminal();
+    // Also output to console when running interactively (stdout is a terminal),
+    // or when FREENET_LOG_TO_CONSOLE forces it for a container, where stdout is
+    // a pipe but is still the operator's only view of the logs. Either way file
+    // logging is unaffected, so diagnostic reports keep working. See
+    // `console_logging_enabled`.
+    let also_log_to_console = console_logging_enabled(
+        std::io::stdout().is_terminal(),
+        std::env::var(LOG_TO_CONSOLE_ENV_VAR).is_ok(),
+    );
 
     // Get rate limit from environment or use default (1000 events/sec)
     let rate_limit: u64 = std::env::var("FREENET_LOG_RATE_LIMIT")
@@ -828,6 +863,89 @@ pub fn init_tracer(
     )
 }
 
+/// Install a stderr-only subscriber for a short-lived CLI subcommand.
+///
+/// ## Why this exists (#5244)
+///
+/// `freenet update` ran with **no subscriber at all**: `set_logger` is called
+/// only on the node path (`run_node`), so every `tracing::warn!` / `error!` in
+/// the installer was a no-op. Combined with the supervisor invoking it as
+/// `freenet update --quiet`, sites whose only output was a `warn!` plus a
+/// `!quiet`-gated `eprintln!` were completely silent in production — including
+/// "installed the update but could not arm crash-loop rollback".
+///
+/// ## Why not just call [`set_logger`] here
+///
+/// Two traps, both of which produce a fix that looks done and changes nothing:
+///
+/// 1. Passing a `log_dir` (the natural copy-paste from `run_node`) sets
+///    `use_file_logging`, which routes everything into the rolling log files.
+///    systemd captures stdout/stderr, NOT those files — that asymmetry is the
+///    whole of #5232. Every `warn!` would start "working" and the journal would
+///    stay exactly as blind.
+/// 2. With no log dir, [`init_tracer`] still falls through to stdout unless the
+///    `FREENET_LOG_TO_STDERR` env var happens to be set.
+///
+/// So this is explicit rather than configuration-dependent: **stderr, always**.
+/// Diagnostics belong there, it leaves the command's human-facing `println!`
+/// output on stdout, and systemd records both.
+///
+/// Deliberately minimal: no file appenders, no rate limiters. This is a
+/// process that runs for seconds and exits, and the output it must not lose is
+/// the handful of lines saying a safety mechanism did not engage.
+///
+/// `FREENET_DISABLE_LOGS` is still honoured, and `RUST_LOG` still overrides
+/// `level` via `from_env_lossy`.
+pub fn init_cli_stderr_tracer(level: LevelFilter) -> anyhow::Result<()> {
+    if std::env::var("FREENET_DISABLE_LOGS").is_ok() {
+        return Ok(());
+    }
+    let use_json = std::env::var("FREENET_LOG_FORMAT")
+        .map(|v| v.eq_ignore_ascii_case("json"))
+        .unwrap_or(false);
+    let filter_layer = tracing_subscriber::EnvFilter::builder()
+        .with_default_directive(level.into())
+        .from_env_lossy()
+        .add_directive("moka=off".parse().expect("infallible"))
+        .add_directive("sqlx=error".parse().expect("infallible"));
+
+    // ANSI only for a human at a terminal. journald stores what it is given
+    // byte for byte, so colouring unconditionally would write escape sequences
+    // into the journal — which is the destination this whole function exists to
+    // reach. The file layers in `init_tracer` set `.with_ansi(false)` for the
+    // same reason.
+    let ansi = std::io::stderr().is_terminal();
+
+    use tracing_subscriber::layer::SubscriberExt;
+    let registry = Registry::default().with(filter_layer);
+    // `compact` rather than the `pretty` multi-line format `init_stdout_tracer`
+    // uses: one journal entry per event is far easier to read (and to grep)
+    // than an event split across several.
+    let result = if use_json {
+        tracing::subscriber::set_global_default(
+            registry.with(
+                tracing_subscriber::fmt::layer()
+                    .json()
+                    .with_ansi(false)
+                    .with_writer(std::io::stderr),
+            ),
+        )
+    } else {
+        tracing::subscriber::set_global_default(
+            registry.with(
+                tracing_subscriber::fmt::layer()
+                    .compact()
+                    .with_ansi(ansi)
+                    .with_writer(std::io::stderr),
+            ),
+        )
+    };
+    // Returned, not `expect`ed. `init_stdout_tracer` panics here, which for a
+    // CLI would turn "a subscriber was already installed" into a failed update
+    // — trading a diagnostics problem for an outage.
+    result.map_err(|e| anyhow::anyhow!("could not install the CLI subscriber: {e}"))
+}
+
 fn init_stdout_tracer(
     _default_filter: LevelFilter,
     to_stderr: bool,
@@ -900,6 +1018,64 @@ fn init_stdout_tracer(
         tracing::subscriber::set_global_default(subscriber).expect("Error setting subscriber");
     }
     Ok(())
+}
+
+/// Coverage for the console-layer decision, which is what makes a
+/// containerized node's logs visible to `docker logs` at all.
+#[cfg(test)]
+mod console_logging_tests {
+    use super::{LOG_TO_CONSOLE_ENV_VAR, console_logging_enabled};
+
+    #[test]
+    fn interactive_stdout_still_logs_to_console() {
+        assert!(
+            console_logging_enabled(true, false),
+            "a terminal must keep its console output with no env var set"
+        );
+    }
+
+    /// The container case, and the reason this flag exists. Without it a
+    /// containerized node writes nothing to `docker logs` beyond its
+    /// entrypoint banner and looks wedged while running perfectly.
+    #[test]
+    fn piped_stdout_logs_to_console_when_forced() {
+        assert!(
+            console_logging_enabled(false, true),
+            "FREENET_LOG_TO_CONSOLE must enable console output when stdout is a pipe"
+        );
+    }
+
+    #[test]
+    fn a_terminal_with_the_flag_set_also_logs_to_console() {
+        assert!(
+            console_logging_enabled(true, true),
+            "setting the flag on an interactive terminal must not turn console output off"
+        );
+    }
+
+    /// The default must not change: a piped stdout with no opt-in stays quiet,
+    /// so nothing starts double-logging into a pipeline that did not ask for it.
+    #[test]
+    fn piped_stdout_stays_quiet_by_default() {
+        assert!(
+            !console_logging_enabled(false, false),
+            "a pipe with no opt-in must not gain console output"
+        );
+    }
+
+    /// Pinned so the container image and the code cannot drift apart: the
+    /// Dockerfile sets this exact name.
+    #[test]
+    fn env_var_name_is_the_one_the_container_image_sets() {
+        assert_eq!(LOG_TO_CONSOLE_ENV_VAR, "FREENET_LOG_TO_CONSOLE");
+
+        let dockerfile = include_str!("../../../../docker/freenet-node/Dockerfile");
+        assert!(
+            dockerfile.contains(LOG_TO_CONSOLE_ENV_VAR),
+            "docker/freenet-node/Dockerfile must set {LOG_TO_CONSOLE_ENV_VAR}, or a \
+             containerized node logs nothing to `docker logs`"
+        );
+    }
 }
 
 /// Regression coverage for issue #5015: `freenet.error.*` was a
@@ -1242,14 +1418,89 @@ mod error_filter_tests {
             "the WARN floor must live in build_error_filter and nowhere else"
         );
 
-        // `build_filter` (main + console) is the only remaining
-        // `from_env_lossy` caller. A second one means an error layer
-        // regressed to the unfloored inline shape this fix removed.
+        // `from_env_lossy` belongs to CONSOLE filters only, because RUST_LOG is
+        // the operator's console knob. An error layer using it would inherit
+        // RUST_LOG's level and lose the WARN floor again (#5015).
+        //
+        // There are exactly two console filters: `build_filter` (the node's
+        // main + console layers) and `init_cli_stderr_tracer` (the CLI's own
+        // stderr layer, added for #5244 so `freenet update` is not mute).
+        //
+        // Counting is not enough on its own — two callers could be the wrong
+        // two — so each is pinned to its own function body below, and the total
+        // is then pinned so a THIRD caller anywhere fails here rather than
+        // sliding in unnoticed.
+        // Brace-matched, NOT "until the next `fn`". The file's own `fn_body`
+        // helper refuses indented definitions on purpose, and `build_filter`
+        // is a nested fn inside `init_tracer`, so it cannot be reused here.
+        // An unbounded slice is the failure AGENTS.md calls out: ending at the
+        // next `fn` would swallow the remaining ~250 lines of `init_tracer`,
+        // making the assertion "somewhere in that range there is one call",
+        // which passes vacuously once an unrelated edit lands in the range.
+        let body_of = |sig: &str| -> String {
+            let at = source
+                .find(sig)
+                .unwrap_or_else(|| panic!("definition not found: {sig}"));
+            assert!(
+                at < cut,
+                "`{sig}` matched inside the test module — this pin would be \
+                 scraping its own source and would pass vacuously"
+            );
+            let after = &source[at + sig.len()..];
+            let open = after
+                .find('{')
+                .unwrap_or_else(|| panic!("no opening brace after: {sig}"));
+            let mut depth = 0usize;
+            let mut end = None;
+            for (i, c) in after[open..].char_indices() {
+                match c {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = Some(open + i);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let end = end.unwrap_or_else(|| panic!("unbalanced braces in: {sig}"));
+            let body = &after[open..=end];
+            // Over-swallow detectors: a correctly bounded body cannot contain
+            // the test-module attribute or a following top-level definition.
+            assert!(
+                !body.contains("\n#[cfg(test)]\nmod "),
+                "`{sig}` body ran past the function into the test module"
+            );
+            assert!(
+                !body.contains("\npub fn "),
+                "`{sig}` body swallowed a following `pub fn` — the brace match \
+                 is wrong and this pin would measure more than one function"
+            );
+            body.to_string()
+        };
+
+        assert_eq!(
+            body_of("fn build_filter(")
+                .matches(".from_env_lossy()")
+                .count(),
+            1,
+            "build_filter is the node's console filter and must read RUST_LOG"
+        );
+        assert_eq!(
+            body_of("pub fn init_cli_stderr_tracer(")
+                .matches(".from_env_lossy()")
+                .count(),
+            1,
+            "init_cli_stderr_tracer is the CLI's console filter and must read RUST_LOG \
+             (#5244)"
+        );
         assert_eq!(
             count(".from_env_lossy()"),
-            1,
-            "only the main/console filter may use from_env_lossy(); an error layer \
-             using it would inherit RUST_LOG's level again (#5015)"
+            2,
+            "only the two console filters may use from_env_lossy(); a third caller is \
+             an error layer inheriting RUST_LOG's level again (#5015)"
         );
     }
 }

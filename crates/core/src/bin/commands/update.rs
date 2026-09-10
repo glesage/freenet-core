@@ -719,12 +719,20 @@ impl UpdateCommand {
         ) {
             Ok(prepared) => Some(prepared),
             Err(e) => {
-                if !self.quiet {
-                    eprintln!(
-                        "Warning: failed to snapshot known-good binary for crash-loop \
-                             rollback: {e}. Proceeding without rollback protection for this update."
-                    );
-                }
+                // NOT gated on `--quiet` (#5244). This is one of the two states
+                // where #4073's brick-safety machinery is silently OFF: the
+                // update is about to land with no rollback target, so a release
+                // that then crash-loops cannot be reverted. `--quiet` must mean
+                // "be less chatty", never "do not record safety events".
+                // Belt-and-braces alongside the subscriber installed in
+                // `freenet_main`, so this survives a later refactor that drops
+                // the subscriber. Matches `handle_post_stop`'s precedent above.
+                eprintln!(
+                    "Freenet: failed to snapshot the known-good binary for crash-loop \
+                     rollback: {e}. PROCEEDING WITHOUT ROLLBACK PROTECTION for this update — if \
+                     this version crash-loops it will NOT be auto-reverted. Check the \
+                     permissions and free space on the Freenet state directory."
+                );
                 tracing::warn!(error = %e, "Failed to capture known-good rollback binary (#4073)");
                 None
             }
@@ -762,12 +770,15 @@ impl UpdateCommand {
                 &current_exe,
                 &meta,
             ) {
-                if !self.quiet {
-                    eprintln!(
-                        "Warning: installed the update but failed to arm crash-loop rollback \
-                         protection: {e}. If this version crash-loops it will NOT auto-roll-back."
-                    );
-                }
+                // NOT gated on `--quiet` — see the sibling above (#5244).
+                // The update HAS landed and the probation marker is absent, so
+                // the post-stop hook will find nothing to count and this
+                // version can crash-loop indefinitely without being reverted.
+                eprintln!(
+                    "Freenet: installed the update but FAILED TO ARM crash-loop rollback \
+                     protection: {e}. If this version crash-loops it will NOT be auto-reverted. \
+                     Check the permissions and free space on the Freenet state directory."
+                );
                 tracing::warn!(error = %e, "Failed to arm crash-loop rollback probation (#4073)");
             }
         }
@@ -4086,6 +4097,75 @@ done
         // Must be a valid ed25519 point, or verification could never succeed.
         ed25519_dalek::VerifyingKey::from_bytes(&FREENET_RELEASE_PUBKEY)
             .expect("baked-in release public key must be a valid ed25519 point");
+    }
+
+    /// The container image verifies the release manifest at BUILD time, before
+    /// the node binary is ever in the image, so it cannot reuse
+    /// [`FREENET_RELEASE_PUBKEY`] and carries its own DER copy of the same key.
+    ///
+    /// Two copies of a key is exactly the shape that rots: rotating the signing
+    /// key and updating only this file would leave every image build failing
+    /// signature verification, with an error that points at the download rather
+    /// than at the stale key. Pin them together so the rotation fails here, in
+    /// CI, instead.
+    #[test]
+    fn release_pubkey_matches_docker_image_key() {
+        let der: &[u8] =
+            include_bytes!("../../../../../docker/freenet-node/release-signing-key.der");
+
+        // SubjectPublicKeyInfo for ed25519: a fixed 12-byte header (the
+        // AlgorithmIdentifier for id-Ed25519) followed by the raw 32-byte key.
+        // Stored as DER rather than PEM so this comparison is a plain byte
+        // check with no base64 dependency, and so `openssl pkeyutl -keyform
+        // DER` in the Dockerfile can read the very same file.
+        const ED25519_SPKI_PREFIX: [u8; 12] = [
+            0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+        ];
+        assert_eq!(
+            der.len(),
+            ED25519_SPKI_PREFIX.len() + FREENET_RELEASE_PUBKEY.len(),
+            "docker release-signing-key.der must be an ed25519 SubjectPublicKeyInfo"
+        );
+        assert_eq!(
+            &der[..ED25519_SPKI_PREFIX.len()],
+            &ED25519_SPKI_PREFIX,
+            "docker release-signing-key.der must carry the ed25519 SPKI header"
+        );
+        assert_eq!(
+            &der[ED25519_SPKI_PREFIX.len()..],
+            FREENET_RELEASE_PUBKEY.as_slice(),
+            "docker/freenet-node/release-signing-key.der does not match the release \
+             key compiled into the node; a key rotation missed one of the two copies"
+        );
+    }
+
+    /// The container image verifies the release manifest at build time and
+    /// mirrors this crate's signing-transition policy: a signature that is
+    /// PRESENT must verify, an ABSENT one warns and proceeds. That mirroring is
+    /// a copy of a decision made here, so it rots the moment the decision
+    /// changes: flipping [`REQUIRE_RELEASE_SIGNATURE`] to `true` would leave the
+    /// Dockerfile silently permissive, building images from unsigned manifests
+    /// long after the node itself refused to.
+    #[test]
+    fn docker_image_signature_policy_matches_require_release_signature() {
+        let dockerfile = include_str!("../../../../../docker/freenet-node/Dockerfile");
+
+        let tolerates_absent_signature = dockerfile.contains("echo absent > /tmp/signature-status");
+        assert_eq!(
+            tolerates_absent_signature, !REQUIRE_RELEASE_SIGNATURE,
+            "docker/freenet-node/Dockerfile tolerates a missing release signature = {}, \
+             but REQUIRE_RELEASE_SIGNATURE = {}. When the signed floor is established \
+             and that constant flips, the Dockerfile's 404 branch must go with it.",
+            tolerates_absent_signature, REQUIRE_RELEASE_SIGNATURE
+        );
+
+        // The whole point of the branch split: only a 404 may skip verification.
+        // Any other status has to abort, or a rate limit or TLS blip produces an
+        // unverified image that exits 0 and looks identical to a verified one.
+        assert!(
+            dockerfile.contains("refusing to build an unverified image"),
+            "the Dockerfile must abort on a signature fetch failure that is not a 404"
+        );
     }
 
     #[test]

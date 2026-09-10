@@ -360,6 +360,220 @@ impl ContractExecutor for Executor<Runtime> {
     }
 }
 
+/// Install the two V2-delegate state-write hooks on `rt`: the pre-write
+/// disk-budget admission gate and the post-write side-effect callback.
+///
+/// **There is exactly one of these on purpose.** V2 delegate writes
+/// (`put_contract_state_sync` / `update_contract_state_sync`) go straight
+/// through the raw `Storage`, bypassing the executor's
+/// `state_store.{store,update}` chokepoints — so everything those chokepoints
+/// do has to be re-applied by these hooks, and until #5479 the installers were
+/// two copy-paste twins (`from_config` and `from_config_with_shared_modules`)
+/// guarded only by a pin test that counted occurrences. That is precisely the
+/// shape the "manually-inlined originator side effects" row in
+/// `.claude/rules/bug-prevention-patterns.md` warns about: the next side effect
+/// added to one twin and not the other is silent. One installer, two callers.
+fn install_v2_delegate_state_write_hooks(
+    rt: &mut Runtime,
+    state_store: &StateStore<Storage>,
+    op_manager: Option<Arc<OpManager>>,
+) {
+    rt.set_state_write_callback(v2_delegate_state_write_callback(
+        state_store.cache_invalidator(),
+        op_manager.clone(),
+    ));
+
+    // Disk-budget admission gate for the V2 delegate write path (#4683,
+    // PR 3): V2 PUT/UPDATE bypass the executor's `state_store` chokepoints
+    // (and hence the gate installed there), so install the same pre-write
+    // gate here. Returns Err(cause) → the native-API method aborts without
+    // writing. No-op admit until the disk tracker is seeded.
+    if let Some(op_manager) = op_manager {
+        rt.set_state_admit_callback(Arc::new(
+            move |key: &ContractKey, state_size: usize, is_update: bool| {
+                // V2 PUT → hard gate; V2 UPDATE → growth-only gate (#4683).
+                // A shrinking/holding V2 UPDATE must never block convergence.
+                let result = if is_update {
+                    op_manager.ring.admit_state_update(key, state_size)
+                } else {
+                    op_manager.ring.admit_state_write(key, state_size)
+                };
+                result.map_err(|over| over.to_string())
+            },
+        ));
+    }
+}
+
+/// The post-write callback `install_v2_delegate_state_write_hooks` installs.
+///
+/// Split out from the installer so a test can drive the PRODUCTION closure
+/// directly and observe what it emits — see
+/// `pool_tests::v2_delegate_propagation_tests`. Building a whole `Runtime`
+/// (contract, delegate and secret stores plus a WASM engine) just to reach the
+/// closure would make that test cost far more than the behaviour it checks.
+///
+/// It does three things:
+///
+/// 1. **Drops `StateStore`'s cached view of the contract — ALWAYS**, whether or
+///    not an `op_manager` is wired. The bypass write touches neither the moka
+///    state-bytes cache nor the change-detector, so without this a later read
+///    serves the OLD bytes and the summarize/delta fast path can serve a STALE
+///    summary/delta → state divergence.
+/// 2. **`Ring::commit_state_write`** — generation bump, hosting-cache snapshot
+///    refresh, and the StateBytesWritten meter report. Without it the
+///    EvictContract re-host race stays open for V2 writes and governance
+///    scoring undercounts them.
+/// 3. **`Ring::record_contract_update`** — the dashboard "last updated"
+///    timestamp. `commit_state_write` does not do this; the V1 UPDATE path
+///    does it separately, so it has to be here too.
+/// 4. **Queueing the network fan-out** via
+///    `OpManager::queue_v2_delegate_broadcast` — the propagation V1 gets for
+///    free from `upsert_contract_state` (#5479). It enqueues a KEY-ONLY
+///    `NodeEvent::V2DelegateStateChanged`; the handler reads current state when
+///    it drains, so the queue holds contract ids rather than states and repeat
+///    writes to one contract coalesce. Suppressed for a contract flagged as
+///    violating a CRDT invariant, mirroring `Executor::broadcast_state_change`,
+///    and enqueued NON-BLOCKING: a blocking `notify_node_event(...).await` on a
+///    commit path is what wedged both gateways in #4145, and this one runs
+///    inside a synchronous WASM host call, where blocking would be worse still.
+///
+///    This leg — and ONLY this leg — is skipped when the write did not change
+///    the stored bytes. Legs 1-3 run for every committed write; see
+///    `native_api::after_state_write` for why skipping them was a data-loss
+///    bug rather than an optimisation.
+///
+/// Legs 2-4 need the ring, so they run only when `op_manager` is `Some`
+/// (unit-test and local-only executors have none). Leg 1 always runs.
+///
+/// **What this deliberately does NOT re-apply**, so the next reader does not
+/// have to rediscover it — an explicit list is what stops the fourth omission:
+///
+/// - **Local fan-out** (this node's own WebSocket clients and other subscribed
+///   delegates). Not reachable from here: the `DelegateNotificationSender` is
+///   installed on the executor after this callback is built (`pool.rs`), and
+///   the WS subscriber maps need `&mut Executor`. Tracked as **#5486**.
+/// - **The no-change filter and the `MAX_STATE_SIZE` ceiling.** Both belong
+///   next to the write rather than after it, and live in
+///   `native_api::{state_content_changed, check_state_size}`.
+/// - **Hosting registration.** A V2 write does not make this node a host, so
+///   the emitted broadcast is still dropped by `should_broadcast_contract` (the
+///   `should_summarize_or_broadcast` gate, applied at the per-peer send in
+///   `broadcast_queue::broadcast_to_single_peer` — not in
+///   `handle_broadcast_state_change`) for a contract held only because a
+///   delegate wrote it. That is **#4669** (a delegate subscription must
+///   register demand), not this fix.
+/// - **Contract validation, and any check on WHICH contract a delegate may
+///   write.** The V1 path reaches the network only after
+///   `bridged_upsert_contract_state` has run the contract's own
+///   `validate_state`/`update_state`; this path does not, and this fix turns
+///   that from a local-disk question into a network one. Tracked separately;
+///   receivers still merge through their own contract, which bounds it.
+pub(super) fn v2_delegate_state_write_callback(
+    cache_invalidator: crate::wasm_runtime::StateCacheInvalidator,
+    op_manager: Option<Arc<OpManager>>,
+) -> crate::wasm_runtime::StateWriteCallback {
+    Arc::new(
+        move |key: &ContractKey,
+              new_state: &freenet_stdlib::prelude::WrappedState,
+              content_changed: bool| {
+            cache_invalidator.invalidate(key);
+            let Some(op_manager) = &op_manager else {
+                return;
+            };
+            op_manager
+                .ring
+                .commit_state_write(key, new_state.as_ref().len());
+
+            // Dashboard "last updated" telemetry. The V1 UPDATE path does
+            // this in `Executor::commit_state_update`; `commit_state_write`
+            // does not, so without this line a contract written only by a V2
+            // delegate shows a stale last-update timestamp forever.
+            op_manager.ring.record_contract_update(key);
+
+            // Propagate, mirroring `Executor::broadcast_state_change` (the
+            // helper the V1 commit path uses). Keep the two in step: a gate
+            // added there — the broken-invariant check below is the existing
+            // one — has to be added here as well, because these are two
+            // hand-written copies of one decision.
+            //
+            // KNOWN LIMIT, and it is the case #5467 cares about: the event is
+            // dropped downstream by the `Ring::should_summarize_or_broadcast`
+            // gate unless this node is hosting the contract or it is
+            // `contract_in_use` — and a DELEGATE subscription is neither
+            // (`ring::hosting::contract_in_use` counts client subscriptions and
+            // downstream subscribers only).
+            //
+            // WHERE THAT GATE ACTUALLY IS, because two independent readers have
+            // now looked in the wrong place and concluded it was absent: NOT in
+            // `handle_broadcast_state_change`, which is where this comment used
+            // to send them. It is one layer down, at the per-peer send in
+            // `broadcast_queue::broadcast_to_single_peer`, wrapped in the
+            // one-line `should_broadcast_contract` — so grepping
+            // `broadcast.rs` for the inner name finds only a comment. A
+            // limitation stated where it cannot be verified reads, to the next
+            // reader who checks, as one that was fixed or imagined. So a
+            // contract this node holds ONLY because a delegate wrote it still
+            // does not propagate. Making a delegate subscription register
+            // demand is #4669 and is a hosting-invariants decision, not
+            // something to smuggle into a propagation fix.
+            //
+            // Not registered with `ring::broadcast_coverage` — see the
+            // residual list in that module, which this path is named in.
+            // Everything above is owed for ANY committed write. Only the
+            // network fan-out below is skipped when the bytes did not change:
+            // it is the one leg an idempotent rewrite genuinely does not need,
+            // and the one whose cost scales with the subscriber set.
+            //
+            // The generation bump inside `commit_state_write` is why the split
+            // is here rather than at the caller: it is what tells a scheduled
+            // `EvictContract` the contract was written after it was queued
+            // (`pool.rs::remove_contract` guard 3). A V2 write has already
+            // committed to storage by the time this runs, so gating the whole
+            // hook on `content_changed` let an in-flight eviction reclaim a
+            // contract that had just been written.
+            if !content_changed {
+                return;
+            }
+            if op_manager.ring.is_contract_broken(key) {
+                tracing::debug!(
+                    contract = %key,
+                    event = "broadcast_suppressed_broken_contract",
+                    "Skipping BroadcastStateChange for contract flagged as broken"
+                );
+                return;
+            }
+            // Queue the fan-out rather than enqueueing the state itself.
+            //
+            // `NodeEvent::V2DelegateStateChanged` names the contract and
+            // carries no state, and the handler re-reads what is stored when
+            // it drains. Two reasons this is the right shape here, both of
+            // which the state-carrying `BroadcastStateChange` cannot give:
+            //
+            // 1. The event-loop notification channel is bounded by message
+            //    COUNT (`DEFAULT_EVENT_LOOP_CHANNEL_CAPACITY`), and a
+            //    `WrappedState` runs to `MAX_STATE_SIZE`. Queueing ids keeps
+            //    the queue's retained bytes bounded by that count rather than
+            //    by count times the largest state.
+            // 2. Successive writes to one contract coalesce into the single
+            //    queued broadcast, which then carries the NEWEST state rather
+            //    than the oldest — strictly better than the snapshot a
+            //    state-carrying event would have frozen at emit time.
+            //
+            // Best-effort by design (#4145 / #4231): a dropped queue attempt
+            // heals via the next write or a summary-mismatch SyncStateToPeer
+            // round. `queue_v2_delegate_broadcast` logs the drop and releases
+            // its own marker; the rate-limited `notify_node_event:
+            // Notification channel full for too long` ERROR in
+            // op_state_manager.rs is the sustained-back-pressure alert.
+            // Outcome deliberately discarded: all three are correct here.
+            // `Coalesced` means an undrained broadcast already covers this
+            // write, and `EnqueueFailed` has already been counted and WARNed
+            // inside the call.
+            let _ = op_manager.queue_v2_delegate_broadcast(*key);
+        },
+    )
+}
+
 impl Executor<Runtime> {
     /// Create an Executor for local-only mode (no network operations).
     /// Use this from the binary for local mode execution.
@@ -388,47 +602,10 @@ impl Executor<Runtime> {
         .map_err(|e| anyhow::anyhow!("building the contract runtime: {e}"))?;
         // Enable V2 delegate contract access by providing the state store DB
         rt.set_state_store_db(state_store.storage());
-        // V2 delegate state writes (put/update_contract_state_sync) write
-        // directly through the raw `Storage`, bypassing the executor's
-        // `state_store.{store,update}` chokepoints. The callback restores the
-        // side effects those chokepoints perform on every write:
-        //   1. Drop StateStore's cached view of the contract — ALWAYS. The
-        //      bypass write doesn't touch the moka state-bytes cache OR the
-        //      change-detector, so without this a later read would serve the OLD
-        //      bytes from moka and the summarize/delta fast path could serve a
-        //      STALE summary/delta → state divergence (Codex review).
-        //   2. Bump+refresh+report via `Ring::commit_state_write` — only when an
-        //      op_manager is present (it owns the ring/governance state).
-        //      Without this, V2 PUT/UPDATE would leave the EvictContract re-host
-        //      race open AND undercount StateBytesWritten in the meter.
-        let cache_invalidator = state_store.cache_invalidator();
-        let op_manager_for_cb = op_manager.clone();
-        rt.set_state_write_callback(Arc::new(move |key: &ContractKey, state_size: usize| {
-            cache_invalidator.invalidate(key);
-            if let Some(op_manager) = &op_manager_for_cb {
-                op_manager.ring.commit_state_write(key, state_size);
-            }
-        }));
-        // Disk-budget admission gate for the V2 delegate write path (#4683,
-        // PR 3): V2 PUT/UPDATE bypass the executor's `state_store` chokepoints
-        // (and hence the gate installed there), so install the same pre-write
-        // gate here. Returns Err(cause) → the native-API method aborts without
-        // writing. No-op admit until the disk tracker is seeded.
-        let op_manager_for_admit = op_manager.clone();
-        if let Some(op_manager) = op_manager_for_admit {
-            rt.set_state_admit_callback(Arc::new(
-                move |key: &ContractKey, state_size: usize, is_update: bool| {
-                    // V2 PUT → hard gate; V2 UPDATE → growth-only gate (#4683).
-                    // A shrinking/holding V2 UPDATE must never block convergence.
-                    let result = if is_update {
-                        op_manager.ring.admit_state_update(key, state_size)
-                    } else {
-                        op_manager.ring.admit_state_write(key, state_size)
-                    };
-                    result.map_err(|over| over.to_string())
-                },
-            ));
-        }
+        // V2 delegate state writes bypass the executor chokepoints — one
+        // shared installer restores every side effect they skip, propagation
+        // included. See `install_v2_delegate_state_write_hooks`.
+        install_v2_delegate_state_write_hooks(&mut rt, &state_store, op_manager.clone());
         Executor::new(
             state_store,
             move || {
@@ -543,40 +720,9 @@ impl Executor<Runtime> {
         )
         .unwrap();
         rt.set_state_store_db(db);
-        // V2 delegate state writes bypass the executor chokepoints — install the
-        // callback that (1) ALWAYS drops StateStore's cached view of the contract
-        // (both the moka state-bytes cache and the change-detector; a stale
-        // cached state or detector hash after a V2 write would serve a stale
-        // summary/delta → divergence; Codex review) and (2) mirrors the
-        // bump+refresh+report side effects via `Ring::commit_state_write` when an
-        // op_manager is present. See `from_config` and
-        // `Runtime::set_state_write_callback`.
-        let cache_invalidator = shared_state_store.cache_invalidator();
-        let op_manager_for_cb = op_manager.clone();
-        rt.set_state_write_callback(Arc::new(move |key: &ContractKey, state_size: usize| {
-            cache_invalidator.invalidate(key);
-            if let Some(op_manager) = &op_manager_for_cb {
-                op_manager.ring.commit_state_write(key, state_size);
-            }
-        }));
-        // Disk-budget admission gate for the V2 delegate write path (#4683,
-        // PR 3) — see `from_config` for the rationale. Same gate the executor
-        // chokepoints apply, restored for the V2 bypass.
-        let op_manager_for_admit = op_manager.clone();
-        if let Some(op_manager) = op_manager_for_admit {
-            rt.set_state_admit_callback(Arc::new(
-                move |key: &ContractKey, state_size: usize, is_update: bool| {
-                    // V2 PUT → hard gate; V2 UPDATE → growth-only gate (#4683).
-                    // A shrinking/holding V2 UPDATE must never block convergence.
-                    let result = if is_update {
-                        op_manager.ring.admit_state_update(key, state_size)
-                    } else {
-                        op_manager.ring.admit_state_write(key, state_size)
-                    };
-                    result.map_err(|over| over.to_string())
-                },
-            ));
-        }
+        // Same shared installer as `from_config` — see
+        // `install_v2_delegate_state_write_hooks` for what the V2 bypass owes.
+        install_v2_delegate_state_write_hooks(&mut rt, &shared_state_store, op_manager.clone());
         Executor::new(
             shared_state_store,
             || Ok(()),
@@ -886,6 +1032,34 @@ thread_local! {
 #[cfg(test)]
 pub(crate) fn set_test_network_fetch_override(stub: Option<NetworkFetchStub>) {
     TEST_NETWORK_FETCH_OVERRIDE.with(|cell| *cell.borrow_mut() = stub);
+}
+
+/// Test hook for the OTHER network-fetch leg: `local_state_or_from_network`.
+///
+/// Distinct from [`NetworkFetchStub`] because the two legs return different
+/// things and only this one can install a contract. `fetch_related_via_network`
+/// resolves a bare state; `local_state_or_from_network` resolves a whole
+/// `GetResult`, and it is the `GetResult::contract` half that lets
+/// `get_updated_state` install a SECOND contract mid-UPDATE — the site whose
+/// post-store fan-out #5481 is about. Returning `None` stands for
+/// `SubOpGetOutcome::NotFound`.
+#[cfg(test)]
+pub(crate) type SubOpGetStub =
+    std::rc::Rc<dyn Fn(ContractInstanceId) -> Option<crate::operations::get::GetResult>>;
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook used by `local_state_or_from_network` to bypass the real
+    /// network sub-op driver. Set with [`set_test_sub_op_get_override`]
+    /// inside a `#[tokio::test(flavor = "current_thread")]` so the
+    /// thread-local lookup hits the same task that ran the test setup.
+    static TEST_SUB_OP_GET_OVERRIDE: std::cell::RefCell<Option<SubOpGetStub>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_test_sub_op_get_override(stub: Option<SubOpGetStub>) {
+    TEST_SUB_OP_GET_OVERRIDE.with(|cell| *cell.borrow_mut() = stub);
 }
 
 #[cfg(test)]
@@ -1967,243 +2141,27 @@ mod remove_contract_tests {
         }
     }
 
-    /// Handler-level (GHSA-824h-7x5x-wfmf): `RegisterDelegateWithPredecessors`
-    /// NEVER copies a predecessor's secrets, even when the registering request's
-    /// `origin_contract` exactly matches the predecessor's recorded
-    /// first-registration origin (the one case the H1 same-origin gate in
-    /// `SecretsStore::migrate_secrets` would otherwise allow). The copy-forward
-    /// call is disabled at the handler level because `origin_contract` itself is
-    /// forgeable by any HTTP client (see GHSA-824h-7x5x-wfmf) — so even a "matching" origin
-    /// proves nothing. Registration still succeeds, exactly as plain
-    /// `RegisterDelegate` would. This replaces the pre-advisory test asserting the
-    /// copy DID happen on a matching origin.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn register_delegate_with_predecessors_never_copies_secrets() {
-        use crate::wasm_runtime::SecretScope;
-        use freenet_stdlib::client_api::{DelegateRequest, HostResponse};
-        use freenet_stdlib::prelude::{
-            ContractInstanceId, Delegate, DelegateContainer, DelegateWasmAPIVersion, SecretsId,
-        };
-        use zeroize::Zeroizing;
-
-        const ORIGIN: [u8; 32] = [0x11u8; 32];
-
-        let temp_dir = crate::util::tests::get_temp_dir();
-        let db = Storage::new(temp_dir.path()).await.expect("create db");
-        let contract_store =
-            ContractStore::new(temp_dir.path().join("contracts"), 10_000, db.clone())
-                .expect("create contract store");
-        let delegate_store =
-            DelegateStore::new(temp_dir.path().join("delegate"), 10_000, db.clone())
-                .expect("create delegate store");
-        let secrets_dir = temp_dir.path().join("secrets");
-        let mut secrets_store =
-            SecretsStore::new(secrets_dir.clone(), Default::default(), db.clone())
-                .expect("create secrets store");
-
-        // Same params, different code == an ABI bump that mints a new key.
-        let pred = Delegate::from((&vec![0u8].into(), &vec![1u8].into()));
-        let succ = Delegate::from((&vec![0u8].into(), &vec![2u8].into()));
-
-        // Seed a predecessor Local secret under its DERIVED DEK (the at-rest
-        // path) BEFORE moving the secrets store into the runtime.
-        let secret_id = SecretsId::new(b"room:alice".to_vec());
-        secrets_store
-            .store_secret(
-                pred.key(),
-                &secret_id,
-                SecretScope::Local,
-                Zeroizing::new(b"profile".to_vec()),
-            )
-            .expect("seed predecessor secret");
-
-        // Record the predecessor's FIRST-registration origin (H1 same-origin
-        // gate): the migrating registration below must present this SAME origin
-        // for the copy to be allowed.
-        secrets_store
-            .record_delegate_registration_origin(pred.key(), Some(ORIGIN))
-            .unwrap();
-
-        let successor_secret_path = secrets_dir
-            .join(succ.key().encode())
-            .join(secret_id.encode());
-        assert!(
-            !successor_secret_path.exists(),
-            "successor secret must not exist before migration"
-        );
-
-        let state_store = StateStore::new(db, 10_000_000).expect("create state store");
-        let runtime = Runtime::build(contract_store, delegate_store, secrets_store, false)
-            .expect("build runtime");
-        let mut executor = Executor::new(
-            state_store,
-            || Ok(()),
-            crate::contract::executor::OperationMode::Local,
-            runtime,
-            None,
-        )
-        .await
-        .expect("create executor");
-
-        let origin_contract = ContractInstanceId::new(ORIGIN);
-
-        let req = DelegateRequest::RegisterDelegateWithPredecessors {
-            delegate: DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(succ.clone())),
-            cipher: [7u8; 32],
-            nonce: [9u8; 24],
-            predecessors: vec![pred.key().clone()],
-        };
-        let resp = executor
-            .delegate_request(
-                req,
-                Some(&origin_contract),
-                None,
-                crate::client_events::ConnectionScope::Local,
-                None,
-            )
-            .expect("register-with-predecessors must succeed");
-        let HostResponse::DelegateResponse { key, .. } = &resp else {
-            panic!("expected DelegateResponse, got {resp:?}");
-        };
-        assert_eq!(key, succ.key(), "response carries the successor key");
-
-        // The predecessor's Local secret must NOT be copied — the copy-forward
-        // is unconditionally disabled (GHSA-824h-7x5x-wfmf), even though the supplied
-        // `origin_contract` matches the predecessor's recorded origin exactly
-        // (the one case the underlying H1 gate would otherwise have allowed).
-        assert!(
-            !successor_secret_path.exists(),
-            "successor secret file must NOT exist: copy-forward is disabled (GHSA-824h-7x5x-wfmf) \
-             regardless of origin_contract"
-        );
-
-        // The predecessor's own secret is untouched (registration never mutates
-        // or deletes a predecessor's data, disabled copy-forward or not).
-        let predecessor_secret_path = secrets_dir
-            .join(pred.key().encode())
-            .join(secret_id.encode());
-        assert!(
-            predecessor_secret_path.exists(),
-            "predecessor secret must remain untouched"
-        );
-    }
-
-    /// Regression test for GHSA-824h-7x5x-wfmf, directory-level: a
-    /// predecessor holding MULTIPLE Local secrets, named in a
-    /// `RegisterDelegateWithPredecessors` request with a matching
-    /// `origin_contract`, must leave the successor's on-disk secrets
-    /// directory completely absent (or empty) — not merely missing one
-    /// known secret ID. This is stronger than
-    /// `register_delegate_with_predecessors_never_copies_secrets`, which
-    /// only checks a single secret path; a copy-forward bug that mis-copies
-    /// a DIFFERENT secret ID than the one under test would slip past a
-    /// single-path check but not a whole-directory scan.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn register_delegate_with_predecessors_successor_dir_stays_empty() {
-        use crate::wasm_runtime::SecretScope;
-        use freenet_stdlib::client_api::{DelegateRequest, HostResponse};
-        use freenet_stdlib::prelude::{
-            ContractInstanceId, Delegate, DelegateContainer, DelegateWasmAPIVersion, SecretsId,
-        };
-        use zeroize::Zeroizing;
-
-        const ORIGIN: [u8; 32] = [0x22u8; 32];
-
-        let temp_dir = crate::util::tests::get_temp_dir();
-        let db = Storage::new(temp_dir.path()).await.expect("create db");
-        let contract_store =
-            ContractStore::new(temp_dir.path().join("contracts"), 10_000, db.clone())
-                .expect("create contract store");
-        let delegate_store =
-            DelegateStore::new(temp_dir.path().join("delegate"), 10_000, db.clone())
-                .expect("create delegate store");
-        let secrets_dir = temp_dir.path().join("secrets");
-        let mut secrets_store =
-            SecretsStore::new(secrets_dir.clone(), Default::default(), db.clone())
-                .expect("create secrets store");
-
-        let pred = Delegate::from((&vec![9u8].into(), &vec![1u8].into()));
-        let succ = Delegate::from((&vec![9u8].into(), &vec![2u8].into()));
-
-        // Seed THREE Local secrets under the predecessor.
-        for i in 0u8..3 {
-            secrets_store
-                .store_secret(
-                    pred.key(),
-                    &SecretsId::new(format!("secret-{i}").into_bytes()),
-                    SecretScope::Local,
-                    Zeroizing::new(format!("value-{i}").into_bytes()),
-                )
-                .expect("seed predecessor secret");
-        }
-        secrets_store
-            .record_delegate_registration_origin(pred.key(), Some(ORIGIN))
-            .unwrap();
-
-        let successor_secrets_dir = secrets_dir.join(succ.key().encode());
-        assert!(
-            !successor_secrets_dir.exists(),
-            "successor secrets directory must not exist before registration"
-        );
-
-        let state_store = StateStore::new(db, 10_000_000).expect("create state store");
-        let runtime = Runtime::build(contract_store, delegate_store, secrets_store, false)
-            .expect("build runtime");
-        let mut executor = Executor::new(
-            state_store,
-            || Ok(()),
-            crate::contract::executor::OperationMode::Local,
-            runtime,
-            None,
-        )
-        .await
-        .expect("create executor");
-
-        let origin_contract = ContractInstanceId::new(ORIGIN);
-        let req = DelegateRequest::RegisterDelegateWithPredecessors {
-            delegate: DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(succ.clone())),
-            cipher: [7u8; 32],
-            nonce: [9u8; 24],
-            predecessors: vec![pred.key().clone()],
-        };
-        let resp = executor
-            .delegate_request(
-                req,
-                Some(&origin_contract),
-                None,
-                crate::client_events::ConnectionScope::Local,
-                None,
-            )
-            .expect("register-with-predecessors must succeed");
-        assert!(matches!(resp, HostResponse::DelegateResponse { .. }));
-
-        // Whole-directory check: NOTHING was copied into the successor's
-        // namespace, whether the directory was never created or was created
-        // empty.
-        let successor_has_any_secret = successor_secrets_dir
-            .read_dir()
-            .map(|mut entries| entries.next().is_some())
-            .unwrap_or(false);
-        assert!(
-            !successor_has_any_secret,
-            "successor secrets directory must be absent or empty: copy-forward is \
-             disabled (GHSA-824h-7x5x-wfmf) regardless of origin_contract or predecessor secret count"
-        );
-    }
-
     /// Handler-level (#4117 H1, persistence-succeeds-before-usable): if the
     /// first-writer origin record cannot be DURABLY persisted, the WHOLE
-    /// registration is aborted — for BOTH the plain `RegisterDelegate` and the
-    /// `RegisterDelegateWithPredecessors` variants. The delegate is NOT
-    /// registered (no `.reg` file) and no predecessor secret is copied, so a
-    /// registered-but-recordless delegate (a claimable first-writer slot an
+    /// registration is aborted. The delegate is NOT registered (no `.reg` file),
+    /// so a registered-but-recordless delegate (a claimable first-writer slot an
     /// attacker could later name as its own) can never exist. Once the disk
-    /// recovers, the app's retry registers and records normally (copy-forward
-    /// itself is unconditionally disabled, GHSA-824h-7x5x-wfmf, so it never copies — see
-    /// the final assertion). Uses the fault-injecting redb backend to fail the
-    /// origin-record write on demand.
+    /// recovers, the app's retry registers and records normally. Uses the
+    /// fault-injecting redb backend to fail the origin-record write on demand.
+    ///
+    /// This test used to drive the same property through
+    /// `RegisterDelegateWithPredecessors` as well; that wire variant was removed
+    /// in freenet-stdlib 0.9.0 (freenet/freenet-stdlib#91), so only the plain
+    /// `RegisterDelegate` path remains — which is the whole surface now.
     #[cfg(feature = "redb")]
     #[tokio::test(flavor = "multi_thread")]
+    // Shares the process-global `POISON_RECOVERY_TRIGGERED` counter with the
+    // poison-recovery tests in `contract::storages::redb`, because driving the
+    // fault injector trips it through `route_txn_error`/`route_redb_error`/
+    // `commit_guarded` whether or not this test looks at it. The key is
+    // cross-module by design: `serial_test` serializes on the key, not the
+    // module. Pinned by `every_test_using_the_failure_injector_is_serialized`.
+    #[serial_test::serial(redb_poison_recovery)]
     async fn register_aborts_when_origin_record_fails_then_recovers() {
         use crate::contract::storages::redb::{FailingBackend, open_redb_with_backend};
         use crate::wasm_runtime::SecretScope;
@@ -2235,8 +2193,9 @@ mod remove_contract_tests {
         let pred = Delegate::from((&vec![0u8].into(), &vec![1u8].into()));
         let succ = Delegate::from((&vec![0u8].into(), &vec![2u8].into()));
 
-        // Seed a predecessor Local secret + its first-registration origin WHILE the
-        // backend is healthy (both must exist for the copy to be allowed later).
+        // Seed an unrelated delegate's Local secret + its first-registration
+        // origin WHILE the backend is healthy: it is the bystander whose data
+        // must survive the failed registrations below untouched.
         let secret_id = SecretsId::new(b"room:alice".to_vec());
         secrets_store
             .store_secret(
@@ -2275,12 +2234,11 @@ mod remove_contract_tests {
         // ---- The disk now fails: the successor's origin-record write cannot persist.
         backend.start_failing();
 
-        // (a) RegisterDelegateWithPredecessors MUST abort: no register, no copy.
-        let req = DelegateRequest::RegisterDelegateWithPredecessors {
+        // (a) RegisterDelegate MUST abort: nothing registered, nothing written.
+        let req = DelegateRequest::RegisterDelegate {
             delegate: DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(succ.clone())),
             cipher: [7u8; 32],
             nonce: [9u8; 24],
-            predecessors: vec![pred.key().clone()],
         };
         assert!(
             executor
@@ -2300,10 +2258,12 @@ mod remove_contract_tests {
         );
         assert!(
             !succ_secret_path.exists(),
-            "an aborted registration must copy NOTHING"
+            "an aborted registration must write NOTHING"
         );
 
-        // (b) Plain RegisterDelegate MUST abort under the SAME failure (both variants).
+        // (b) A SECOND, independent delegate must abort under the SAME failure,
+        // so the abort is a property of the failed origin-record write and not
+        // of anything specific to `succ`.
         let plain = Delegate::from((&vec![0u8].into(), &vec![3u8].into()));
         let plain_reg_path = delegate_dir
             .join(plain.key().encode())
@@ -2330,10 +2290,10 @@ mod remove_contract_tests {
             "an aborted RegisterDelegate must register NOTHING"
         );
 
-        // The predecessor's own secret is untouched throughout.
+        // The bystander delegate's own secret is untouched throughout.
         assert!(
             pred_secret_path.exists(),
-            "the predecessor's own secret must survive the failed migrating registrations"
+            "an unrelated delegate's secret must survive the failed registrations"
         );
 
         // ---- Recovery: the disk heals (a fresh handle over a healthy backend);
@@ -2350,7 +2310,7 @@ mod remove_contract_tests {
                 .expect("create secrets store 2");
         // The origin table lived in the failed DB; on a real node it persists
         // across the restart, but here the fresh handle starts empty, so
-        // re-establish the predecessor's origin as the app's retry would.
+        // re-establish the bystander's origin as the app's retry would.
         secrets_store2
             .record_delegate_registration_origin(pred.key(), Some(ORIGIN))
             .expect("re-record predecessor origin after recovery");
@@ -2367,11 +2327,10 @@ mod remove_contract_tests {
         .await
         .expect("create executor 2");
 
-        let req2 = DelegateRequest::RegisterDelegateWithPredecessors {
+        let req2 = DelegateRequest::RegisterDelegate {
             delegate: DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(succ.clone())),
             cipher: [7u8; 32],
             nonce: [9u8; 24],
-            predecessors: vec![pred.key().clone()],
         };
         executor2
             .delegate_request(
@@ -2386,213 +2345,16 @@ mod remove_contract_tests {
             succ_reg_path.exists(),
             "after recovery the successor IS registered (.reg present)"
         );
-        // Copy-forward is unconditionally disabled (GHSA-824h-7x5x-wfmf): the retry succeeds
-        // (registration itself was only ever blocked by the origin-record
-        // write failure, now healed), but no secret is ever copied.
+        // Registration was only ever blocked by the origin-record write failure,
+        // now healed. Registering a delegate never creates secrets for it, and
+        // no node-side path copies another delegate's secrets forward — the
+        // request variant that once could was removed in freenet-stdlib 0.9.0.
         assert!(
             !succ_secret_path.exists(),
-            "the predecessor secret must NOT be copied forward: copy-forward is disabled (GHSA-824h-7x5x-wfmf)"
+            "registration must not create any secret for the newly-registered delegate"
         );
     }
 
-    /// #4117 P2b/M1: the predecessor-list bound is TWO-tiered and enforced
-    /// through the real `Executor::delegate_request` path (not just the pure
-    /// dedupe fn). The cap is on the UNIQUE count, matching the docstrings:
-    ///   - 65 DISTINCT predecessors (> the deduped cap of 64) → request REJECTED,
-    ///     nothing registered (silent truncation would strand older generations);
-    ///   - a duplicate-heavy list whose UNIQUE count is within the cap → ACCEPTED
-    ///     (duplicates dropped, not counted);
-    ///   - a raw list past the DoS sanity bound → REJECTED up front regardless of
-    ///     unique count.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn register_with_predecessors_cap_is_on_unique_count_end_to_end() {
-        use super::delegates::{MAX_MIGRATION_PREDECESSORS, MAX_MIGRATION_PREDECESSORS_RAW};
-        use freenet_stdlib::client_api::DelegateRequest;
-        use freenet_stdlib::prelude::{Delegate, DelegateContainer, DelegateWasmAPIVersion};
-
-        let (mut executor, _contracts_dir, temp_dir) = build_disk_executor("pred-cap").await;
-        let delegate_dir = temp_dir.path().join("delegate");
-
-        let make_pred = |i: u8| {
-            Delegate::from((&vec![i].into(), &vec![0u8].into()))
-                .key()
-                .clone()
-        };
-        let reg_path =
-            |succ: &Delegate| delegate_dir.join(succ.key().encode()).with_extension("reg");
-
-        // (1) 65 UNIQUE predecessors > the deduped cap of 64 → REJECTED.
-        let succ_over = Delegate::from((&vec![0u8].into(), &vec![0xA1u8].into()));
-        let over: Vec<_> = (0u8..=64).map(make_pred).collect(); // 65 distinct
-        assert_eq!(over.len(), MAX_MIGRATION_PREDECESSORS + 1);
-        let req_over = DelegateRequest::RegisterDelegateWithPredecessors {
-            delegate: DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(succ_over.clone())),
-            cipher: [7u8; 32],
-            nonce: [9u8; 24],
-            predecessors: over,
-        };
-        assert!(
-            executor
-                .delegate_request(
-                    req_over,
-                    None,
-                    None,
-                    crate::client_events::ConnectionScope::Local,
-                    None
-                )
-                .is_err(),
-            "an over-cap UNIQUE predecessor list must be rejected"
-        );
-        assert!(
-            !reg_path(&succ_over).exists(),
-            "a rejected over-cap request must register NOTHING"
-        );
-
-        // (2) A duplicate-heavy list whose UNIQUE count (3) is within the cap →
-        //     ACCEPTED (duplicates dropped, not counted).
-        let succ_ok = Delegate::from((&vec![0u8].into(), &vec![0xB2u8].into()));
-        let mut dupes: Vec<_> = Vec::new();
-        for _ in 0..40 {
-            dupes.push(make_pred(1));
-            dupes.push(make_pred(2));
-            dupes.push(make_pred(3));
-        } // 120 raw, 3 unique
-        assert!(
-            dupes.len() > MAX_MIGRATION_PREDECESSORS
-                && dupes.len() <= MAX_MIGRATION_PREDECESSORS_RAW,
-            "the duplicate-heavy list must exceed the deduped cap in RAW length \
-             yet stay under the raw sanity bound, to isolate the dedupe semantics"
-        );
-        let req_ok = DelegateRequest::RegisterDelegateWithPredecessors {
-            delegate: DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(succ_ok.clone())),
-            cipher: [7u8; 32],
-            nonce: [9u8; 24],
-            predecessors: dupes,
-        };
-        executor
-            .delegate_request(
-                req_ok,
-                None,
-                None,
-                crate::client_events::ConnectionScope::Local,
-                None,
-            )
-            .expect("a duplicate-heavy but under-cap-UNIQUE list must be accepted");
-        assert!(
-            reg_path(&succ_ok).exists(),
-            "an accepted request must register the successor"
-        );
-
-        // (3) A raw list past the DoS sanity bound → REJECTED up front regardless
-        //     of unique count (all identical here: unique = 1, raw > the bound).
-        let succ_raw = Delegate::from((&vec![0u8].into(), &vec![0xC3u8].into()));
-        let raw_huge = vec![make_pred(7); MAX_MIGRATION_PREDECESSORS_RAW + 1];
-        let req_raw = DelegateRequest::RegisterDelegateWithPredecessors {
-            delegate: DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(succ_raw.clone())),
-            cipher: [7u8; 32],
-            nonce: [9u8; 24],
-            predecessors: raw_huge,
-        };
-        assert!(
-            executor
-                .delegate_request(
-                    req_raw,
-                    None,
-                    None,
-                    crate::client_events::ConnectionScope::Local,
-                    None
-                )
-                .is_err(),
-            "a raw list past the DoS sanity bound must be rejected even when unique count is small"
-        );
-        assert!(
-            !reg_path(&succ_raw).exists(),
-            "a rejected raw-oversize request must register NOTHING"
-        );
-
-        // (4) EXACTLY 64 UNIQUE predecessors (the at-cap boundary) → ACCEPTED.
-        let succ_at_cap = Delegate::from((&vec![0u8].into(), &vec![0xD4u8].into()));
-        let at_cap: Vec<_> = (0u8..64).map(make_pred).collect(); // 64 distinct
-        assert_eq!(at_cap.len(), MAX_MIGRATION_PREDECESSORS);
-        let req_at_cap = DelegateRequest::RegisterDelegateWithPredecessors {
-            delegate: DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(succ_at_cap.clone())),
-            cipher: [7u8; 32],
-            nonce: [9u8; 24],
-            predecessors: at_cap,
-        };
-        executor
-            .delegate_request(
-                req_at_cap,
-                None,
-                None,
-                crate::client_events::ConnectionScope::Local,
-                None,
-            )
-            .expect("an exactly-at-cap UNIQUE count (64) must be accepted");
-        assert!(
-            reg_path(&succ_at_cap).exists(),
-            "the at-cap boundary (64 unique) must register the successor"
-        );
-
-        // (5) EMPTY predecessor list → ACCEPTED, behaving like a plain
-        //     RegisterDelegate (successor registered, nothing to copy). Pins the
-        //     intended zero-predecessor semantics (the code does NOT reject empty).
-        let succ_empty = Delegate::from((&vec![0u8].into(), &vec![0xE5u8].into()));
-        let req_empty = DelegateRequest::RegisterDelegateWithPredecessors {
-            delegate: DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(succ_empty.clone())),
-            cipher: [7u8; 32],
-            nonce: [9u8; 24],
-            predecessors: Vec::new(),
-        };
-        executor
-            .delegate_request(
-                req_empty,
-                None,
-                None,
-                crate::client_events::ConnectionScope::Local,
-                None,
-            )
-            .expect("an empty predecessor list must be accepted (plain-register equivalent)");
-        assert!(
-            reg_path(&succ_empty).exists(),
-            "an empty-predecessor request must register the successor"
-        );
-
-        // (6) A raw list at EXACTLY the sanity bound (1024) with a within-cap
-        //     UNIQUE count (64) → ACCEPTED (the raw-bound boundary: only > the
-        //     bound is rejected).
-        let succ_raw_boundary = Delegate::from((&vec![0u8].into(), &vec![0xF6u8].into()));
-        let mut raw_at_bound: Vec<_> = Vec::new();
-        for _ in 0..(MAX_MIGRATION_PREDECESSORS_RAW / MAX_MIGRATION_PREDECESSORS) {
-            for i in 0..MAX_MIGRATION_PREDECESSORS as u8 {
-                raw_at_bound.push(make_pred(i));
-            }
-        } // 16 * 64 = 1024 raw, 64 unique
-        assert_eq!(raw_at_bound.len(), MAX_MIGRATION_PREDECESSORS_RAW);
-        let req_raw_boundary = DelegateRequest::RegisterDelegateWithPredecessors {
-            delegate: DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(
-                succ_raw_boundary.clone(),
-            )),
-            cipher: [7u8; 32],
-            nonce: [9u8; 24],
-            predecessors: raw_at_bound,
-        };
-        executor
-            .delegate_request(
-                req_raw_boundary,
-                None,
-                None,
-                crate::client_events::ConnectionScope::Local,
-                None,
-            )
-            .expect("a raw list at exactly the sanity bound (unique within cap) must be accepted");
-        assert!(
-            reg_path(&succ_raw_boundary).exists(),
-            "the raw-bound boundary (raw == 1024, 64 unique) must register the successor"
-        );
-    }
-
-    /// Core regression test: storing a contract makes its state retrievable
     /// and its `.wasm` blob present on disk; `remove_contract` reclaims both.
     #[tokio::test(flavor = "multi_thread")]
     async fn remove_contract_reclaims_state_and_wasm_from_disk() {
@@ -2813,42 +2575,99 @@ mod state_write_attribution_pin_tests {
     /// real code — the heuristic is: the line is not a comment AND the
     /// needle does not appear inside a double-quoted string on that line.
     fn count_call_sites(src: &str, needle: &str) -> usize {
-        src.lines()
-            .filter(|line| {
-                let trimmed = line.trim_start();
-                if trimmed.starts_with("//") {
-                    return false;
-                }
-                // Strip everything between matched double quotes so we
-                // don't count needle occurrences inside string literals
-                // (the test's own assertion messages contain the needles).
-                let stripped = strip_string_literals(line);
-                stripped.contains(needle)
-            })
-            .count()
+        let code = strip_comments_and_strings(src);
+        code.lines().filter(|line| line.contains(needle)).count()
     }
 
-    /// Replace the contents of every `"..."` on the line with empty
-    /// quotes so substring searches on the result skip string literals.
-    /// Handles escaped quotes pragmatically (rare in this codebase).
-    fn strip_string_literals(line: &str) -> String {
-        let mut out = String::with_capacity(line.len());
+    /// Blank out every COMMENT and every STRING LITERAL in `src`, preserving
+    /// line structure so line-based counting still works.
+    ///
+    /// # Why this replaced a line-prefix filter
+    ///
+    /// The previous version skipped a line only when its trimmed start was
+    /// `//`, and blanked string literals per line. That left two ways to
+    /// satisfy a pin without the code it guards:
+    ///
+    /// 1. **Block comments.** `/* op_manager.ring.record_contract_update(key); */`
+    ///    does not begin with `//`, so the needle stayed visible and the pin
+    ///    stayed green while the call was inert. A reviewer demonstrated this
+    ///    against `one_v2_delegate_write_callback_shared_by_both_executor_constructors`
+    ///    by block-commenting the call and watching it pass.
+    /// 2. **Trailing comments.** `foo(); // ... .commit_state_write() ...` has
+    ///    real code before the `//`, so the line was scanned in full and the
+    ///    needle inside the comment counted as a call site — which inflates an
+    ///    exact-count pin and can mask a genuine deletion.
+    ///
+    /// Both are the same defect: a scraper that skips SOME comments is not
+    /// skipping comments. That shape has now been found five times in this
+    /// workstream, which is why this is a single scanner rather than another
+    /// filter refinement.
+    ///
+    /// KNOWN LIMIT: raw strings (`r#"..."#`) are not recognised, so a needle
+    /// inside one would still count. None of the scraped sources contains one
+    /// (verified); if that changes, this needs a raw-string state.
+    fn strip_comments_and_strings(src: &str) -> String {
+        let mut out = String::with_capacity(src.len());
+        let mut chars = src.chars().peekable();
         let mut in_string = false;
-        let mut prev_was_backslash = false;
-        for c in line.chars() {
+        let mut in_line_comment = false;
+        let mut in_block_comment = false;
+        let mut prev_backslash = false;
+
+        while let Some(c) = chars.next() {
+            if in_line_comment {
+                if c == '\n' {
+                    in_line_comment = false;
+                    out.push('\n');
+                }
+                continue;
+            }
+            if in_block_comment {
+                if c == '*' && chars.peek() == Some(&'/') {
+                    chars.next();
+                    in_block_comment = false;
+                } else if c == '\n' {
+                    // Keep the newline so a multi-line block comment does not
+                    // splice two code lines into one.
+                    out.push('\n');
+                }
+                continue;
+            }
             if in_string {
-                if c == '"' && !prev_was_backslash {
+                if prev_backslash {
+                    prev_backslash = false;
+                } else if c == '\\' {
+                    prev_backslash = true;
+                } else if c == '"' {
                     in_string = false;
                     out.push('"');
                 }
-                // drop characters inside the string
-            } else if c == '"' {
+                if c == '\n' {
+                    out.push('\n');
+                }
+                continue;
+            }
+            if c == '/' {
+                match chars.peek() {
+                    Some('/') => {
+                        chars.next();
+                        in_line_comment = true;
+                        continue;
+                    }
+                    Some('*') => {
+                        chars.next();
+                        in_block_comment = true;
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+            if c == '"' {
                 in_string = true;
                 out.push('"');
-            } else {
-                out.push(c);
+                continue;
             }
-            prev_was_backslash = c == '\\' && !prev_was_backslash;
+            out.push(c);
         }
         out
     }
@@ -2885,9 +2704,10 @@ mod state_write_attribution_pin_tests {
     #[test]
     fn every_runtime_state_write_chokepoint_goes_through_commit_state_write() {
         // 4 executor-internal chokepoints (PUT-new, UPDATE, re-PUT,
-        // verify_and_store PUT) + 2 V2 delegate callback installers
-        // = 6 total commit_state_write call sites in runtime.rs.
-        const EXPECTED: usize = 6;
+        // verify_and_store PUT) + 1 V2 delegate callback (the two
+        // installers collapsed into `v2_delegate_state_write_callback`
+        // in #5479) = 5 total commit_state_write call sites in runtime.rs.
+        const EXPECTED: usize = 5;
         let count = count_call_sites(RUNTIME_SRC, ".commit_state_write(");
         assert_eq!(
             count, EXPECTED,
@@ -2901,28 +2721,44 @@ mod state_write_attribution_pin_tests {
     }
 
     #[test]
-    fn v2_delegate_state_write_paths_invoke_callback_with_state_size() {
-        // The V2 delegate PUT and UPDATE paths in native_api.rs MUST
-        // capture state.len() BEFORE the move into store_state_sync /
-        // update_state_sync, and pass it to the callback. Otherwise the
-        // governance scoring undercounts every V2 delegate write by the
-        // full state size of that write.
-        let calls = count_call_sites(NATIVE_API_SRC, "cb(&contract_key,");
+    fn v2_delegate_state_write_paths_run_the_shared_post_write_hook() {
+        // Both V2 delegate write paths in native_api.rs (PUT and UPDATE) MUST
+        // go through the one `after_state_write` helper, which is what fires
+        // the installed callback. Hand-inlining the callback invocation at
+        // each path is how a side effect ends up on one path and not the
+        // other — the "manually-inlined originator side effects" row in
+        // `.claude/rules/bug-prevention-patterns.md`.
+        let hook_calls = count_call_sites(NATIVE_API_SRC, "self.after_state_write(");
         assert_eq!(
-            calls, 2,
-            "expected exactly 2 callback invocations passing state_size \
-             in native_api.rs (one for PUT, one for UPDATE); found {calls}"
+            hook_calls, 2,
+            "expected exactly 2 `self.after_state_write(` call sites in \
+             native_api.rs (one for V2 PUT, one for V2 UPDATE); found \
+             {hook_calls}"
         );
-        // And state.len() MUST be captured before the move.
-        let captures = count_call_sites(NATIVE_API_SRC, "let state_size = state.len();");
+        // …and exactly one place that actually invokes the callback.
+        let invocations = count_call_sites(
+            NATIVE_API_SRC,
+            "cb(contract_key, new_state, content_changed)",
+        );
+        assert_eq!(
+            invocations, 1,
+            "expected exactly 1 callback invocation in native_api.rs (inside \
+             after_state_write); found {invocations}. A second one means a \
+             write path has started re-inlining the post-write sequence."
+        );
+        // The state is wrapped ONCE and the same value is admitted, written
+        // and handed to the callback. Reconstructing it for the hook, or
+        // measuring a different value than the one written, is the drift this
+        // catches.
+        let captures = count_call_sites(
+            NATIVE_API_SRC,
+            "let new_state = freenet_stdlib::prelude::WrappedState::new(state);",
+        );
         assert_eq!(
             captures, 2,
-            "expected exactly 2 `let state_size = state.len();` captures \
-             in native_api.rs (one before each state-store move); found \
-             {captures}. The order matters — capturing AFTER the move \
-             into store_state_sync would not compile, but a refactor \
-             that moves state into an intermediate first could regress \
-             this silently."
+            "expected exactly 2 `WrappedState::new(state)` wraps in \
+             native_api.rs (one per V2 write path, before the admission \
+             gate); found {captures}."
         );
     }
 
@@ -2957,23 +2793,84 @@ mod state_write_attribution_pin_tests {
     }
 
     #[test]
-    fn v2_delegate_callback_installers_invalidate_state_caches() {
+    fn one_v2_delegate_write_callback_shared_by_both_executor_constructors() {
         // V2 delegate state writes (put/update_contract_state_sync) bypass
-        // `StateStore::{store,update}`, so both `state_write_callback` installers
-        // (in `from_config` and `from_config_with_shared_modules`) MUST drop
-        // StateStore's cached view of the contract (moka state cache + change
-        // detector). Dropping this would let a V2 write leave a stale cached
-        // state/detector hash and the summarize/delta fast path serve a STALE
-        // summary/delta → state divergence (Codex review).
-        let count = count_call_sites(RUNTIME_SRC, "cache_invalidator.invalidate(");
+        // `StateStore::{store,update}`, so the `state_write_callback` has to
+        // re-apply every side effect those chokepoints perform. Before #5479
+        // that callback was built TWICE — once in `from_config`, once in
+        // `from_config_with_shared_modules` — as copy-paste twins, which is
+        // exactly the shape that lets a side effect be added to one and not
+        // the other. There is now ONE builder and ONE installer.
+        let installs = count_call_sites(RUNTIME_SRC, "rt.set_state_write_callback(");
         assert_eq!(
-            count, 2,
-            "expected exactly 2 `cache_invalidator.invalidate(` calls in \
-             runtime.rs (one per V2 state_write_callback installer); found \
-             {count}. If a callback installer stopped invalidating StateStore's \
-             caches, a V2 delegate state write would leave stale cached state \
-             and the summarize/delta fast path could serve a stale result."
+            installs, 1,
+            "expected exactly 1 `rt.set_state_write_callback(` site in \
+             runtime.rs (inside install_v2_delegate_state_write_hooks); found \
+             {installs}. A second installer is a copy-paste twin waiting to \
+             drift — extend the shared one instead."
         );
+        // Both constructors must call it, AND must pass the op_manager
+        // through. `install_v2_delegate_state_write_hooks(&mut rt, &store,
+        // None)` would compile, disable network propagation on every
+        // production node, and leave every unit test and every pin above
+        // green — only the 3-node E2E would notice. Pin the argument, not
+        // just the call.
+        let callers = count_call_sites(
+            RUNTIME_SRC,
+            "install_v2_delegate_state_write_hooks(&mut rt, &state_store, op_manager.clone())",
+        ) + count_call_sites(
+            RUNTIME_SRC,
+            "install_v2_delegate_state_write_hooks(&mut rt, &shared_state_store, \
+             op_manager.clone())",
+        );
+        assert_eq!(
+            callers, 2,
+            "expected both executor constructors (`from_config` and \
+             `from_config_with_shared_modules`) to call \
+             install_v2_delegate_state_write_hooks WITH `op_manager.clone()`; \
+             found {callers} matching call sites."
+        );
+
+        // And the one callback must still do all three legs. Anchored on API
+        // surface, not local names, so a rename inside it cannot pass vacuously.
+        let start = RUNTIME_SRC
+            .find("pub(super) fn v2_delegate_state_write_callback(")
+            .expect("v2_delegate_state_write_callback must exist");
+        let body = &RUNTIME_SRC[start..];
+        let end = body
+            .find("\nimpl Executor<Runtime> {")
+            .expect("the callback builder sits just above impl Executor<Runtime>");
+        let body = &body[..end];
+        for required in [
+            "cache_invalidator.invalidate(",
+            ".commit_state_write(",
+            // The propagation leg. It queues a key-only event rather than
+            // enqueueing the state; see `queue_v2_delegate_broadcast`.
+            "queue_v2_delegate_broadcast(",
+            // Leg 3 in the rustdoc above. Deleting it was green before this
+            // line existed: the dashboard timestamp for a contract written only
+            // by a V2 delegate would silently stop advancing.
+            ".record_contract_update(",
+            "is_contract_broken(",
+        ] {
+            // `count_call_sites`, not `body.contains`: the callback carries a
+            // long comment block that names each of these symbols, and a raw
+            // substring search is satisfied by the COMMENT alone. That is the
+            // vacuous-pin shape `.claude/rules/bug-prevention-patterns.md`
+            // warns about — the pin would keep passing after the call it
+            // guards was deleted, as long as the prose survived.
+            assert!(
+                count_call_sites(body, required) >= 1,
+                "the V2 delegate write callback must invoke `{required}` as \
+                 real code (not merely mention it in a comment). Dropping the \
+                 invalidation serves stale bytes and stale summaries; dropping \
+                 commit_state_write re-opens the EvictContract race and \
+                 undercounts the meter; dropping the broadcast queue is #5479 \
+                 (the write returns success and the network never learns of \
+                 it); dropping the broken-contract check re-engages a \
+                 suppressed storm."
+            );
+        }
     }
 }
 

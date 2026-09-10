@@ -1,6 +1,6 @@
 //! `fdev verify-merge`: check a contract's merge laws offline (RFC #5320).
 //!
-//! A contract that breaks them cannot converge — peers given the same updates
+//! A contract that breaks them usually cannot converge — peers given the same updates
 //! in different orders end up with different state and never agree.
 //!
 //! This is a thin CLI wrapper around `freenet::conformance` and does not
@@ -32,10 +32,9 @@ use freenet::conformance::generator::Corpus;
 use freenet::conformance::host_clock;
 use freenet::conformance::verifier::Bytes;
 use freenet::conformance::{
-    ConformanceCase, ConformanceEvidence, ConformanceProperty, EVIDENCE_SCHEMA_VERSION,
-    EvidenceRejected, GeneratorConfig, Inconclusive, MinimizeConfig, OracleBuildError,
-    PropertyOutcome, ReplayBundle, RuntimeOracle, Severity, Transition, generate_cases, minimize,
-    verify_case,
+    ConformanceCase, ConformanceEvidence, ConformanceProperty, EvidenceRejected, GeneratorConfig,
+    IdempotenceSettling, Inconclusive, MinimizeConfig, OracleBuildError, PropertyOutcome,
+    ReplayBundle, RuntimeOracle, Severity, Transition, generate_cases, minimize, verify_case,
 };
 use freenet_stdlib::prelude::{CodeHash, ContractCode, ContractInstanceId, State, UpdateData};
 use serde::Serialize;
@@ -412,8 +411,11 @@ fn write_bundle(
 /// distinction CI needs and a single exit code cannot express.
 #[derive(Debug, thiserror::Error)]
 #[error(
-    "{count} merge-law violation(s) found: this contract cannot converge, so peers \
-     holding it will disagree and keep retrying"
+    "{count} merge-law violation(s) found. A violation is removal-eligible under \
+     enforcement; see each finding for what it means. NOTE: `state_idempotence` \
+     reporting `settled_after` is a real break whose harm is redundant anti-entropy \
+     rather than divergence \u{2014} expected against correct canonicalizing \
+     contracts until the PUT install path canonicalizes"
 )]
 pub struct ConformanceViolations {
     pub count: usize,
@@ -473,18 +475,8 @@ fn parse_properties(names: &[String]) -> anyhow::Result<Vec<ConformanceProperty>
 /// differ, and both are worth knowing.
 async fn verify_evidence(config: &ConformanceConfig, path: &PathBuf) -> anyhow::Result<()> {
     let bytes = read_file(path)?;
-    let evidence: ConformanceEvidence = bincode::deserialize(&bytes)
+    let evidence = ConformanceEvidence::decode(&bytes)
         .with_context(|| format!("decoding evidence {}", path.display()))?;
-
-    // Refuse a schema this build does not know, rather than reading fields that may
-    // have changed meaning. Silently misreading evidence is worse than declining.
-    if evidence.schema_version != EVIDENCE_SCHEMA_VERSION {
-        anyhow::bail!(
-            "evidence uses schema version {}, this build understands {}",
-            evidence.schema_version,
-            EVIDENCE_SCHEMA_VERSION
-        );
-    }
 
     // Bounds-check with the same function a receiving peer uses, so this command
     // never accepts evidence the network itself would reject, and do it BEFORE
@@ -1053,8 +1045,9 @@ fn write_evidence<O: ConformanceOracle + ?Sized>(
         if !written.insert(id) {
             continue;
         }
-        let bytes =
-            bincode::serialize(&evidence).with_context(|| format!("encoding evidence {id}"))?;
+        let bytes = evidence
+            .encode()
+            .with_context(|| format!("encoding evidence {id}"))?;
         let path = dir.join(format!("{id}.bin"));
         std::fs::write(&path, bytes)
             .with_context(|| format!("writing evidence to {}", path.display()))?;
@@ -1302,6 +1295,15 @@ struct Finding {
     detail: String,
     left: String,
     right: String,
+    /// Machine-readable settling classification for `state_idempotence`; `null`
+    /// for every other property.
+    ///
+    /// `detail` states it in prose, but `Violation::detail` is documented as
+    /// diagnostic and never parsed, and this distinction is exactly what an
+    /// eventual removal policy branches on (#5462). Carrying it only as text
+    /// would leave the tool discarding structure it was handed — the defect
+    /// #5461 fixed, one field over.
+    settling: Option<IdempotenceSettling>,
 }
 
 /// How many distinct detail texts the HUMAN report shows per inconclusive reason.
@@ -1413,6 +1415,7 @@ impl Report {
                         detail: v.detail.clone(),
                         left: v.left.to_string(),
                         right: v.right.to_string(),
+                        settling: v.settling,
                     });
                 }
                 PropertyOutcome::Inconclusive(reason) => {
@@ -3037,11 +3040,8 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("temp dir");
         let evidence_path = dir.path().join("evidence.bin");
-        std::fs::write(
-            &evidence_path,
-            bincode::serialize(&evidence).expect("encode evidence"),
-        )
-        .expect("write evidence");
+        std::fs::write(&evidence_path, evidence.encode().expect("encode evidence"))
+            .expect("write evidence");
 
         let store_file = dir.path().join("contract.wasm");
         let encoded = ContractCode::from(code.clone())
@@ -3093,11 +3093,8 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("temp dir");
         let evidence_path = dir.path().join("evidence.bin");
-        std::fs::write(
-            &evidence_path,
-            bincode::serialize(&evidence).expect("encode evidence"),
-        )
-        .expect("write evidence");
+        std::fs::write(&evidence_path, evidence.encode().expect("encode evidence"))
+            .expect("write evidence");
 
         let store_file = dir.path().join("contract.wasm");
         let encoded = ContractCode::from(wrong_code.clone())
@@ -3115,6 +3112,59 @@ mod tests {
             err.to_string().contains(&inner_hash),
             "the error must name the INNER code hash so an operator can compare \
              it against store filenames; got: {err}"
+        );
+    }
+
+    /// An evidence file from an unsupported schema version must be refused politely
+    /// with an explicit version message rather than an opaque deserialization error.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn verify_evidence_rejects_unsupported_schema_politely() {
+        let code = minimal_contract_wasm(1);
+        let params = Vec::new();
+        let instance = ContractInstanceId::from_params_and_code(
+            freenet_stdlib::prelude::Parameters::from(params.clone()),
+            ContractCode::from(code.clone()),
+        );
+        let case = ConformanceCase::new(
+            ConformanceProperty::StateIdempotence,
+            vec![Bytes::from(vec![1u8, 2, 3])],
+        );
+        let evidence = ConformanceEvidence::new(instance, params, &case, None);
+        let mut bytes = evidence.encode().expect("encode");
+
+        // Set the schema version to 1 in the framing header.
+        bytes[8..10].copy_from_slice(&1u16.to_le_bytes());
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let evidence_path = dir.path().join("evidence.bin");
+        std::fs::write(&evidence_path, &bytes).expect("write evidence");
+
+        let config = wasm_only_config(None);
+        let err = verify_evidence(&config, &evidence_path)
+            .await
+            .expect_err("unsupported schema must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("evidence uses schema version 1, this build understands 2"),
+            "error should state schema version mismatch cleanly; got: {msg}"
+        );
+    }
+
+    /// A file with bad magic is rejected fast as not conformance evidence.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn verify_evidence_rejects_bad_magic() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let evidence_path = dir.path().join("evidence.bin");
+        std::fs::write(&evidence_path, b"not evidence content here").expect("write file");
+
+        let config = wasm_only_config(None);
+        let err = verify_evidence(&config, &evidence_path)
+            .await
+            .expect_err("bad magic must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("not conformance evidence (bad magic)"),
+            "error should indicate bad magic; got: {msg}"
         );
     }
 
@@ -3318,6 +3368,7 @@ mod tests {
             left: digest(),
             right: digest(),
             detail: "test".to_string(),
+            settling: None,
         }
     }
 
@@ -3353,6 +3404,7 @@ mod tests {
             detail: detail.to_string(),
             left: left.to_string(),
             right: right.to_string(),
+            settling: None,
         }
     }
 
@@ -3851,6 +3903,75 @@ mod tests {
         assert!(
             resource_header < resource_text,
             "the resource-limit message is not under its heading:\n{rendered}"
+        );
+    }
+
+    /// `--json` must carry the settling classification, not just its prose.
+    ///
+    /// `Violation::detail` says the same thing in words, but it is documented as
+    /// diagnostic and never parsed, and this distinction is what an eventual
+    /// removal policy branches on (#5462): a contract that normalises once is a
+    /// different animal from one that mutates on every redelivery. Dropping the
+    /// structured field here would leave the tool discarding information it was
+    /// handed, which is the defect #5461 fixed one field over.
+    #[test]
+    fn the_json_report_carries_the_settling_classification() {
+        let outcomes = vec![
+            (
+                ConformanceCase::new(
+                    ConformanceProperty::StateIdempotence,
+                    vec![Bytes::from(vec![1u8])],
+                ),
+                PropertyOutcome::Violated(Violation {
+                    property: ConformanceProperty::StateIdempotence,
+                    severity: Severity::Violation,
+                    left: digest(),
+                    right: digest(),
+                    detail: "merge(A, A) != A".to_string(),
+                    settling: Some(IdempotenceSettling::NeverSettled),
+                }),
+            ),
+            (
+                ConformanceCase::new(
+                    ConformanceProperty::StateIdempotence,
+                    vec![Bytes::from(vec![2u8])],
+                ),
+                PropertyOutcome::Violated(Violation {
+                    property: ConformanceProperty::StateIdempotence,
+                    severity: Severity::Violation,
+                    left: digest(),
+                    right: digest(),
+                    detail: "merge(A, A) != A, settles".to_string(),
+                    // A SECOND finding with a DIFFERENT class. One fixture value can
+                    // always be satisfied by hardcoding that value: this test used
+                    // `SettledAfter` until a mutation hardcoded `SettledAfter`, and
+                    // switching to `NeverSettled` only moved which constant passed.
+                    // Two classes in one report mean no constant can.
+                    settling: Some(IdempotenceSettling::SettledAfter(1)),
+                }),
+            ),
+        ];
+        let report = Report::build(&Corpus::default(), &outcomes, None, Vec::new());
+        let json = serde_json::to_string(&report).expect("the report must serialize");
+
+        assert!(
+            json.contains("\"settling\""),
+            "the settling field never reached --json: {json}"
+        );
+        // `NeverSettled` deliberately, and asserting the OTHER variant is absent.
+        // Found by mutation: with a `SettledAfter` fixture, hardcoding the forwarded
+        // value to `SettledAfter(1)` passed — the test proved the field was present,
+        // not that it carried what the verifier decided. `NeverSettled` is also the
+        // classification an enforcement policy can act on, so silently substituting
+        // the benign one is the direction that matters.
+        assert!(
+            json.contains("NeverSettled"),
+            "--json must forward the classification the verifier made: {json}"
+        );
+        assert!(
+            json.contains("SettledAfter"),
+            "the second finding's class must be forwarded too — with a single \
+             class in the fixture, hardcoding that class passes: {json}"
         );
     }
 
