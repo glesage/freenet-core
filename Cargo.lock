@@ -1993,7 +1993,7 @@ dependencies = [
 
 [[package]]
 name = "fdev"
-version = "0.3.296"
+version = "0.3.297"
 dependencies = [
  "anyhow",
  "axum",
@@ -2172,7 +2172,7 @@ dependencies = [
 
 [[package]]
 name = "freenet"
-version = "0.2.134"
+version = "0.2.135"
 dependencies = [
  "aes-gcm",
  "ahash",
@@ -2327,7 +2327,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "freenet",
- "freenet-stdlib 0.8.5",
+ "freenet-stdlib 0.10.0",
  "serde_json",
  "tempfile",
  "thiserror 2.0.20",

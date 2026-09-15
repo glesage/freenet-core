@@ -2704,6 +2704,14 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 // they never reach the collector — pinned by
                 // `router_snapshot_json_includes_fd_gauges`.
                 "open_fds": snapshot.open_fds,
+                // Chain-blame soak histogram (#5657); pinned by
+                // `router_snapshot_json_includes_timeout_label_histogram`.
+                "timeout_label_peers_1": snapshot.timeout_label_peers_1,
+                "timeout_label_peers_2_3": snapshot.timeout_label_peers_2_3,
+                "timeout_label_peers_4_7": snapshot.timeout_label_peers_4_7,
+                "timeout_label_peers_8_plus": snapshot.timeout_label_peers_8_plus,
+                "timeout_label_max_per_peer": snapshot.timeout_label_max_per_peer,
+                "timeout_labels_untracked": snapshot.timeout_labels_untracked,
                 "fd_soft_limit": snapshot.fd_soft_limit,
                 "contract_module_cache_entries": snapshot.contract_module_cache_entries,
                 "contract_module_cache_total_bytes": snapshot.contract_module_cache_total_bytes,
@@ -2974,6 +2982,29 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 obj.insert(
                     "hosting_budget_evictions_total".to_string(),
                     serde_json::json!(snapshot.hosting_budget_evictions_total),
+                );
+                // Resident-overhead pressure axis (#5325) — the SECOND, independent
+                // eviction pressure alongside the state-byte budget above. Same
+                // hand-mirrored footgun; pinned by
+                // `router_snapshot_json_includes_resident_overhead_gauges`. Note the
+                // budget/estimate pair is a contract-COUNT ceiling in memory units,
+                // not measured RAM (see the `RouterSnapshotInfo` doc), which is why
+                // `hosting_contract_slot_budget` travels with it.
+                obj.insert(
+                    "hosting_resident_overhead_budget_bytes".to_string(),
+                    serde_json::json!(snapshot.hosting_resident_overhead_budget_bytes),
+                );
+                obj.insert(
+                    "hosting_estimated_resident_overhead_bytes".to_string(),
+                    serde_json::json!(snapshot.hosting_estimated_resident_overhead_bytes),
+                );
+                obj.insert(
+                    "hosting_contract_slot_budget".to_string(),
+                    serde_json::json!(snapshot.hosting_contract_slot_budget),
+                );
+                obj.insert(
+                    "hosting_resident_overhead_evictions_total".to_string(),
+                    serde_json::json!(snapshot.hosting_resident_overhead_evictions_total),
                 );
                 // Demand-ordered eviction gauges (#4642 A3). Same
                 // hand-mirrored footgun as the A2 gauges above: a new
@@ -3468,6 +3499,35 @@ mod tests {
         );
     }
 
+    /// Pin: the chain-blame timeout-label histogram (#5657) must reach the
+    /// hand-mirrored `router_snapshot` OTLP body, like every other
+    /// `RouterSnapshotInfo` field (the #4009/#4010 manually-mirrored-telemetry
+    /// footgun).
+    #[test]
+    fn router_snapshot_json_includes_timeout_label_histogram() {
+        use arbitrary::{Arbitrary, Unstructured};
+        let mut u = Unstructured::new(&[0u8; 4096]);
+        let mut info = crate::router::RouterSnapshotInfo::arbitrary(&mut u)
+            .expect("construct RouterSnapshotInfo for test");
+        info.timeout_label_peers_1 = Some(11);
+        info.timeout_label_peers_2_3 = Some(12);
+        info.timeout_label_peers_4_7 = Some(13);
+        info.timeout_label_peers_8_plus = Some(14);
+        info.timeout_label_max_per_peer = Some(15);
+        info.timeout_labels_untracked = Some(16);
+        let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
+        for (field, value) in [
+            ("timeout_label_peers_1", 11),
+            ("timeout_label_peers_2_3", 12),
+            ("timeout_label_peers_4_7", 13),
+            ("timeout_label_peers_8_plus", 14),
+            ("timeout_label_max_per_peer", 15),
+            ("timeout_labels_untracked", 16),
+        ] {
+            assert_eq!(json[field], value, "{field} must reach the OTLP body");
+        }
+    }
+
     /// Pin: the manually-mirrored `router_snapshot` OTLP body
     /// (`event_kind_to_json`) must forward the node-health gauges. The body is a
     /// hand-written `json!` block, so a new `RouterSnapshotInfo` field is
@@ -3794,6 +3854,34 @@ mod tests {
             ("hosting_current_bytes", 263),
             ("hosting_contract_count", 269),
             ("hosting_budget_evictions_total", 271),
+        ] {
+            assert_eq!(json[key], want, "{key} must reach the OTLP body");
+        }
+    }
+
+    /// Pin: the resident-overhead pressure gauges (#5325) must reach the
+    /// hand-mirrored OTLP body. This is the second hop of a two-hop hand-mirror
+    /// (`HostingCacheStats` → `RouterSnapshotInfo` → here); the first hop is
+    /// pinned by `ring::hosting_stats_mirror_source_tests`. The axis shipped
+    /// computed-and-rendered-but-unexported, so a fleet audit could see a node's
+    /// state-byte occupancy sitting at 13% with no way to tell it was
+    /// nevertheless evicting under slot pressure.
+    #[test]
+    fn router_snapshot_json_includes_resident_overhead_gauges() {
+        use arbitrary::{Arbitrary, Unstructured};
+        let mut u = Unstructured::new(&[0u8; 4096]);
+        let mut info = crate::router::RouterSnapshotInfo::arbitrary(&mut u)
+            .expect("construct RouterSnapshotInfo for test");
+        info.hosting_resident_overhead_budget_bytes = Some(277);
+        info.hosting_estimated_resident_overhead_bytes = Some(281);
+        info.hosting_contract_slot_budget = Some(283);
+        info.hosting_resident_overhead_evictions_total = Some(293);
+        let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
+        for (key, want) in [
+            ("hosting_resident_overhead_budget_bytes", 277),
+            ("hosting_estimated_resident_overhead_bytes", 281),
+            ("hosting_contract_slot_budget", 283),
+            ("hosting_resident_overhead_evictions_total", 293),
         ] {
             assert_eq!(json[key], want, "{key} must reach the OTLP body");
         }

@@ -8313,6 +8313,170 @@ fn test_connect_despite_nat_partition() {
 }
 
 // =============================================================================
+// Gateway Zombie Sweep vs. an Unjoined Peer's Live Link (#5654)
+// =============================================================================
+
+/// Regression test for #5654: the gateway's zombie-transport sweep must not
+/// collect a link that a peer which cannot join the ring is still using.
+///
+/// **The bug.** With this seed, one node's every CONNECT is rejected (a
+/// saturated neighbourhood), so its gateway transport is its only route and is
+/// never in the gateway's ring. The gateway's zombie sweep judged that
+/// transport purely by AGE (`> 3 × transient_ttl`, 90s by default) and dropped
+/// it. The transport has no close message, so the peer was never told; it
+/// exempts its own gateway links from zombie cleanup and only notices a dead
+/// link after its 120s idle timeout. GETs it sent into the dead link timed out
+/// and reported NotFound for a contract that exists.
+///
+/// **The scenario.** 1 gateway + 12 nodes. Every node GETs a contract that has
+/// not been PUT yet, the gateway PUTs it, then every node GETs it again, with
+/// operations 5s apart. The second round is what is checked: every node must
+/// end up holding the state. At 5s spacing the last node's second-round GET
+/// lands inside the dead-link window on the unfixed base (the sweep dropping
+/// the link was confirmed as the cause by disabling the sweep, which made this
+/// pass). At 15s spacing a first-round GET lands there instead, which this
+/// assertion cannot see, so the spacing is load-bearing.
+///
+/// **Coupling.** Which node lands in the dead-link window depends on:
+/// `transient_ttl` (default 30s, so a transport is a zombie by age after 90s),
+/// the sweep interval (`STATS_LOG_INTERVAL`, 30s, in `p2p_protoc.rs`), the op
+/// spacing (5s, below), the seed, and the network shape. Changing any of them
+/// can move the window off every checked GET and make the outcome assertion
+/// pass for the wrong reason. The precondition assertions below catch that:
+/// they require that node 12 never joined the ring and that the gateway's sweep
+/// did evaluate its transport as a zombie by age.
+#[test_log::test]
+fn test_gateway_zombie_sweep_keeps_unjoined_peers_live_link() {
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation, register_crdt_contract};
+
+    const SEED: u64 = 0x4485_0000_0001;
+    const NETWORK_NAME: &str = "gw-zombie-live-link";
+    let num_nodes = 12;
+
+    setup_deterministic_state(SEED);
+    let rt = create_runtime();
+    let mut sim = rt.block_on(async {
+        SimNetwork::new(
+            NETWORK_NAME,
+            1,         // gateways
+            num_nodes, // nodes
+            4,         // ring_max_htl
+            2,         // rnd_if_htl_above
+            5,         // max_connections
+            3,         // min_connections
+            SEED,
+        )
+        .await
+    });
+    sim.with_controlled_op_interval(Duration::from_secs(5));
+    // The unjoined node for this seed. See "Coupling" above.
+    const UNJOINED_NODE: usize = 12;
+    let gateway_addr = sim
+        .node_address(&NodeLabel::gateway(NETWORK_NAME, 0))
+        .expect("gateway address");
+    let unjoined_addr = sim
+        .node_address(&NodeLabel::node(NETWORK_NAME, UNJOINED_NODE))
+        .expect("unjoined node address");
+
+    let contract = SimOperation::create_test_contract(0x85);
+    let contract_id = *contract.key().id();
+    register_crdt_contract(contract_id);
+
+    let get_round = |ops: &mut Vec<ScheduledOperation>| {
+        for i in 1..=num_nodes {
+            ops.push(ScheduledOperation::new(
+                NodeLabel::node(NETWORK_NAME, i),
+                SimOperation::Get {
+                    contract_id,
+                    return_contract_code: true,
+                    subscribe: false,
+                },
+            ));
+        }
+    };
+    let mut operations = Vec::new();
+    get_round(&mut operations);
+    operations.push(ScheduledOperation::new(
+        NodeLabel::gateway(NETWORK_NAME, 0),
+        SimOperation::Put {
+            contract: contract.clone(),
+            state: SimOperation::create_crdt_state(1, 0x85),
+            subscribe: true,
+        },
+    ));
+    get_round(&mut operations);
+
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(900),
+        Duration::from_secs(180),
+    );
+    assert!(
+        result.turmoil_result.is_ok(),
+        "simulation failed: {:?}",
+        result.turmoil_result.err()
+    );
+
+    // Preconditions: without these the outcome below could pass for a reason
+    // that has nothing to do with the sweep.
+    let unjoined_ring_connections = result
+        .topology_snapshots
+        .iter()
+        .find(|snap| snap.peer_addr == unjoined_addr)
+        .map(|snap| snap.connection_count);
+    assert_eq!(
+        unjoined_ring_connections,
+        Some(0),
+        "precondition: node {UNJOINED_NODE} must end the run unjoined, so its \
+         gateway transport is its only route"
+    );
+    // `connection_count` reads 0 when unstamped, so require that the snapshot
+    // mechanism stamped other nodes, or the check above would be vacuous.
+    assert!(
+        result
+            .topology_snapshots
+            .iter()
+            .any(|snap| snap.peer_addr != unjoined_addr && snap.connection_count > 0),
+        "precondition check is vacuous: no node's snapshot carries a connection count"
+    );
+    let (past_age_threshold, kept_for_link_use) =
+        result.zombie_sweep_counts(gateway_addr, unjoined_addr);
+    assert!(
+        past_age_threshold > 0,
+        "precondition: the gateway's zombie sweep must have evaluated node \
+         {UNJOINED_NODE}'s transport as a zombie by age at least once"
+    );
+    tracing::info!(
+        past_age_threshold,
+        kept_for_link_use,
+        "gateway zombie sweep verdicts for the unjoined node's transport"
+    );
+
+    let key = contract.key();
+    let nodes_without_state: Vec<usize> = (1..=num_nodes)
+        .filter(|i| {
+            result
+                .node_storages
+                .get(&NodeLabel::node(NETWORK_NAME, *i))
+                .is_none_or(|s| s.get_stored_state(&key).is_none())
+        })
+        .collect();
+    assert!(
+        nodes_without_state.is_empty(),
+        "every second-round GET for a PUT contract must deliver state; nodes \
+         without state: {nodes_without_state:?} (#5654: the gateway's zombie \
+         sweep dropped an unjoined peer's only, still-used link)"
+    );
+    // Mechanism: the transport survived because its recent requests exempted it.
+    assert!(
+        kept_for_link_use > 0,
+        "the gateway's sweep must have kept node {UNJOINED_NODE}'s transport for \
+         recent requests (past_age_threshold={past_age_threshold})"
+    );
+}
+
+// =============================================================================
 // Connection Growth Stall Regression Test (PRs #3408, #3398, #3396, #3380)
 // =============================================================================
 
@@ -9025,6 +9189,276 @@ fn test_relay_route_events_multihop() {
         "RELAY_PUT_ROUTE_EVENT_COUNT did not advance — the gateway PUT at HTL=3 in a \
          sparse {num_nodes}-node mesh must forward through at least one relay. \
          Baseline: {put_route_baseline}, after: {put_route_after}."
+    );
+}
+
+/// #5657: route attempts feed the router the right labels, per node.
+///
+/// Before the fix a relay recorded a downstream `NotFound` as a SUCCESS and
+/// originators recorded only their final success, so a production gateway saw
+/// 2 failures in 361 route events. Now timeouts and dropped connections are
+/// failures, a `NotFound` is a failure only when this node stored state from
+/// a later reply in the SAME operation, and ambiguous `NotFound`s are not
+/// trained.
+///
+/// Two runs on the same 13-node topology and seed:
+///
+/// * **absent** — every node GETs a contract that is never PUT. Every search
+///   dead-ends, nothing can prove the contract exists, so NO node may feed its
+///   router a single `NotFound` failure label.
+/// * **evidence** — every node GETs a contract before it is PUT (correct
+///   `NotFound`s that must not be trained later), the gateway PUTs it, every
+///   node GETs it again (GET health: all must resolve), then the gateway PUTs
+///   a second contract, three nodes are crashed, and the remaining nodes GET
+///   the second contract. Attempts forwarded into a crashed (or otherwise
+///   silent) peer time out, and those timeouts must reach the routers as
+///   failures. Observed at this seed: timeouts at several nodes, and one
+///   NotFound label (node 9) from an operation that later found the contract.
+///
+/// Labels are read per node from each Ring's per-cause failure counters and
+/// Router totals, not from a proxy.
+#[test_log::test]
+fn test_router_receives_failures_for_dead_end_gets() {
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation, register_crdt_contract};
+
+    const SEED: u64 = 0x4485_0000_0001;
+    let num_nodes = 12;
+    let crashed = 1..=3;
+
+    let run = |network_name: &'static str, operations: &dyn Fn(&mut Vec<ScheduledOperation>)| {
+        setup_deterministic_state(SEED);
+        let rt = create_runtime();
+        let mut sim = rt.block_on(async {
+            SimNetwork::new(
+                network_name,
+                1,         // gateways
+                num_nodes, // nodes
+                4,         // ring_max_htl
+                2,         // rnd_if_htl_above
+                5,         // max_connections
+                3,         // min_connections
+                SEED,
+            )
+            .await
+        });
+        // 15 s between operations. With 5 s the last node's second-round GET
+        // fails to store the state, which is NOT this change and not GET
+        // overlap: that node never joins the ring (every CONNECT is rejected),
+        // the gateway's zombie sweep silently drops its only connection after
+        // 90 s with no close message, and the node keeps sending GETs into the
+        // dead link until its 120 s idle timeout (#5654). The spacing only
+        // decides which of its GETs lands in that dead window; at 15 s it is a
+        // first-round GET, which this test does not require to resolve. Its
+        // first-round timeouts are genuine routing failures caused by that bug,
+        // so the timeout assertion below excludes the node. The #5654 fix
+        // (PR #5656) may remove that failure mode; revisit this exclusion
+        // and the spacing when it lands.
+        sim.with_controlled_op_interval(Duration::from_secs(15));
+        let mut ops = Vec::new();
+        operations(&mut ops);
+        let result = sim.run_controlled_simulation(
+            SEED,
+            ops,
+            Duration::from_secs(1200),
+            Duration::from_secs(180),
+        );
+        assert!(
+            result.turmoil_result.is_ok(),
+            "{network_name}: simulation failed: {:?}",
+            result.turmoil_result.err()
+        );
+        result
+    };
+
+    let first = SimOperation::create_test_contract(0x85);
+    let first_id = *first.key().id();
+    register_crdt_contract(first_id);
+    let second = SimOperation::create_test_contract(0x86);
+    let second_id = *second.key().id();
+    register_crdt_contract(second_id);
+
+    let get_round = |ops: &mut Vec<ScheduledOperation>,
+                     network: &'static str,
+                     contract_id,
+                     nodes: &mut dyn Iterator<Item = usize>| {
+        for i in nodes {
+            ops.push(ScheduledOperation::new(
+                NodeLabel::node(network, i),
+                SimOperation::Get {
+                    contract_id,
+                    return_contract_code: true,
+                    subscribe: false,
+                },
+            ));
+        }
+    };
+
+    // ── absent ──────────────────────────────────────────────────────────────
+    const ABSENT: &str = "route-failures-absent";
+    let absent = run(ABSENT, &|ops| {
+        get_round(ops, ABSENT, first_id, &mut (1..=num_nodes))
+    });
+    let absent_labels: Vec<(usize, (u64, u64, u64))> = (0..=num_nodes)
+        .map(|i| {
+            let label = if i == 0 {
+                NodeLabel::gateway(ABSENT, 0)
+            } else {
+                NodeLabel::node(ABSENT, i)
+            };
+            (
+                i,
+                absent.node_route_failure_causes(&label).unwrap_or_default(),
+            )
+        })
+        .collect();
+    tracing::info!(
+        ?absent_labels,
+        "absent run: (not_found, timeout, send_failure) per node"
+    );
+    let trained_not_found: Vec<_> = absent_labels
+        .iter()
+        .filter(|(_, (not_found, _, _))| *not_found > 0)
+        .collect();
+    assert!(
+        trained_not_found.is_empty(),
+        "a contract that never exists proves nothing about any peer: no node may \
+         train a NotFound failure. Offending nodes (index, causes): {trained_not_found:?}"
+    );
+    // Non-vacuous: the GETs must actually have met NotFounds (dropped
+    // untrained), or the assertion above proves nothing.
+    let untrained_per_node: Vec<(usize, Option<u64>)> = (0..=num_nodes)
+        .map(|i| {
+            let label = if i == 0 {
+                NodeLabel::gateway(ABSENT, 0)
+            } else {
+                NodeLabel::node(ABSENT, i)
+            };
+            (i, absent.node_untrained_not_founds(&label))
+        })
+        .collect();
+    let unpublished: Vec<usize> = untrained_per_node
+        .iter()
+        .filter(|(_, count)| count.is_none())
+        .map(|(i, _)| *i)
+        .collect();
+    assert!(
+        unpublished.is_empty(),
+        "every node must publish its Ring's untrained-NotFound count; \
+         missing for node indices {unpublished:?}"
+    );
+    let untrained_not_founds: u64 = untrained_per_node
+        .iter()
+        .filter_map(|(_, count)| *count)
+        .sum();
+    assert!(
+        untrained_not_founds > 0,
+        "the absent-contract GETs must meet NotFounds for the assertion above to \
+         mean anything; none were observed"
+    );
+
+    // ── evidence ────────────────────────────────────────────────────────────
+    const EVIDENCE: &str = "route-failures-evidence";
+    let evidence = run(EVIDENCE, &|ops| {
+        get_round(ops, EVIDENCE, first_id, &mut (1..=num_nodes));
+        ops.push(ScheduledOperation::new(
+            NodeLabel::gateway(EVIDENCE, 0),
+            SimOperation::Put {
+                contract: first.clone(),
+                state: SimOperation::create_crdt_state(1, 0x85),
+                subscribe: true,
+            },
+        ));
+        get_round(ops, EVIDENCE, first_id, &mut (1..=num_nodes));
+        ops.push(ScheduledOperation::new(
+            NodeLabel::gateway(EVIDENCE, 0),
+            SimOperation::Put {
+                contract: second.clone(),
+                state: SimOperation::create_crdt_state(1, 0x86),
+                subscribe: true,
+            },
+        ));
+        for i in crashed.clone() {
+            ops.push(ScheduledOperation::new(
+                NodeLabel::node(EVIDENCE, i),
+                SimOperation::CrashNode,
+            ));
+        }
+        get_round(
+            ops,
+            EVIDENCE,
+            second_id,
+            &mut ((crashed.end() + 1)..=num_nodes),
+        );
+    });
+
+    let first_key = first.key();
+    let nodes_without_state: Vec<usize> = (1..=num_nodes)
+        .filter(|i| {
+            evidence
+                .node_storages
+                .get(&NodeLabel::node(EVIDENCE, *i))
+                .is_none_or(|s| s.get_stored_state(&first_key).is_none())
+        })
+        .collect();
+    assert!(
+        nodes_without_state.is_empty(),
+        "every second-round GET for a PUT contract must resolve (GET success \
+         rate must not regress); nodes without state: {nodes_without_state:?}"
+    );
+
+    /// `(node, (not_found, timeout, send_failure), (failures, successes))`.
+    type NodeLabels = (usize, (u64, u64, u64), (u64, u64));
+    let per_node: Vec<NodeLabels> = (1..=num_nodes)
+        .map(|i| {
+            let label = NodeLabel::node(EVIDENCE, i);
+            (
+                i,
+                evidence
+                    .node_route_failure_causes(&label)
+                    .unwrap_or_default(),
+                evidence
+                    .node_route_outcome_totals(&label)
+                    .unwrap_or_default(),
+            )
+        })
+        .collect();
+    tracing::info!(
+        ?per_node,
+        "evidence run: (node, (not_found, timeout, send_failure), (failures, successes))"
+    );
+    let (all_failures, all_successes) = evidence.aggregate_route_outcome_totals();
+    assert!(all_successes > 0, "routers must receive success labels");
+    // A NotFound is labelled only with existence proof: this node stored a
+    // later reply's state in the same GET. The GETs after the PUT must
+    // produce some.
+    let not_found_labels: u64 = per_node
+        .iter()
+        .map(|(_, (not_found, _, _), _)| not_found)
+        .sum();
+    assert!(
+        not_found_labels > 0,
+        "some GET must label a NotFound hop a failure once this node stored a \
+         later reply's state; per node={per_node:?}"
+    );
+    // Per node: of the nodes that were neither crashed nor #5654's node (see
+    // the spacing comment), at least MIN_NODES_WITH_TIMEOUT_LABELS must have
+    // fed their OWN router a timeout or send-failure label.
+    const MIN_NODES_WITH_TIMEOUT_LABELS: usize = 2;
+    let eligible: Vec<_> = per_node
+        .iter()
+        .filter(|(i, _, _)| !crashed.contains(i) && *i != num_nodes)
+        .collect();
+    let labelled: Vec<usize> = eligible
+        .iter()
+        .filter(|(_, (_, timeout, send_failure), _)| timeout + send_failure > 0)
+        .map(|(i, _, _)| *i)
+        .collect();
+    assert!(
+        labelled.len() >= MIN_NODES_WITH_TIMEOUT_LABELS,
+        "at least {MIN_NODES_WITH_TIMEOUT_LABELS} of the {} eligible nodes must \
+         label a timeout or send failure after the crash; labelled: {labelled:?} \
+         (failures={all_failures}, per node={per_node:?})",
+        eligible.len()
     );
 }
 

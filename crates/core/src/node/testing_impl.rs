@@ -525,6 +525,13 @@ pub struct ControlledSimulationResult {
     /// `crate::ring::topology_registry::record_summarize_wasm_call` (#4440, spec
     /// step 8).
     pub summarize_wasm_calls: HashMap<std::net::SocketAddr, u64>,
+    /// Zombie-transport sweep observations, keyed by (sweeping node address,
+    /// remote transport address), captured before the registry is cleared.
+    /// See `crate::ring::topology_registry::ZombieSweepObservation` (#5654).
+    pub zombie_sweep_observations: HashMap<
+        (std::net::SocketAddr, std::net::SocketAddr),
+        crate::ring::topology_registry::ZombieSweepObservation,
+    >,
 }
 
 #[cfg(any(test, feature = "testing"))]
@@ -541,6 +548,42 @@ impl ControlledSimulationResult {
         self.node_rings
             .get(label)
             .is_some_and(|ring| ring.is_hosting_contract(key))
+    }
+
+    /// `(failures, successes)` route events ingested by `label`'s router over
+    /// the whole run, or `None` if the node never published its Ring (#5657).
+    /// Cumulative, unlike the router's 500-event estimator windows.
+    pub fn node_route_outcome_totals(&self, label: &NodeLabel) -> Option<(u64, u64)> {
+        self.node_rings.get(label).map(|ring| {
+            let totals = ring.router.read().outcome_totals();
+            (totals.failures, totals.successes)
+        })
+    }
+
+    /// `(not_found, timeout, send_failure)` route failure labels `label`'s
+    /// node fed its router, by cause, or `None` if the node never published
+    /// its Ring (#5657).
+    pub fn node_route_failure_causes(&self, label: &NodeLabel) -> Option<(u64, u64, u64)> {
+        self.node_rings
+            .get(label)
+            .map(|ring| ring.route_failure_cause_counts())
+    }
+
+    /// Ambiguous NotFounds `label`'s node dropped untrained, or `None` if the
+    /// node never published its Ring (#5657).
+    pub fn node_untrained_not_founds(&self, label: &NodeLabel) -> Option<u64> {
+        self.node_rings
+            .get(label)
+            .map(|ring| ring.untrained_not_found_count())
+    }
+
+    /// `(failures, successes)` route events summed over every node's router
+    /// (#5657). See [`Self::node_route_outcome_totals`].
+    pub fn aggregate_route_outcome_totals(&self) -> (u64, u64) {
+        self.node_rings
+            .values()
+            .map(|ring| ring.router.read().outcome_totals())
+            .fold((0, 0), |(f, s), t| (f + t.failures, s + t.successes))
     }
 
     /// The protocol version `label`'s node had recorded for the peer at `addr`
@@ -742,6 +785,21 @@ impl ControlledSimulationResult {
     /// every-hop load and the #4440 storm has re-armed.
     pub fn total_summarize_wasm_calls(&self) -> u64 {
         self.summarize_wasm_calls.values().copied().sum()
+    }
+
+    /// How many times `sweeper`'s zombie sweep found the transport from `remote`
+    /// never promoted to its ring and old enough to be a zombie by age, and how
+    /// many of those times it kept the transport because `remote` had sent a
+    /// request recently. `(0, 0)` if never. See #5654.
+    pub fn zombie_sweep_counts(
+        &self,
+        sweeper: std::net::SocketAddr,
+        remote: std::net::SocketAddr,
+    ) -> (u64, u64) {
+        self.zombie_sweep_observations
+            .get(&(sweeper, remote))
+            .map(|o| (o.past_age_threshold, o.kept_for_link_use))
+            .unwrap_or((0, 0))
     }
 
     /// The single peer's peak WASM-summarize count — the worst per-node
@@ -5373,6 +5431,8 @@ impl SimNetwork {
         // every-hop summarize-storm falsifier reads these after the run returns.
         let summarize_wasm_calls =
             crate::ring::topology_registry::get_all_summarize_wasm_calls(&network_name);
+        let zombie_sweep_observations =
+            crate::ring::topology_registry::get_all_zombie_sweep_observations(&network_name);
 
         // Capture the crash-drop count BEFORE self drops (Drop clears the fault
         // injector via `set_fault_injector(None)`). `> 0` proves a scripted
@@ -5397,6 +5457,7 @@ impl SimNetwork {
             renewal_metrics,
             crash_packets_dropped,
             summarize_wasm_calls,
+            zombie_sweep_observations,
         }
     }
 
@@ -6478,7 +6539,7 @@ impl Drop for SimNetwork {
         use crate::node::network_bridge::set_fault_injector;
         use crate::ring::topology_registry::{
             clear_current_network_name, clear_renewal_metrics, clear_summarize_metrics,
-            clear_topology_snapshots,
+            clear_topology_snapshots, clear_zombie_sweep_observations,
         };
         use crate::transport::in_memory_socket::{
             clear_network_address_mappings, remove_network_socket_registry,
@@ -6491,6 +6552,7 @@ impl Drop for SimNetwork {
         clear_topology_snapshots(&self.name);
         clear_renewal_metrics(&self.name);
         clear_summarize_metrics(&self.name);
+        clear_zombie_sweep_observations(&self.name);
         remove_network_socket_registry(&self.name);
         clear_network_address_mappings(&self.name);
 

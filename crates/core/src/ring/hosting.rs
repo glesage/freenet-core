@@ -812,7 +812,7 @@ impl HostingManager {
 
     /// Update the hosting-cache snapshot of `key`'s state-write generation
     /// to `new_gen`. Paired with `bump_state_generation` at every state-write
-    /// chokepoint (executor PUT/UPDATE and V2 delegate PUT/UPDATE) so a
+    /// chokepoint (the executor's PUT/UPDATE paths) so a
     /// later eviction's snapshot reflects the current generation and the
     /// deletion-time guard in `RuntimePool::remove_contract` does not
     /// permanently skip reclamation after an UPDATE-then-evict. No-op when
@@ -1110,7 +1110,7 @@ impl HostingManager {
 
     /// Apply a state-write delta to the disk tracker at a state-write chokepoint.
     /// Wired from `Ring::commit_state_write` (the single infallible post-write
-    /// funnel for all four executor chokepoints + the V2 delegate callback), so
+    /// funnel for all four executor chokepoints), so
     /// the counter only moves after the bytes actually landed.
     ///
     /// Calls through even when the tracker is not yet seeded (only skipping when
@@ -7957,6 +7957,95 @@ mod tests {
             eff,
             64 * MIB,
             "RAM budget (64 MiB) is below the disk MIN floor and wins as the min"
+        );
+    }
+
+    /// `--max-hosting-storage` is how an operator contributes disk to the
+    /// network, and this pins the two properties that make it safe to use for
+    /// that (#5647).
+    ///
+    /// 1. An explicit value far ABOVE the RAM-scaled default's 1 GiB clamp
+    ///    survives the 60s recompute, bounded only by the disk budget — and the
+    ///    32 GiB `--max-hosting-disk` default still caps it, which is why the
+    ///    help text tells an operator to keep the state budget below the disk
+    ///    budget rather than assume the flag alone is the limit.
+    /// 2. Raising it does NOT move the contract-COUNT limit, in either
+    ///    direction. That budget is derived from `total_ram` alone, because
+    ///    per-contract resident memory is the real RAM cost (~0.8 MiB/contract
+    ///    measured across 714 production peers in #5647), whereas contract state
+    ///    lives on disk. A regression that fed the configured state budget into
+    ///    it could SHRINK it (subtracting 20 GiB of "state" from RAM would floor
+    ///    a disk donor's count budget and evict everything it hosts) or GROW it
+    ///    (over-granting contracts its memory cannot hold). Checked on both the
+    ///    live-signal path and the structural path, because with live signals
+    ///    present `min()` can pick the live term and mask a change in the
+    ///    structural one.
+    #[test]
+    fn explicit_state_budget_above_ram_clamp_survives_recompute() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+
+        // (1a) A 20 GiB contribution with the disk cap raised to 64 GiB and a
+        // roomy disk: disk_budget = min(0.5 * (1 + 200) GiB, 64 GiB) = 64 GiB,
+        // so the operator's 20 GiB is what binds.
+        let donor = HostingManager::new(20 * GIB);
+        donor.configure_disk_budget(0.5, 64 * GIB);
+        donor.seed_disk_tracker_for_test([(make_contract_key(1), GIB)]);
+        let eff = donor
+            .recompute_effective_budget(200 * GIB)
+            .expect("seeded → recompute runs");
+        assert_eq!(
+            eff,
+            20 * GIB,
+            "an explicit state budget must survive the recompute unclamped"
+        );
+        assert!(
+            eff > MAX_DEFAULT_HOSTING_BUDGET_BYTES,
+            "the RAM-scaled default's 1 GiB clamp must not apply to an explicit value"
+        );
+        assert_eq!(donor.hosting_budget_bytes(), 20 * GIB);
+
+        // (1b) The same kind of contribution under the DEFAULT disk cap is
+        // capped at 32 GiB — the disk budget, not the state flag, is the limit.
+        let capped = HostingManager::new(100 * GIB);
+        capped.configure_disk_budget(0.5, DEFAULT_MAX_HOSTING_DISK_BYTES);
+        capped.seed_disk_tracker_for_test([(make_contract_key(2), GIB)]);
+        let eff = capped
+            .recompute_effective_budget(500 * GIB)
+            .expect("seeded → recompute runs");
+        assert_eq!(
+            eff, DEFAULT_MAX_HOSTING_DISK_BYTES,
+            "without raising --max-hosting-disk, the 32 GiB disk cap binds"
+        );
+
+        // (2) The contract-count budget is identical whether the node contributes
+        // 1 GiB or 20 GiB of state: same host, same signals, same result — on
+        // BOTH paths through the formula.
+        let total_ram = 4 * GIB;
+        let pool_size = 4;
+        let default_node = HostingManager::new(GIB);
+        for (path, live_signals) in [
+            ("live-signal", Some((GIB, 2 * GIB))),
+            // No live signals: the structural residual is the only term, so a
+            // change to it cannot hide behind `min()` picking the live term.
+            ("structural", None),
+        ] {
+            let default_count_budget =
+                default_node.recompute_resident_overhead_budget(total_ram, pool_size, live_signals);
+            let donor_count_budget =
+                donor.recompute_resident_overhead_budget(total_ram, pool_size, live_signals);
+            assert_eq!(
+                donor_count_budget, default_count_budget,
+                "{path} path: contributing more disk must not change the RAM-derived \
+                 contract-count budget"
+            );
+        }
+        // Guard against the structural comparison passing vacuously because both
+        // values collapsed to the floor: on this host shape the structural term
+        // must sit above it, or equality proves nothing.
+        assert!(
+            default_node.recompute_resident_overhead_budget(total_ram, pool_size, None)
+                > cache::MIN_RESIDENT_OVERHEAD_BUDGET_BYTES,
+            "test shape must keep the structural term off its floor"
         );
     }
 

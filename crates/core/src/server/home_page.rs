@@ -1209,7 +1209,7 @@ mod tests {
 
     #[test]
     fn reliability_chart_empty_is_placeholder() {
-        let svg = build_reliability_chart(&[], None);
+        let svg = build_reliability_chart(&[]);
         assert!(svg.contains("collecting data"));
         assert!(svg.contains("<svg"));
     }
@@ -1220,9 +1220,23 @@ mod tests {
         let pairs: Vec<(f64, f64)> = (0..20)
             .map(|i| (i as f64 / 20.0, if i > 10 { 1.0 } else { 0.0 }))
             .collect();
-        let svg = build_reliability_chart(&pairs, Some(0.042));
+        let svg = build_reliability_chart(&pairs);
         assert!(svg.contains("Failure (calibration)"));
-        assert!(svg.contains("Brier 0.042"));
+        // The caption is now DERIVED from these pairs rather than supplied, so
+        // this asserts the derivation rather than echoing an argument back.
+        // Predicted i/20 against actual 0 for i<=10 and 1 for i>10:
+        let expected: f64 = (0..20)
+            .map(|i| {
+                let predicted = i as f64 / 20.0;
+                let actual = if i > 10 { 1.0 } else { 0.0 };
+                (predicted - actual).powi(2)
+            })
+            .sum::<f64>()
+            / 20.0;
+        assert!(
+            svg.contains(&format!("Brier {expected:.3}")),
+            "caption must carry the Brier of the plotted pairs ({expected:.3}), got: {svg}"
+        );
         assert!(svg.contains("n=20"));
         assert!(svg.contains("<circle"), "bins should render as points");
     }
@@ -1237,14 +1251,14 @@ mod tests {
             (0.7, 1.0),
         ];
         // Only 2 valid pairs survive the finite filter.
-        let svg = build_reliability_chart(&pairs, None);
+        let svg = build_reliability_chart(&pairs);
         assert!(svg.contains("n=2"));
     }
 
     #[test]
     fn reliability_chart_boundary_values_no_panic() {
         // p == 1.0 and p == 0.0 must clamp into a bin without panicking.
-        let svg = build_reliability_chart(&[(1.0, 0.0), (0.0, 1.0)], Some(0.5));
+        let svg = build_reliability_chart(&[(1.0, 0.0), (0.0, 1.0)]);
         assert!(svg.contains("<svg"));
         assert!(svg.contains("n=2"));
     }
@@ -1339,10 +1353,7 @@ mod tests {
 
     #[test]
     fn accuracy_panel_empty_when_no_data() {
-        assert_eq!(
-            build_renegade_accuracy_panel(&[], None, &[], &[]),
-            String::new()
-        );
+        assert_eq!(build_renegade_accuracy_panel(&[], &[], &[]), String::new());
     }
 
     #[test]
@@ -1350,7 +1361,7 @@ mod tests {
         let failure: Vec<(f64, f64)> = (0..20)
             .map(|i| (i as f64 / 20.0, if i > 10 { 1.0 } else { 0.0 }))
             .collect();
-        let svg = build_renegade_accuracy_panel(&failure, Some(0.05), &[], &[]);
+        let svg = build_renegade_accuracy_panel(&failure, &[], &[]);
         assert!(svg.contains("Prediction Accuracy"));
         assert!(svg.contains("Failure (calibration)"));
         // Timing models have no data yet -> their placeholders still appear.
@@ -2556,7 +2567,53 @@ mod tests {
         );
         assert!(
             html.contains("64.0 MB / 256.0 MB"),
-            "RAM used/budget tile — got:\n{html}"
+            "contract-state used/budget tile — got:\n{html}"
+        );
+        // This tile was labelled "RAM used" until 2026-09 and it is not RAM: it
+        // is tracked contract STATE bytes against a ceiling on that state. An
+        // operator read it as resident memory and reported a 4 GB node "near
+        // full" while the process was using under 1 GB.
+        //
+        // Assert the whole label ELEMENT, not the phrase: the tooltip on this
+        // same tile contains "contract state" in prose, so an unanchored
+        // `contains` would survive deleting the label itself.
+        assert!(
+            html.contains(r#"<div class="g-norm-label">Contract state</div>"#),
+            "state tile must be labelled as contract state, not memory — got:\n{html}"
+        );
+        // Pin the INVARIANT, not one spelling of its violation: any memory word
+        // in this label re-creates the confusion, not just the string that
+        // shipped. (`.claude/rules/browser-assets.md` rule 2.)
+        for banned in [
+            "RAM used",
+            "Memory used",
+            "Mem used",
+            "RSS used",
+            "RAM",
+            "RSS",
+        ] {
+            assert!(
+                !html.contains(&format!(">{banned}<")),
+                "the state tile must not be labelled {banned:?}: it measures contract \
+                 state bytes, not the node's resident memory — got:\n{html}"
+            );
+        }
+        // The tooltip is the load-bearing half of the fix — the label says what
+        // the number is, the tooltip says what it is NOT. Dropping `title=` from
+        // the tile passed every test before this assertion existed.
+        assert!(
+            html.contains("Contract STATE bytes, not the node's resident memory"),
+            "the state tile must carry its corrective tooltip — got:\n{html}"
+        );
+        // The tooltip must not restate the RAM-scaled DEFAULT as if it were the
+        // only path: `budget_bytes` is "the RAM-scaled default, or the operator
+        // override", further tightened to min(RAM, disk). An operator running
+        // --max-hosting-storage would otherwise read a confident falsehood inside
+        // the tooltip whose whole purpose is to stop a misreading of this tile.
+        assert!(
+            html.contains("max-hosting-storage") && html.contains("disk budget"),
+            "the state tooltip must name the operator override and the disk-budget \
+             floor, not just the RAM-scaled default — got:\n{html}"
         );
         // Non-zero recently-read evictions are the miscalibration alarm: colored.
         assert!(
