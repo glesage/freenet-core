@@ -195,13 +195,14 @@ async fn handle_command(
     listener: &ListenerSlot,
     cmd: Command,
 ) {
+    // A caller may cancel while its request is in flight; discard that reply.
     match cmd {
         Command::Get {
             key,
             subscribe,
             reply,
         } => {
-            reply_or_log(reply, do_get(api, known, listener, key, subscribe).await);
+            drop(reply.send(do_get(api, known, listener, key, subscribe).await));
         }
         Command::Put {
             contract,
@@ -209,30 +210,17 @@ async fn handle_command(
             subscribe,
             reply,
         } => {
-            reply_or_log(
-                reply,
-                do_put(api, known, listener, contract, state, subscribe).await,
-            );
+            drop(reply.send(do_put(api, known, listener, contract, state, subscribe).await));
         }
         Command::UpdateDelta { key, delta, reply } => {
-            reply_or_log(reply, do_update(api, known, listener, key, delta).await);
+            drop(reply.send(do_update(api, known, listener, key, delta).await));
         }
         Command::Subscribe { key, reply } => {
-            reply_or_log(reply, do_subscribe(api, known, listener, key).await);
+            drop(reply.send(do_subscribe(api, known, listener, key).await));
         }
         Command::ConnectedPeers { reply } => {
-            reply_or_log(reply, do_connected_peers(api, known, listener).await);
+            drop(reply.send(do_connected_peers(api, known, listener).await));
         }
-    }
-}
-
-/// Deliver a command's outcome; a receiver that already went away is not an error.
-fn reply_or_log<T>(
-    reply: oneshot::Sender<Result<T, MobileError>>,
-    outcome: Result<T, MobileError>,
-) {
-    if reply.send(outcome).is_err() {
-        tracing::debug!("command reply dropped: caller went away");
     }
 }
 
@@ -368,13 +356,8 @@ async fn do_subscribe(
             Some(if *subscribed {
                 Ok(())
             } else {
-                // Unreachable from this client for an unknown key in local
-                // mode: verified by running `subscribe` against one, and the
-                // local request loop answers with a generic client error
-                // (the same shape `do_get` sees for a missing contract), not
-                // this `SubscribeResponse { subscribed: false }` shape. Left
-                // in place for whatever peer answer or mode this client has
-                // not yet been tested against that DOES produce a refusal.
+                // Local unknown-key requests return a generic client error;
+                // other peers may explicitly refuse a subscription this way.
                 Err(MobileError::Request(format!(
                     "subscription to {key} refused"
                 )))
@@ -437,7 +420,7 @@ fn dispatch_notification(response: &HostResponse, known: &mut KnownKeys, listene
     let HostResponse::ContractResponse(ContractResponse::UpdateNotification { key, update }) =
         response
     else {
-        tracing::debug!(?response, "ignoring unsolicited response");
+        tracing::debug!("ignoring unsolicited response");
         return;
     };
     known.insert(*key.id(), *key);
@@ -455,8 +438,7 @@ fn dispatch_notification(response: &HostResponse, known: &mut KnownKeys, listene
         }
     };
     let listener = listener.read().ok().and_then(|slot| slot.clone());
-    match listener {
-        Some(listener) => listener.on_update(key.encoded_contract_id(), state, delta),
-        None => tracing::debug!(%key, "update notification with no listener registered"),
+    if let Some(listener) = listener {
+        listener.on_update(key.encoded_contract_id(), state, delta);
     }
 }

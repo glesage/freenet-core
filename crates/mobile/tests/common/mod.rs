@@ -66,12 +66,9 @@ pub fn network_profile(
 ) -> MobileProfile {
     MobileProfile {
         mode: NodeMode::Network,
-        data_dir: root.join("data").to_string_lossy().into_owned(),
-        config_dir: root.join("config").to_string_lossy().into_owned(),
-        log_dir: root.join("logs").to_string_lossy().into_owned(),
-        ws_port,
         network_port: Some(network_port),
         gateways: vec![gateway],
+        ..local_profile(root, ws_port)
     }
 }
 

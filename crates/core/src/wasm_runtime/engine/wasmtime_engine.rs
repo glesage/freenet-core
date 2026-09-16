@@ -2561,12 +2561,8 @@ mod tests {
     /// refuse to build an engine, not silently keep the Cranelift JIT — that
     /// refusal is what stops an iOS build from crashing on its first
     /// contract call if the feature is ever left out of a release build.
-    /// The only code that sets `use_pulley: true` today
-    /// (`pulley_conformance.rs`) is itself gated on the feature, so nothing
-    /// else in the tree can ever exercise this arm; hence its own test here,
-    /// built with `-p freenet` alone (never `--workspace`, where feature
-    /// unification from `freenet-mobile`'s dependency would compile this
-    /// arm out — see M2.1 / M3 in TEST-PLAN-mobile-phase1.md).
+    /// The dedicated test keeps this refusal covered in feature-off builds,
+    /// where feature unification could otherwise hide the error path.
     #[cfg(not(feature = "pulley"))]
     #[test]
     fn use_pulley_without_the_feature_is_a_hard_error() {
@@ -2700,15 +2696,10 @@ mod tests {
         assert_oob_access_traps(RuntimeConfig::default());
     }
 
-    /// Same guarantee on the Pulley interpreter profile. This is the one
-    /// property `signals_based_traps(false)` / `memory_guard_size(0)` exist
-    /// for; removing either line from the PULLEY block leaves every other
-    /// pulley test in this file green (verified), so this is the only test
-    /// that would catch it — though on a host with working signal handlers
-    /// it may not distinguish the two settings either, since the host
-    /// tolerates signal-based traps for an interpreter target regardless. A
-    /// device/simulator run is the complement (TEST-PLAN-mobile-phase1.md
-    /// M6.4).
+    /// Same guarantee on the Pulley interpreter profile. This exercises the
+    /// explicit trap settings in the PULLEY profile. A host that supports
+    /// signal-based traps cannot prove those settings are required on iOS;
+    /// device testing is still needed.
     #[cfg(feature = "pulley")]
     #[test]
     fn oob_access_traps_under_pulley() {

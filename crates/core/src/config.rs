@@ -1921,24 +1921,6 @@ pub struct Config {
     pub use_pulley: bool,
 }
 
-/// Test-only: a Local-mode [`ConfigArgs`] with every path pinned under `dir`,
-/// for tests OUTSIDE this module that need a real, built [`Config`] rather than
-/// a `RuntimeConfig` (`wasm_runtime::runtime::node_config_plumbing_tests`).
-/// Explicit paths matter: `ConfigPathsArgs::default_dirs` would point a debug
-/// build at `temp_dir()/freenet` and DELETE a stale one on startup.
-#[cfg(test)]
-pub(crate) fn local_test_config_args(dir: &std::path::Path) -> ConfigArgs {
-    ConfigArgs {
-        mode: Some(OperationMode::Local),
-        config_paths: ConfigPathsArgs {
-            config_dir: Some(dir.to_path_buf()),
-            data_dir: Some(dir.to_path_buf()),
-            log_dir: Some(dir.to_path_buf()),
-        },
-        ..ConfigArgs::default()
-    }
-}
-
 /// Default for [`Config::use_pulley`]: the Pulley interpreter on iOS, which
 /// forbids JIT, the Cranelift JIT elsewhere.
 ///

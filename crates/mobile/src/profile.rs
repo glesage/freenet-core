@@ -241,7 +241,7 @@ mod tests {
         let cfg = p.build_config().await.expect("build_config");
         assert_eq!(
             cfg.use_pulley,
-            freenet::config::default_use_pulley(),
+            cfg!(target_os = "ios"),
             "build_config must not override the per-target pulley default"
         );
     }

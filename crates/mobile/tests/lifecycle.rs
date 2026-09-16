@@ -158,11 +158,8 @@ async fn run_cycles(cycles: usize) -> Result<(), MobileError> {
     }
 
     let (threads_after, fds_after) = settled_resource_counts();
-    // Measured (2026-09-02, this host, three runs of this exact test): 0
-    // growth in both threads and fds every time. The +4/+8 thresholds this
-    // replaced were loose enough that a leak of one descriptor every five
-    // cycles (5 over these 25) would pass; tightened to just above the
-    // measured noise floor so a slow leak has nowhere to hide.
+    // Keep thresholds just above normal measurement noise so gradual leaks are
+    // detected without requiring exact process-wide resource counts.
     assert!(
         threads_after <= threads_before + 1,
         "thread count grew from {threads_before} to {threads_after} over {cycles} cycles"
@@ -176,21 +173,8 @@ async fn run_cycles(cycles: usize) -> Result<(), MobileError> {
 
 const LEAK_CHECK_CHILD_ENV: &str = "FREENET_MOBILE_LEAK_CHECK_CHILD";
 
-/// `settled_resource_counts` measures PROCESS-WIDE thread/fd counts
-/// (`.claude/rules/testing.md`'s cross-test-interference class): under plain
-/// `cargo test`, which runs every test in this binary in one shared process,
-/// a sibling test's own threads/sockets inflate `threads_before`/`fds_before`
-/// unpredictably and can trip a tight threshold with no real leak — this
-/// tripped intermittently under the full suite once the +4/+8 thresholds
-/// were tightened to +1/+2 (see git history). `cargo nextest` (CI's actual
-/// gate) already isolates each test into its own process and never saw
-/// this, but the documented local pre-commit command is plain `cargo test
-/// -p freenet-mobile`, so the measurement needs to be reliable there too.
-///
-/// Re-execs the test binary filtered to exactly `test_name`, so the
-/// measurement always runs alone regardless of what invoked it — mirrors
-/// `util::test_log_capture`'s re-exec pattern in crates/core, used there for
-/// the same class of process-global-state interference.
+/// Re-exec the test binary with an exact filter so process-wide resource
+/// counts are not affected by sibling tests running in the same process.
 async fn run_cycles_isolated(cycles: usize, test_name: &str) -> Result<(), MobileError> {
     if std::env::var_os(LEAK_CHECK_CHILD_ENV).is_some() {
         return run_cycles(cycles).await;
@@ -233,7 +217,7 @@ async fn twenty_five_start_stop_cycles_do_not_leak() -> Result<(), MobileError> 
     run_cycles_isolated(25, "twenty_five_start_stop_cycles_do_not_leak").await
 }
 
-/// Phase 1 exit criterion. Slow; run with `cargo test -p freenet-mobile -- --ignored`.
+/// Slow leak check; run with `cargo test -p freenet-mobile -- --ignored`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "slow: 100 start/stop cycles"]
 async fn one_hundred_start_stop_cycles_do_not_leak() -> Result<(), MobileError> {
@@ -306,30 +290,9 @@ async fn a_config_from_another_data_dir_is_discarded_with_its_gateways() -> Resu
     node.stop().await
 }
 
-/// Every network-mode assertion elsewhere in this suite is the FAILURE path:
-/// an unreachable gateway, zero peers, a bounded timeout
-/// (`network_node_starts_and_stops_without_joining`). Network mode's actual
-/// purpose — joining a peer and exchanging a contract with it — was
-/// untested. `MobileProfile` can only be a joiner, never a gateway (by
-/// design: a mobile peer is thin), so the gateway side here is a real
-/// `freenet` node built directly through `NodeConfig`, the same way
-/// `crates/core/tests/in_process_restart.rs` builds its nodes — the mobile
-/// `FreenetNode` only plays the joiner.
-///
-/// This is real UDP transport and a real ring join, run alongside every
-/// other test in this binary under plain `cargo test` (one shared process,
-/// concurrent by default). Its CPU/IO load, combined with
-/// `run_cycles_isolated`'s child-process spawn above, has been observed to
-/// push an unrelated sibling test's fixed timeout
-/// (`local_node_restarts_on_the_same_dirs`'s 30s GET-after-restart wait) past
-/// its budget under contention on a loaded machine — a `client API did not
-/// accept a connection within 15s` failure from `node.rs`'s
-/// `CLIENT_CONNECT_TIMEOUT`, not a logic bug in either test. `cargo nextest`
-/// (CI's actual gate, one process per test) saw none of this across 6
-/// repeated runs while diagnosing it. This is the plain-`cargo-test`-only
-/// cross-test-interference class `.claude/rules/testing.md` already
-/// documents and accepts; recorded here rather than papered over with a
-/// longer timeout, since the timeout itself is not what's wrong.
+/// Exercise the network-mode path with a real gateway and joiner. The mobile
+/// profile is joiner-only, so the gateway is built directly through
+/// `NodeConfig`; the test verifies a contract crosses the UDP connection.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn two_peers_join_and_exchange_a_contract() -> Result<(), MobileError> {
     init_test_logging();
@@ -482,13 +445,7 @@ async fn connect_gw_ws(port: u16, within: Duration) -> Result<WebApi, MobileErro
 async fn recv_get_state(client: &mut WebApi, within: Duration) -> Result<Vec<u8>, MobileError> {
     let deadline = tokio::time::Instant::now() + within;
     loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            return Err(MobileError::Timeout(format!(
-                "no GetResponse within {within:?}"
-            )));
-        }
-        match tokio::time::timeout(remaining, client.recv()).await {
+        match tokio::time::timeout_at(deadline, client.recv()).await {
             Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
                 state, ..
             }))) => return Ok(state.as_ref().to_vec()),

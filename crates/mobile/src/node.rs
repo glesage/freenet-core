@@ -76,7 +76,7 @@ impl FreenetNode {
         })
     }
 
-    pub(crate) fn set_status(&self, status: NodeStatus) {
+    fn set_status(&self, status: NodeStatus) {
         if let Ok(mut slot) = self.status.write() {
             *slot = status.clone();
         }

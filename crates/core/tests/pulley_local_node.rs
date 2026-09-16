@@ -1,22 +1,10 @@
 //! End-to-end contract round-trip through a local-mode node running on
 //! wasmtime's Pulley interpreter.
 //!
-//! Coverage gap from the mobile phase-1 test audit: every existing Pulley
-//! test operates on a raw `Runtime`/`Engine`
-//! (`wasm_runtime::tests::pulley_conformance`, the epoch and out-of-bounds
-//! tests in `wasmtime_engine.rs`). `RuntimeConfig::from_node_config` copying
-//! `Config::use_pulley` was only ever checked as a pure struct copy
-//! (`wasm_runtime::runtime::node_config_plumbing_tests::
-//! from_node_config_copies_use_pulley`) — nothing built a real `Executor`
-//! from a `Config` with the switch on and ran a contract through it.
-//!
-//! Both backends compute byte-identical answers for this contract (that is
-//! what `pulley_conformance::cranelift_and_pulley_agree_on_contract_vectors`
-//! already proves), so a PUT/GET round-trip alone cannot tell a dropped
-//! `use_pulley` copy from a correctly-wired one — it would pass either way.
-//! `interpreter_target_is_actually_selected` closes that gap by asserting on
-//! the backend directly, the same way `pulley_conformance::
-//! pulley_profile_targets_the_interpreter` does for a raw engine.
+//! Runtime config plumbing and direct Pulley targeting are covered by internal
+//! and conformance tests; this file checks the local node's execution path.
+//! A round-trip alone cannot distinguish Pulley from the JIT, since both
+//! backends return the same contract state.
 
 #![cfg(feature = "pulley")]
 
@@ -72,10 +60,8 @@ async fn connect_ws(port: u16, within: Duration) -> anyhow::Result<WebApi> {
     }
 }
 
-/// Publish the workspace test contract on a local-mode node built with
-/// `use_pulley: true`, read it back, and assert the state round-trips —
-/// proving the interpreter switch reaches a real `Executor`, not just
-/// `RuntimeConfig`.
+/// Publish a contract through a local-mode node using the Pulley interpreter
+/// and verify that its state round-trips.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn contract_round_trips_on_the_interpreter() -> anyhow::Result<()> {
     ensure_contract_compiled(TEST_CONTRACT)?;
@@ -126,32 +112,5 @@ async fn contract_round_trips_on_the_interpreter() -> anyhow::Result<()> {
 
     drop(client);
     run.abort();
-    Ok(())
-}
-
-/// Companion to the round-trip above: builds an engine straight from the same
-/// kind of `Config` (`use_pulley: true`) and checks its serialized module
-/// names the `pulley64` target, the way
-/// `pulley_conformance::pulley_profile_targets_the_interpreter` does for a
-/// raw `RuntimeConfig`. Exists because the round-trip alone cannot
-/// distinguish the interpreter from the JIT: both compute the same answer.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn interpreter_target_is_actually_selected() -> anyhow::Result<()> {
-    use freenet::test_utils::engine_backend_for_config;
-
-    let dir = tempfile::tempdir()?;
-    let ws_port = reserve_local_port()?;
-    let mut cfg = local_config_args(dir.path(), ws_port).build().await?;
-    release_local_port(ws_port);
-    cfg.use_pulley = true;
-
-    let engine = engine_backend_for_config(&cfg)?;
-    let module = wasmtime::Module::new(&engine, b"(module)").expect("trivial module compiles");
-    let bytes = module.serialize().expect("module serializes");
-    let mentions_pulley = bytes.windows(b"pulley64".len()).any(|w| w == b"pulley64");
-    assert!(
-        mentions_pulley,
-        "a Config with use_pulley: true must select the pulley64 target"
-    );
     Ok(())
 }

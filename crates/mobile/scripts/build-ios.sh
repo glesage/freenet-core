@@ -47,14 +47,13 @@ for target in aarch64-apple-ios aarch64-apple-ios-sim; do
   cargo build -p freenet-mobile --lib $CARGO_PROFILE_FLAG --target "$target"
 done
 
-echo "==> building host cdylib for uniffi-bindgen (library mode)"
-cargo build -p freenet-mobile --lib $CARGO_PROFILE_FLAG
-HOST_DYLIB="$TARGET_DIR/$PROFILE/libfreenet_mobile.dylib"
-
 echo "==> generating Swift bindings"
-rm -rf "$OUT/gen" && mkdir -p "$OUT/gen" "$OUT/swift"
-cargo run -p freenet-mobile --bin uniffi-bindgen $CARGO_PROFILE_FLAG -- \
-  generate --library "$HOST_DYLIB" --language swift --out-dir "$OUT/gen"
+GEN_PROFILE_FLAG=""
+if [[ "$PROFILE" == debug ]]; then
+  GEN_PROFILE_FLAG=--debug
+fi
+rm -rf "$OUT/gen" && mkdir -p "$OUT/swift"
+"$ROOT/crates/mobile/scripts/generate-bindings.sh" $GEN_PROFILE_FLAG --out "$OUT/gen"
 cp "$OUT/gen/$MODULE.swift" "$OUT/swift/"
 
 echo "==> assembling XCFramework"

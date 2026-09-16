@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::*;
-use freenet_mobile::MobileError;
+use freenet_mobile::{FreenetNode, MobileError};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn put_then_get_round_trips_state() -> Result<(), MobileError> {
@@ -25,13 +25,9 @@ async fn put_then_get_round_trips_state() -> Result<(), MobileError> {
     node.stop().await
 }
 
-/// `MobileError::NotFound` exists for `ContractResponse::NotFound`
-/// (`client.rs`'s `do_get` matcher), but a local peer's request loop answers
-/// a well-formed, unknown key with a generic client error instead — verified
-/// by running this test against the current code and reading the message.
-/// `NotFound` is unreachable from this client for a local GET; if that ever
-/// changes this assertion should narrow further, not widen back to accepting
-/// both, which would silently tolerate every GET failing generically again.
+/// A well-formed but unknown local GET is reported as a generic request error.
+/// Keep this narrow: accepting `NotFound` too would hide a regression in the
+/// local request loop's error mapping.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_of_unknown_contract_is_a_client_error() -> Result<(), MobileError> {
     init_test_logging();
@@ -49,13 +45,13 @@ async fn get_of_unknown_contract_is_a_client_error() -> Result<(), MobileError> 
 async fn invalid_key_is_rejected_before_hitting_the_node() -> Result<(), MobileError> {
     init_test_logging();
     let root = tempfile::tempdir().expect("tempdir");
-    let node = start_node(local_profile(root.path(), reserve_port())).await?;
+    let node = FreenetNode::new_plain(local_profile(root.path(), 0))?;
     let err = node
         .get("not a key".into(), false)
         .await
         .expect_err("garbage key must fail");
     assert!(matches!(err, MobileError::Request(_)), "{err}");
-    node.stop().await
+    Ok(())
 }
 
 /// `do_update` (client.rs) falls back to a GET when the contract key is not
@@ -137,27 +133,10 @@ async fn explicit_subscribe_then_update_notifies() -> Result<(), MobileError> {
     node.stop().await
 }
 
-/// Proves the API is safe to call concurrently from multiple tasks: fire
-/// overlapping requests for two distinct contracts plus a peer-count query
-/// from separate tasks and check each caller gets the answer for its own
-/// key.
-///
-/// It does NOT prove the stronger thing its name might suggest — that the
-/// by-key matcher in `do_get`'s `wait_for` closure arbitrates between two
-/// GENUINELY in-flight requests. Mutation-checked: stripping `if
-/// *full.id() == key` from that matcher left this test green across 15 runs.
-/// Reading `actor()` explains why: `handle_command(..).await` runs to
-/// completion — including its own `wait_for` loop — before the actor loop
-/// reads the next queued `Command`, so two `Get`s are never actually
-/// awaiting a reply at the same time; the mpsc channel serializes them
-/// before the key check ever gets a chance to matter. What this test DOES
-/// prove is that concurrent callers queue safely and each gets routed the
-/// right answer once its turn comes.
-///
-/// The key check's real job is different: a late response for an EARLIER
-/// command whose caller already gave up (a client-side timeout) arriving
-/// while a LATER, different command is waiting. That scenario is still
-/// untested (see TEST-PLAN-mobile-phase1.md M4.3).
+/// Concurrent public calls are serialized by `FreenetNode::with_client`'s
+/// lifecycle mutex before reaching the actor queue. This checks that callers
+/// still receive the response for their own key; it does not exercise matching
+/// two simultaneously pending actor requests or late-response recovery.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_requests_are_routed_to_their_callers() -> Result<(), MobileError> {
     init_test_logging();

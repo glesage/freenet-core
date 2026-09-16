@@ -427,20 +427,6 @@ pub async fn make_node_diagnostics(
 static COMPILED_CONTRACT_CACHE: LazyLock<dashmap::DashMap<String, Vec<u8>>> =
     LazyLock::new(dashmap::DashMap::new);
 
-/// Build a wasmtime engine straight from a node [`Config`](crate::config::Config)'s
-/// `use_pulley` flag, for tests that need to confirm which backend a
-/// `Config` actually selects (e.g. by inspecting a serialized module's
-/// target triple) without going through a full `Executor`. Mirrors
-/// `wasm_runtime::tests::pulley_conformance::pulley_profile_targets_the_interpreter`,
-/// which does the same check starting from a raw `RuntimeConfig` rather than
-/// a `Config`.
-#[cfg(feature = "pulley")]
-pub fn engine_backend_for_config(cfg: &crate::config::Config) -> anyhow::Result<wasmtime::Engine> {
-    let runtime_config = crate::wasm_runtime::RuntimeConfig::from_node_config(cfg);
-    crate::wasm_runtime::engine::Engine::create_backend_engine(&runtime_config)
-        .map_err(|e| anyhow::anyhow!("{e}"))
-}
-
 /// Pre-compile a test contract WASM binary without loading it.
 /// Call this BEFORE any test timeout to ensure `cargo build` time
 /// doesn't count against the test's deadline. Thread-safe and idempotent.
