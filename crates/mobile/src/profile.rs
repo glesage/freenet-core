@@ -97,7 +97,7 @@ impl MobileProfile {
     /// mode with no overrides, fetches and saves `gateways.toml`). `ws_port` is
     /// the resolved port, always passed through to [`Self::config_args`].
     pub(crate) async fn build_config(&self, ws_port: u16) -> Result<Config, MobileError> {
-        self.discard_relocated_config()?;
+        self.discard_stale_config()?;
         let mut cfg = self
             .config_args(ws_port)?
             .build()
@@ -119,7 +119,7 @@ impl MobileProfile {
     /// here: when the persisted file is stale for this profile, drop it and the
     /// cached `gateways.toml` (absolute key paths too) and let `freenet`
     /// rebuild both.
-    fn discard_relocated_config(&self) -> Result<(), MobileError> {
+    fn discard_stale_config(&self) -> Result<(), MobileError> {
         let config_dir = Path::new(&self.config_dir);
         let config_file = config_dir.join("config.toml");
         let Ok(text) = std::fs::read_to_string(&config_file) else {

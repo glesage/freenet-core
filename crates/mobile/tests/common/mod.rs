@@ -93,8 +93,9 @@ pub fn unreachable_gateway(dir: &Path, port: u16) -> String {
 /// right before the bind. When `profile.ws_port` is `None` the node reserves
 /// its own ephemeral port at start, so there is nothing to release here.
 pub async fn start_node(profile: MobileProfile) -> Result<FreenetNode, MobileError> {
-    let node = FreenetNode::new_plain(profile.clone())?;
-    if let Some(port) = profile.ws_port {
+    let ws_port = profile.ws_port;
+    let node = FreenetNode::new_plain(profile)?;
+    if let Some(port) = ws_port {
         release_port(port);
     }
     node.start().await?;
@@ -118,7 +119,6 @@ pub async fn persisted_config_from_a_real_run(root: &Path) -> Result<String, Mob
 /// Compile (once per process) and load the test contract, returning the raw
 /// wasm and the parameters the way a host would hand them to `put`.
 pub fn test_contract() -> (Vec<u8>, Vec<u8>) {
-    freenet::test_utils::ensure_contract_compiled(TEST_CONTRACT).expect("compile test contract");
     let container =
         freenet::test_utils::load_contract(TEST_CONTRACT, Parameters::from(Vec::<u8>::new()))
             .expect("load test contract");

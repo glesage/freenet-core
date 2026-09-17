@@ -11,7 +11,6 @@
 use freenet_stdlib::prelude::*;
 
 use super::{TestSetup, setup_test_contract};
-use crate::wasm_runtime::engine::Engine;
 use crate::wasm_runtime::runtime::RuntimeConfig;
 use crate::wasm_runtime::{ContractError, ContractRuntimeInterface, Runtime};
 
@@ -46,8 +45,8 @@ async fn runtime_for(
 /// compared across backends with a plain `assert_eq!`.
 #[derive(Debug, PartialEq, Eq)]
 struct Outcomes {
-    validate_valid: String,
-    validate_invalid: String,
+    validate_valid: ValidateResult,
+    validate_invalid: ValidateResult,
     updated: Vec<u8>,
     summary: Vec<u8>,
     delta: Vec<u8>,
@@ -83,43 +82,12 @@ fn run_vectors(runtime: &mut Runtime, key: &ContractKey) -> Result<Outcomes, Con
         &StateSummary::from([2, 3].as_ref()),
     )?;
     Ok(Outcomes {
-        validate_valid: format!("{validate_valid:?}"),
-        validate_invalid: format!("{validate_invalid:?}"),
+        validate_valid,
+        validate_invalid,
         updated: updated.as_ref().to_vec(),
         summary: summary.as_ref().to_vec(),
         delta: delta.as_ref().to_vec(),
     })
-}
-
-/// The Pulley profile must actually select the interpreter target, otherwise
-/// the whole feature is a no-op that would JIT (and crash) on iOS. wasmtime
-/// keeps the engine's target private, but a serialized module carries the
-/// compiler's target triple in its metadata header, so compile a trivial module
-/// on each engine and look for the triple there.
-#[test]
-fn pulley_profile_targets_the_interpreter() -> Result<(), Box<dyn std::error::Error>> {
-    fn serialized_module(use_pulley: bool) -> Result<Vec<u8>, ContractError> {
-        let engine = Engine::create_backend_engine(&RuntimeConfig {
-            use_pulley,
-            ..RuntimeConfig::default()
-        })?;
-        let module = wasmtime::Module::new(&engine, b"(module)").expect("trivial module compiles");
-        Ok(module.serialize().expect("module serializes"))
-    }
-    fn mentions(bytes: &[u8], needle: &str) -> bool {
-        bytes.windows(needle.len()).any(|w| w == needle.as_bytes())
-    }
-    let jit_bytes = serialized_module(false)?;
-    let pulley_bytes = serialized_module(true)?;
-    assert!(
-        mentions(&pulley_bytes, "pulley64"),
-        "use_pulley must compile for the pulley64 target"
-    );
-    assert!(
-        !mentions(&jit_bytes, "pulley64"),
-        "the default profile must keep the native JIT target"
-    );
-    Ok(())
 }
 
 /// Same vectors, both backends, byte-identical outcomes.
@@ -144,7 +112,10 @@ async fn cranelift_and_pulley_agree_on_contract_vectors() -> Result<(), Box<dyn 
     assert_eq!(expected.updated, vec![5, 2, 3, 4]);
     assert_eq!(expected.summary, vec![5, 2, 3]);
     assert_eq!(expected.delta, vec![4]);
-    assert!(expected.validate_valid.contains("Valid"));
-    assert!(expected.validate_invalid.contains("RequestRelated"));
+    assert_eq!(expected.validate_valid, ValidateResult::Valid);
+    assert!(matches!(
+        expected.validate_invalid,
+        ValidateResult::RequestRelated(_)
+    ));
     Ok(())
 }

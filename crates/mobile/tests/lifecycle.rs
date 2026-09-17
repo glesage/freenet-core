@@ -170,9 +170,7 @@ async fn local_node_restarts_on_the_same_dirs() -> Result<(), MobileError> {
 
     let (wasm, params) = test_contract();
     node.start().await?;
-    let key = node
-        .put(wasm.clone(), params.clone(), empty_todo_list(), false)
-        .await?;
+    let key = node.put(wasm, params, empty_todo_list(), false).await?;
     node.stop().await?;
 
     node.start().await?;
@@ -385,8 +383,7 @@ async fn a_config_from_another_data_dir_is_discarded_with_its_gateways() -> Resu
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn two_peers_join_and_exchange_a_contract() -> Result<(), MobileError> {
     init_test_logging();
-    freenet::test_utils::ensure_contract_compiled(TEST_CONTRACT)
-        .map_err(|e| MobileError::Other(e.to_string()))?;
+    let (wasm, params) = test_contract();
 
     let gw_dir = tempfile::tempdir().expect("gw tempdir");
     let gw_ws_port = reserve_port();
@@ -480,7 +477,6 @@ async fn two_peers_join_and_exchange_a_contract() -> Result<(), MobileError> {
     // Publish on the joiner, read back through the gateway's own client API —
     // proving the contract actually crossed the wire, not just that both
     // sides answer locally.
-    let (wasm, params) = test_contract();
     let state = empty_todo_list();
     let key = joiner.put(wasm, params, state.clone(), false).await?;
 

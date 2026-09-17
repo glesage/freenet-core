@@ -1,8 +1,8 @@
 //! End-to-end contract round-trip through a local-mode node running on
 //! wasmtime's Pulley interpreter.
 //!
-//! Runtime config plumbing and direct Pulley targeting are covered by internal
-//! and conformance tests; this file checks the local node's execution path.
+//! Runtime config plumbing and direct Pulley targeting are covered by engine
+//! tests; this file checks the local node's execution path.
 //! A round-trip alone cannot distinguish Pulley from the JIT, since both
 //! backends return the same contract state.
 
@@ -15,8 +15,8 @@ use std::time::{Duration, Instant};
 use freenet::config::{ConfigArgs, ConfigPathsArgs, WebsocketApiArgs};
 use freenet::local_node::{Executor, OperationMode};
 use freenet::test_utils::{
-    create_empty_todo_list, ensure_contract_compiled, load_contract, make_get, make_put,
-    release_local_port, reserve_local_port,
+    create_empty_todo_list, load_contract, make_get, make_put, release_local_port,
+    reserve_local_port,
 };
 use freenet_stdlib::{
     client_api::{ContractResponse, HostResponse, WebApi},
@@ -64,7 +64,6 @@ async fn connect_ws(port: u16, within: Duration) -> anyhow::Result<WebApi> {
 /// and verify that its state round-trips.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn contract_round_trips_on_the_interpreter() -> anyhow::Result<()> {
-    ensure_contract_compiled(TEST_CONTRACT)?;
     let contract = load_contract(TEST_CONTRACT, Parameters::from(Vec::<u8>::new()))?;
     let contract_key = contract.key();
     let initial_state = WrappedState::from(create_empty_todo_list());

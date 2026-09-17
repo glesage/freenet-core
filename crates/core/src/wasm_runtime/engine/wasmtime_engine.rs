@@ -2579,6 +2579,96 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "pulley")]
+    fn mentions_pulley64(bytes: &[u8]) -> bool {
+        bytes.windows(b"pulley64".len()).any(|w| w == b"pulley64")
+    }
+
+    #[cfg(feature = "pulley")]
+    fn serialized_trivial_module(config: &RuntimeConfig) -> Result<Vec<u8>, ContractError> {
+        let engine = WasmtimeEngine::create_backend_engine(config)?;
+        let module = Module::new(&engine, b"(module)").expect("trivial module compiles");
+        Ok(module.serialize().expect("module serializes"))
+    }
+
+    /// The Pulley profile must actually select the interpreter target, otherwise
+    /// the whole feature is a no-op that would JIT (and crash) on iOS. wasmtime
+    /// keeps the engine's target private, but a serialized module carries the
+    /// compiler's target triple in its metadata header, so compile a trivial
+    /// module on each engine and look for the triple there.
+    #[cfg(feature = "pulley")]
+    #[test]
+    fn pulley_profile_targets_the_interpreter() {
+        let pulley_bytes = serialized_trivial_module(&RuntimeConfig {
+            use_pulley: true,
+            ..RuntimeConfig::default()
+        })
+        .expect("pulley engine builds");
+        let jit_bytes = serialized_trivial_module(&RuntimeConfig {
+            use_pulley: false,
+            ..RuntimeConfig::default()
+        })
+        .expect("jit engine builds");
+        assert!(
+            mentions_pulley64(&pulley_bytes),
+            "use_pulley must compile for the pulley64 target"
+        );
+        assert!(
+            !mentions_pulley64(&jit_bytes),
+            "the default profile must keep the native JIT target"
+        );
+    }
+
+    fn local_test_config_args(dir: &std::path::Path) -> crate::config::ConfigArgs {
+        crate::config::ConfigArgs {
+            mode: Some(crate::local_node::OperationMode::Local),
+            config_paths: crate::config::ConfigPathsArgs {
+                config_dir: Some(dir.to_path_buf()),
+                data_dir: Some(dir.to_path_buf()),
+                log_dir: Some(dir.to_path_buf()),
+            },
+            ..crate::config::ConfigArgs::default()
+        }
+    }
+
+    /// `Config::use_pulley` is the embedder's switch; it must be what
+    /// `from_node_config` hands to `create_engine`, in both directions.
+    #[tokio::test]
+    async fn from_node_config_copies_use_pulley() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = local_test_config_args(dir.path()).build().await.unwrap();
+        cfg.use_pulley = true;
+        let pulley_rc = RuntimeConfig::from_node_config(&cfg);
+        assert!(pulley_rc.use_pulley);
+
+        #[cfg(feature = "pulley")]
+        {
+            let bytes = serialized_trivial_module(&pulley_rc).expect("pulley engine builds");
+            assert!(
+                mentions_pulley64(&bytes),
+                "a Config with use_pulley: true must select the pulley64 target"
+            );
+        }
+
+        cfg.use_pulley = false;
+        let rc = RuntimeConfig::from_node_config(&cfg);
+        assert!(!rc.use_pulley);
+        // Every other knob stays at its default on this path.
+        let default = RuntimeConfig::default();
+        assert_eq!(rc.enable_metering, default.enable_metering);
+        assert_eq!(rc.offload_compilation, default.offload_compilation);
+        assert_eq!(rc.wasmtime_cache_dir, default.wasmtime_cache_dir);
+
+        #[cfg(feature = "pulley")]
+        {
+            let bytes = serialized_trivial_module(&rc).expect("jit engine builds");
+            assert!(
+                !mentions_pulley64(&bytes),
+                "a Config with use_pulley: false must keep the native JIT target"
+            );
+        }
+    }
+
     #[test]
     fn test_module_compilation() {
         let config = RuntimeConfig::default();

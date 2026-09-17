@@ -57,17 +57,12 @@ rm -rf "$OUT/gen" && mkdir -p "$OUT/swift"
 cp "$OUT/gen/$MODULE.swift" "$OUT/swift/"
 
 echo "==> assembling XCFramework"
-# Headers dir shared by both slices: the FFI header plus a module map that
-# names the module the generated Swift imports.
+# Headers dir shared by both slices: the FFI header plus UniFFI's generated
+# module map, staged as module.modulemap so Clang finds it as the umbrella.
 HEADERS="$OUT/headers"
 rm -rf "$HEADERS" && mkdir -p "$HEADERS"
 cp "$OUT/gen/${MODULE}FFI.h" "$HEADERS/"
-cat > "$HEADERS/module.modulemap" <<EOF
-module ${MODULE}FFI {
-    header "${MODULE}FFI.h"
-    export *
-}
-EOF
+cp "$OUT/gen/${MODULE}FFI.modulemap" "$HEADERS/module.modulemap"
 
 rm -rf "$OUT/$MODULE.xcframework"
 xcodebuild -create-xcframework \

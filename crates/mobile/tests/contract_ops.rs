@@ -12,7 +12,7 @@ use freenet_mobile::{FreenetNode, MobileError};
 async fn put_then_get_round_trips_state() -> Result<(), MobileError> {
     init_test_logging();
     let root = tempfile::tempdir().expect("tempdir");
-    let node = start_node(local_profile(root.path(), Some(reserve_port()))).await?;
+    let node = start_node(local_profile(root.path(), None)).await?;
     let (wasm, params) = test_contract();
     let state = empty_todo_list();
 
@@ -32,7 +32,7 @@ async fn put_then_get_round_trips_state() -> Result<(), MobileError> {
 async fn get_of_unknown_contract_is_a_client_error() -> Result<(), MobileError> {
     init_test_logging();
     let root = tempfile::tempdir().expect("tempdir");
-    let node = start_node(local_profile(root.path(), Some(reserve_port()))).await?;
+    let node = start_node(local_profile(root.path(), None)).await?;
     let err = node
         .get("6Sf2buCM1LzU5EhscNvjeNqPYbQbtvKSkzC6EFUy8Jjh".into(), false)
         .await
@@ -64,7 +64,7 @@ async fn invalid_key_is_rejected_before_hitting_the_node() -> Result<(), MobileE
 async fn update_delta_learns_the_key_after_a_restart() -> Result<(), MobileError> {
     init_test_logging();
     let root = tempfile::tempdir().expect("tempdir");
-    let node = start_node(local_profile(root.path(), Some(reserve_port()))).await?;
+    let node = start_node(local_profile(root.path(), None)).await?;
     let (wasm, params) = test_contract();
     let key = node.put(wasm, params, empty_todo_list(), false).await?;
     node.stop().await?;
@@ -87,7 +87,7 @@ async fn update_delta_learns_the_key_after_a_restart() -> Result<(), MobileError
 async fn subscriber_receives_update_notifications() -> Result<(), MobileError> {
     init_test_logging();
     let root = tempfile::tempdir().expect("tempdir");
-    let node = start_node(local_profile(root.path(), Some(reserve_port()))).await?;
+    let node = start_node(local_profile(root.path(), None)).await?;
     let listener = Arc::new(RecordingListener::default());
     node.set_update_listener(listener.clone());
 
@@ -118,7 +118,7 @@ async fn subscriber_receives_update_notifications() -> Result<(), MobileError> {
 async fn explicit_subscribe_then_update_notifies() -> Result<(), MobileError> {
     init_test_logging();
     let root = tempfile::tempdir().expect("tempdir");
-    let node = start_node(local_profile(root.path(), Some(reserve_port()))).await?;
+    let node = start_node(local_profile(root.path(), None)).await?;
     let listener = Arc::new(RecordingListener::default());
     node.set_update_listener(listener.clone());
 
@@ -141,7 +141,7 @@ async fn explicit_subscribe_then_update_notifies() -> Result<(), MobileError> {
 async fn concurrent_requests_are_routed_to_their_callers() -> Result<(), MobileError> {
     init_test_logging();
     let root = tempfile::tempdir().expect("tempdir");
-    let node = Arc::new(start_node(local_profile(root.path(), Some(reserve_port()))).await?);
+    let node = Arc::new(start_node(local_profile(root.path(), None)).await?);
 
     // Same code, different params: distinct contract keys (the test contract
     // ignores params in validate_state, so both PUTs succeed identically).

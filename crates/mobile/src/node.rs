@@ -242,17 +242,10 @@ async fn start_mode(
     match profile.mode {
         NodeMode::Local => {
             let ws_api = cfg.ws_api.clone();
-            // `run_local_node` binds its own listener internally; there is no
-            // listener-injection variant for local mode. Release the
-            // reservation immediately before starting it (reserve-then-
-            // release). The race window between this drop and the bind
-            // inside `run_local_node` is microseconds — acceptable on a
-            // phone, where nothing else on the loopback interface is racing
-            // for the same ephemeral port at that exact instant.
-            // `run_local_node_with_listener` would close this window but
-            // would touch `crates/core` and needs an upstream issue first
-            // (see docs/plans/consolidate-node-embedding-upstream.md,
-            // "Out of scope" in the atlas-discover-ios sibling checkout).
+            // `run_local_node` binds its own listener; local mode has no
+            // listener-injection path. Drop the reservation before that bind.
+            // The executor is constructed in between, so the port is free
+            // for that window.
             drop(reservation);
             let executor = Executor::from_config_local(Arc::new(cfg))
                 .await
@@ -264,17 +257,14 @@ async fn start_mode(
             let clients = match reservation {
                 // The profile fixed this port itself; no listener was ever
                 // bound for it, so let `serve_client_api` bind it fresh.
-                Reservation::Fixed(_) => serve_client_api(cfg.ws_api.clone())
-                    .await
-                    .map_err(|e| MobileError::Startup(format!("client API: {e}")))?,
+                Reservation::Fixed(_) => serve_client_api(cfg.ws_api.clone()).await,
                 // Race-free: hand the already-bound listener straight to the
                 // server instead of releasing and rebinding it.
                 Reservation::Ephemeral(listener) => {
-                    serve_client_api_with_listener(cfg.ws_api.clone(), listener)
-                        .await
-                        .map_err(|e| MobileError::Startup(format!("client API: {e}")))?
+                    serve_client_api_with_listener(cfg.ws_api.clone(), listener).await
                 }
-            };
+            }
+            .map_err(|e| MobileError::Startup(format!("client API: {e}")))?;
             let node = NodeConfig::new(cfg)
                 .await
                 .map_err(|e| MobileError::Startup(format!("node config: {e}")))?
