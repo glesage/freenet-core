@@ -42,8 +42,9 @@ pub fn release_port(port: u16) {
     freenet::test_utils::release_local_port(port);
 }
 
-/// A local-mode profile rooted at `root`.
-pub fn local_profile(root: &Path, ws_port: u16) -> MobileProfile {
+/// A local-mode profile rooted at `root`. `ws_port: None` lets the node
+/// reserve an ephemeral loopback port at start.
+pub fn local_profile(root: &Path, ws_port: Option<u16>) -> MobileProfile {
     MobileProfile {
         mode: NodeMode::Local,
         data_dir: root.join("data").to_string_lossy().into_owned(),
@@ -60,7 +61,7 @@ pub fn local_profile(root: &Path, ws_port: u16) -> MobileProfile {
 /// is not fetched, so no request leaves the machine.
 pub fn network_profile(
     root: &Path,
-    ws_port: u16,
+    ws_port: Option<u16>,
     network_port: u16,
     gateway: String,
 ) -> MobileProfile {
@@ -89,10 +90,13 @@ pub fn unreachable_gateway(dir: &Path, port: u16) -> String {
 }
 
 /// Build a node for `profile` and start it, releasing the reserved ws port
-/// right before the bind.
+/// right before the bind. When `profile.ws_port` is `None` the node reserves
+/// its own ephemeral port at start, so there is nothing to release here.
 pub async fn start_node(profile: MobileProfile) -> Result<FreenetNode, MobileError> {
     let node = FreenetNode::new_plain(profile.clone())?;
-    release_port(profile.ws_port);
+    if let Some(port) = profile.ws_port {
+        release_port(port);
+    }
     node.start().await?;
     Ok(node)
 }
@@ -103,7 +107,7 @@ pub async fn start_node(profile: MobileProfile) -> Result<FreenetNode, MobileErr
 /// config dir to simulate a moved or reused app container, since a
 /// hand-truncated TOML string is missing fields a real file always has.
 pub async fn persisted_config_from_a_real_run(root: &Path) -> Result<String, MobileError> {
-    let node = start_node(local_profile(root, reserve_port())).await?;
+    let node = start_node(local_profile(root, Some(reserve_port()))).await?;
     node.stop().await?;
     Ok(
         std::fs::read_to_string(root.join("config").join("config.toml"))

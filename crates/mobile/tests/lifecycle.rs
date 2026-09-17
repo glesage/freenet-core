@@ -22,7 +22,7 @@ async fn local_node_starts_and_stops() -> Result<(), MobileError> {
     init_test_logging();
     let root = tempfile::tempdir().expect("tempdir");
     let port = reserve_port();
-    let node = FreenetNode::new_plain(local_profile(root.path(), port))?;
+    let node = FreenetNode::new_plain(local_profile(root.path(), Some(port)))?;
     // Registered before start so every transition is observed.
     let listener = Arc::new(RecordingListener::default());
     node.set_update_listener(listener.clone());
@@ -53,10 +53,94 @@ async fn local_node_starts_and_stops() -> Result<(), MobileError> {
 async fn starting_twice_is_rejected() -> Result<(), MobileError> {
     init_test_logging();
     let root = tempfile::tempdir().expect("tempdir");
-    let node = start_node(local_profile(root.path(), reserve_port())).await?;
+    let node = start_node(local_profile(root.path(), Some(reserve_port()))).await?;
     let err = node.start().await.expect_err("second start must fail");
     assert!(matches!(err, MobileError::InvalidState(_)), "{err}");
     assert_eq!(node.status(), NodeStatus::Running);
+    node.stop().await
+}
+
+/// `ws_port: None` must not surface a live port before start, must bind and
+/// report a real, connectable one once running, and must forget it again
+/// after stop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unset_ws_port_binds_an_ephemeral_port_and_reports_it() -> Result<(), MobileError> {
+    init_test_logging();
+    let root = tempfile::tempdir().expect("tempdir");
+    let node = FreenetNode::new_plain(local_profile(root.path(), None))?;
+    assert_eq!(node.api_port(), None, "no port before start");
+    node.start().await?;
+    let port = node.api_port().expect("running node reports its port");
+    assert_ne!(port, 0);
+    // A second, independent connection proves the number is real.
+    let url = format!("ws://127.0.0.1:{port}/v1/contract/command?encodingProtocol=native");
+    connect_async(&url)
+        .await
+        .expect("connect to the reported port");
+    node.stop().await?;
+    assert_eq!(node.api_port(), None, "no port after stop");
+    Ok(())
+}
+
+/// Two nodes in the same process must never be handed the same ephemeral
+/// port — each reserves and releases its own listener independently.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_ephemeral_nodes_in_one_process_get_distinct_ports() -> Result<(), MobileError> {
+    init_test_logging();
+    let root_a = tempfile::tempdir().expect("tempdir a");
+    let root_b = tempfile::tempdir().expect("tempdir b");
+    let node_a = FreenetNode::new_plain(local_profile(root_a.path(), None))?;
+    let node_b = FreenetNode::new_plain(local_profile(root_b.path(), None))?;
+    node_a.start().await?;
+    node_b.start().await?;
+    let port_a = node_a.api_port().expect("node a reports its port");
+    let port_b = node_b.api_port().expect("node b reports its port");
+    assert_ne!(port_a, port_b, "two ephemeral nodes must not share a port");
+    node_a.stop().await?;
+    node_b.stop().await?;
+    Ok(())
+}
+
+/// A profile with a fixed `ws_port` must be honoured exactly, and reported
+/// back through `api_port` while running.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fixed_ws_port_is_honoured_and_reported() -> Result<(), MobileError> {
+    init_test_logging();
+    let root = tempfile::tempdir().expect("tempdir");
+    let port = reserve_port();
+    let node = start_node(local_profile(root.path(), Some(port))).await?;
+    assert_eq!(node.api_port(), Some(port));
+    node.stop().await
+}
+
+/// A restart with `ws_port: None` must never reuse the port from the
+/// previous run's persisted `config.toml` (core's `ConfigArgs::build` would
+/// otherwise merge it back in when `ws_api_port` is `None`). Occupying the
+/// old port with a plain listener before the second start proves the node
+/// picked a genuinely different one rather than merely getting lucky.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restart_with_unset_port_does_not_reuse_the_persisted_one() -> Result<(), MobileError> {
+    init_test_logging();
+    let root = tempfile::tempdir().expect("tempdir");
+    let node = FreenetNode::new_plain(local_profile(root.path(), None))?;
+    node.start().await?;
+    let port_a = node.api_port().expect("first run reports its port");
+    node.stop().await?;
+
+    // Hold the old port so a merge-back regression cannot silently reuse it.
+    // The local node's own server task is torn down by aborting it (see
+    // `stop_mode` in node.rs); the abort is requested, not synchronously
+    // waited for, so the socket the old server task held can still be
+    // closing in the background for a few scheduler ticks after `stop`
+    // returns. Retry briefly rather than racing that teardown.
+    let _holder = bind_loopback_retrying(port_a, Duration::from_secs(5)).await;
+
+    node.start().await?;
+    let port_b = node.api_port().expect("second run must also report a port");
+    assert_ne!(
+        port_b, port_a,
+        "a restart with ws_port: None must not merge the persisted port back"
+    );
     node.stop().await
 }
 
@@ -64,7 +148,7 @@ async fn starting_twice_is_rejected() -> Result<(), MobileError> {
 async fn requests_fail_cleanly_when_stopped() {
     init_test_logging();
     let root = tempfile::tempdir().expect("tempdir");
-    let node = FreenetNode::new_plain(local_profile(root.path(), 7509)).expect("build node");
+    let node = FreenetNode::new_plain(local_profile(root.path(), Some(7509))).expect("build node");
     let err = node
         .get("6Sf2buCM1LzU5EhscNvjeNqPYbQbtvKSkzC6EFUy8Jjh".into(), false)
         .await
@@ -80,7 +164,7 @@ async fn local_node_restarts_on_the_same_dirs() -> Result<(), MobileError> {
     init_test_logging();
     let root = tempfile::tempdir().expect("tempdir");
     let port = reserve_port();
-    let profile = local_profile(root.path(), port);
+    let profile = local_profile(root.path(), Some(port));
     let node = FreenetNode::new_plain(profile)?;
     release_port(port);
 
@@ -107,15 +191,20 @@ async fn local_node_restarts_on_the_same_dirs() -> Result<(), MobileError> {
 async fn network_node_starts_and_stops_without_joining() -> Result<(), MobileError> {
     init_test_logging();
     let root = tempfile::tempdir().expect("tempdir");
-    let ws_port = reserve_port();
+    // `None` here exercises the pre-bound-listener path: network mode hands
+    // the reserved ephemeral listener straight to
+    // `serve_client_api_with_listener` instead of dropping and rebinding.
     let net_port = reserve_port();
     let gw_port = reserve_port();
     let gateway = unreachable_gateway(root.path(), gw_port);
-    let node = FreenetNode::new_plain(network_profile(root.path(), ws_port, net_port, gateway))?;
-    release_port(ws_port);
+    let node = FreenetNode::new_plain(network_profile(root.path(), None, net_port, gateway))?;
     release_port(net_port);
     node.start().await?;
     assert_eq!(node.status(), NodeStatus::Running);
+    assert!(
+        node.api_port().is_some(),
+        "a running network node must report its bound client API port"
+    );
     assert!(root.path().join("data").join("db").is_dir());
     // Nobody answers at the gateway, so the peer count stays at zero and a
     // bounded wait times out instead of hanging.
@@ -137,7 +226,7 @@ async fn run_cycles(cycles: usize) -> Result<(), MobileError> {
     init_test_logging();
     let root = tempfile::tempdir().expect("tempdir");
     let port = reserve_port();
-    let node = FreenetNode::new_plain(local_profile(root.path(), port))?;
+    let node = FreenetNode::new_plain(local_profile(root.path(), Some(port)))?;
     release_port(port);
 
     // First cycle warms every lazily created resource (runtime threads, epoch
@@ -244,7 +333,7 @@ async fn startup_survives_a_config_naming_a_dead_key_path() -> Result<(), Mobile
     // The new container reuses that exact file, the way iOS would restore it
     // from a backup, under directories of its own.
     let root = tempfile::tempdir().expect("tempdir");
-    let profile = local_profile(root.path(), reserve_port());
+    let profile = local_profile(root.path(), Some(reserve_port()));
     let config_dir = root.path().join("config");
     std::fs::create_dir_all(&config_dir).expect("config dir");
     std::fs::write(config_dir.join("config.toml"), &persisted_by_old_run)
@@ -273,7 +362,7 @@ async fn a_config_from_another_data_dir_is_discarded_with_its_gateways() -> Resu
     let persisted_by_old_run = persisted_config_from_a_real_run(old.path()).await?;
 
     let root = tempfile::tempdir().expect("tempdir");
-    let profile = local_profile(root.path(), reserve_port());
+    let profile = local_profile(root.path(), Some(reserve_port()));
     let config_dir = root.path().join("config");
     std::fs::create_dir_all(&config_dir).expect("config dir");
     std::fs::write(config_dir.join("config.toml"), &persisted_by_old_run)
@@ -377,7 +466,7 @@ async fn two_peers_join_and_exchange_a_contract() -> Result<(), MobileError> {
     let joiner_net_port = reserve_port();
     let joiner = FreenetNode::new_plain(network_profile(
         joiner_root.path(),
-        joiner_ws_port,
+        Some(joiner_ws_port),
         joiner_net_port,
         gateway_entry,
     ))?;
@@ -438,6 +527,24 @@ async fn connect_gw_ws(port: u16, within: Duration) -> Result<WebApi, MobileErro
                 )));
             }
             Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+        }
+    }
+}
+
+/// Bind a plain loopback listener on `port`, retrying on `AddrInUse` until
+/// `within` elapses. Used right after stopping a node whose server task was
+/// torn down by aborting it: the abort is requested, not synchronously
+/// awaited to completion, so the socket can still be closing for a few
+/// scheduler ticks after `stop()` returns.
+async fn bind_loopback_retrying(port: u16, within: Duration) -> std::net::TcpListener {
+    let deadline = tokio::time::Instant::now() + within;
+    loop {
+        match std::net::TcpListener::bind(("127.0.0.1", port)) {
+            Ok(listener) => return listener,
+            Err(e) if tokio::time::Instant::now() >= deadline => {
+                panic!("hold the previous run's port within {within:?}: {e}");
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
         }
     }
 }

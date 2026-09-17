@@ -88,6 +88,13 @@ impl FreenetNode {
         self.status_impl()
     }
 
+    /// Loopback port of the running node's client API, or `None` when
+    /// stopped (before start, or after stop). The URL to connect to is
+    /// `ws://127.0.0.1:<port>/v1/contract/command?encodingProtocol=native`.
+    pub fn api_port(&self) -> Option<u16> {
+        self.api_port_impl()
+    }
+
     /// Register (or replace) the host callbacks. May be called before start.
     pub fn set_update_listener(&self, listener: Arc<dyn ContractUpdateListener>) {
         self.set_update_listener_impl(listener);

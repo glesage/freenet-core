@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use freenet::ShutdownHandle;
 use freenet::local_node::{Executor, NodeConfig};
-use freenet::server::serve_client_api;
+use freenet::server::{serve_client_api, serve_client_api_with_listener};
 use tokio::runtime::{Handle, Runtime};
 use tokio::task::JoinHandle;
 
@@ -53,6 +53,40 @@ struct Running {
     client: ClientHandle,
 }
 
+/// The client API port, either fixed by the profile or reserved on a loopback
+/// listener that is still held open.
+enum Reservation {
+    /// The profile named this exact port; nothing is bound yet.
+    Fixed(u16),
+    /// A loopback listener already bound to an OS-assigned free port.
+    Ephemeral(std::net::TcpListener),
+}
+
+impl Reservation {
+    fn port(&self) -> Result<u16, MobileError> {
+        match self {
+            Reservation::Fixed(port) => Ok(*port),
+            Reservation::Ephemeral(listener) => {
+                listener.local_addr().map(|a| a.port()).map_err(|e| {
+                    MobileError::Startup(format!("cannot read the reserved port back: {e}"))
+                })
+            }
+        }
+    }
+}
+
+/// Reserve the client API port a profile will start on. `Some(port)` is used
+/// as-is; `None` binds an ephemeral loopback listener so the OS hands out a
+/// free port, without yet telling `freenet` to serve on it.
+fn reserve_client_api_port(profile: &MobileProfile) -> Result<Reservation, MobileError> {
+    match profile.ws_port {
+        Some(port) => Ok(Reservation::Fixed(port)),
+        None => std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .map(Reservation::Ephemeral)
+            .map_err(|e| MobileError::Startup(format!("cannot reserve a loopback port: {e}"))),
+    }
+}
+
 /// An embedded Freenet node. Construct with [`FreenetNode::new_plain`] (Rust)
 /// or the UniFFI constructor, then [`start`](Self::start).
 #[derive(uniffi::Object)]
@@ -61,18 +95,25 @@ pub struct FreenetNode {
     running: tokio::sync::Mutex<Option<Running>>,
     status: RwLock<NodeStatus>,
     listener: ListenerSlot,
+    /// Loopback port of the client API while the node is running; `None`
+    /// before start and after stop. Set in `launch` only once the node has
+    /// actually started serving, cleared in `stop_impl`.
+    api_port: RwLock<Option<u16>>,
 }
 
 impl FreenetNode {
     /// Plain Rust constructor (the FFI one wraps this in an `Arc`).
     pub fn new_plain(profile: MobileProfile) -> Result<Self, MobileError> {
-        // Validate eagerly so a bad profile fails at construction, not at start.
-        profile.config_args()?;
+        // Validate eagerly so a bad profile fails at construction, not at
+        // start. The port value is irrelevant to validation (only
+        // directories and mode are checked), so a placeholder is fine here.
+        profile.config_args(profile.ws_port.unwrap_or(0))?;
         Ok(Self {
             profile,
             running: tokio::sync::Mutex::new(None),
             status: RwLock::new(NodeStatus::Stopped),
             listener: Arc::new(RwLock::new(None)),
+            api_port: RwLock::new(None),
         })
     }
 
@@ -101,6 +142,12 @@ impl FreenetNode {
         }
     }
 
+    /// Loopback port of the running node's client API, or `None` when the
+    /// node is stopped (before start, or after a stop/failed start).
+    pub(crate) fn api_port_impl(&self) -> Option<u16> {
+        self.api_port.read().ok().and_then(|slot| *slot)
+    }
+
     /// Start the node described by the profile. Errors if already running.
     pub(crate) async fn start_impl(&self) -> Result<(), MobileError> {
         let mut running = self.running.lock().await;
@@ -125,19 +172,27 @@ impl FreenetNode {
 
     /// Launch the node on the crate runtime, then connect the in-process
     /// client. A node whose client fails to connect is stopped again before
-    /// the error is returned.
+    /// the error is returned. The port is resolved here, at start, not at
+    /// construction: a `None` profile port reserves a fresh loopback listener
+    /// every time the node starts.
     async fn launch(&self) -> Result<Running, MobileError> {
         let handle = runtime().handle();
-        let mode = handle.spawn(start_mode(self.profile.clone())).await??;
-        match ClientHandle::connect(
-            handle,
-            self.profile.ws_port,
-            self.listener.clone(),
-            CLIENT_CONNECT_TIMEOUT,
-        )
-        .await
+        let reservation = reserve_client_api_port(&self.profile)?;
+        let port = reservation.port()?;
+        let mode = handle
+            .spawn(start_mode(self.profile.clone(), port, reservation))
+            .await??;
+        match ClientHandle::connect(handle, port, self.listener.clone(), CLIENT_CONNECT_TIMEOUT)
+            .await
         {
-            Ok(client) => Ok(Running { mode, client }),
+            Ok(client) => {
+                // Only recorded once the node is actually serving; every
+                // error path above leaves `api_port` at `None`.
+                if let Ok(mut slot) = self.api_port.write() {
+                    *slot = Some(port);
+                }
+                Ok(Running { mode, client })
+            }
             Err(e) => {
                 stop_mode(handle, mode).await;
                 Err(e)
@@ -155,6 +210,9 @@ impl FreenetNode {
         client.shutdown().await;
         stop_mode(runtime().handle(), mode).await;
         self.set_status(NodeStatus::Stopped);
+        if let Ok(mut slot) = self.api_port.write() {
+            *slot = None;
+        }
         Ok(())
     }
 
@@ -172,11 +230,30 @@ impl FreenetNode {
 }
 
 /// Build and launch the node for `profile` on the current (crate) runtime.
-async fn start_mode(profile: MobileProfile) -> Result<ModeHandle, MobileError> {
-    let cfg = profile.build_config().await?;
+/// `port` is the already-resolved client API port; `reservation` is either
+/// the still-open ephemeral listener for it, or a marker that the profile
+/// fixed the port itself.
+async fn start_mode(
+    profile: MobileProfile,
+    port: u16,
+    reservation: Reservation,
+) -> Result<ModeHandle, MobileError> {
+    let cfg = profile.build_config(port).await?;
     match profile.mode {
         NodeMode::Local => {
             let ws_api = cfg.ws_api.clone();
+            // `run_local_node` binds its own listener internally; there is no
+            // listener-injection variant for local mode. Release the
+            // reservation immediately before starting it (reserve-then-
+            // release). The race window between this drop and the bind
+            // inside `run_local_node` is microseconds — acceptable on a
+            // phone, where nothing else on the loopback interface is racing
+            // for the same ephemeral port at that exact instant.
+            // `run_local_node_with_listener` would close this window but
+            // would touch `crates/core` and needs an upstream issue first
+            // (see docs/plans/consolidate-node-embedding-upstream.md,
+            // "Out of scope" in the atlas-discover-ios sibling checkout).
+            drop(reservation);
             let executor = Executor::from_config_local(Arc::new(cfg))
                 .await
                 .map_err(|e| MobileError::Startup(format!("local executor: {e}")))?;
@@ -184,9 +261,20 @@ async fn start_mode(profile: MobileProfile) -> Result<ModeHandle, MobileError> {
             Ok(ModeHandle::Local { task })
         }
         NodeMode::Network => {
-            let clients = serve_client_api(cfg.ws_api.clone())
-                .await
-                .map_err(|e| MobileError::Startup(format!("client API: {e}")))?;
+            let clients = match reservation {
+                // The profile fixed this port itself; no listener was ever
+                // bound for it, so let `serve_client_api` bind it fresh.
+                Reservation::Fixed(_) => serve_client_api(cfg.ws_api.clone())
+                    .await
+                    .map_err(|e| MobileError::Startup(format!("client API: {e}")))?,
+                // Race-free: hand the already-bound listener straight to the
+                // server instead of releasing and rebinding it.
+                Reservation::Ephemeral(listener) => {
+                    serve_client_api_with_listener(cfg.ws_api.clone(), listener)
+                        .await
+                        .map_err(|e| MobileError::Startup(format!("client API: {e}")))?
+                }
+            };
             let node = NodeConfig::new(cfg)
                 .await
                 .map_err(|e| MobileError::Startup(format!("node config: {e}")))?

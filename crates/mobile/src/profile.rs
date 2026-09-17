@@ -31,9 +31,11 @@ pub struct MobileProfile {
     pub config_dir: String,
     /// Rotated log files, when file logging is enabled.
     pub log_dir: String,
-    /// Loopback port of the node's websocket client API. `freenet` tooling
-    /// defaults to 7509.
-    pub ws_port: u16,
+    /// Loopback port of the node's websocket client API. `None` lets the node
+    /// choose a free loopback port at start; read it back with
+    /// `FreenetNode::api_port`. Tools that must know the port in advance (e.g.
+    /// `atlasctl` against a simulator) pass `Some(7509)`.
+    pub ws_port: Option<u16>,
     /// UDP port for peer traffic in network mode. `None` lets `freenet` pick its
     /// default (31337).
     pub network_port: Option<u16>,
@@ -50,8 +52,12 @@ impl MobileProfile {
     }
 
     /// The `freenet` CLI arguments this profile stands for. Every directory is
-    /// explicit and created up front.
-    pub(crate) fn config_args(&self) -> Result<ConfigArgs, MobileError> {
+    /// explicit and created up front. `ws_port` is the RESOLVED port (never the
+    /// profile's own `Option`): it is always set as `Some(ws_port)` because
+    /// `ConfigArgs.ws_api.ws_api_port = None` would make `freenet` core merge
+    /// the port back from a previously persisted `config.toml`, silently
+    /// reusing last run's number instead of the freshly resolved one.
+    pub(crate) fn config_args(&self, ws_port: u16) -> Result<ConfigArgs, MobileError> {
         for dir in [&self.data_dir, &self.config_dir, &self.log_dir] {
             std::fs::create_dir_all(dir)
                 .map_err(|e| MobileError::Config(format!("cannot create {dir}: {e}")))?;
@@ -74,7 +80,7 @@ impl MobileProfile {
             mode: Some(mode),
             ws_api: WebsocketApiArgs {
                 address: Some(Ipv4Addr::LOCALHOST.into()),
-                ws_api_port: Some(self.ws_port),
+                ws_api_port: Some(ws_port),
                 ..Default::default()
             },
             network_api,
@@ -88,11 +94,12 @@ impl MobileProfile {
     }
 
     /// Build the node [`Config`]. This writes `config.toml` (and, in network
-    /// mode with no overrides, fetches and saves `gateways.toml`).
-    pub(crate) async fn build_config(&self) -> Result<Config, MobileError> {
+    /// mode with no overrides, fetches and saves `gateways.toml`). `ws_port` is
+    /// the resolved port, always passed through to [`Self::config_args`].
+    pub(crate) async fn build_config(&self, ws_port: u16) -> Result<Config, MobileError> {
         self.discard_relocated_config()?;
         let mut cfg = self
-            .config_args()?
+            .config_args(ws_port)?
             .build()
             .await
             .map_err(|e| MobileError::Config(e.to_string()))?;
@@ -180,7 +187,7 @@ mod tests {
             data_dir: "/app/freenet/data".into(),
             config_dir: "/app/freenet/config".into(),
             log_dir: "/app/freenet/logs".into(),
-            ws_port: 7509,
+            ws_port: Some(7509),
             network_port: None,
             gateways,
         }
@@ -238,7 +245,7 @@ mod tests {
         p.config_dir = dir.path().join("config").to_string_lossy().into_owned();
         p.log_dir = dir.path().join("logs").to_string_lossy().into_owned();
 
-        let cfg = p.build_config().await.expect("build_config");
+        let cfg = p.build_config(7509).await.expect("build_config");
         assert_eq!(
             cfg.use_pulley,
             cfg!(target_os = "ios"),

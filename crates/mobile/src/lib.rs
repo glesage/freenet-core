@@ -14,11 +14,14 @@
 //!   directories in [`MobileProfile`]; nothing falls back to home or temp
 //!   directories (a debug build of `freenet` would otherwise pick, and delete,
 //!   `$TMPDIR/freenet`).
-//! - The node's client API is its loopback websocket, bound to
-//!   `127.0.0.1:<ws_port>`. This crate talks to it over that socket from inside
-//!   the same process, so every request travels the exact path the node's own
-//!   tests exercise. Tools on the host machine (or the Mac behind an iOS
-//!   simulator, which shares its loopback) can connect to the same port.
+//! - The node's client API is its loopback websocket. [`MobileProfile::ws_port`]
+//!   fixes the port when set; when it is `None`, the node reserves a free
+//!   loopback port at [`FreenetNode::start`] and reports it through
+//!   [`FreenetNode::api_port`] (`None` before start and after stop). This crate
+//!   talks to the socket over `127.0.0.1:<port>` from inside the same process,
+//!   so every request travels the exact path the node's own tests exercise.
+//!   Tools on the host machine (or the Mac behind an iOS simulator, which
+//!   shares its loopback) can connect to the same port once it is known.
 //! - No process-global handlers are installed by this crate: no signal
 //!   handlers, no abort-on-fatal hooks. Stopping is an explicit [`FreenetNode::stop`].
 //!   (Local mode still runs `freenet`'s own cleanup-on-exit registration, which
