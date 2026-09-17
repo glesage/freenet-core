@@ -22,10 +22,9 @@ The protocol has two layers:
   serving, CSP, and lifecycle/timeout semantics. This is what an Android host
   must reproduce byte-for-byte.
 - **Application layer.** The specific commands and events an app defines on
-  top of the generic layer — for the one shipped example, Atlas's
-  `loadIndex`/`refresh`/`addProducts`. Section 13 documents Atlas's layer as a
-  worked example; it is **not normative**, and no Atlas-specific name may
-  appear anywhere else in this document.
+  top of the generic layer. §13 documents the one shipped example's layer as
+  a worked example; it is **not normative**, and its command/event/error-type
+  names are not used anywhere else in this document.
 
 Every envelope and every message carries `protocolVersion: 1`. There is
 currently one version; a host that does not recognize it must not process the
@@ -248,15 +247,17 @@ Generic categories, meaningful to any host regardless of application:
 | `protocolViolation` | The host detected a malformed message from the page (§6); host-manufactured, never posted by the page. |
 
 Application layers may define their own categories that pass through
-opaquely end to end — Atlas's are `notFound`, `decode`, `signing` (§13).
+opaquely end to end — §13 names the shipped example's three.
 
 **An unknown category must be treated as `requestFailed`.** The reference
 host's mapping from a wire category string to its own error type
-(`AtlasWebClient.swift`, `clientError(_:)`) only special-cases
-`notFound`, `timeout`, `cancelled`, `decode`, `signing`, `runtimeTerminated`;
-every other string — including a category this document defines generically,
-such as `resources` or `invalidInput`, if a page ever put one on a reply —
-falls into that function's `default` arm and becomes `requestFailed`. An
+(`AtlasWebClient.swift`, `clientError(_:)`) only special-cases a fixed
+allowlist of strings — `timeout`, `cancelled` and `runtimeTerminated` from
+the generic set above, plus the shipped example's three application
+categories (§13) — via an explicit switch. Every other string — including a
+category this document defines generically, such as `resources` or
+`invalidInput`, if a page ever put one on a reply — falls into that
+function's `default` arm and becomes `requestFailed`. An
 implementer is free to map more of the generic categories to distinct native
 error types than this reference host does; it must not fail to handle a
 category it doesn't recognize.
@@ -264,9 +265,9 @@ category it doesn't recognize.
 ## 8. Sessions and generations
 
 The host chooses a fresh `session` string for every `open` (the reference
-generates a new `UUID` per call — `NodeManager.swift`, `loadIndex(session:)`
-call site — and threads it into `AtlasClientConfig.session`, which becomes
-every envelope's `session` field for that opening).
+generates a new `UUID` per call — in `NodeManager.swift`, at the call site
+that opens the client — and threads it into `AtlasClientConfig.session`,
+which becomes every envelope's `session` field for that opening).
 
 The page keeps its own monotonically increasing counter, `generation`
 (`bootstrap.js`, module-level `let generation = 0`). `initialize` and `close`
@@ -297,23 +298,23 @@ report for the exact command and summary):
   the page level this is the one place the outline's shorthand ("the read
   settles cancelled") does not literally hold, and it is worth being precise
   about, because the difference matters for what a host must do. Once
-  `close`'s own `await closing.close()` unblocks the pending
-  `client.loadIndex()` call, `bootstrap.js`'s dispatch for that original
+  `close`'s own `await closing.close()` unblocks the application command's
+  pending underlying call, `bootstrap.js`'s dispatch for that original
   command falls through to its ordinary success path — it is not forced
   into an error by the page — and posts an unremarkable `reply` with no
   `error` field, addressed to the (by now stale) session. This is verified
   directly: probing `bootstrap.test.cjs`'s fixture for this exact sequence
-  shows the interrupted `loadIndex` request's reply carries `result: null`
-  and no `error`. What *is* true, and what `bootstrap.test.cjs`'s
+  shows the interrupted command's reply carries `result: null` and no
+  `error`. What *is* true, and what `bootstrap.test.cjs`'s
   `'close interrupts a read and drops old session events'` verifies, is that
-  any application event the old client emits after the close — e.g. a late
-  `snapshot` — is silently dropped (`bootstrap.js` only forwards an event
-  when `epoch === generation && event.session === session`, and both have
+  any application event the old client emits after the close is silently
+  dropped (`bootstrap.js` only forwards an event when
+  `epoch === generation && event.session === session`, and both have
   already moved on by then), and that a fresh command sent afterward on the
   old session gets `cancelled`.
 
-  A caller on the host side (e.g. Swift's `loadIndex()`) can still
-  legitimately observe `cancelled` for the interrupted read despite the
+  A caller on the host side can still legitimately observe `cancelled` for
+  the interrupted command despite the
   page's own reply being a bare success — but that has to come from the
   host's own bookkeeping, not from trusting the page's reply. The reference
   host does this in `AtlasWebClient.close()`: it calls `cancelPending(with:
