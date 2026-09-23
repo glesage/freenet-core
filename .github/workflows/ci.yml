@@ -950,6 +950,12 @@ jobs:
           # when tests create directories with different user ownership
           rm -rf /tmp/freenet /tmp/freenet-* 2>/dev/null || true
 
+      - name: Check mobile Swift bindings
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
+        run: crates/mobile/scripts/generate-bindings.sh --debug --check --out "$RUNNER_TEMP/freenet-mobile-bindings"
+
       - name: Test
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
@@ -1005,6 +1011,20 @@ jobs:
         # freenet-ping-types tests need the std feature (default).
         # Run separately since the main step uses --no-default-features.
         run: cargo nextest run -p freenet-ping-types --profile ci
+
+      - name: Test pulley (JIT-less interpreter backend)
+        # Run the interpreter tests directly so coverage does not depend on
+        # workspace feature unification through crates/mobile.
+        if: ${{ !cancelled() && steps.install-nextest.conclusion == 'success' }}
+        run: |
+          cargo nextest run -p freenet --features pulley --profile ci \
+            -E 'test(pulley) or test(oob_access) or binary(pulley_local_node)'
+
+      - name: Test pulley feature-off refusal
+        # Exercise the refusal path in a package-only, feature-off build;
+        # workspace feature unification would compile this arm out.
+        if: ${{ !cancelled() && steps.install-nextest.conclusion == 'success' }}
+        run: cargo nextest run -p freenet --profile ci -E 'test(use_pulley_without)'
 
   macos_unit:
     name: macOS Service Unit
@@ -1063,6 +1083,11 @@ jobs:
 
       - name: Test service commands
         run: cargo nextest run -p freenet --bin freenet --profile ci -E 'test(commands::service)'
+
+      - name: Test macOS memory-pressure reporting
+        # Exercise the Apple memory probes through the library tests;
+        # the service tests above only cover the binary target.
+        run: cargo nextest run -p freenet --lib --profile ci -E 'test(module_cache)'
 
   # Windows unit tests for the wrapper's Windows-only code paths (named-mutex
   # single-instance guard, process classification, etc). `windows_check` above

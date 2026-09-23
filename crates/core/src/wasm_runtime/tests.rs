@@ -14,6 +14,11 @@ mod execution_handling;
 // `--features trace,...`).
 #[cfg(feature = "trace")]
 mod host_clock;
+// Cranelift-vs-Pulley conformance: needs `--features pulley` (wasmtime's
+// interpreter plus `pulley64` target acceptance) to build a second engine in
+// the same process.
+#[cfg(feature = "pulley")]
+mod pulley_conformance;
 mod time;
 
 pub(crate) fn get_test_module(name: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {

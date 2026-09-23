@@ -1499,6 +1499,50 @@ impl WasmtimeEngine {
         wasmtime_config.memory_guard_size(WASM_MEMORY_GUARD_BYTES);
         wasmtime_config.memory_reservation_for_growth(0);
 
+        // ==================================================================
+        // PULLEY (interpreter) PROFILE for JIT-less targets
+        // ==================================================================
+        //
+        // iOS denies third-party processes writable-then-executable pages, so
+        // Cranelift's native code generation fails at runtime. wasmtime does
+        // NOT switch to its Pulley interpreter on its own there: its `build.rs`
+        // computes `default_target_pulley = !has_host_compiler_backend || miri`,
+        // and aarch64 (aarch64-apple-ios included) HAS a Cranelift backend, so
+        // the default stays the JIT. The embedder opts in through
+        // `RuntimeConfig::use_pulley` (fed from `config::Config::use_pulley`,
+        // which defaults to true on iOS).
+        //
+        // `Config::target` normally demands `precompile_module` + `deserialize`
+        // for a non-native target, but `Engine::_check_compatible_with_native_host`
+        // carves Pulley out (same pointer width and endianness as the host), so
+        // `Module::new` keeps working. Once a target is set wasmtime skips the
+        // `apply_tunables` auto-adjustment of signal-based traps and the guard
+        // size, so both are pinned explicitly: the interpreter bounds-checks
+        // every access itself, and a guard page is neither needed nor usable
+        // without signal handlers. The on-disk compile cache stays shared with
+        // the JIT profile safely: wasmtime hashes `compiler.triple()` into the
+        // cache key (`HashedEngineCompileEnv`), so `pulley64` and native
+        // artifacts never collide.
+        if config.use_pulley {
+            #[cfg(feature = "pulley")]
+            {
+                wasmtime_config
+                    .target("pulley64")
+                    .map_err(|e| WasmError::Other(anyhow::anyhow!(e)))?;
+                wasmtime_config.signals_based_traps(false);
+                // Overrides the JIT-oriented one-page guard configured above.
+                wasmtime_config.memory_guard_size(0);
+            }
+            #[cfg(not(feature = "pulley"))]
+            {
+                return Err(WasmError::Other(anyhow::anyhow!(
+                    "RuntimeConfig::use_pulley is set but the `pulley` cargo feature is \
+                     not compiled in; refusing to fall back to the Cranelift JIT silently"
+                ))
+                .into());
+            }
+        }
+
         // Use OptLevel::None for maximum security with untrusted code
         // Simpler compiler = smaller attack surface
         // Memory benefits come from pooling and proper cleanup, not optimizations
@@ -2513,6 +2557,118 @@ mod tests {
         assert!(result.is_ok(), "Failed to create wasmtime engine");
     }
 
+    /// `RuntimeConfig::use_pulley` without the `pulley` cargo feature must
+    /// refuse to build an engine, not silently keep the Cranelift JIT — that
+    /// refusal is what stops an iOS build from crashing on its first
+    /// contract call if the feature is ever left out of a release build.
+    /// The dedicated test keeps this refusal covered in feature-off builds,
+    /// where feature unification could otherwise hide the error path.
+    #[cfg(not(feature = "pulley"))]
+    #[test]
+    fn use_pulley_without_the_feature_is_a_hard_error() {
+        let config = RuntimeConfig {
+            use_pulley: true,
+            ..RuntimeConfig::default()
+        };
+        let err = WasmtimeEngine::create_backend_engine(&config)
+            .expect_err("use_pulley without the feature must refuse, not silently JIT");
+        let message = err.to_string();
+        assert!(
+            message.contains("pulley") && message.contains("feature"),
+            "error must name the missing feature: {message}"
+        );
+    }
+
+    #[cfg(feature = "pulley")]
+    fn mentions_pulley64(bytes: &[u8]) -> bool {
+        bytes.windows(b"pulley64".len()).any(|w| w == b"pulley64")
+    }
+
+    #[cfg(feature = "pulley")]
+    fn serialized_trivial_module(config: &RuntimeConfig) -> Result<Vec<u8>, ContractError> {
+        let engine = WasmtimeEngine::create_backend_engine(config)?;
+        let module = Module::new(&engine, b"(module)").expect("trivial module compiles");
+        Ok(module.serialize().expect("module serializes"))
+    }
+
+    /// The Pulley profile must actually select the interpreter target, otherwise
+    /// the whole feature is a no-op that would JIT (and crash) on iOS. wasmtime
+    /// keeps the engine's target private, but a serialized module carries the
+    /// compiler's target triple in its metadata header, so compile a trivial
+    /// module on each engine and look for the triple there.
+    #[cfg(feature = "pulley")]
+    #[test]
+    fn pulley_profile_targets_the_interpreter() {
+        let pulley_bytes = serialized_trivial_module(&RuntimeConfig {
+            use_pulley: true,
+            ..RuntimeConfig::default()
+        })
+        .expect("pulley engine builds");
+        let jit_bytes = serialized_trivial_module(&RuntimeConfig {
+            use_pulley: false,
+            ..RuntimeConfig::default()
+        })
+        .expect("jit engine builds");
+        assert!(
+            mentions_pulley64(&pulley_bytes),
+            "use_pulley must compile for the pulley64 target"
+        );
+        assert!(
+            !mentions_pulley64(&jit_bytes),
+            "the default profile must keep the native JIT target"
+        );
+    }
+
+    fn local_test_config_args(dir: &std::path::Path) -> crate::config::ConfigArgs {
+        crate::config::ConfigArgs {
+            mode: Some(crate::local_node::OperationMode::Local),
+            config_paths: crate::config::ConfigPathsArgs {
+                config_dir: Some(dir.to_path_buf()),
+                data_dir: Some(dir.to_path_buf()),
+                log_dir: Some(dir.to_path_buf()),
+            },
+            ..crate::config::ConfigArgs::default()
+        }
+    }
+
+    /// `Config::use_pulley` is the embedder's switch; it must be what
+    /// `from_node_config` hands to `create_engine`, in both directions.
+    #[tokio::test]
+    async fn from_node_config_copies_use_pulley() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = local_test_config_args(dir.path()).build().await.unwrap();
+        cfg.use_pulley = true;
+        let pulley_rc = RuntimeConfig::from_node_config(&cfg);
+        assert!(pulley_rc.use_pulley);
+
+        #[cfg(feature = "pulley")]
+        {
+            let bytes = serialized_trivial_module(&pulley_rc).expect("pulley engine builds");
+            assert!(
+                mentions_pulley64(&bytes),
+                "a Config with use_pulley: true must select the pulley64 target"
+            );
+        }
+
+        cfg.use_pulley = false;
+        let rc = RuntimeConfig::from_node_config(&cfg);
+        assert!(!rc.use_pulley);
+        // Every other knob stays at its default on this path.
+        let default = RuntimeConfig::default();
+        assert_eq!(rc.enable_metering, default.enable_metering);
+        assert_eq!(rc.offload_compilation, default.offload_compilation);
+        assert_eq!(rc.wasmtime_cache_dir, default.wasmtime_cache_dir);
+
+        #[cfg(feature = "pulley")]
+        {
+            let bytes = serialized_trivial_module(&rc).expect("jit engine builds");
+            assert!(
+                !mentions_pulley64(&bytes),
+                "a Config with use_pulley: false must keep the native JIT target"
+            );
+        }
+    }
+
     #[test]
     fn test_module_compilation() {
         let config = RuntimeConfig::default();
@@ -2590,12 +2746,94 @@ mod tests {
     /// failure).
     #[test]
     fn epoch_preemption_stops_infinite_loop() {
-        // create_backend_engine enables epoch_interruption AND registers the
-        // engine with the global epoch ticker (100ms period). Metering off.
-        let config = RuntimeConfig {
+        assert_epoch_preempts_infinite_loop(RuntimeConfig {
             enable_metering: false,
             ..RuntimeConfig::default()
-        };
+        });
+    }
+
+    /// Same guarantee on the Pulley interpreter profile (the iOS engine): with
+    /// no JIT and no signal-based traps, the armed epoch deadline must still be
+    /// the thing that stops a spinning guest.
+    #[cfg(feature = "pulley")]
+    #[test]
+    fn epoch_preemption_stops_infinite_loop_under_pulley() {
+        assert_epoch_preempts_infinite_loop(RuntimeConfig {
+            enable_metering: false,
+            use_pulley: true,
+            ..RuntimeConfig::default()
+        });
+    }
+
+    /// WAT for a contract-shaped export that stores far past its one-page
+    /// memory. Exists to check the property `signals_based_traps(false)` /
+    /// `memory_guard_size(0)` (the PULLEY block above) are actually for: a
+    /// guest reading or writing past its linear memory must still trap in a
+    /// controlled way rather than taking the process down, on either backend.
+    const OOB_STORE_WAT: &str = r#"
+        (module
+          (memory (export "memory") 1)
+          (func (export "oob_store")
+            i32.const 200000
+            i64.const 0
+            i64.store))
+    "#;
+
+    /// Out-of-bounds guest memory access must trap, on the default (Cranelift
+    /// JIT) profile.
+    #[test]
+    fn oob_access_traps() {
+        assert_oob_access_traps(RuntimeConfig::default());
+    }
+
+    /// Same guarantee on the Pulley interpreter profile. This exercises the
+    /// explicit trap settings in the PULLEY profile. A host that supports
+    /// signal-based traps cannot prove those settings are required on iOS;
+    /// device testing is still needed.
+    #[cfg(feature = "pulley")]
+    #[test]
+    fn oob_access_traps_under_pulley() {
+        assert_oob_access_traps(RuntimeConfig {
+            use_pulley: true,
+            ..RuntimeConfig::default()
+        });
+    }
+
+    fn assert_oob_access_traps(config: RuntimeConfig) {
+        let engine = WasmtimeEngine::create_backend_engine(&config).unwrap();
+        let module =
+            Module::new(&engine, OOB_STORE_WAT.as_bytes()).expect("oob-store WAT must compile");
+
+        let mut store = Store::new(&engine, HostState::new(DEFAULT_MAX_MEMORY_PAGES));
+        store.limiter(|s| s);
+        // create_backend_engine enables epoch_interruption unconditionally
+        // (see assert_epoch_preempts_infinite_loop above), and an un-armed
+        // deadline defaults to 0 — the very first epoch check would trip an
+        // interrupt before the guest ever reaches the out-of-bounds store.
+        // Arm a deadline this fast test cannot reach.
+        arm_epoch_deadline(&mut store, 10_000);
+
+        let instance = block_on_async(Linker::new(&engine).instantiate_async(&mut store, &module))
+            .expect("instantiation must succeed");
+        let func = instance
+            .get_typed_func::<(), ()>(&mut store, "oob_store")
+            .expect("oob_store export must exist");
+
+        let err = block_on_async(func.call_async(&mut store, ()))
+            .expect_err("an out-of-bounds store must trap, not succeed");
+        // Must be a genuine memory-access trap, not the epoch interrupt this
+        // store never arms — conflating the two would let a broken guard
+        // setting hide behind an unrelated preemption path.
+        assert!(
+            err.downcast_ref::<wasmtime::Trap>()
+                .is_some_and(|t| !matches!(t, wasmtime::Trap::Interrupt)),
+            "out-of-bounds access must trap as a memory fault, got: {err:?}"
+        );
+    }
+
+    fn assert_epoch_preempts_infinite_loop(config: RuntimeConfig) {
+        // create_backend_engine enables epoch_interruption AND registers the
+        // engine with the global epoch ticker (100ms period). Metering off.
         let engine = WasmtimeEngine::create_backend_engine(&config).unwrap();
         let module = Module::new(&engine, INFINITE_LOOP_WAT.as_bytes())
             .expect("infinite-loop WAT must compile");

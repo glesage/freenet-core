@@ -1,6 +1,6 @@
 [package]
 name = "freenet"
-version = "0.2.135"
+version = "0.2.136"
 edition = "2024"
 rust-version = "1.85"
 publish = true
@@ -37,7 +37,7 @@ aes-gcm = { workspace = true }
 # (P3 of #4381). `zeroize` wipes the derived output buffer; we use the low-level
 # `Argon2::hash_password_into` API (not the PHC-string `password_hash` path) so
 # the feature set is minimal.
-argon2 = { version = "0.5", features = ["zeroize"] }
+argon2 = { version = "0.6", features = ["zeroize"] }
 axum = { default-features = false, features = ["http1", "matched-path", "query", "tower-log", "ws", "json"], workspace = true }
 bincode = { workspace = true }
 blake3 = { workspace = true }
@@ -219,7 +219,7 @@ freenet-macros = { path = "../freenet-macros" }
 httptest = { workspace = true }
 # Test-only: proves the collector can verify XEdDSA tokens with a stock
 # ed25519 library after Montgomery->Edwards conversion (4.1.3 = xeddsa's).
-curve25519-dalek = "4.1.3"
+curve25519-dalek = "5.0.0"
 # Test-only: `InMemoryMetricExporter`, so the OTel instrument callbacks can be
 # collected and asserted on without a collector. Dev-only on purpose — the
 # `testing` feature must not reach the shipped binary.
@@ -299,6 +299,13 @@ nightly_tests = []
 jemalloc-prof = ["tikv-jemallocator/profiling", "dep:tikv-jemalloc-ctl"]
 # WASM runtime backend
 wasmtime-backend = ["dep:wasmtime"]
+# Pulley: wasmtime's portable-bytecode interpreter, for targets that forbid JIT
+# (iOS). `wasmtime/pulley` gates the interpreter and lets an engine accept a
+# `pulley64` target; the Pulley compiler backend already comes with Cranelift
+# (wasmtime pins `pulley` on its `wasmtime-cranelift` dependency). Whether an
+# engine uses it is `RuntimeConfig::use_pulley`; see the PULLEY block in
+# `WasmtimeEngine::create_engine`.
+pulley = ["wasmtime-backend", "wasmtime/pulley"]
 
 # ==============================================================================
 # Lint Configuration
