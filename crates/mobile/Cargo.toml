@@ -1,0 +1,49 @@
+[package]
+name = "freenet-mobile"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+description = "Embedded Freenet node for iOS and Android apps, with UniFFI Swift and Kotlin bindings"
+license-file = "../../LICENSE.md"
+repository = "https://github.com/freenet/freenet-core"
+
+[lib]
+name = "freenet_mobile"
+# `staticlib` for the iOS XCFramework, `cdylib` for Android and for
+# generating bindings in UniFFI library mode, `lib` for tests and examples.
+crate-type = ["lib", "staticlib", "cdylib"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+required-features = ["bindgen-cli"]
+
+[features]
+bindgen-cli = ["uniffi/cli"]
+
+[dependencies]
+freenet = { path = "../core" }
+freenet-stdlib = { workspace = true, features = ["net"] }
+anyhow = { workspace = true }
+bincode = { workspace = true }
+bs58 = { workspace = true }
+futures = { workspace = true }
+hex = { workspace = true }
+libc = { workspace = true }
+parking_lot = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "time", "sync", "macros", "fs"] }
+tokio-tungstenite = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+tracing-appender = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
+uniffi = "0.32"
+wasmtime = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

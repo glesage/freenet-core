@@ -1,0 +1,8 @@
+[bindings.swift]
+module_name = "FreenetMobile"
+ffi_module_name = "FreenetMobileFFI"
+ffi_module_filename = "FreenetMobileFFI"
+
+[bindings.kotlin]
+package_name = "org.freenet.mobile"
+cdylib_name = "freenet_mobile"
