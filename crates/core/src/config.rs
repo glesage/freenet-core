@@ -1594,6 +1594,9 @@ impl ConfigArgs {
                 .shutdown_drain_secs
                 .unwrap_or_else(default_shutdown_drain_secs),
             disable_auto_update: self.disable_auto_update,
+            // Per-target default; an embedding overrides it on the built
+            // Config (see the field docs). Never read from config.toml.
+            use_pulley: default_use_pulley(),
             telemetry: TelemetryConfig {
                 enabled: self.telemetry.enabled,
                 endpoint: self
@@ -1897,6 +1900,33 @@ pub struct Config {
     /// (try.freenet.org) needs it (#4690).
     #[serde(skip)]
     pub disable_auto_update: bool,
+
+    /// Run contract WASM on wasmtime's Pulley interpreter instead of the
+    /// Cranelift JIT. RUNTIME-ONLY, NOT persisted (`#[serde(skip)]`, like
+    /// `disable_auto_update` above and `ws_api.webapp_cache_dir`): it describes
+    /// the platform this process runs on, not operator-authored TOML, and a
+    /// `config.toml` copied from a JIT host to a JIT-less one must not pin the
+    /// JIT.
+    ///
+    /// Deliberately a plain public field with no CLI flag: an embedding sets it
+    /// on the built `Config` after [`ConfigArgs::build`] (the
+    /// `webapp_cache_dir` pattern), and every constructor that turns a `Config`
+    /// into a `RuntimeConfig` (`Executor::from_config*`) copies it into
+    /// `RuntimeConfig::use_pulley`.
+    ///
+    /// Defaults per target via [`default_use_pulley`] and requires the `pulley`
+    /// cargo feature; the rationale is the PULLEY block in
+    /// `WasmtimeEngine::create_engine`.
+    #[serde(skip, default = "default_use_pulley")]
+    pub use_pulley: bool,
+}
+
+/// Default for [`Config::use_pulley`]: the Pulley interpreter on iOS, which
+/// forbids JIT, the Cranelift JIT elsewhere.
+///
+/// Rationale: the PULLEY block in `WasmtimeEngine::create_engine`.
+pub fn default_use_pulley() -> bool {
+    cfg!(target_os = "ios")
 }
 
 /// Default graceful-shutdown drain window.
@@ -8345,6 +8375,35 @@ shutdown-drain-secs = 42
         );
     }
 
+    /// `build()` seeds `use_pulley` with the per-target default; a flipped
+    /// value never reaches `config.toml`, and a re-read falls back to that
+    /// default.
+    #[tokio::test]
+    async fn use_pulley_defaults_per_target_and_never_persists() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut cfg = clap_bare_args(temp.path()).build().await.unwrap();
+        assert_eq!(
+            cfg.use_pulley,
+            default_use_pulley(),
+            "build() must seed use_pulley with the per-target default"
+        );
+
+        // Embedder override: flip it, then prove the flip is NOT persisted and
+        // a re-read comes back to the per-target default.
+        cfg.use_pulley = !default_use_pulley();
+        let serialized = toml::to_string(&cfg).unwrap();
+        assert!(
+            !serialized.contains("use_pulley") && !serialized.contains("use-pulley"),
+            "use_pulley is runtime-only and must never be written to config.toml:\n{serialized}"
+        );
+        let reread: Config = toml::from_str(&serialized).unwrap();
+        assert_eq!(
+            reread.use_pulley,
+            default_use_pulley(),
+            "a deserialized Config must fall back to the per-target default"
+        );
+    }
+
     #[test]
     fn disable_auto_update_flag_parses_from_cli() {
         use clap::Parser;
@@ -8484,6 +8543,10 @@ shutdown-drain-secs = 42
             },
             shutdown_drain_secs: 77,
             disable_auto_update: true, // #[serde(skip)] — see destructure below
+            // #[serde(skip)] — runtime-only embedding switch, see destructure
+            // below. Seeded to the NON-default for this host so a leak into
+            // config.toml would be visible.
+            use_pulley: !default_use_pulley(),
         }
     }
 
@@ -8542,6 +8605,11 @@ shutdown-drain-secs = 42
             // at build() time, intentionally not persisted, so it does not
             // round-trip through config.toml (#4690).
             disable_auto_update: _,
+            // #[serde(skip)] runtime-only embedding switch: describes the
+            // platform this process runs on (JIT-less iOS or not), so it must
+            // NOT round-trip through config.toml. Its own coverage is
+            // `use_pulley_defaults_per_target_and_never_persists`.
+            use_pulley: _,
         } = rebuilt;
 
         assert_eq!(mode, seed.mode, "mode");

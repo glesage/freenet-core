@@ -299,6 +299,13 @@ nightly_tests = []
 jemalloc-prof = ["tikv-jemallocator/profiling", "dep:tikv-jemalloc-ctl"]
 # WASM runtime backend
 wasmtime-backend = ["dep:wasmtime"]
+# Pulley: wasmtime's portable-bytecode interpreter, for targets that forbid JIT
+# (iOS). `wasmtime/pulley` gates the interpreter and lets an engine accept a
+# `pulley64` target; the Pulley compiler backend already comes with Cranelift
+# (wasmtime pins `pulley` on its `wasmtime-cranelift` dependency). Whether an
+# engine uses it is `RuntimeConfig::use_pulley`; see the PULLEY block in
+# `WasmtimeEngine::create_engine`.
+pulley = ["wasmtime-backend", "wasmtime/pulley"]
 
 # ==============================================================================
 # Lint Configuration

@@ -452,6 +452,14 @@ pub struct RuntimeConfig {
     /// the memory the node may use AND the disk actually free on the cache's
     /// mount, instead of pinning a flat constant or a RAM-only figure.
     pub wasmtime_cache_size_bytes: Option<u64>,
+    /// Compile contracts to Pulley bytecode and run them on wasmtime's
+    /// interpreter instead of the Cranelift JIT, for JIT-less targets (iOS).
+    /// Default `false` so every existing site keeps the JIT; `from_node_config`
+    /// copies `config::Config::use_pulley` here. A runtime flag rather than a
+    /// `cfg` so one process can build both backends
+    /// (`wasm_runtime::pulley_conformance`); requires the `pulley` cargo
+    /// feature. Rationale: the PULLEY block in `WasmtimeEngine::create_engine`.
+    pub use_pulley: bool,
 }
 
 /// Lower clamp for the node-relative wasmtime **on-disk compile cache** soft
@@ -954,6 +962,22 @@ impl Default for RuntimeConfig {
             // it, so tests and sims see unchanged wasmtime cache behavior.
             wasmtime_cache_dir: None,
             wasmtime_cache_size_bytes: None,
+            // Default: Cranelift JIT. Only `Config::use_pulley` (per-target
+            // default, embedder-settable) turns the interpreter on.
+            use_pulley: false,
+        }
+    }
+}
+
+impl RuntimeConfig {
+    /// `RuntimeConfig::default()` plus the knobs the node `Config` owns (today
+    /// `use_pulley`). Both production constructors (`Executor::from_config` and
+    /// `Executor::from_config_with_shared_modules`) spread over this so the
+    /// next node-derived knob lands once.
+    pub(crate) fn from_node_config(config: &crate::config::Config) -> Self {
+        Self {
+            use_pulley: config.use_pulley,
+            ..Self::default()
         }
     }
 }
