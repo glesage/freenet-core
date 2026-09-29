@@ -452,6 +452,9 @@ pub struct RuntimeConfig {
     /// the memory the node may use AND the disk actually free on the cache's
     /// mount, instead of pinning a flat constant or a RAM-only figure.
     pub wasmtime_cache_size_bytes: Option<u64>,
+    /// Backend that compiles and runs the Wasm. Defaults to the target's
+    /// default, see [`crate::config::WasmBackend::default_for_target`].
+    pub wasm_backend: crate::config::WasmBackend,
 }
 
 /// Lower clamp for the node-relative wasmtime **on-disk compile cache** soft
@@ -954,6 +957,7 @@ impl Default for RuntimeConfig {
             // it, so tests and sims see unchanged wasmtime cache behavior.
             wasmtime_cache_dir: None,
             wasmtime_cache_size_bytes: None,
+            wasm_backend: crate::config::WasmBackend::default_for_target(),
         }
     }
 }

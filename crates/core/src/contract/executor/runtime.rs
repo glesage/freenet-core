@@ -474,6 +474,7 @@ impl Executor<Runtime> {
             // `default_wasmtime_cache_size_bytes_for_dir`.
             wasmtime_cache_dir: Some(wasmtime_cache_dir),
             wasmtime_cache_size_bytes,
+            wasm_backend: config.wasm_backend(),
             ..RuntimeConfig::default()
         };
         let mut rt = Runtime::build_with_shared_module_caches(

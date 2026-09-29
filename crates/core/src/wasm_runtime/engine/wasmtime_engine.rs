@@ -308,7 +308,14 @@ const WASM_STACK_SIZE: usize = 8 * 1024 * 1024;
 /// This bounds VIRTUAL memory and mapping COUNT only. It does NOT bound the
 /// arena's RESIDENT footprint, which is what OOM-kills a peer — see
 /// [`store_arena_budget_bytes`], the companion byte bound (#5268).
-const STORE_REFRESH_THRESHOLD: u64 = 500;
+///
+/// iOS is the exception to "well within the address space": it limits an
+/// app's address space, and a 4 GB iPhone 13 mini (iOS 27) refused the 23rd
+/// reservation. Linear memory must not move (host code keeps pointers into it
+/// across guest calls), so the reservation stays and iOS replaces each Store
+/// after a few instances instead. With the two-executor default pool
+/// (`DEFAULT_RUNTIME_POOL_SIZE_CAP`) that bounds reservations near 2 GiB.
+const STORE_REFRESH_THRESHOLD: u64 = if cfg!(target_os = "ios") { 4 } else { 500 };
 
 /// Fraction of the memory the node may use that all Store arenas together may
 /// hold in retired-but-unreclaimed instance memory before refreshing.
@@ -1427,6 +1434,32 @@ impl WasmtimeEngine {
     fn create_engine(config: &RuntimeConfig) -> Result<(Engine, u64, bool), ContractError> {
         let mut wasmtime_config = Config::new();
 
+        // Backend. Pulley compiles to bytecode that wasmtime interprets, so no
+        // memory is ever mapped executable, which iOS requires. Refuse a backend
+        // the target cannot run here, before wasmtime tries to map executable
+        // memory or finds no native code generator.
+        let backend = config.wasm_backend;
+        if !backend.is_available() {
+            return Err(WasmError::Other(anyhow::anyhow!(
+                "the {backend} Wasm backend is not available on this target; use {}",
+                crate::config::WasmBackend::default_for_target()
+            ))
+            .into());
+        }
+        if backend == crate::config::WasmBackend::Pulley {
+            wasmtime_config
+                .target(crate::config::WasmBackend::pulley_target())
+                .map_err(|e| WasmError::Other(anyhow::anyhow!(e)))?;
+        }
+
+        // Inside an iOS or Android app the app (and ART on Android) owns signal
+        // handling, so wasmtime must not install process-wide SIGSEGV/SIGILL or
+        // Mach exception handlers. Without them, generated code checks memory
+        // bounds and divisors explicitly. Pulley never uses signals.
+        if cfg!(any(target_os = "ios", target_os = "android")) {
+            wasmtime_config.signals_based_traps(false);
+        }
+
         // Enable fuel metering if requested
         let max_fuel = Self::compute_max_fuel(config);
         if config.enable_metering {
@@ -2158,7 +2191,13 @@ fn classify_runtime_error(
         }
     }
     tracing::error!("WASM runtime error: {:?}", error);
-    WasmError::Runtime(error.to_string())
+    // Keep the trap kind, for example "out of bounds memory access", in the
+    // message. `to_string()` alone shows only the outermost context, which is
+    // the Wasm backtrace.
+    match error.downcast_ref::<wasmtime::Trap>() {
+        Some(trap) => WasmError::Runtime(format!("{trap}: {error}")),
+        None => WasmError::Runtime(error.to_string()),
+    }
 }
 
 /// Installs the executing delegate's instance id in the CURRENT thread's

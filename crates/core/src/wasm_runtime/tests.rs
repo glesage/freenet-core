@@ -3,6 +3,7 @@ use std::{path::PathBuf, process::Command};
 use crate::util::workspace::get_workspace_target_dir;
 use tracing::info;
 
+mod backend;
 mod cache;
 mod contract;
 mod contract_metering;

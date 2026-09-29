@@ -129,7 +129,7 @@ wasmtime = { version = "47", default-features = false, features = [
     "compile-time-builtins", "component-model", "component-model-async",
     "coredump", "debug", "debug-builtins", "demangle", "addr2line",
     "gc", "gc-drc", "gc-null", "parallel-compilation", "pooling-allocator",
-    "profiling", "runtime", "std", "threads", "wat",
+    "profiling", "pulley", "runtime", "std", "threads", "wat",
 ] }
 # Lightweight WASM section parser used to reject debug-compiled contracts at
 # PUT time (crates/core/src/client_events.rs::contains_debug_sections) and to

@@ -25,11 +25,13 @@ use crate::{
 
 pub(crate) mod kek;
 mod secret;
+mod wasm_backend;
 pub use kek::{
     KEK_SIZE, KekBackend, KekBackendKind, KekError, ensure_kek_loaded, load_from_backend,
     read_backend_marker, replace_backend_marker, resolve_first_start, write_backend_marker,
 };
 pub use secret::*;
+pub use wasm_backend::WasmBackend;
 
 /// Default maximum number of connections for the peer.
 pub const DEFAULT_MAX_CONNECTIONS: usize = crate::ring::Ring::DEFAULT_MAX_CONNECTIONS;
@@ -244,6 +246,12 @@ pub struct ConfigArgs {
     #[arg(long, env = "FREENET_MODULE_CACHE_BUDGET_BYTES")]
     pub module_cache_budget_bytes: Option<usize>,
 
+    /// Wasm backend for contracts and delegates: `cranelift` compiles to native
+    /// code, `pulley` interprets. Defaults to `cranelift` where the target can
+    /// run it and to `pulley` elsewhere (iOS, 32-bit ARM and 32-bit x86).
+    #[arg(long = "wasm-backend", env = "FREENET_WASM_BACKEND", value_enum)]
+    pub wasm_backend: Option<WasmBackend>,
+
     /// Write the local append-only diagnostic event log (`_EVENT_LOG`).
     ///
     /// On by default in `local` mode, off in `network` mode. Local mode is a
@@ -362,6 +370,7 @@ impl Default for ConfigArgs {
             per_user_inactive_ttl_secs: None,
             inactive_user_sweep_interval_secs: None,
             module_cache_budget_bytes: None,
+            wasm_backend: None,
             enable_event_log: None,
             shutdown_drain_secs: None,
             disable_auto_update: false,
@@ -1059,6 +1068,9 @@ impl ConfigArgs {
                 self.module_cache_budget_bytes
                     .get_or_insert(cfg.module_cache_budget_bytes);
             }
+            if let Some(backend) = cfg.wasm_backend {
+                self.wasm_backend.get_or_insert(backend);
+            }
             self.shutdown_drain_secs
                 .get_or_insert(cfg.shutdown_drain_secs);
             self.max_blocking_threads
@@ -1590,6 +1602,7 @@ impl ConfigArgs {
             module_cache_budget_bytes: self
                 .module_cache_budget_bytes
                 .unwrap_or_else(crate::wasm_runtime::default_module_cache_budget_bytes),
+            wasm_backend: self.wasm_backend,
             shutdown_drain_secs: self
                 .shutdown_drain_secs
                 .unwrap_or_else(default_shutdown_drain_secs),
@@ -1831,6 +1844,16 @@ pub struct Config {
     )]
     pub module_cache_budget_bytes: usize,
 
+    /// The Wasm backend chosen with `--wasm-backend`. `None` means the target's
+    /// default, and stays out of `config.toml` so a later default applies.
+    /// Read it through [`Config::wasm_backend`].
+    #[serde(
+        default,
+        rename = "wasm-backend",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub wasm_backend: Option<WasmBackend>,
+
     /// Whether to write the local append-only diagnostic event log
     /// (`_EVENT_LOG`). Resolved in [`ConfigArgs::build`], where the operation
     /// mode is known: defaults ON in `local` mode and OFF in `network` mode,
@@ -1934,6 +1957,17 @@ const RUNTIME_POOL_SIZE_ENV: &str = "FREENET_RUNTIME_POOL_SIZE";
 /// [`default_max_blocking_threads`].
 const MAX_RUNTIME_POOL_SIZE: usize = 16;
 
+/// Cap on the default pool size. On iOS each executor's Store keeps a 256 MiB
+/// address-space reservation per instance until it is replaced, and iOS limits
+/// an app's address space (a 4 GB iPhone 13 mini refused the 23rd
+/// reservation), so the default pool there is two executors; see
+/// `STORE_REFRESH_THRESHOLD`. An explicit `FREENET_RUNTIME_POOL_SIZE` still wins.
+const DEFAULT_RUNTIME_POOL_SIZE_CAP: usize = if cfg!(target_os = "ios") {
+    2
+} else {
+    MAX_RUNTIME_POOL_SIZE
+};
+
 /// Pure clamp math behind [`runtime_pool_size`], split out so its boundaries are
 /// unit-testable without mutating the process-global environment (which would
 /// race every other test in the binary) or depending on the test host's core
@@ -1945,7 +1979,8 @@ fn resolve_pool_size(cores: Option<usize>, override_value: Option<usize>) -> Non
     let from_cores = cores
         .unwrap_or(4)
         .saturating_sub(1)
-        .clamp(1, MAX_RUNTIME_POOL_SIZE);
+        .clamp(1, MAX_RUNTIME_POOL_SIZE)
+        .min(DEFAULT_RUNTIME_POOL_SIZE_CAP);
     let resolved = override_value
         .map(|n| n.clamp(1, MAX_RUNTIME_POOL_SIZE))
         .unwrap_or(from_cores);
@@ -4036,6 +4071,11 @@ impl Config {
     /// Relocated wasmtime compile-cache directory (#4683). Not mode-split.
     pub fn wasmtime_cache_dir(&self) -> PathBuf {
         self.config_paths.wasmtime_cache_dir()
+    }
+
+    /// The Wasm backend this node runs contracts and delegates on.
+    pub fn wasm_backend(&self) -> WasmBackend {
+        self.wasm_backend.unwrap_or_default()
     }
 
     pub fn delegates_dir(&self) -> PathBuf {
@@ -8313,6 +8353,7 @@ shutdown-drain-secs = 42
             per_user_inactive_ttl_secs: None,
             inactive_user_sweep_interval_secs: None,
             module_cache_budget_bytes: None,
+            wasm_backend: None,
             enable_event_log: None,
             shutdown_drain_secs: None,
             disable_auto_update: false,
@@ -8464,6 +8505,9 @@ shutdown-drain-secs = 42
             per_user_inactive_ttl_secs: 1_234_567,
             inactive_user_sweep_interval_secs: 7_200,
             module_cache_budget_bytes: 987_654_321,
+            // Explicit on purpose: `None` never reaches config.toml, so only a
+            // chosen backend proves the merge keeps it.
+            wasm_backend: Some(WasmBackend::Pulley),
             // Non-default on purpose: the seed is Local mode, where the #4968
             // default is ON, so `Some(false)` fails this test if the merge
             // drops the field (it would come back as `None`).
@@ -8534,6 +8578,7 @@ shutdown-drain-secs = 42
             per_user_inactive_ttl_secs,
             inactive_user_sweep_interval_secs,
             module_cache_budget_bytes,
+            wasm_backend,
             enable_event_log,
             telemetry,
             otel,
@@ -8578,6 +8623,7 @@ shutdown-drain-secs = 42
             module_cache_budget_bytes, seed.module_cache_budget_bytes,
             "module_cache_budget_bytes"
         );
+        assert_eq!(wasm_backend, seed.wasm_backend, "wasm_backend");
         assert_eq!(
             enable_event_log, seed.enable_event_log,
             "enable_event_log (#4968) — an explicit setting must survive the \

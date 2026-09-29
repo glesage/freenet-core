@@ -1127,7 +1127,18 @@ pub const MIN_DEFAULT_MODULE_CACHE_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 /// `default_module_cache_budget_bytes`). Operators who truly need more raise it
 /// explicitly via the config override below (the explicit override is
 /// unclamped).
-pub const MAX_DEFAULT_MODULE_CACHE_BUDGET_BYTES: usize = 4096 * 1024 * 1024;
+///
+/// On 32-bit targets (32-bit ARM Android) 4 GiB does not fit in `usize`, so
+/// the ceiling there is a quarter of the address space.
+pub const MAX_DEFAULT_MODULE_CACHE_BUDGET_BYTES: usize = {
+    const FOUR_GIB: u64 = 4096 * 1024 * 1024;
+    let quarter_of_address_space = usize::MAX as u64 / 4;
+    (if FOUR_GIB < quarter_of_address_space {
+        FOUR_GIB
+    } else {
+        quarter_of_address_space
+    }) as usize
+};
 
 /// Fraction of total system RAM used to size the default contract cache budget.
 ///

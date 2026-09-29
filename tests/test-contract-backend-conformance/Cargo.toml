@@ -1,0 +1,33 @@
+[package]
+name = "test-contract-backend-conformance"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+freenet-stdlib = { version = "0.12.1", features = ["contract"] }
+
+[features]
+default = ["freenet-main-contract"]
+freenet-main-contract = []
+trace = ["freenet-stdlib/trace"]
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+# The Core tests build this crate with the dev profile. Optimize it and keep
+# undefined-behaviour and overflow checks off there too, so the divide-by-zero
+# case reaches the engine's own trap instead of Rust's zero-check panic.
+[profile.dev]
+opt-level = "s"
+debug-assertions = false
+overflow-checks = false
+panic = "abort"
