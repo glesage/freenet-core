@@ -5,15 +5,12 @@
 
 mod assets;
 mod cards;
+mod charts;
 mod contract_detail;
 mod estimator;
-
-/// Re-exported for the router test that pins the hierarchical cost to the
-/// range this formatter can print.
-#[cfg(test)]
-pub(crate) use estimator::fmt_prediction_time;
 mod favicon;
 mod peer_detail;
+mod routing;
 
 use axum::extract::Path;
 use axum::response::{Html, IntoResponse};
@@ -31,6 +28,7 @@ use cards::{
 use contract_detail::contract_detail_html;
 use favicon::{build_dashboard_title, build_favicon_data_uri};
 use peer_detail::peer_detail_html;
+use routing::routing_html;
 
 /// Freenet rabbit silhouette SVG path, derived from freenet_logo.svg.
 /// Used for the favicon with a solid color fill (no gradient) so the
@@ -108,6 +106,11 @@ pub(super) async fn homepage() -> impl IntoResponse {
 /// Handler for `GET /peer/{address}` — returns a detail page for a single peer.
 pub(super) async fn peer_detail(Path(address): Path<String>) -> impl IntoResponse {
     Html(peer_detail_html(&address))
+}
+
+/// Handler for `GET /routing` — the network-wide routing model page.
+pub(super) async fn routing() -> impl IntoResponse {
+    Html(routing_html())
 }
 
 /// Per-contract detail page (#5369). Accepts either the full `ContractKey`
@@ -225,9 +228,8 @@ mod tests {
     };
     use super::contract_detail::contract_detail_html_from;
     use super::estimator::{
-        RegKind, build_estimator_chart, build_estimator_chart_or_placeholder,
-        build_regression_chart, build_reliability_chart, build_renegade_accuracy_panel,
-        failure_chart_y_max, fmt_prediction_prob, fmt_prediction_speed, fmt_prediction_time,
+        ChartUnit, RegKind, build_accuracy_panel, build_estimator_chart,
+        build_estimator_chart_or_placeholder, build_regression_chart, failure_chart_y_max,
     };
     use super::favicon::{build_dashboard_title, build_favicon_data_uri};
     use super::peer_detail::peer_detail_html;
@@ -239,7 +241,6 @@ mod tests {
         FailureSnapshot, HealthLevel, NatStatsSnapshot, NetworkStatusSnapshot, OpStatsSnapshot,
         RingStatsSnapshot,
     };
-    use crate::router::AdjustmentMode;
     use crate::transport::metrics::TransportSnapshot;
     use std::net::SocketAddr;
 
@@ -284,10 +285,7 @@ mod tests {
     /// tested) makes the rule's edge cases explicit and guards against the JS
     /// drifting from the intended behaviour. It lives in the test module (not as
     /// production code) because the production decision is made in JS, not in the
-    /// server-side render — and keeping it inside the single `#[cfg(test)]`
-    /// boundary preserves the source-scrape pin invariant relied on by
-    /// `peer_detail_panel_calls_estimator_helper_for_all_three_components` (the
-    /// first `#[cfg(test)]` marker must be the production/test boundary).
+    /// server-side render.
     ///
     /// The mismatch is meaningful in the #3967 / #4289 scenario: a browser is
     /// still holding a cached homepage emitted by an old binary while a newer
@@ -618,6 +616,20 @@ mod tests {
         assert!(html.contains("health-trouble"), "trouble banner missing");
     }
 
+    /// dashboard.js reopens only `main details[id]` after it swaps `<main>`,
+    /// so a `<details>` without an id snaps shut on every refresh.
+    pub(super) fn assert_every_details_has_an_id(html: &str) {
+        // The embedded dashboard.js mentions `<details>` in a comment.
+        let html = match (html.find("<script>"), html.rfind("</script>")) {
+            (Some(start), Some(end)) => format!("{}{}", &html[..start], &html[end..]),
+            _ => html.to_string(),
+        };
+        for (at, _) in html.match_indices("<details") {
+            let tag = &html[at..at + html[at..].find('>').unwrap()];
+            assert!(tag.contains(" id=\""), "{tag} has no id");
+        }
+    }
+
     #[test]
     fn failures_demoted_when_connected() {
         let mut snap = base_snapshot();
@@ -633,6 +645,7 @@ mod tests {
             html.contains("diagnostics-muted"),
             "failures should be demoted when connected"
         );
+        assert_every_details_has_an_id(&html);
         assert!(
             !html.contains(r#"class="diagnostics""#),
             "should not use prominent diagnostics style"
@@ -1234,62 +1247,6 @@ mod tests {
     }
 
     #[test]
-    fn reliability_chart_empty_is_placeholder() {
-        let svg = build_reliability_chart(&[]);
-        assert!(svg.contains("collecting data"));
-        assert!(svg.contains("<svg"));
-    }
-
-    #[test]
-    fn reliability_chart_renders_points_and_brier() {
-        // Well-separated: low predicted -> success, high predicted -> failure.
-        let pairs: Vec<(f64, f64)> = (0..20)
-            .map(|i| (i as f64 / 20.0, if i > 10 { 1.0 } else { 0.0 }))
-            .collect();
-        let svg = build_reliability_chart(&pairs);
-        assert!(svg.contains("Failure (calibration)"));
-        // The caption is now DERIVED from these pairs rather than supplied, so
-        // this asserts the derivation rather than echoing an argument back.
-        // Predicted i/20 against actual 0 for i<=10 and 1 for i>10:
-        let expected: f64 = (0..20)
-            .map(|i| {
-                let predicted = i as f64 / 20.0;
-                let actual = if i > 10 { 1.0 } else { 0.0 };
-                (predicted - actual).powi(2)
-            })
-            .sum::<f64>()
-            / 20.0;
-        assert!(
-            svg.contains(&format!("Brier {expected:.3}")),
-            "caption must carry the Brier of the plotted pairs ({expected:.3}), got: {svg}"
-        );
-        assert!(svg.contains("n=20"));
-        assert!(svg.contains("<circle"), "bins should render as points");
-    }
-
-    #[test]
-    fn reliability_chart_filters_nonfinite() {
-        let pairs = vec![
-            (0.5, 0.0),
-            (f64::NAN, 1.0),
-            (0.3, f64::NAN),
-            (f64::INFINITY, 0.0),
-            (0.7, 1.0),
-        ];
-        // Only 2 valid pairs survive the finite filter.
-        let svg = build_reliability_chart(&pairs);
-        assert!(svg.contains("n=2"));
-    }
-
-    #[test]
-    fn reliability_chart_boundary_values_no_panic() {
-        // p == 1.0 and p == 0.0 must clamp into a bin without panicking.
-        let svg = build_reliability_chart(&[(1.0, 0.0), (0.0, 1.0)]);
-        assert!(svg.contains("<svg"));
-        assert!(svg.contains("n=2"));
-    }
-
-    #[test]
     fn regression_chart_sparse_is_placeholder() {
         // Fewer than 2 valid (positive, finite) points -> placeholder.
         let svg = build_regression_chart("Response time", RegKind::Time, &[(0.5, 0.4)]);
@@ -1308,7 +1265,10 @@ mod tests {
             .collect();
         let svg = build_regression_chart("Response time", RegKind::Time, &pairs);
         assert!(svg.contains("Response time"));
-        assert!(svg.contains("median err"));
+        assert!(
+            svg.contains("typically within &#215;1.1 · last 20"),
+            "the headline is the typical miss factor, as on the peer page: {svg}"
+        );
         assert!(svg.contains("<circle"));
         assert!(
             svg.contains("ms"),
@@ -1379,41 +1339,18 @@ mod tests {
 
     #[test]
     fn accuracy_panel_empty_when_no_data() {
-        assert_eq!(build_renegade_accuracy_panel(&[], &[], &[]), String::new());
+        assert_eq!(build_accuracy_panel(&[], &[]), String::new());
     }
 
     #[test]
-    fn accuracy_panel_renders_all_three_models() {
-        let failure: Vec<(f64, f64)> = (0..20)
-            .map(|i| (i as f64 / 20.0, if i > 10 { 1.0 } else { 0.0 }))
+    fn accuracy_panel_renders_both_timing_models() {
+        let response: Vec<(f64, f64)> = (1..=20)
+            .map(|i| (i as f64 * 0.01, i as f64 * 0.01))
             .collect();
-        let svg = build_renegade_accuracy_panel(&failure, &[], &[]);
-        assert!(svg.contains("Prediction Accuracy"));
-        assert!(svg.contains("Failure (calibration)"));
-        // Timing models have no data yet -> their placeholders still appear.
-        assert!(svg.contains("Response time"));
-        assert!(svg.contains("Transfer speed"));
-    }
-
-    #[test]
-    fn fmt_prediction_time_sentinel_values() {
-        assert_eq!(fmt_prediction_time(f64::MAX / 2.0), "N/A");
-        assert_eq!(fmt_prediction_time(f64::INFINITY), "N/A");
-        assert_eq!(fmt_prediction_time(f64::NAN), "N/A");
-        assert_eq!(fmt_prediction_time(-1.0), "N/A");
-        assert_eq!(fmt_prediction_time(0.0), "0.000s");
-        assert_eq!(fmt_prediction_time(1.5), "1.500s");
-        assert_eq!(fmt_prediction_time(1.0e9), "N/A"); // at the limit
-        assert_eq!(fmt_prediction_time(999_999_999.0), "999999999.000s");
-    }
-
-    #[test]
-    fn fmt_prediction_speed_sentinel_values() {
-        assert_eq!(fmt_prediction_speed(0.0), "N/A");
-        assert_eq!(fmt_prediction_speed(-5.0), "N/A");
-        assert_eq!(fmt_prediction_speed(f64::NAN), "N/A");
-        assert_eq!(fmt_prediction_speed(f64::INFINITY), "N/A");
-        assert_eq!(fmt_prediction_speed(1024.0), "1024 B/s");
+        let svg = build_accuracy_panel(&response, &[]);
+        assert!(svg.contains("Response time") && svg.contains("<circle"));
+        // The transfer model has no data yet, so its placeholder still appears.
+        assert!(svg.contains("Transfer speed") && svg.contains("collecting data"));
     }
 
     /// Regression: with no data the helper must still emit a titled
@@ -1427,12 +1364,11 @@ mod tests {
     fn build_estimator_chart_or_placeholder_empty_renders_titled_placeholder() {
         let html = build_estimator_chart_or_placeholder(
             "Response Time (s)",
+            ChartUnit::Seconds,
+            560.0,
             &[],
             &[],
             (0.0, 0.0),
-            None,
-            AdjustmentMode::Additive,
-            None,
             "0",
             "auto",
             "No timed responses have been observed from this peer yet.",
@@ -1459,66 +1395,21 @@ mod tests {
         let scatter = vec![(0.05, 0.0), (0.1, 1.0), (0.3, 0.0), (0.4, 1.0)];
         let html = build_estimator_chart_or_placeholder(
             "Failure Probability",
+            ChartUnit::Probability,
+            560.0,
             &curve,
             &scatter,
             (0.0, 0.5),
-            None,
-            AdjustmentMode::Additive,
-            None,
             "0.0",
             "1.0",
             "no data",
         );
         assert!(html.contains("<svg"), "should render an SVG, got: {html}");
-        assert!(
-            html.contains("<circle"),
-            "raw observations should render as scatter circles, got: {html}"
+        assert_eq!(
+            html.matches("h0").count(),
+            4,
+            "each raw observation renders as a scatter dot, got: {html}"
         );
-    }
-
-    /// Regression: the per-tab "Outcomes vs Distance" panel must call
-    /// `build_estimator_chart_or_placeholder` for all three
-    /// prediction-component slots (Failure Probability, Response Time,
-    /// Transfer Rate). Hiding empty slots previously masked the
-    /// driver data-collection regression for months — keeping every
-    /// slot visible makes future regressions detectable on sight.
-    /// Source-scrape rather than HTML-grep because the visible-when-empty
-    /// behaviour depends on a router_snapshot being present, and the
-    /// `home_page.rs::tests` module does not have a snapshot fixture
-    /// builder.
-    #[test]
-    fn peer_detail_panel_calls_estimator_helper_for_all_three_components() {
-        let src = include_str!("home_page/peer_detail.rs");
-        let prod = src;
-        for title in [
-            "Failure Probability",
-            "Response Time (s)",
-            "Transfer Rate (B/s)",
-        ] {
-            // Find the helper call site and walk forward up to 200 bytes
-            // for the title literal. Whitespace-tolerant so rustfmt
-            // doesn't churn this pin.
-            let mut found = false;
-            let mut cursor = 0;
-            while let Some(call) = prod[cursor..].find("build_estimator_chart_or_placeholder(") {
-                let abs = cursor + call;
-                let tail_end = (abs + 400).min(prod.len());
-                let needle = format!("\"{title}\"");
-                if prod[abs..tail_end].contains(&needle) {
-                    found = true;
-                    break;
-                }
-                cursor = abs + 1;
-            }
-            assert!(
-                found,
-                "peer-detail panel builder must call \
-                 build_estimator_chart_or_placeholder with title {title:?} so the slot is \
-                 always visible. Without this every prediction-component \
-                 slot can silently disappear when its estimator has no \
-                 data — the original regression."
-            );
-        }
     }
 
     #[test]
@@ -1526,12 +1417,11 @@ mod tests {
         let curve = vec![(0.0, 0.1), (0.25, 0.5), (0.5, 0.9)];
         let html = build_estimator_chart_or_placeholder(
             "Failure Probability",
+            ChartUnit::Probability,
+            560.0,
             &curve,
             &[],
             (0.0, 0.5),
-            None,
-            AdjustmentMode::Additive,
-            None,
             "0.0",
             "1.0",
             "should not see this",
@@ -1545,11 +1435,18 @@ mod tests {
 
     #[test]
     fn failure_chart_y_max_zooms_to_twice_right_edge() {
-        // Monotonic, tiny failure curve: right edge is 0.04 → axis top 0.08, so
-        // the line sits around mid-height instead of hugging y=0.
+        // Monotonic, tiny failure curve: right edge is 0.04 → twice that is
+        // 0.08, rounded up to 0.10 for round ticks, so the line sits below
+        // mid-height instead of hugging y=0.
         let curve = vec![(0.0, 0.001), (0.25, 0.02), (0.5, 0.04)];
-        let y_max = failure_chart_y_max(&curve, None);
-        assert!((y_max - 0.08).abs() < 1e-9, "expected 0.08, got {y_max}");
+        let y_max = failure_chart_y_max(&curve);
+        assert!((y_max - 0.10).abs() < 1e-9, "expected 0.10, got {y_max}");
+        // Twice the right edge already on a round step stays put.
+        let on_step = failure_chart_y_max(&[(0.0, 0.0), (0.5, 0.025)]);
+        assert!(
+            (on_step - 0.05).abs() < 1e-9,
+            "expected 0.05, got {on_step}"
+        );
     }
 
     #[test]
@@ -1557,28 +1454,16 @@ mod tests {
         // No failures observed (all-zero curve) → keep the original 0..1 axis
         // rather than collapsing to a degenerate zero-height range.
         let curve = vec![(0.0, 0.0), (0.5, 0.0)];
-        assert_eq!(failure_chart_y_max(&curve, None), 1.0);
+        assert_eq!(failure_chart_y_max(&curve), 1.0);
         // An empty curve also falls back to the full range.
-        assert_eq!(failure_chart_y_max(&[], None), 1.0);
+        assert_eq!(failure_chart_y_max(&[]), 1.0);
     }
 
     #[test]
     fn failure_chart_y_max_capped_at_one() {
         // A large right edge would give 2x > 1; a probability axis can't exceed 1.
         let curve = vec![(0.0, 0.2), (0.5, 0.7)];
-        assert_eq!(failure_chart_y_max(&curve, None), 1.0);
-    }
-
-    #[test]
-    fn failure_chart_y_max_accounts_for_peer_adjustment() {
-        let curve = vec![(0.0, 0.001), (0.5, 0.02)];
-        // Upward adjustment lifts the peer-adjusted line, so the axis must grow
-        // to keep it on-screen: (0.02 + 0.03) * 2 = 0.10.
-        let up = failure_chart_y_max(&curve, Some(0.03));
-        assert!((up - 0.10).abs() < 1e-9, "expected 0.10, got {up}");
-        // A downward adjustment must not shrink the axis below the global edge.
-        let down = failure_chart_y_max(&curve, Some(-0.01));
-        assert!((down - 0.04).abs() < 1e-9, "expected 0.04, got {down}");
+        assert_eq!(failure_chart_y_max(&curve), 1.0);
     }
 
     #[test]
@@ -1587,18 +1472,19 @@ mod tests {
         let curve = vec![(0.0, 0.1), (0.25, 0.5), (0.5, 0.9)];
         let html = build_estimator_chart(
             "Failure Probability",
+            ChartUnit::Probability,
+            560.0,
             &curve,
             &[],
             (0.0, 0.5),
-            None,
-            AdjustmentMode::Additive,
-            None,
             "0.0",
             "1.0",
         );
         assert!(
-            html.contains(">Distance<"),
-            "estimator chart must label its x-axis 'Distance', got: {html}"
+            html.contains(
+                ">ring distance between peer and contract (0 = same spot, 0.5 = opposite side)<"
+            ),
+            "estimator chart must label its x-axis as the peer page does, got: {html}"
         );
     }
 
@@ -1610,23 +1496,41 @@ mod tests {
         let curve = vec![(0.0, 0.0), (0.25, 0.003), (0.5, 0.005)];
         let html = build_estimator_chart(
             "Failure Probability",
+            ChartUnit::Probability,
+            560.0,
             &curve,
             &[],
             (0.0, 0.5),
-            None,
-            AdjustmentMode::Additive,
-            None,
             "0.0",
             "0.01",
         );
         assert!(
-            html.contains(">0.0050<"),
+            html.contains(">0.50%<"),
             "middle y-tick must remain readable at a small range, got: {html}"
         );
         assert!(
-            html.contains(">0.0100<"),
+            html.contains(">1.00%<"),
             "top y-tick must remain readable at a small range, got: {html}"
         );
+    }
+
+    #[test]
+    fn estimator_failure_axis_ticks_land_on_round_percentages() {
+        // Twice a right edge of 8.15% read as "0.0% / 8.2% / 16.3%".
+        let curve = vec![(0.0, 0.01), (0.25, 0.04), (0.5, 0.0815)];
+        let html = build_estimator_chart(
+            "Failure Probability",
+            ChartUnit::Probability,
+            560.0,
+            &curve,
+            &[],
+            (0.0, 0.5),
+            "0",
+            &failure_chart_y_max(&curve).to_string(),
+        );
+        for tick in [">0%<", ">10%<", ">20%<"] {
+            assert!(html.contains(tick), "missing tick {tick}: {html}");
+        }
     }
 
     #[test]
@@ -1634,47 +1538,25 @@ mod tests {
         // With a zoomed failure axis (0.0 .. 0.08), raw failure outcomes at
         // y=1.0 are off-scale-high. They must still render (clamped to the top
         // edge) instead of vanishing, so failures stay visible on the
-        // low-probability peers the zoom targets. The fitted curve renders as a
-        // <path>, so every <circle> here is a scatter dot.
+        // low-probability peers the zoom targets. The scatter is one path of
+        // zero-length `h0` segments, one per dot; the curve has none.
         let curve = vec![(0.0, 0.001), (0.25, 0.02), (0.5, 0.04)];
         let scatter = vec![(0.1, 0.0), (0.2, 1.0), (0.3, 1.0)];
         let html = build_estimator_chart(
             "Failure Probability",
+            ChartUnit::Probability,
+            560.0,
             &curve,
             &scatter,
             (0.0, 0.5),
-            None,
-            AdjustmentMode::Additive,
-            None,
             "0.0",
             "0.08",
         );
-        let circles = html.matches("<circle").count();
+        let dots = html.matches("h0").count();
         assert!(
-            circles >= 3,
-            "all 3 scatter dots (incl. the 2 off-scale failures) must render, got {circles}: {html}"
+            dots >= 3,
+            "all 3 scatter dots (incl. the 2 off-scale failures) must render, got {dots}: {html}"
         );
-    }
-
-    #[test]
-    fn peer_detail_links_renegade_to_repo() {
-        // The "Renegade" label on the Routing Model card links to the project repo.
-        let src = include_str!("home_page/peer_detail.rs");
-        assert!(
-            src.contains(r#"href="https://github.com/sanity/renegade""#),
-            "the Renegade label must link to https://github.com/sanity/renegade"
-        );
-    }
-
-    #[test]
-    fn fmt_prediction_prob_sentinel_values() {
-        assert_eq!(fmt_prediction_prob(f64::NAN), "N/A");
-        assert_eq!(fmt_prediction_prob(f64::INFINITY), "N/A");
-        assert_eq!(fmt_prediction_prob(-0.1), "N/A");
-        assert_eq!(fmt_prediction_prob(1.1), "N/A");
-        assert_eq!(fmt_prediction_prob(0.0), "0.0000");
-        assert_eq!(fmt_prediction_prob(1.0), "1.0000");
-        assert_eq!(fmt_prediction_prob(0.5), "0.5000");
     }
 
     fn sample_peer(addr: &str, location: f64) -> crate::node::network_status::PeerSnapshot {
@@ -1727,6 +1609,15 @@ mod tests {
             html.contains("data-sort=\"2048\""),
             "recv bytes cell must carry raw byte count for sorting"
         );
+    }
+
+    /// The network-wide routing page is reachable from the home dashboard,
+    /// even on a node with no peers yet (the status card always renders once
+    /// the node is up; the peers card does not).
+    #[test]
+    fn status_card_links_to_the_routing_page() {
+        let html = build_status_card(&Some(base_snapshot()));
+        assert!(html.contains(r#"href="/routing""#), "{html}");
     }
 
     #[test]
@@ -3025,11 +2916,16 @@ mod tests {
         // The explanatory paragraph must name the pressures that can actually
         // trigger a sweep. It used to claim the floor was "min(RAM budget,
         // disk budget)", and this assertion pinned that wording — which is how
-        // the claim outlived the two axes added since: the count-derived
-        // resident-overhead ceiling (#5325, the one that binds first on a
-        // real low-RAM peer) and cost pressure (#4861). Pin the axes, not the
-        // phrasing, so adding a fifth fails here instead of going unnoticed.
-        for axis in ["state bytes", "disk", "resident-overhead", "update work"] {
+        // the claim outlived the two axes added since: the contract-memory
+        // ceiling (#5325, counted since #5647) and cost pressure (#4861). Pin
+        // the axes, not the phrasing, so adding a fifth fails here instead of
+        // going unnoticed.
+        for axis in [
+            "state bytes",
+            "disk",
+            "memory hosted contracts hold",
+            "update work",
+        ] {
             assert!(
                 html.contains(axis),
                 "explanatory paragraph must name the {axis:?} eviction pressure \
@@ -3038,16 +2934,13 @@ mod tests {
         }
     }
 
-    /// The count-derived pressure axis (#5325) must render as contract SLOTS,
-    /// not as bytes.
+    /// The resident-overhead axis (#5325, #5647) renders as MEMORY in bytes.
     ///
-    /// The underlying pair is `contract_count * 1 MiB` against a RAM-scaled
-    /// ceiling, so printing it as "30.0 MB / 100.0 MB" reads as measured
-    /// memory. It is not measured, and what it constrains is a number of
-    /// contracts — a low-RAM peer showed "520.0 MB / 524.0 MB" when the honest
-    /// statement was "520 of 524 contract slots used".
+    /// Before #5647 it rendered as contract SLOTS, because the figure was
+    /// `contract_count * 1 MiB`, a count wearing memory units. It is now the
+    /// counted bytes hosted contracts hold in RAM, so bytes are the honest unit.
     #[test]
-    fn hosting_card_renders_slot_axis_as_counts_not_bytes() {
+    fn hosting_card_renders_memory_axis_as_bytes() {
         use crate::node::network_status::HostingSnapshot;
         let mut snap = base_snapshot();
         snap.hosting = HostingSnapshot {
@@ -3056,29 +2949,26 @@ mod tests {
             contract_count: 30,
             contracts: vec![mk_hosted_entry("A", false)],
             resident_overhead_budget_bytes: 100 * 1024 * 1024,
-            estimated_resident_overhead_bytes: 30 * 1024 * 1024,
-            contract_slot_budget: 100,
+            resident_overhead_bytes: 30 * 1024 * 1024,
             resident_overhead_evictions_total: 7,
             ..Default::default()
         };
         let html = build_hosting_card(&Some(snap));
         assert!(
-            html.contains("Contract slots used") && html.contains("30 / 100"),
-            "slot axis must render as counts — got:\n{html}"
+            html.contains("Contract memory") && html.contains("30.0 MB / 100.0 MB"),
+            "memory axis must render as bytes — got:\n{html}"
         );
         assert!(
-            html.contains(">70<"),
-            "slots free = budget(100) - used(30) — got:\n{html}"
+            html.contains(">70.0 MB<"),
+            "memory headroom = budget(100 MB) - used(30 MB) — got:\n{html}"
         );
         assert!(
             html.contains(">7<"),
-            "slot-pressure eviction counter renders the snapshot value — got:\n{html}"
+            "memory-pressure eviction counter renders the snapshot value — got:\n{html}"
         );
-        // The byte framing must be gone: it is what made this read as RAM.
         assert!(
-            !html.contains("Resident overhead (est.)")
-                && !html.contains("Resident overhead budget"),
-            "the byte-denominated resident-overhead tiles must not return — got:\n{html}"
+            !html.contains("Contract slots used") && !html.contains("Slots free"),
+            "the slot tiles are gone: there is no per-contract constant to divide by — got:\n{html}"
         );
     }
 
@@ -3086,7 +2976,7 @@ mod tests {
     /// closest to binding.
     ///
     /// Measured on a live low-RAM peer: 34% of the state-byte budget, 1% of
-    /// the disk budget, 99.2% of the contract-slot ceiling. All three rendered
+    /// the disk budget, 99.2% of the contract-memory ceiling. All three rendered
     /// as identical muted tiles, so the only number that mattered was
     /// indistinguishable from the two with room to spare.
     #[test]
@@ -3097,9 +2987,10 @@ mod tests {
             // State bytes: 34% used.
             budget_bytes: 1000,
             used_bytes: 340,
-            // Slots: 99% used — this is the binding axis.
+            // Contract memory: 99% used — this is the binding axis.
             contract_count: 99,
-            contract_slot_budget: 100,
+            resident_overhead_budget_bytes: 100,
+            resident_overhead_bytes: 99,
             // Disk: 1% used.
             disk_total_bytes: Some(10),
             disk_budget_bytes: Some(1000),
@@ -3108,14 +2999,14 @@ mod tests {
         };
         let html = build_hosting_card(&Some(snap));
         assert!(
-            html.contains("Closest limit:") && html.contains("contract slots"),
+            html.contains("Closest limit:") && html.contains("contract memory"),
             "the binding axis must be named — got:\n{html}"
         );
         assert!(
-            html.contains("99 of 100"),
+            html.contains("99 B of 100 B"),
             "the binding axis detail must show its own units — got:\n{html}"
         );
-        // Naming it is the whole signal. It is NOT coloured: a slot ceiling
+        // Naming it is the whole signal. It is NOT coloured: a contract-memory ceiling
         // is a cache ceiling and 99% is where a busy node is supposed to sit
         // (this test used to assert red here, which is the false alarm
         // `hosting_card_full_cache_axis_is_not_an_alarm` now pins against).
@@ -3140,7 +3031,7 @@ mod tests {
 
     /// A full cache is the steady state, not an alarm.
     ///
-    /// Reported from a live peer: "Closest limit: contract slots — 508 of 508
+    /// Reported from a live peer: "Closest limit: contract memory — 508 of 508
     /// (100%)" over a solid red bar. Nothing was wrong. A cache is supposed to
     /// be full: the sweep trims back to the budget and stops, so a busy node
     /// sits at or around N of N for as long as it stays busy. The strip
@@ -3157,7 +3048,8 @@ mod tests {
                     budget_bytes: 1000,
                     used_bytes: 100,
                     contract_count: 508,
-                    contract_slot_budget: 508,
+                    resident_overhead_budget_bytes: 508,
+                    resident_overhead_bytes: 508,
                     contracts: vec![mk_hosted_entry("A", true)],
                     ..Default::default()
                 },
@@ -3168,7 +3060,8 @@ mod tests {
                     budget_bytes: 1_000_000,
                     used_bytes: 999_900,
                     contract_count: 5,
-                    contract_slot_budget: 508,
+                    resident_overhead_budget_bytes: 508,
+                    resident_overhead_bytes: 5,
                     contracts: vec![mk_hosted_entry("A", true)],
                     ..Default::default()
                 },
@@ -3206,7 +3099,8 @@ mod tests {
             budget_bytes: 1000,
             used_bytes: 500,
             contract_count: 5,
-            contract_slot_budget: 100,
+            resident_overhead_budget_bytes: 100,
+            resident_overhead_bytes: 5,
             contracts: vec![mk_hosted_entry("A", true)],
             ..Default::default()
         };
@@ -3228,7 +3122,8 @@ mod tests {
                 budget_bytes: 1000,
                 used_bytes: 100,
                 contract_count: count,
-                contract_slot_budget: 100,
+                resident_overhead_budget_bytes: 100,
+                resident_overhead_bytes: count,
                 contracts: vec![mk_hosted_entry("A", true)],
                 ..Default::default()
             };
@@ -3252,20 +3147,21 @@ mod tests {
     fn hosting_card_over_budget_cache_axis_is_explained_not_coloured() {
         use crate::node::network_status::HostingSnapshot;
         for (count, budget, printed) in [
-            // One over at the slot floor.
-            (129, 128, "129 of 128 (101%)"),
+            // One over at a small budget.
+            (129, 128, "129 B of 128 B (101%)"),
             // One over on a bigger node: prints as 100%, but the detail text
-            // says 509 of 508, so the note must say "over" and not "full".
-            (509, 508, "509 of 508 (100%)"),
+            // says 509 B of 508 B, so the note must say "over" and not "full".
+            (509, 508, "509 B of 508 B (100%)"),
             // Well over.
-            (120, 100, "120 of 100 (120%)"),
+            (120, 100, "120 B of 100 B (120%)"),
         ] {
             let mut snap = base_snapshot();
             snap.hosting = HostingSnapshot {
                 budget_bytes: 1000,
                 used_bytes: 100,
                 contract_count: count,
-                contract_slot_budget: budget,
+                resident_overhead_budget_bytes: budget,
+                resident_overhead_bytes: count,
                 contracts: vec![mk_hosted_entry("A", true)],
                 ..Default::default()
             };
@@ -3291,7 +3187,8 @@ mod tests {
             budget_bytes: 100,
             used_bytes: 150,
             contract_count: 1,
-            contract_slot_budget: 100,
+            resident_overhead_budget_bytes: 100,
+            resident_overhead_bytes: 1,
             contracts: vec![mk_hosted_entry("A", true)],
             ..Default::default()
         };
@@ -3321,7 +3218,8 @@ mod tests {
                 budget_bytes: 1000,
                 used_bytes: 10,
                 contract_count: 1,
-                contract_slot_budget: 100,
+                resident_overhead_budget_bytes: 100,
+                resident_overhead_bytes: 1,
                 disk_total_bytes: Some(used),
                 disk_budget_bytes: Some(1000),
                 contracts: vec![mk_hosted_entry("A", true)],
@@ -3344,7 +3242,7 @@ mod tests {
     ///
     /// The strip names the single highest-utilisation axis. Before full cache
     /// axes went neutral that was harmless, since whichever axis won was red
-    /// anyway. Now a slot ceiling at its normal 100% would outrank a disk at
+    /// anyway. Now a contract-memory ceiling at its normal 100% would outrank a disk at
     /// 95% and the one real warning on the card would disappear behind a grey
     /// bar, so any other axis in a warning state gets its own strip.
     #[test]
@@ -3355,7 +3253,8 @@ mod tests {
             budget_bytes: 1000,
             used_bytes: 100,
             contract_count: 508,
-            contract_slot_budget: 508,
+            resident_overhead_budget_bytes: 508,
+            resident_overhead_bytes: 508,
             disk_total_bytes: Some(950),
             disk_budget_bytes: Some(1000),
             contracts: vec![mk_hosted_entry("A", true)],
@@ -3364,7 +3263,7 @@ mod tests {
         let html = build_hosting_card(&Some(snap));
         let strips = binding_strips(&html);
         assert!(
-            strips.contains("Closest limit: <strong>contract slots</strong>"),
+            strips.contains("Closest limit: <strong>contract memory</strong>"),
             "the highest-utilisation axis is still the closest — got:\n{strips}"
         );
         assert!(
@@ -3389,7 +3288,8 @@ mod tests {
             budget_bytes: 1000,
             used_bytes: 100,
             contract_count: 130,
-            contract_slot_budget: 100,
+            resident_overhead_budget_bytes: 100,
+            resident_overhead_bytes: 130,
             disk_total_bytes: Some(1200),
             disk_budget_bytes: Some(1000),
             contracts: vec![mk_hosted_entry("A", true)],
@@ -3398,7 +3298,7 @@ mod tests {
         let html = build_hosting_card(&Some(snap));
         let strips = binding_strips(&html);
         assert!(
-            strips.contains("Closest limit: <strong>contract slots</strong>")
+            strips.contains("Closest limit: <strong>contract memory</strong>")
                 && strips.contains("Also over its limit: <strong>disk</strong>")
                 && strips.contains("new writes are being refused"),
             "a disk over its limit must say so — got:\n{strips}"
@@ -3411,7 +3311,8 @@ mod tests {
             budget_bytes: 1000,
             used_bytes: 100,
             contract_count: 1,
-            contract_slot_budget: 100,
+            resident_overhead_budget_bytes: 100,
+            resident_overhead_bytes: 1,
             disk_total_bytes: Some(1000),
             disk_budget_bytes: Some(1000),
             contracts: vec![mk_hosted_entry("A", true)],
@@ -3438,7 +3339,8 @@ mod tests {
             used_bytes: 900,
             // Slots only 10%.
             contract_count: 10,
-            contract_slot_budget: 100,
+            resident_overhead_budget_bytes: 100,
+            resident_overhead_bytes: 10,
             contracts: vec![mk_hosted_entry("A", true)],
             ..Default::default()
         };
@@ -3448,7 +3350,7 @@ mod tests {
             "state bytes at 90% must outrank slots at 10% — got:\n{html}"
         );
         assert!(
-            !html.contains("Closest limit: <strong>contract slots"),
+            !html.contains("Closest limit: <strong>contract memory"),
             "the slack axis must not be reported as closest — got:\n{html}"
         );
     }
@@ -3509,7 +3411,8 @@ mod tests {
             used_bytes: 100,
             contract_count: 5,
             // A slot budget of 0 means "not configured", NOT "no slots left".
-            contract_slot_budget: 0,
+            resident_overhead_budget_bytes: 0,
+            resident_overhead_bytes: 5,
             // Disk tracker unseeded.
             disk_total_bytes: None,
             disk_budget_bytes: None,
@@ -3522,7 +3425,7 @@ mod tests {
             "the one configured axis must be reported — got:\n{html}"
         );
         assert!(
-            !html.contains("contract slots</strong>"),
+            !html.contains("contract memory</strong>"),
             "an unconfigured axis must not be ranked at all — got:\n{html}"
         );
     }

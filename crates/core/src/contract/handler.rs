@@ -120,7 +120,7 @@ impl ContractHandler for NetworkContractHandler {
             config.hosting_disk_pct,
             config.max_hosting_disk,
         );
-        // Resident-overhead (count-derived) budget's live-surplus share (#5333).
+        // Share of the memory limit hosted contracts may hold in RAM (#5647).
         op_manager
             .ring
             .configure_resident_overhead_mem_share(config.hosting_mem_share);
@@ -160,10 +160,9 @@ impl ContractHandler for NetworkContractHandler {
         // Populate neighbor hosting from hosted contracts so HostingStateResponse
         // reports our full contract set when ring connections establish.
         let hosted_keys = op_manager.ring.hosting_contract_keys();
-        let hosted_ids = hosted_keys.iter().map(|k| *k.id());
         op_manager
             .neighbor_hosting
-            .initialize_from_hosting_cache(hosted_ids);
+            .initialize_from_hosting_cache(hosted_keys.into_iter());
 
         // #4780: also rehydrate InterestManager local-hosting for every restored
         // hosted contract, so a client GET for a cached contract serves LOCALLY
