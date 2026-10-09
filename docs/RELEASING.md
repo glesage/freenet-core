@@ -705,6 +705,39 @@ If you're bumping a major or minor version, double-check the binstall
 URL rewrite (a regression test in `crates/fdev/tests/binstall_metadata.rs`
 covers this).
 
+### The handshake floor (`min-compatible-version`)
+
+`[package.metadata.freenet] min-compatible-version` in `crates/core/Cargo.toml`
+is the oldest peer version a node will connect to. The check runs in both
+directions. It is a different mechanism from the wire-gated feature floors
+above: it refuses the connection outright, rather than deciding which message
+variants a peer can receive.
+
+`release.yml` ships the committed value unchanged, so raising it is its own
+reviewed PR, never a side effect of a release. (`scripts/release.sh` still
+rewrites it; see #5833.) `build.rs` requires an `X.Y.Z` value with the same
+major.minor as the package and no higher than the package version. The
+handshake carries only the patch component. A minor or major version bump
+therefore has to reset the floor in the same PR, or the build fails.
+
+Raise it only to cut off versions that cannot rejoin by themselves, such as
+0.2.120 and 0.2.121, which cannot detect updates (#5221). Set it to the first
+release after the broken ones, and no higher.
+
+Before raising it:
+
+- **Count what it cuts.** It is a single threshold, so it also refuses every
+  older release. Count the peers below the new value in telemetry.
+- **Tell the affected operators.** Announce the change to their operators
+  with the release. A refused node whose update check works starts a normal
+  auto-update. A node that cannot detect updates (0.2.120/0.2.121) updates
+  itself only once it has no connections left, through its supervisor's
+  `freenet update`. Until then, its operator has to run `freenet update` by
+  hand.
+- **Expect a gradual effect.** Peers still on older releases keep accepting
+  the refused versions until they update, so the refusal reaches the whole
+  network only as the release spreads.
+
 ## Rollback
 
 The release-agent refuses downgrades by design (`X.Y.Z < installed` returns
@@ -788,6 +821,16 @@ something. So a break in the installer half of the binary you are shipping is
 caught by Gate B one release later, when that binary becomes the previous one.
 Gate B is also post-publish and non-blocking, so even then it reports rather
 than stops.
+
+**Neither gate runs on a slow link.** #5790 (an update download killed by
+systemd's `TimeoutStopSec`, then an exit-42 restart loop) never showed on CI
+because runners download the release in seconds. Since #5790 the node
+downloads the release before it exits 42. Once the previous release does
+that, Gate B requires its download to finish (`MARKER_STAGE_DONE`) and
+`freenet update` to install from it (`MARKER_INSTALLED_STAGED`), so a staging
+path that silently falls back to the stop-phase download is caught; it then
+installs once more with no staged download, so the installer's own download
+path stays covered. What no gate can show is the time budget itself.
 
 **Gate A checks the COMPARISON in one direction only.** Since #5236 it checks
 the version the node says it observed (`latest=`) against the tag
