@@ -213,13 +213,25 @@ struct LayoutMarker {
 /// Core's cache of the public gateway index, next to `config.toml`.
 pub(crate) const GATEWAY_CACHE_FILE: &str = "gateways.toml";
 
-/// A saved gateway list from an earlier index fetch, with at least one entry.
+/// A saved gateway list from an earlier index fetch, with at least one entry
+/// whose public key file is still there. Core saves absolute key paths, and
+/// iOS moves an app's container on updates, so a list from before a move
+/// names files that are gone; the next start fetches the index again.
 pub(crate) fn has_gateway_cache(config_dir: &Path) -> bool {
-    std::fs::read_to_string(config_dir.join(GATEWAY_CACHE_FILE))
+    let Some(gateways) = std::fs::read_to_string(config_dir.join(GATEWAY_CACHE_FILE))
         .ok()
         .and_then(|text| text.parse::<toml::Table>().ok())
         .and_then(|table| table.get("gateways").and_then(|g| g.as_array()).cloned())
-        .is_some_and(|gateways| !gateways.is_empty())
+    else {
+        return false;
+    };
+    !gateways.is_empty()
+        && gateways.iter().all(|gateway| {
+            gateway
+                .get("public_key")
+                .and_then(|key| key.as_str())
+                .is_some_and(|key| Path::new(key).is_file())
+        })
 }
 
 fn gateway_source(settings: &NodeSettings, config_dir: &Path) -> String {
@@ -612,11 +624,21 @@ mod tests {
         std::fs::write(first.config.join(GATEWAY_CACHE_FILE), "gateways = []\n").unwrap();
         assert!(!Layout::prepare(&s).unwrap().discarded_config);
 
-        std::fs::write(
-            first.config.join(GATEWAY_CACHE_FILE),
-            "[[gateways]]\npublic_key = \"gw.pub\"\nlocation = 0.5\n\n[gateways.address]\nhostname = \"gw.example\"\n",
-        )
-        .unwrap();
+        // A list whose key files are gone, as after iOS moves the container.
+        let key = first.data.join("gw.pub");
+        let list = format!(
+            "[[gateways]]\npublic_key = {:?}\nlocation = 0.5\n\n[gateways.address]\nhostname = \"gw.example\"\n",
+            key.display().to_string()
+        );
+        std::fs::write(first.config.join(GATEWAY_CACHE_FILE), &list).unwrap();
+        assert!(!Layout::prepare(&s).unwrap().discarded_config);
+        let args = config_args(&s, &first, 1).unwrap();
+        assert!(
+            !args.network_api.skip_load_from_network,
+            "a stale list fetches the index"
+        );
+
+        std::fs::write(&key, "ab".repeat(32)).unwrap();
         let cached = Layout::prepare(&s).unwrap();
         assert!(cached.discarded_config, "the index-mode config is replaced");
         let args = config_args(&s, &cached, 1).unwrap();
