@@ -3,9 +3,15 @@
 
 use std::path::Path;
 
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use freenet_mobile::client::{ContractListener, ContractRef, UpdateKind, connect_client};
 use freenet_mobile::fixtures::operation_fixtures;
+use freenet_mobile::node::STOP_DEADLINE;
 use freenet_mobile::{MobileNode, NodeMode, NodeSettings, NodeState};
 use futures::executor::block_on;
+use parking_lot::Mutex;
 
 fn settings(root: &Path, mode: NodeMode) -> NodeSettings {
     NodeSettings {
@@ -112,7 +118,99 @@ fn operation_fixtures_run_against_a_local_node() {
     assert_eq!(get("op.get.state"), "010203");
     assert_eq!(get("op.get_after_update.state"), "0102030405");
     assert_eq!(&get("op.update.summary")[..8], "05000000");
-    assert_eq!(get("op.cancel.timed_out"), "Timeout");
+    assert_eq!(get("op.cancel.timed_out"), "UncertainWrite");
     assert_eq!(get("op.cancel.read_after"), "0102030405060708");
     block_on(node.clone().stop()).unwrap();
+}
+
+fn config_files(dir: &Path) -> Vec<std::path::PathBuf> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(dir).unwrap().flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            found.extend(config_files(&path));
+        } else if path.file_name().is_some_and(|n| n == "config.toml") {
+            found.push(path);
+        }
+    }
+    found
+}
+
+#[test]
+fn reports_stay_off_in_fresh_and_persisted_configs() {
+    let root = tempfile::tempdir().unwrap();
+    let node = MobileNode::new(settings(root.path(), NodeMode::Local)).unwrap();
+    let fresh = block_on(node.clone().start()).unwrap();
+    assert!(!fresh.telemetry_enabled);
+    assert!(!fresh.otel_enabled);
+    block_on(node.clone().stop()).unwrap();
+
+    // A persisted config that turns both on is overridden.
+    let files = config_files(&root.path().join("config"));
+    assert!(!files.is_empty(), "the node persisted its config");
+    for file in files {
+        let text = std::fs::read_to_string(&file).unwrap();
+        let mut doc: toml::Table = toml::from_str(&text).unwrap();
+        // Core flattens both report settings into the top level.
+        for key in [
+            "telemetry-enabled",
+            "reference-ping-enabled",
+            "otel-telemetry-enabled",
+        ] {
+            doc.insert(key.into(), true.into());
+        }
+        std::fs::write(&file, toml::to_string(&doc).unwrap()).unwrap();
+    }
+    let persisted = block_on(node.clone().start()).unwrap();
+    assert!(!persisted.discarded_config);
+    assert!(!persisted.telemetry_enabled);
+    assert!(!persisted.otel_enabled);
+    block_on(node.clone().stop()).unwrap();
+}
+
+struct Closed(Mutex<Vec<String>>);
+
+impl ContractListener for Closed {
+    fn on_update(&self, _contract: ContractRef, _kind: UpdateKind, _bytes: Vec<u8>) {}
+
+    fn on_closed(&self, reason: String) {
+        self.0.lock().push(reason);
+    }
+}
+
+#[test]
+fn stop_fits_its_deadline_frees_the_port_and_closes_clients() {
+    let root = tempfile::tempdir().unwrap();
+    let node = MobileNode::new(settings(root.path(), NodeMode::Local)).unwrap();
+    let info = block_on(node.clone().start()).unwrap();
+    let client = block_on(connect_client(info.ws_port)).unwrap();
+    let wasm = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/fixtures/backend-conformance.wasm"
+    ))
+    .unwrap();
+    let put = block_on(client.put(wasm, vec![], vec![1, 2, 3], false, None)).unwrap();
+    let listener = Arc::new(Closed(Mutex::new(Vec::new())));
+    block_on(client.subscribe(put.contract.instance_id.clone(), listener.clone(), None)).unwrap();
+
+    let started = Instant::now();
+    block_on(node.clone().stop()).unwrap();
+    let took = started.elapsed();
+    assert!(
+        took <= STOP_DEADLINE + Duration::from_millis(500),
+        "stop took {took:?}"
+    );
+    assert_eq!(node.status().state, NodeState::Stopped);
+    assert_eq!(node.status().last_error, None);
+    std::net::TcpListener::bind(("127.0.0.1", info.ws_port)).expect("the port is free");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while listener.0.lock().is_empty() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(listener.0.lock().len(), 1, "the subscription closed once");
+    assert!(
+        block_on(client.get(put.contract.instance_id.clone(), false, false, Some(1_000))).is_err(),
+        "the old session's client is closed"
+    );
 }
