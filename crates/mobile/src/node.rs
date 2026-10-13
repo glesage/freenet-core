@@ -74,6 +74,11 @@ pub struct NodeInfo {
     pub data_dir: String,
     /// A stale persisted config was removed before this start.
     pub discarded_config: bool,
+    /// This session's embedder secret. The client API answers only callers
+    /// that present it: the SDK sends it as a header, and the host's web view
+    /// holds it as the cookie `freenet-embedder` for `http_base` before it
+    /// loads a page. A new secret is made for every session.
+    pub embedder_secret: String,
     /// Legacy telemetry in the resolved config. Always false.
     pub telemetry_enabled: bool,
     /// The OpenTelemetry exporter in the resolved config. Always false.
@@ -132,9 +137,27 @@ fn elapsed_ms(since: Instant) -> f64 {
     since.elapsed().as_secs_f64() * 1000.0
 }
 
-/// Open a client API connection with the native (bincode) encoding.
+/// Each running session's embedder secret, by client API port. Only callers
+/// in this process (the SDK client and the host's web view) can present it,
+/// so other processes on the device are refused.
+static SESSION_SECRETS: std::sync::LazyLock<Mutex<std::collections::HashMap<u16, String>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Open a client API connection with the native (bincode) encoding, carrying
+/// the session's embedder secret.
 pub(crate) async fn connect_native(port: u16) -> Result<WebApi, MobileError> {
-    let (stream, _) = tokio_tungstenite::connect_async(ws_url(port))
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite::tungstenite::http::HeaderValue;
+    let mut request = ws_url(port)
+        .into_client_request()
+        .map_err(|e| MobileError::client(ClientErrorKind::Disconnected, e.to_string()))?;
+    if let Some(secret) = SESSION_SECRETS.lock().get(&port) {
+        let value = HeaderValue::from_str(secret).map_err(MobileError::internal)?;
+        request
+            .headers_mut()
+            .insert(freenet::server::EMBEDDER_SECRET_HEADER, value);
+    }
+    let (stream, _) = tokio_tungstenite::connect_async(request)
         .await
         .map_err(|e| MobileError::client(ClientErrorKind::Disconnected, e.to_string()))?;
     Ok(WebApi::start(stream))
@@ -342,12 +365,17 @@ impl MobileNode {
         let otel_enabled = config.otel.enabled;
 
         let phase = Instant::now();
-        let clients =
-            freenet::server::serve_client_api_with_listener(config.ws_api.clone(), listener)
-                .await
-                .map_err(|e| MobileError::StartFailed {
-                    reason: format!("client API: {e}"),
-                })?;
+        let secret = freenet::dev_tool::AuthToken::generate().as_str().to_owned();
+        let clients = freenet::server::serve_client_api_with_embedder_secret(
+            config.ws_api.clone(),
+            listener,
+            secret.clone(),
+        )
+        .await
+        .map_err(|e| MobileError::StartFailed {
+            reason: format!("client API: {e}"),
+        })?;
+        SESSION_SECRETS.lock().insert(port, secret.clone());
         let client_api_ms = elapsed_ms(phase);
 
         let phase = Instant::now();
@@ -371,6 +399,7 @@ impl MobileNode {
 
         let phase = Instant::now();
         if let Err(err) = wait_for_client_api(port, &run_task).await {
+            SESSION_SECRETS.lock().remove(&port);
             shutdown.shutdown().await;
             run_task.abort();
             return Err(LaunchError::Fatal(err));
@@ -394,6 +423,7 @@ impl MobileNode {
             session,
             data_dir: layout.data.display().to_string(),
             discarded_config: layout.discarded_config,
+            embedder_secret: secret,
             telemetry_enabled,
             otel_enabled,
             timings: StartTimings {
@@ -480,6 +510,7 @@ impl MobileNode {
         // end. Wait for the port, so the next start gets it back and web apps
         // keep the same origin.
         let port_released = wait_for_port_release(running.info.ws_port, deadline).await;
+        SESSION_SECRETS.lock().remove(&running.info.ws_port);
         *self.info.lock() = None;
         let incomplete = (!exited || !port_released).then(|| MobileError::IncompleteShutdown {
             node_exited: exited,

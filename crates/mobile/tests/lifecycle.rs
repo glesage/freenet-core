@@ -214,3 +214,78 @@ fn stop_fits_its_deadline_frees_the_port_and_closes_clients() {
         "the old session's client is closed"
     );
 }
+
+/// The status code of a plain HTTP GET to the node, with extra header lines.
+fn http_status(port: u16, path: &str, extra: &str) -> u16 {
+    use std::io::{Read, Write};
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{extra}Connection: close\r\n\r\n"
+    )
+    .unwrap();
+    let mut head = [0u8; 12];
+    stream.read_exact(&mut head).unwrap();
+    std::str::from_utf8(&head[9..12]).unwrap().parse().unwrap()
+}
+
+#[test]
+fn only_callers_with_the_session_secret_reach_the_node() {
+    let root = tempfile::tempdir().unwrap();
+    let node = MobileNode::new(settings(root.path(), NodeMode::Local)).unwrap();
+    let info = block_on(node.clone().start()).unwrap();
+    let port = info.ws_port;
+    assert!(!info.embedder_secret.is_empty());
+
+    // Another process: no secret, with or without an Origin.
+    assert_eq!(http_status(port, "/", ""), 403);
+    assert_eq!(http_status(port, "/", "Origin: http://127.0.0.1\r\n"), 403);
+    let shell = "/v1/contract/web/raAqMhMG7KUpXBU2SxgCQ3Vh4PYjttxdSWd9ftV7RLv/";
+    assert_eq!(
+        http_status(port, shell, ""),
+        403,
+        "the shell page issues app tokens"
+    );
+    let upgrade = "Upgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nConnection: Upgrade\r\n";
+    assert_eq!(
+        http_status(
+            port,
+            "/v1/contract/command?encodingProtocol=native",
+            upgrade
+        ),
+        403
+    );
+    // A made-up app token does not help.
+    assert_eq!(
+        http_status(
+            port,
+            "/v1/contract/command?encodingProtocol=native&authToken=made-up",
+            upgrade
+        ),
+        403
+    );
+
+    // The host: the secret as a header (SDK) or as the web view's cookie.
+    let header = format!("X-Freenet-Embedder: {}\r\n", info.embedder_secret);
+    assert_ne!(http_status(port, "/", &header), 403);
+    let cookie = format!(
+        "Cookie: theme=dark; freenet-embedder={}\r\n",
+        info.embedder_secret
+    );
+    assert_ne!(http_status(port, "/", &cookie), 403);
+    let wrong = format!("X-Freenet-Embedder: {}x\r\n", info.embedder_secret);
+    assert_eq!(http_status(port, "/", &wrong), 403);
+    // The SDK client presents it by itself.
+    block_on(connect_client(port)).unwrap();
+
+    // The next session has a new secret; the old one stops working.
+    block_on(node.clone().stop()).unwrap();
+    let next = block_on(node.clone().start()).unwrap();
+    assert_ne!(next.embedder_secret, info.embedder_secret);
+    let old = format!("X-Freenet-Embedder: {}\r\n", info.embedder_secret);
+    assert_eq!(http_status(next.ws_port, "/", &old), 403);
+    block_on(node.clone().stop()).unwrap();
+}
