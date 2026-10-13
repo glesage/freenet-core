@@ -110,9 +110,12 @@ pub(crate) use broken_invariants::{BrokenInvariant, BrokenInvariantsTracker};
 /// executor chokepoints so a write that would overflow the aggregate disk
 /// budget is refused before any bytes land.
 pub(crate) use hosting::DiskBudgetExceeded;
+pub(crate) use hosting::EvictedInUseTeardown;
 /// Hosting-BEGIN attribution: WHY this peer started hosting a contract. Every
 /// production caller of [`Ring::host_contract`] names one.
 pub(crate) use hosting::HostingCause;
+/// The directories the aggregate disk-usage tracker measures (#5007).
+pub(crate) use hosting::HostingDiskPaths;
 /// The pre-A2 flat 1 GiB budget, used as the upgrade-migration sentinel in
 /// `config::ConfigArgs::build` so an upgraded node re-derives its hosting budget
 /// instead of keeping the historically-pinned default (#4565).
@@ -173,6 +176,7 @@ mod peer_connection_backoff;
 mod peer_key_location;
 mod placement_migration_metrics;
 pub(crate) mod resync_rate_limit;
+pub(crate) mod stranded_recovery;
 pub mod topology_registry;
 pub(crate) mod update_rate_limit;
 
@@ -263,6 +267,37 @@ struct RouteFailureCauseCounts {
     /// The subset of `timeout` recorded as the originator of the operation,
     /// excluding labels recorded while relaying other nodes' operations.
     originator_timeout: std::sync::atomic::AtomicU64,
+}
+
+/// Copy the joiner/acceptor bootstrap counters (#4787, #5858) onto a router
+/// snapshot. A free function so the hand-mirrored field mapping is unit-tested
+/// (`apply_bootstrap_churn_stats_maps_each_field`): a swapped or dropped
+/// assignment compiles cleanly and emits a plausible wrong number.
+fn apply_bootstrap_churn_stats(
+    snapshot: &mut crate::router::RouterSnapshotInfo,
+    b: &crate::node::network_status::BootstrapChurnStats,
+) {
+    snapshot.bootstrap_transient_registered = Some(b.transient_registered);
+    snapshot.bootstrap_transient_expired = Some(b.transient_expired);
+    snapshot.bootstrap_promoted_to_ring = Some(b.promoted_to_ring);
+    snapshot.bootstrap_time_to_min_connections_secs =
+        b.time_to_min_connections.map(|d| d.as_secs_f64());
+    // `Some(false)` (never bootstrapped) is a different fact from `None`
+    // (this build/collector doesn't report it) — see #4787 finding 3.
+    snapshot.bootstrap_completed = Some(b.time_to_min_connections.is_some());
+    // #5858: time to the FIRST ring connection, in ms, plus how many join
+    // CONNECT attempts it took.
+    snapshot.bootstrap_time_to_first_ring_connection_ms = b
+        .time_to_first_ring_connection
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+    snapshot.bootstrap_connect_attempts_before_first_connection =
+        Some(b.connect_attempts_before_first_connection);
+    snapshot.bootstrap_startup_rounds_connect_issued_gateway =
+        Some(b.startup_rounds_connect_issued_gateway);
+    snapshot.bootstrap_startup_rounds_connect_issued_routed =
+        Some(b.startup_rounds_connect_issued_routed);
+    snapshot.bootstrap_startup_rounds_backoff_blocked = Some(b.startup_rounds_backoff_blocked);
+    snapshot.bootstrap_startup_rounds_no_target = Some(b.startup_rounds_no_target);
 }
 
 /// Distinct peers tracked per snapshot window by [`TimeoutLabelWindow`].
@@ -376,6 +411,9 @@ pub(crate) struct Ring {
     /// matching `(contract, source)` entry BEFORE applying; consume-on-first-match
     /// kills replay. See `crate::ring::resync_rate_limit::OutstandingResyncRequests`.
     pub(crate) outstanding_resync_requests: Arc<resync_rate_limit::OutstandingResyncRequests>,
+    /// Receiving-side rate limit for the stranded-holder backward bootstrap
+    /// (design §5d(b), #5846). See `crate::ring::stranded_recovery`.
+    pub(crate) stranded_recovery_limiter: Arc<stranded_recovery::StrandedRecoveryLimiter>,
     /// Per-contract ban list. Populated by the governance reaper on
     /// `BanTriggered` / `BanLifted` transitions; consulted at the
     /// inbound dispatch site to drop wire requests for banned
@@ -809,6 +847,9 @@ impl Ring {
             outstanding_resync_requests: Arc::new(
                 resync_rate_limit::new_outstanding_resync_requests(time_source.clone()),
             ),
+            stranded_recovery_limiter: Arc::new(stranded_recovery::StrandedRecoveryLimiter::new(
+                time_source.clone(),
+            )),
             contract_ban_list: Arc::new(contract_ban_list::ContractBanList::new(
                 time_source.clone(),
             )),
@@ -1558,6 +1599,10 @@ impl Ring {
             // cannot pin the map past OUTSTANDING_RESYNC_TTL.
             ring.outstanding_resync_requests.cleanup();
 
+            // Sweep idle stranded-recovery buckets (#5846) so the per-requester
+            // and per-contract maps stay bounded.
+            ring.stranded_recovery_limiter.cleanup();
+
             // Phase 7 ban-list maintenance. Defense-in-depth — the
             // BanLifted decisions below explicitly unban, but if any
             // entry slipped through the reaper (e.g. mode flipped off
@@ -2156,13 +2201,18 @@ impl Ring {
 
             // Aggregate on-disk usage gauges (#4683): state (delta-tracked) +
             // WASM blobs + wasmtime compile cache (both du-measured) + their sum.
+            // Plus two gauges reported but NOT in that sum (#5007, #5853): the
+            // measured database directory, whose difference from `state` is the
+            // database's dead space, and the unpacked-webapp cache.
             // `None` until the tracker is configured and seeded (early startup),
-            // in which case the fields stay unset. Observational only in this PR.
+            // in which case the fields stay unset.
             let disk_usage = ring.hosting_manager.disk_usage_stats();
             if let Some(disk) = disk_usage {
                 snapshot.hosting_disk_state_bytes = Some(disk.state_bytes);
+                snapshot.hosting_disk_db_bytes = disk.db_file_bytes;
                 snapshot.hosting_disk_wasm_bytes = Some(disk.wasm_bytes);
                 snapshot.hosting_disk_compile_cache_bytes = Some(disk.compile_cache_bytes);
+                snapshot.hosting_disk_webapp_cache_bytes = disk.webapp_cache_bytes;
                 snapshot.hosting_disk_total_bytes = Some(disk.total_bytes);
             }
 
@@ -2250,22 +2300,7 @@ impl Ring {
             // Instrumentation only, no behavior change — see
             // `network_status::BootstrapChurnStats`.
             if let Some(b) = crate::node::network_status::bootstrap_churn_counts() {
-                snapshot.bootstrap_transient_registered = Some(b.transient_registered);
-                snapshot.bootstrap_transient_expired = Some(b.transient_expired);
-                snapshot.bootstrap_promoted_to_ring = Some(b.promoted_to_ring);
-                snapshot.bootstrap_time_to_min_connections_secs =
-                    b.time_to_min_connections.map(|d| d.as_secs_f64());
-                // `Some(false)` (never bootstrapped) is a different fact from
-                // `None` (this build/collector doesn't report it) — see #4787
-                // finding 3.
-                snapshot.bootstrap_completed = Some(b.time_to_min_connections.is_some());
-                snapshot.bootstrap_startup_rounds_connect_issued_gateway =
-                    Some(b.startup_rounds_connect_issued_gateway);
-                snapshot.bootstrap_startup_rounds_connect_issued_routed =
-                    Some(b.startup_rounds_connect_issued_routed);
-                snapshot.bootstrap_startup_rounds_backoff_blocked =
-                    Some(b.startup_rounds_backoff_blocked);
-                snapshot.bootstrap_startup_rounds_no_target = Some(b.startup_rounds_no_target);
+                apply_bootstrap_churn_stats(&mut snapshot, &b);
             }
 
             // Computed-upstream vs. stored-`is_upstream`-flag divergence counters
@@ -2825,7 +2860,7 @@ impl Ring {
 
     /// Skip renewal cycle when channel remaining capacity falls below this
     /// fraction of max (i.e. channel is more than 50% full).
-    const RENEWAL_DEFER_CAPACITY_FRACTION: usize = 2; // channel_max / 2
+    pub(crate) const RENEWAL_DEFER_CAPACITY_FRACTION: usize = 2; // channel_max / 2
 
     /// Stop spawning mid-cycle when remaining capacity falls below this
     /// fraction of max (i.e. channel is more than 75% full).
@@ -3592,11 +3627,7 @@ impl Ring {
             // retraction), mirroring the GET/PUT host-formation paths.
             if let Some(op_manager) = &op_manager {
                 for teardown in &evicted_in_use_teardown {
-                    op_manager.interest_manager.remove_evicted_in_use(
-                        &teardown.key,
-                        &teardown.downstream_peers,
-                        teardown.local_client_count,
-                    );
+                    crate::operations::sync_interest_for_evicted_in_use(op_manager, teardown);
                 }
             }
 
@@ -3740,14 +3771,18 @@ impl Ring {
             // Disk-usage accounting maintenance (#4683). Runs OUTSIDE any
             // hosting-cache write lock (the du-walks would stall cache readers).
             // First tick lazily seeds the tracker from the true on-disk state
-            // total; every tick re-walks the `du`-measured WASM-blob and
-            // compile-cache totals so telemetry stays fresh. Observational only
-            // in this PR — no admission/eviction decision reads these yet.
+            // total; every tick re-walks the four `du`-measured totals (WASM
+            // blobs, compile cache, the storage backend's database directory and
+            // the webapp cache, #5007) so telemetry stays fresh. The WASM and
+            // compile-cache totals feed live decisions since #4702 (the eviction
+            // floor and the pre-write admission gate read the aggregate); the
+            // database and webapp-cache measurements are reported only (#5853).
             //
-            // The seed + refresh are synchronous, blocking disk I/O: a recursive
-            // `std::fs` walk of `contracts_dir` + the wasmtime cache dir on every
-            // tick, plus a one-time sync redb `load_all_hosting_metadata` on the
-            // seeding tick. `contracts_dir` is unbounded and non-self-pruning, so
+            // The seed + refresh are synchronous, blocking disk I/O: recursive
+            // `std::fs` walks of `contracts_dir`, the wasmtime cache dir and the
+            // webapp cache plus a shallow walk of `db_dir` on every tick, plus a
+            // one-time sync redb `load_all_hosting_metadata` on the seeding
+            // tick. `contracts_dir` is unbounded and non-self-pruning, so
             // on a node hosting many contracts the walk can run for a while with
             // no `.await` point. Push it onto a blocking thread so it can never
             // stall other tasks on the async reactor — the same discipline
@@ -3967,19 +4002,18 @@ impl Ring {
         self.hosting_manager.set_storage(storage);
     }
 
-    /// Install the aggregate disk-usage tracker's paths (#4683). Called once at
-    /// startup with the node's mode-resolved contracts dir and the relocated
-    /// wasmtime compile-cache dir. The tracker is seeded lazily on the first
-    /// sweep tick.
-    pub fn set_hosting_disk_paths(
+    /// Install the aggregate disk-usage tracker's paths (#4683, #5007). Called
+    /// once at startup with every directory the node's footprint lands in: the
+    /// mode-resolved contracts dir, the relocated wasmtime compile-cache dir,
+    /// the storage backend's database dir, and the unpacked-webapp cache. The
+    /// tracker is seeded lazily on the first sweep tick.
+    pub(crate) fn set_hosting_disk_paths(
         &self,
-        contracts_dir: std::path::PathBuf,
-        wasmtime_cache_dir: std::path::PathBuf,
+        paths: HostingDiskPaths,
         hosting_disk_pct: f64,
         max_hosting_disk: u64,
     ) {
-        self.hosting_manager
-            .configure_disk_tracker(contracts_dir, wasmtime_cache_dir);
+        self.hosting_manager.configure_disk_tracker(paths);
         // #4683 eviction-floor sizing knobs (mirrors the disk paths install; the
         // config is only reachable here). The 60s sweep's recompute reads them.
         self.hosting_manager
@@ -4113,6 +4147,11 @@ impl Ring {
                 added: false,
                 just_became_ready: false,
             };
+        }
+        // #5858: a gateway's first connection is whenever some joiner dials
+        // it, which says nothing about join latency.
+        if !self.is_gateway {
+            crate::node::network_status::record_bootstrap_first_ring_connection();
         }
         if let Some(own_loc) = self.connection_manager.own_location().location() {
             crate::node::network_status::set_own_location(own_loc.as_f64());
@@ -4615,10 +4654,11 @@ impl Ring {
             .await
     }
 
-    /// Whether at least one LOCAL WebSocket client is currently subscribed to
-    /// `contract` (real local demand, distinct from downstream peer
-    /// subscribers). Used by the reconcile input-builder (keystone step-2,
-    /// #4642) for `ReconcileInputs::has_local_client`.
+    /// Whether at least one LOCAL client (a WebSocket client or a delegate on
+    /// this node, #4669) is currently subscribed to `contract` (real local
+    /// demand, distinct from downstream peer subscribers). Used by the
+    /// reconcile input-builder (keystone step-2, #4642) for
+    /// `ReconcileInputs::has_local_client`.
     pub(crate) fn has_client_subscriptions(&self, contract: &ContractKey) -> bool {
         self.hosting_manager.has_client_subscriptions(contract.id())
     }
@@ -4853,9 +4893,9 @@ impl Ring {
         self.hosting_manager
             .refresh_cache_generation(contract, new_gen);
         // Disk-usage accounting (#4683): maintain the aggregate on-disk state
-        // total by signed delta (`new − previous_for_key`). Observational only
-        // in this PR — no admission/eviction decision reads it yet. No-op until
-        // the tracker is seeded.
+        // total by signed delta (`new − previous_for_key`). Read by the
+        // eviction floor and the admission gates since #4702. No-op until the
+        // tracker is seeded.
         self.hosting_manager
             .record_state_write(contract, state_size as u64);
         self.report_contract_resource_usage(
@@ -4867,8 +4907,7 @@ impl Ring {
 
     /// Subtract a reclaimed contract's state bytes from the aggregate disk-usage
     /// tracker (#4683). Called from the executor's reclaim path on successful
-    /// state deletion. Observational only in this PR; no-op until the tracker is
-    /// seeded.
+    /// state deletion. No-op until the tracker is seeded.
     pub(crate) fn record_state_removed(&self, contract: &ContractKey) {
         self.hosting_manager.record_state_removed(contract);
     }
@@ -4975,6 +5014,20 @@ impl Ring {
         // need to gate on `is_new_for_client` for scoring purposes.
         self.hosting_manager
             .add_client_subscription(instance_id, client_id)
+    }
+
+    /// Register a delegate's subscription to `contract` as local demand (#4669).
+    /// See [`hosting::HostingManager::add_delegate_subscription`]; called only
+    /// by `contract::record_delegate_demand`.
+    pub(crate) fn add_delegate_subscription(&self, contract: &ContractKey) {
+        self.hosting_manager.add_delegate_subscription(contract)
+    }
+
+    /// Release one delegate subscription registered by
+    /// [`Self::add_delegate_subscription`]. Called by the delegate interest
+    /// hold's release closure.
+    pub(crate) fn remove_delegate_subscription(&self, contract: &ContractKey) {
+        self.hosting_manager.remove_delegate_subscription(contract)
     }
 
     /// Remove a client from all its subscriptions (used when client disconnects).
@@ -5314,8 +5367,10 @@ impl Ring {
         // usage.
         let disk = self.hosting_manager.disk_usage_stats();
         let disk_state_bytes = disk.map(|d| d.state_bytes);
+        let disk_db_bytes = disk.and_then(|d| d.db_file_bytes);
         let disk_wasm_bytes = disk.map(|d| d.wasm_bytes);
         let disk_compile_cache_bytes = disk.map(|d| d.compile_cache_bytes);
+        let disk_webapp_cache_bytes = disk.and_then(|d| d.webapp_cache_bytes);
         let disk_total_bytes = disk.map(|d| d.total_bytes);
         // `disk_budget_bytes` starts at `u64::MAX` until the first 60s
         // recompute installs a real value (see `HostingManager::
@@ -5332,8 +5387,10 @@ impl Ring {
             evictions_of_recently_read_total: stats.evictions_of_recently_read_total,
             contracts,
             disk_state_bytes,
+            disk_db_bytes,
             disk_wasm_bytes,
             disk_compile_cache_bytes,
+            disk_webapp_cache_bytes,
             disk_total_bytes,
             disk_budget_bytes,
             resident_overhead_budget_bytes: stats.resident_overhead_budget_bytes,
@@ -8089,9 +8146,10 @@ mod k_closest_source_tests {
         // Teardown of a still-in-use victim (subscribed contract shed as a last
         // resort) must sync the InterestManager, matching GET/PUT.
         assert!(
-            body.contains("remove_evicted_in_use"),
-            "sweep must call remove_evicted_in_use to sync the InterestManager for \
-             a subscribed contract it sheds (mirrors GET/PUT)."
+            body.contains("sync_interest_for_evicted_in_use"),
+            "sweep must call operations::sync_interest_for_evicted_in_use to sync \
+             the InterestManager and release delegate demand for a subscribed \
+             contract it sheds (mirrors GET/PUT)."
         );
         // Every evicted contract must clear its local hosting flag …
         assert!(
@@ -8113,14 +8171,14 @@ mod k_closest_source_tests {
         // not the bare identifiers, so a prose mention in a leading comment (e.g.
         // "Run BEFORE the `unregister_local_hosting` loop") can't fool the check.
         let teardown_pos = body
-            .find("interest_manager.remove_evicted_in_use(")
-            .expect("remove_evicted_in_use call present");
+            .find("operations::sync_interest_for_evicted_in_use(")
+            .expect("sync_interest_for_evicted_in_use call present");
         let unregister_pos = body
             .find("interest_manager.unregister_local_hosting(")
             .expect("unregister_local_hosting call present");
         assert!(
             teardown_pos < unregister_pos,
-            "remove_evicted_in_use must precede unregister_local_hosting in the sweep \
+            "sync_interest_for_evicted_in_use must precede unregister_local_hosting in the sweep \
              so interest loss is reported against the already-zeroed subscriber counts."
         );
     }
@@ -10967,8 +11025,24 @@ mod cost_pressure_seam_tests {
     /// split, because gating the counter on the plain `bool` — the obvious
     /// reading of a function returning `false` on rejection — would silently
     /// count almost no promotions at all.
-    #[tokio::test]
-    async fn add_connection_reporting_separates_added_from_readiness() {
+    ///
+    /// Sync wrapper: a successful add writes the process-global
+    /// `NETWORK_STATUS` (first-ring-connection telemetry, #5858), so it takes
+    /// `TEST_GLOBAL_STATE_LOCK` like every other test that can reach it; the
+    /// guard lives in this sync frame, never across an `.await`.
+    #[test]
+    fn add_connection_reporting_separates_added_from_readiness() {
+        let _lock = crate::node::network_status::TEST_GLOBAL_STATE_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build test runtime")
+            .block_on(add_connection_reporting_separates_added_from_readiness_body());
+    }
+
+    async fn add_connection_reporting_separates_added_from_readiness_body() {
         let config_args = crate::config::ConfigArgs {
             id: Some("add-conn-outcome-4787".to_string()),
             mode: Some(crate::contract::OperationMode::Local),
@@ -11054,6 +11128,70 @@ mod cost_pressure_seam_tests {
         assert!(
             added >= max,
             "expected at least {max} accepted adds, got {added}"
+        );
+    }
+
+    /// The hand-mirrored `BootstrapChurnStats` -> `RouterSnapshotInfo` mapping
+    /// (#4787, #5858). Every field gets a DISTINCT value, so a dropped or
+    /// transposed assignment fails here instead of emitting a plausible wrong
+    /// number; the not-yet-connected state must keep `None` distinct from zero.
+    #[test]
+    fn apply_bootstrap_churn_stats_maps_each_field() {
+        use crate::node::network_status::BootstrapChurnStats;
+        use arbitrary::{Arbitrary, Unstructured};
+        use std::time::Duration;
+
+        let mut u = Unstructured::new(&[0u8; 4096]);
+        let mut snapshot = crate::router::RouterSnapshotInfo::arbitrary(&mut u)
+            .expect("construct RouterSnapshotInfo for test");
+        super::apply_bootstrap_churn_stats(
+            &mut snapshot,
+            &BootstrapChurnStats {
+                transient_registered: 11,
+                transient_expired: 12,
+                promoted_to_ring: 13,
+                time_to_min_connections: Some(Duration::from_millis(14_500)),
+                time_to_first_ring_connection: Some(Duration::from_millis(2_345)),
+                connect_attempts_before_first_connection: 17,
+                startup_rounds_connect_issued_gateway: 18,
+                startup_rounds_connect_issued_routed: 19,
+                startup_rounds_backoff_blocked: 20,
+                startup_rounds_no_target: 21,
+            },
+        );
+        assert_eq!(snapshot.bootstrap_transient_registered, Some(11));
+        assert_eq!(snapshot.bootstrap_transient_expired, Some(12));
+        assert_eq!(snapshot.bootstrap_promoted_to_ring, Some(13));
+        assert_eq!(snapshot.bootstrap_time_to_min_connections_secs, Some(14.5));
+        assert_eq!(snapshot.bootstrap_completed, Some(true));
+        assert_eq!(
+            snapshot.bootstrap_time_to_first_ring_connection_ms,
+            Some(2_345),
+            "milliseconds, not seconds"
+        );
+        assert_eq!(
+            snapshot.bootstrap_connect_attempts_before_first_connection,
+            Some(17)
+        );
+        assert_eq!(
+            snapshot.bootstrap_startup_rounds_connect_issued_gateway,
+            Some(18)
+        );
+        assert_eq!(
+            snapshot.bootstrap_startup_rounds_connect_issued_routed,
+            Some(19)
+        );
+        assert_eq!(snapshot.bootstrap_startup_rounds_backoff_blocked, Some(20));
+        assert_eq!(snapshot.bootstrap_startup_rounds_no_target, Some(21));
+
+        super::apply_bootstrap_churn_stats(&mut snapshot, &BootstrapChurnStats::default());
+        assert_eq!(snapshot.bootstrap_time_to_first_ring_connection_ms, None);
+        assert_eq!(snapshot.bootstrap_time_to_min_connections_secs, None);
+        assert_eq!(snapshot.bootstrap_completed, Some(false));
+        assert_eq!(
+            snapshot.bootstrap_connect_attempts_before_first_connection,
+            Some(0),
+            "no attempts yet is a real zero, not an absent field"
         );
     }
 

@@ -559,17 +559,27 @@ pub(crate) struct RouterSnapshotInfo {
     /// until the ring is built. Per-node aggregate scalars.
     pub hosting_evicted_unread_total: Option<u64>,
     pub hosting_evicted_unread_age_secs_sum: Option<u64>,
-    /// Aggregate on-disk usage gauges (#4683), populated by `Ring` from the
-    /// `HostingManager`'s `DiskUsageTracker` on the snapshot cadence.
+    /// Aggregate on-disk usage gauges (#4683, #5007), populated by `Ring` from
+    /// the `HostingManager`'s `DiskUsageTracker` on the snapshot cadence.
     /// `hosting_disk_state_bytes` is the delta-tracked persisted-state total;
     /// `hosting_disk_wasm_bytes` is the `du`-measured WASM-blob total;
     /// `hosting_disk_compile_cache_bytes` is the relocated wasmtime compile-cache
-    /// total; `hosting_disk_total_bytes` is their sum — the aggregate the future
-    /// disk budget will bound. `None` until the tracker is configured and seeded
-    /// (early startup). Per-node aggregate scalars.
+    /// total; `hosting_disk_total_bytes` is their sum, the aggregate the disk
+    /// budget bounds. Reported but NOT in that sum (#5007, #5853):
+    /// `hosting_disk_db_bytes`, the allocated size of the storage backend's
+    /// database directory (its difference from state is the database's dead
+    /// space: one production peer had 583 MB of state in a 2.68 GB
+    /// database), and `hosting_disk_webapp_cache_bytes`, the unpacked-webapp
+    /// cache. The webapp cache defaults to a per-USER directory, so several
+    /// peers run as one user report the same bytes. Both are allocated blocks
+    /// on unix and apparent length elsewhere. `None` until the tracker
+    /// is configured and seeded (early startup), and for those two until their
+    /// first successful walk. Per-node aggregate scalars.
     pub hosting_disk_state_bytes: Option<u64>,
+    pub hosting_disk_db_bytes: Option<u64>,
     pub hosting_disk_wasm_bytes: Option<u64>,
     pub hosting_disk_compile_cache_bytes: Option<u64>,
+    pub hosting_disk_webapp_cache_bytes: Option<u64>,
     pub hosting_disk_total_bytes: Option<u64>,
     /// OOM-valve falsifier (subscriber-primary hosting rework, #4642): monotonic
     /// count of evictions performed under genuine RAM overflow (counted by
@@ -1074,6 +1084,18 @@ pub(crate) struct RouterSnapshotInfo {
     pub bootstrap_promoted_to_ring: Option<u64>,
     pub bootstrap_time_to_min_connections_secs: Option<f64>,
     pub bootstrap_completed: Option<bool>,
+    /// Milliseconds from process start to this node's first ring connection
+    /// (#5858), recorded once; `None` until the first connection exists, and
+    /// never reported by gateways. Lifetime value, present on every snapshot,
+    /// but only snapshots that carry `network_efficiency_v1` (the first one
+    /// ~5 minutes after start, then every 30 minutes) bypass the node-side
+    /// 10/s limiter and the collector's 5% sampler; the plain 5-minute
+    /// snapshots are subject to both and are mostly dropped under load. Read
+    /// this field from the efficiency-carrying snapshots.
+    pub bootstrap_time_to_first_ring_connection_ms: Option<u64>,
+    /// Self-initiated CONNECT attempts issued before that first connection
+    /// (#5858); frozen once it exists.
+    pub bootstrap_connect_attempts_before_first_connection: Option<u64>,
     pub bootstrap_startup_rounds_connect_issued_gateway: Option<u64>,
     /// Sustained growth with `bootstrap_completed == Some(false)` means this
     /// joiner never bootstrapped; the `bootstrap_transient_expired` :
@@ -3488,8 +3510,10 @@ impl Router {
             // Aggregate on-disk usage gauges, populated by Ring from the
             // DiskUsageTracker on the snapshot cadence (#4683).
             hosting_disk_state_bytes: None,
+            hosting_disk_db_bytes: None,
             hosting_disk_wasm_bytes: None,
             hosting_disk_compile_cache_bytes: None,
+            hosting_disk_webapp_cache_bytes: None,
             hosting_disk_total_bytes: None,
             hosting_oom_valve_evictions_total: None,
             hosting_subscribed_evictions_total: None,
@@ -3655,6 +3679,8 @@ impl Router {
             bootstrap_promoted_to_ring: None,
             bootstrap_time_to_min_connections_secs: None,
             bootstrap_completed: None,
+            bootstrap_time_to_first_ring_connection_ms: None,
+            bootstrap_connect_attempts_before_first_connection: None,
             bootstrap_startup_rounds_connect_issued_gateway: None,
             bootstrap_startup_rounds_connect_issued_routed: None,
             bootstrap_startup_rounds_backoff_blocked: None,

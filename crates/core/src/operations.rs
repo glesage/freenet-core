@@ -660,6 +660,44 @@ pub(crate) fn record_terminal_consult_outcome(resolved_found: bool) {
     }
 }
 
+/// Replay a subscriber-primary eviction's subscription teardown against the
+/// state that lives outside `HostingManager` (#4642 invariant 3, PR #4734 Fix
+/// 1; delegates #4669).
+///
+/// The ONE call every eviction consumer makes for each
+/// `evicted_in_use_teardown` entry (the hosting sweep, GET's
+/// `cache_contract_locally`, PUT's host-formation helper), so the side effects
+/// cannot drift apart between them:
+///
+/// 1. `InterestManager::remove_evicted_in_use` for the downstream peers and
+///    WebSocket clients the teardown removed.
+/// 2. For delegate subscriptions, release THIS node's delegate interest holds
+///    on the contract. Each release decrements the `InterestManager` refcount
+///    and the hosting-side delegate count together, so afterwards
+///    `contract_in_use` is false and reclamation can proceed, exactly as for a
+///    client. Without it a delegate-subscribed contract would be shed from the
+///    cache yet stay in use forever: never reclaimed, and re-subscribed by the
+///    renewal loop, i.e. pinned, which invariant 3 forbids.
+///
+/// Run it BEFORE `unregister_local_hosting`, so that call observes the zeroed
+/// counts and reports full interest loss.
+pub(crate) fn sync_interest_for_evicted_in_use(
+    op_manager: &OpManager,
+    teardown: &crate::ring::EvictedInUseTeardown,
+) {
+    op_manager.interest_manager.remove_evicted_in_use(
+        &teardown.key,
+        &teardown.downstream_peers,
+        teardown.local_client_count,
+    );
+    if teardown.delegate_subscription_count > 0 {
+        crate::wasm_runtime::delegate_interest::release_contract_for_node(
+            teardown.key.id(),
+            op_manager.node_identity,
+        );
+    }
+}
+
 /// Reclaim the on-disk storage of a contract that was evicted from the
 /// hosting cache. Skips contracts that are still in use — an active client
 /// subscription or a downstream peer subscriber means something still
@@ -860,6 +898,8 @@ pub(crate) async fn has_contract(
         | crate::contract::ContractHandlerEvent::GetSummaryResponse { .. }
         | crate::contract::ContractHandlerEvent::GetDeltaQuery { .. }
         | crate::contract::ContractHandlerEvent::GetDeltaResponse { .. }
+        | crate::contract::ContractHandlerEvent::GetStateAndSummaryQuery { .. }
+        | crate::contract::ContractHandlerEvent::GetStateAndSummaryResponse { .. }
         | crate::contract::ContractHandlerEvent::ClientDisconnect { .. }
         | crate::contract::ContractHandlerEvent::EvictContract { .. } => Ok(None),
     }
@@ -2267,7 +2307,7 @@ mod routing_dataset_call_site_pins {
                 site("drive_client_get_inner", 1, 0, 1, &[]),
                 site("fallback_target", 1, 0, 1, &[]),
                 site("advance_to_next_peer", 1, 0, 1, &[]),
-                site("drive_sub_op_get", 1, 0, 1, &[]),
+                site("sub_op_driver", 1, 0, 1, &[]),
                 site("first_hop_candidate", 1, 0, 1, &[]),
                 site(
                     "relay_advance_to_next_peer",

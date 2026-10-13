@@ -3159,12 +3159,20 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     serde_json::json!(snapshot.hosting_disk_state_bytes),
                 );
                 obj.insert(
+                    "hosting_disk_db_bytes".to_string(),
+                    serde_json::json!(snapshot.hosting_disk_db_bytes),
+                );
+                obj.insert(
                     "hosting_disk_wasm_bytes".to_string(),
                     serde_json::json!(snapshot.hosting_disk_wasm_bytes),
                 );
                 obj.insert(
                     "hosting_disk_compile_cache_bytes".to_string(),
                     serde_json::json!(snapshot.hosting_disk_compile_cache_bytes),
+                );
+                obj.insert(
+                    "hosting_disk_webapp_cache_bytes".to_string(),
+                    serde_json::json!(snapshot.hosting_disk_webapp_cache_bytes),
                 );
                 obj.insert(
                     "hosting_disk_total_bytes".to_string(),
@@ -3327,6 +3335,14 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     (
                         "bootstrap_transient_registered",
                         snapshot.bootstrap_transient_registered,
+                    ),
+                    (
+                        "bootstrap_time_to_first_ring_connection_ms",
+                        snapshot.bootstrap_time_to_first_ring_connection_ms,
+                    ),
+                    (
+                        "bootstrap_connect_attempts_before_first_connection",
+                        snapshot.bootstrap_connect_attempts_before_first_connection,
                     ),
                     (
                         "bootstrap_transient_expired",
@@ -4071,14 +4087,21 @@ mod tests {
         let mut info = crate::router::RouterSnapshotInfo::arbitrary(&mut u)
             .expect("construct RouterSnapshotInfo for test");
         info.hosting_disk_state_bytes = Some(401);
+        info.hosting_disk_db_bytes = Some(431);
         info.hosting_disk_wasm_bytes = Some(409);
         info.hosting_disk_compile_cache_bytes = Some(419);
+        info.hosting_disk_webapp_cache_bytes = Some(433);
         info.hosting_disk_total_bytes = Some(1229);
         let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
         for (key, want) in [
             ("hosting_disk_state_bytes", 401),
+            // #5007: the database measurement and the webapp cache are the two
+            // gauges that were entirely absent. Without them in the OTLP body
+            // there is no way to see the dead-space gap from central telemetry.
+            ("hosting_disk_db_bytes", 431),
             ("hosting_disk_wasm_bytes", 409),
             ("hosting_disk_compile_cache_bytes", 419),
+            ("hosting_disk_webapp_cache_bytes", 433),
             ("hosting_disk_total_bytes", 1229),
         ] {
             assert_eq!(json[key], want, "{key} must reach the OTLP body");
@@ -4374,6 +4397,8 @@ mod tests {
         info.bootstrap_promoted_to_ring = Some(1);
         info.bootstrap_time_to_min_connections_secs = Some(12.5);
         info.bootstrap_completed = Some(true);
+        info.bootstrap_time_to_first_ring_connection_ms = Some(1500);
+        info.bootstrap_connect_attempts_before_first_connection = Some(7);
         info.bootstrap_startup_rounds_connect_issued_gateway = Some(4);
         info.bootstrap_startup_rounds_connect_issued_routed = Some(5);
         info.bootstrap_startup_rounds_backoff_blocked = Some(3);
@@ -4384,6 +4409,11 @@ mod tests {
         assert_eq!(json["bootstrap_promoted_to_ring"], 1);
         assert_eq!(json["bootstrap_time_to_min_connections_secs"], 12.5);
         assert_eq!(json["bootstrap_completed"], true);
+        assert_eq!(json["bootstrap_time_to_first_ring_connection_ms"], 1500);
+        assert_eq!(
+            json["bootstrap_connect_attempts_before_first_connection"],
+            7
+        );
         assert_eq!(json["bootstrap_startup_rounds_connect_issued_gateway"], 4);
         assert_eq!(json["bootstrap_startup_rounds_connect_issued_routed"], 5);
         assert_eq!(json["bootstrap_startup_rounds_backoff_blocked"], 3);

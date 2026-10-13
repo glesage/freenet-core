@@ -96,7 +96,7 @@ pub(crate) use cache::disk_budget_for_clamped;
 use dashmap::{DashMap, DashSet};
 use demand::ProximityPrior;
 use disk_usage::DiskUsageTracker;
-pub(crate) use disk_usage::{DiskBudgetExceeded, DiskUsageStats};
+pub(crate) use disk_usage::{DiskBudgetExceeded, DiskUsageStats, HostingDiskPaths};
 // #5014: the wasmtime on-disk compile-cache startup sizing needs the same
 // mount-availability probe and directory walk this module already uses for
 // the aggregate disk budget, re-exported one level further in `ring.rs`.
@@ -520,6 +520,35 @@ pub struct SubscribedContractSnapshot {
 // HostingManager
 // =============================================================================
 
+/// The local subscribers of one contract: WebSocket clients, plus the number
+/// of delegates on this node holding a subscription to it (#4669).
+///
+/// `len()` and `is_empty()` count BOTH, which is the point: a delegate is a
+/// local client for demand purposes. Only the WebSocket half is addressable by
+/// `ClientId`, because only it is removed by a client disconnect. The delegate
+/// half is a count, not a set of keys: it is written only by
+/// [`HostingManager::add_delegate_subscription`] and
+/// [`HostingManager::remove_delegate_subscription`], which the delegate
+/// interest hold calls when it is recorded and when it is released
+/// (`contract::record_delegate_demand`), so the count always equals the number
+/// of holds this node has outstanding for the contract.
+#[derive(Debug, Default)]
+pub(crate) struct LocalSubscribers {
+    clients: HashSet<crate::client_events::ClientId>,
+    delegates: usize,
+}
+
+impl LocalSubscribers {
+    /// WebSocket clients plus delegates.
+    pub(crate) fn len(&self) -> usize {
+        self.clients.len() + self.delegates
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.clients.is_empty() && self.delegates == 0
+    }
+}
+
 /// Manages contract hosting and subscription state.
 ///
 /// # Subscription Model
@@ -544,9 +573,18 @@ pub(crate) struct HostingManager {
     /// directly without a parallel mirror.
     active_subscriptions: DashMap<ContractKey, SubscriptionLease>,
 
-    /// Contracts where a local client (WebSocket) is actively subscribed.
-    /// Prevents hosting cache eviction while client subscriptions exist.
-    client_subscriptions: DashMap<ContractInstanceId, HashSet<crate::client_events::ClientId>>,
+    /// Contracts a LOCAL client is subscribed to: a WebSocket client, or a
+    /// delegate running on this node (#4669). Ranks the contract in the local
+    /// tier of the eviction order and makes it `contract_in_use`.
+    ///
+    /// A delegate counts here because it acts on the user's behalf, so its
+    /// subscription is treated exactly like any other client's (Ian,
+    /// 2026-10-11). Both kinds live in ONE map so every reader of local demand
+    /// (`contract_in_use`, the eviction key, renewal, governance benefit, the
+    /// in-use set) counts them identically by construction; a second map would
+    /// have to be mirrored into each reader, and the next reader added would
+    /// silently miss it.
+    client_subscriptions: DashMap<ContractInstanceId, LocalSubscribers>,
 
     /// Unified hosting cache with byte-budget demand-ordered eviction ("fuel
     /// gauge") and TTL protection. This is the single source of truth for which
@@ -860,12 +898,8 @@ impl HostingManager {
     /// Called once at startup (alongside `set_storage`), since `with_time_source`
     /// has no path access. The tracker starts unseeded; the first sweep tick
     /// seeds it lazily off the hot path.
-    pub(crate) fn configure_disk_tracker(
-        &self,
-        contracts_dir: std::path::PathBuf,
-        wasmtime_cache_dir: std::path::PathBuf,
-    ) {
-        *self.disk_tracker.write() = Some(DiskUsageTracker::new(contracts_dir, wasmtime_cache_dir));
+    pub(crate) fn configure_disk_tracker(&self, paths: HostingDiskPaths) {
+        *self.disk_tracker.write() = Some(DiskUsageTracker::new(paths));
     }
 
     /// Install the operator-configured disk-budget sizing knobs (#4683): the
@@ -1171,12 +1205,17 @@ impl HostingManager {
         self.disk_tracker.read().as_ref()?.available_bytes()
     }
 
-    /// Re-walk the WASM-blob and compile-cache totals. Called on the telemetry
-    /// cadence (the 60s sweep) since both are `du`-measured, not delta-tracked.
+    /// Re-walk the WASM-blob and compile-cache totals, plus the database
+    /// directory and webapp cache that are measured for reporting only (#5007).
+    /// Called on the telemetry cadence (the 60s sweep) since all four are
+    /// `du`-measured, not delta-tracked. Pinned by
+    /// `refresh_disk_usage_measures_database_and_webapp_cache`.
     pub(crate) fn refresh_disk_usage(&self) {
         if let Some(tracker) = self.disk_tracker.read().as_ref() {
             tracker.refresh_wasm();
             tracker.refresh_compile_cache();
+            tracker.refresh_db_file();
+            tracker.refresh_webapp_cache();
         }
     }
 
@@ -1286,12 +1325,42 @@ impl HostingManager {
     where
         I: IntoIterator<Item = (ContractKey, u64)>,
     {
-        self.configure_disk_tracker(
-            std::path::PathBuf::from("/nonexistent/contracts"),
-            std::path::PathBuf::from("/nonexistent/cache"),
-        );
+        self.configure_disk_tracker(HostingDiskPaths {
+            contracts_dir: std::path::PathBuf::from("/nonexistent/contracts"),
+            wasmtime_cache_dir: std::path::PathBuf::from("/nonexistent/cache"),
+            db_dir: std::path::PathBuf::from("/nonexistent/db"),
+            webapp_cache_dir: std::path::PathBuf::from("/nonexistent/webapp"),
+        });
+        self.seed_configured_disk_tracker_for_test(rows);
+    }
+
+    /// Test-only: seed the ALREADY-configured disk tracker, leaving its paths
+    /// alone, so a test can point the tracker at real temp dirs.
+    #[cfg(test)]
+    pub(crate) fn seed_configured_disk_tracker_for_test<I>(&self, rows: I)
+    where
+        I: IntoIterator<Item = (ContractKey, u64)>,
+    {
         if let Some(tracker) = self.disk_tracker.read().as_ref() {
             tracker.seed(rows);
+        }
+    }
+
+    /// Test-only: install a measured database-directory size on the configured
+    /// tracker. See `DiskUsageTracker::set_db_file_bytes_for_test`.
+    #[cfg(test)]
+    pub(crate) fn set_db_file_bytes_for_test(&self, bytes: u64) {
+        if let Some(tracker) = self.disk_tracker.read().as_ref() {
+            tracker.set_db_file_bytes_for_test(bytes);
+        }
+    }
+
+    /// Test-only: install a measured webapp-cache size on the configured
+    /// tracker.
+    #[cfg(test)]
+    pub(crate) fn set_webapp_cache_bytes_for_test(&self, bytes: u64) {
+        if let Some(tracker) = self.disk_tracker.read().as_ref() {
+            tracker.set_webapp_cache_bytes_for_test(bytes);
         }
     }
 
@@ -1595,12 +1664,15 @@ impl HostingManager {
         client_id: crate::client_events::ClientId,
     ) -> AddClientSubscriptionResult {
         let mut entry = self.client_subscriptions.entry(*instance_id).or_default();
-        let is_first_client = entry.is_empty();
+        // "First" WebSocket client: `hosting_started` telemetry keys on this,
+        // and delegates do not emit it, so a delegate already holding the
+        // contract must not suppress it.
+        let is_first_client = entry.clients.is_empty();
         // Idempotent re-subscribe (same client + same contract) no
         // longer needs special handling for governance: benefit is a
         // live snapshot of `local_client_count`, so a duplicate insert
         // into the set is a no-op and cannot inflate the count.
-        let is_new_for_client = entry.insert(client_id);
+        let is_new_for_client = entry.clients.insert(client_id);
         debug!(
             contract = %instance_id,
             %client_id,
@@ -1621,14 +1693,19 @@ impl HostingManager {
         let mut no_more_subscriptions = false;
 
         if let Some(mut clients) = self.client_subscriptions.get_mut(instance_id) {
-            clients.remove(&client_id);
+            clients.clients.remove(&client_id);
+            // `is_empty` counts delegates too, so a contract a delegate still
+            // holds keeps its entry when its last WebSocket client leaves.
             if clients.is_empty() {
                 no_more_subscriptions = true;
             }
         }
 
         if no_more_subscriptions {
-            self.client_subscriptions.remove(instance_id);
+            // Conditional: a delegate subscription landing after the guard was
+            // dropped must not be deleted with the entry.
+            self.client_subscriptions
+                .remove_if(instance_id, |_, subscribers| subscribers.is_empty());
         }
 
         debug!(
@@ -1641,12 +1718,57 @@ impl HostingManager {
         no_more_subscriptions
     }
 
-    /// Check if there are any client subscriptions for a contract.
+    /// Check if there are any local subscriptions for a contract: a WebSocket
+    /// client or a delegate on this node (#4669).
     pub fn has_client_subscriptions(&self, instance_id: &ContractInstanceId) -> bool {
         self.client_subscriptions
             .get(instance_id)
             .map(|clients| !clients.is_empty())
             .unwrap_or(false)
+    }
+
+    /// Register one delegate subscription to `contract` as local demand
+    /// (#4669): from here on the contract counts exactly as if a WebSocket
+    /// client were subscribed to it.
+    ///
+    /// Called only by `contract::record_delegate_demand`, paired one-for-one
+    /// with the delegate interest hold it records; the hold's release calls
+    /// [`Self::remove_delegate_subscription`]. Not idempotent, deliberately: it
+    /// counts holds, and a node holds at most one per `(contract, delegate)`.
+    pub(crate) fn add_delegate_subscription(&self, contract: &ContractKey) {
+        let mut entry = self.client_subscriptions.entry(*contract.id()).or_default();
+        entry.delegates += 1;
+        debug!(
+            contract = %contract,
+            delegates = entry.delegates,
+            "add_delegate_subscription: registered"
+        );
+    }
+
+    /// Release one delegate subscription registered by
+    /// [`Self::add_delegate_subscription`]. Saturates at zero, so a release
+    /// that finds nothing (an eviction teardown already cleared the entry) is a
+    /// no-op.
+    pub(crate) fn remove_delegate_subscription(&self, contract: &ContractKey) {
+        let became_empty = match self.client_subscriptions.get_mut(contract.id()) {
+            Some(mut entry) => {
+                entry.delegates = entry.delegates.saturating_sub(1);
+                entry.is_empty()
+            }
+            None => return,
+        };
+        if became_empty {
+            self.client_subscriptions
+                .remove_if(contract.id(), |_, subscribers| subscribers.is_empty());
+        }
+        debug!(
+            contract = %contract,
+            became_empty,
+            "remove_delegate_subscription: released"
+        );
+        // Same hook as a client disconnect: the contract may just have stopped
+        // being in use. Called with no subscription-map guard held.
+        self.maybe_record_abandonment(contract);
     }
 
     /// Remove a client from ALL its subscriptions (used when client disconnects).
@@ -1661,7 +1783,7 @@ impl HostingManager {
         let mut instance_ids_with_client: Vec<ContractInstanceId> = self
             .client_subscriptions
             .iter()
-            .filter(|entry| entry.value().contains(&client_id))
+            .filter(|entry| entry.value().clients.contains(&client_id))
             .map(|entry| *entry.key())
             .collect();
         instance_ids_with_client.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
@@ -1949,10 +2071,19 @@ impl HostingManager {
     /// would also be effectively unbounded, blocking reclamation
     /// indefinitely, which violates the cleanup-exemption rule in `AGENTS.md`
     /// (exemptions must be time-bounded). Local-client subscriptions and
-    /// downstream subscribers ARE both time-bounded and represent real
-    /// external demand: client subscriptions expire on disconnect; downstream
-    /// subscribers expire via `expire_stale_downstream_subscribers` after
-    /// `SUBSCRIPTION_LEASE_DURATION` without renewal.
+    /// downstream subscribers represent real external demand: WebSocket client
+    /// subscriptions expire on disconnect; downstream subscribers expire via
+    /// `expire_stale_downstream_subscribers` after `SUBSCRIPTION_LEASE_DURATION`
+    /// without renewal.
+    ///
+    /// A delegate's subscription counts as a local client's (#4669) and is NOT
+    /// time-bounded yet: it ends on `UnregisterDelegate`, contract removal,
+    /// notification-channel close, the per-delegate cap
+    /// (`MAX_CONTRACT_SUBSCRIPTIONS_PER_DELEGATE`) or subscriber-primary
+    /// eviction, and an inactivity horizon is the unbuilt sleep/wake half of
+    /// #4669. It is still not an eviction exemption: it orders the contract in
+    /// the local tier, and an over-budget node sheds it as a last resort
+    /// (`sync_interest_for_evicted_in_use` then releases it).
     ///
     /// The narrow case "subscribed but no local interest" is handled by the
     /// orphaned upstream subscription lapsing, not by carrying an unbounded GC
@@ -1990,7 +2121,8 @@ impl HostingManager {
     }
 
     /// The SPLIT genuine-demand counts pinning `contract`:
-    /// `(local_client_subscriptions, downstream_subscribers)`. This is the
+    /// `(local_client_subscriptions, downstream_subscribers)`, where a local
+    /// subscription is a WebSocket client's or a delegate's (#4669). This is the
     /// subscriber-primary eviction key (#4642, Ian's confirmed ordering): the
     /// cache orders victims ascending by `(local, downstream, recency_seq, key)`,
     /// so a contract THIS node's own client is subscribed to (local >= 1) is
@@ -2032,6 +2164,10 @@ impl HostingManager {
     ///   renewal loop (ring-routed via `k_closest_potentially_hosting`), NOT from
     ///   here — this PR builds no proactive re-home signal.
     /// - `client_subscriptions[key.id()]` — local WebSocket client subscriptions.
+    ///   Delegate subscriptions in the same entry are left for the consumer,
+    ///   which releases their interest holds (see
+    ///   [`EvictedInUseTeardown::delegate_subscription_count`]); after that
+    ///   release the entry is gone too.
     ///   Under the fewest-`(local, downstream)` ordering a contract with LOCAL
     ///   subscriptions is only ever a victim in the all-local-subscribed extreme
     ///   (every eligible contract carries a local subscriber and the peer is still
@@ -2062,21 +2198,49 @@ impl HostingManager {
             .remove(key)
             .map(|(_, peers)| peers.into_keys().collect())
             .unwrap_or_default();
-        let local_client_count = self
-            .client_subscriptions
-            .remove(key.id())
-            .map(|(_, clients)| clients.len())
-            .unwrap_or(0);
+        // WebSocket clients are removed here. Delegate subscriptions are NOT:
+        // each is backed by a delegate interest hold, and the consumer releases
+        // this node's holds on the contract
+        // (`operations::sync_interest_for_evicted_in_use`), which decrements
+        // this count through `remove_delegate_subscription` and the
+        // `InterestManager` refcount together, one decrement per hold. So the
+        // count and the holds cannot drift apart, which zeroing the count here
+        // would allow. What is NOT protected: a delegate subscribe that records
+        // a hold between this teardown and the consumer's release loses it to
+        // that release (its demand is shed with the contract, consistently);
+        // one whose increment lands before the release and whose hold lands
+        // after keeps both, so the contract stays in use with no cached copy
+        // until that delegate's subscription ends. Both windows are inside one
+        // task's eviction handling. A wider window of the same shape: a
+        // delegate subscribing through the local-state branch after the
+        // eviction but before the (fire-and-forget) reclamation registers
+        // demand for a contract with state on disk and no cache entry, so it
+        // is in use, not rankable for eviction, and its reclamation is
+        // re-queued until that delegate's subscription ends. The same
+        // client-subscription-only shape `phantom_in_use_count` already
+        // describes for WebSocket clients, bounded per delegate by
+        // `MAX_CONTRACT_SUBSCRIPTIONS_PER_DELEGATE`.
+        let (local_client_count, delegate_subscription_count) =
+            match self.client_subscriptions.get_mut(key.id()) {
+                Some(mut subscribers) => {
+                    let clients = std::mem::take(&mut subscribers.clients).len();
+                    (clients, subscribers.delegates)
+                }
+                None => (0, 0),
+            };
+        self.client_subscriptions
+            .remove_if(key.id(), |_, subscribers| subscribers.is_empty());
         // Drop our own upstream lease too (same as the sweep loop's belt-and-
         // suspenders `ring.unsubscribe`), so renewal section 1 won't re-drive it.
         self.unsubscribe(key);
         let had_downstream = !downstream_peers.is_empty();
         let had_client = local_client_count > 0;
-        if had_downstream || had_client {
+        if had_downstream || had_client || delegate_subscription_count > 0 {
             debug!(
                 contract = %key,
                 had_downstream,
                 had_client,
+                delegate_subscription_count,
                 "Tore down subscription state for a subscriber-primary eviction \
                  (#4642 invariant 3); disk reclamation can now proceed"
             );
@@ -2085,6 +2249,7 @@ impl HostingManager {
             key: *key,
             downstream_peers,
             local_client_count,
+            delegate_subscription_count,
         }
     }
 
@@ -3122,10 +3287,12 @@ impl HostingManager {
     /// - We have client subscriptions but no active network subscription
     ///
     /// Hosted contracts without active interest (no client subscriptions,
-    /// no downstream subscribers) are intentionally NOT renewed. Contracts
-    /// persisted to disk are kept as a recovery mechanism (last-resort PUT
-    /// if the contract is lost from the network) but are not actively
-    /// subscribed to avoid subscription accumulation.
+    /// no downstream subscribers) are intentionally NOT renewed, to avoid
+    /// subscription accumulation. There is no last-resort PUT for a contract
+    /// lost from near its key: a holder with demand re-places it through its
+    /// own subscribe, which the first closer peer answers by pulling the state
+    /// back from it (design §5d(b), #5846,
+    /// `operations::subscribe::op_ctx_task::recover_from_stranded_requester`).
     pub fn contracts_needing_renewal(&self) -> Vec<ContractKey> {
         let now = self.time_source.now();
         let renewal_threshold = now + SUBSCRIPTION_RENEWAL_INTERVAL;
@@ -6823,6 +6990,196 @@ mod tests {
         );
     }
 
+    /// #4669: a delegate subscription is a LOCAL subscription, counted exactly
+    /// like a WebSocket client's by every reader of local demand: the
+    /// in-use gate, the eviction key, the in-use set, renewal, the
+    /// unsubscribe-upstream decision, freshness and governance benefit. One
+    /// delegate and one client on two contracts must read identically.
+    #[test]
+    fn a_delegate_subscription_counts_exactly_like_a_client_subscription() {
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+        let by_delegate = make_contract_key(1);
+        let by_client = make_contract_key(2);
+        let client = crate::client_events::ClientId::next();
+        // Renewal section 2 re-subscribes only contracts in the hosting cache.
+        for key in [by_delegate, by_client] {
+            manager.record_contract_access(key, 100, AccessType::Get, HostingCause::Other);
+        }
+        manager.add_delegate_subscription(&by_delegate);
+        manager.add_client_subscription(by_client.id(), client);
+
+        let in_use = manager.in_use_contract_ids();
+        let benefit = manager.beneficiary_counts(1.0, 0.1);
+        let renewal = manager.contracts_needing_renewal();
+        for key in [&by_delegate, &by_client] {
+            assert!(manager.contract_in_use(key));
+            assert!(manager.has_client_subscriptions(key.id()));
+            assert_eq!(manager.local_and_downstream_counts(key), (1, 0));
+            assert_eq!(manager.local_client_count(key.id()), 1);
+            assert!(in_use.contains(key.id()));
+            assert_eq!(benefit.get(key.id()), Some(&1.0));
+            assert!(
+                renewal.iter().any(|k| k.id() == key.id()),
+                "local demand with no network subscription must be renewed"
+            );
+            assert!(!manager.should_unsubscribe_upstream(key));
+            assert!(manager.is_receiving_updates(key));
+        }
+
+        // A delegate and a client on the SAME contract are two local
+        // subscribers, and either one alone keeps it in use.
+        manager.add_client_subscription(by_delegate.id(), client);
+        assert_eq!(manager.local_and_downstream_counts(&by_delegate), (2, 0));
+        manager.remove_client_subscription(by_delegate.id(), client);
+        assert!(
+            manager.contract_in_use(&by_delegate),
+            "the last WebSocket client leaving must not drop a delegate's demand"
+        );
+
+        manager.remove_delegate_subscription(&by_delegate);
+        assert!(!manager.contract_in_use(&by_delegate));
+        assert_eq!(manager.local_and_downstream_counts(&by_delegate), (0, 0));
+        assert!(!manager.in_use_contract_ids().contains(by_delegate.id()));
+        // Releasing what is not held is a no-op, never an underflow.
+        manager.remove_delegate_subscription(&by_delegate);
+        assert_eq!(manager.local_and_downstream_counts(&by_delegate), (0, 0));
+    }
+
+    /// #4669 + hosting invariant 3: a contract held only by a delegate ranks in
+    /// the LOCAL tier of the eviction order, so a zero-subscriber contract is
+    /// shed before it even when the delegate's contract is least recent; and it
+    /// is NOT pinned, so in the all-locally-subscribed extreme it is shed as the
+    /// last resort like any other locally subscribed contract (least recent
+    /// first), its teardown reports the delegate subscription, and once the
+    /// consumer releases the delegate's hold it is no longer in use.
+    #[test]
+    fn a_delegate_only_contract_ranks_local_and_is_evicted_only_as_last_resort() {
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+        {
+            let mut cache = manager.hosting_cache.write();
+            *cache = cache::HostingCache::new(
+                200, // room for 2 contracts at 100 bytes
+                std::sync::Arc::new(crate::util::time_source::InstantTimeSrc::new()),
+            );
+        }
+        let delegated = make_contract_key(1);
+        let unsubscribed = make_contract_key(2);
+        let client_a = make_contract_key(3);
+        let client_b = make_contract_key(4);
+        let client = crate::client_events::ClientId::next();
+        manager.add_delegate_subscription(&delegated);
+        manager.add_client_subscription(client_a.id(), client);
+        manager.add_client_subscription(client_b.id(), client);
+
+        // `delegated` is the LEAST recent; `unsubscribed` is more recent.
+        manager.record_contract_access(delegated, 100, AccessType::Get, HostingCause::Other);
+        manager.record_contract_access(unsubscribed, 100, AccessType::Get, HostingCause::Other);
+        let result =
+            manager.record_contract_access(client_a, 100, AccessType::Get, HostingCause::Other);
+        assert_eq!(
+            result.evicted,
+            vec![(unsubscribed, 0)],
+            "the zero-subscriber contract is shed first even though the \
+             delegate-held one is less recent: the delegate's subscription ranks \
+             it in the local tier"
+        );
+        assert!(result.evicted_in_use_teardown.is_empty());
+        assert!(manager.is_hosting_contract(&delegated));
+
+        // Every held contract is now locally subscribed, and the next arrival
+        // puts the node over budget. Ties break by recency, so the delegate's
+        // contract, least recent, is the last-resort victim.
+        let result =
+            manager.record_contract_access(client_b, 100, AccessType::Get, HostingCause::Other);
+        assert_eq!(
+            result.evicted,
+            vec![(delegated, 0)],
+            "a delegate subscription orders its contract last, it does not pin \
+             it: with nothing lower-ranked left, it is shed"
+        );
+        assert_eq!(result.evicted_in_use, vec![delegated]);
+        let teardown = result
+            .evicted_in_use_teardown
+            .iter()
+            .find(|t| t.key == delegated)
+            .expect("the shed delegate-held contract is torn down");
+        assert_eq!(teardown.local_client_count, 0);
+        assert_eq!(
+            teardown.delegate_subscription_count, 1,
+            "the teardown must report the delegate subscription so the consumer \
+             releases its hold"
+        );
+        assert!(!manager.is_hosting_contract(&delegated));
+        assert!(!manager.is_subscribed(&delegated));
+
+        // What the consumer's hold release does
+        // (`operations::sync_interest_for_evicted_in_use`).
+        manager.remove_delegate_subscription(&delegated);
+        assert!(
+            !manager.contract_in_use(&delegated),
+            "after the hold is released the shed contract is not in use, so \
+             disk reclamation proceeds"
+        );
+        assert!(
+            !manager
+                .contracts_needing_renewal()
+                .iter()
+                .any(|k| k.id() == delegated.id()),
+            "a shed delegate-held contract must not be re-driven by renewal"
+        );
+        assert!(manager.contract_in_use(&client_a));
+        assert!(manager.contract_in_use(&client_b));
+    }
+
+    /// #4669: a contract held only by a delegate is NOT a cost-eviction
+    /// candidate, exactly as a client-subscribed one is not (invariant 3:
+    /// cost candidacy requires no local subscription). Mirrors
+    /// `cost_pressure_sweep_evicts_zero_subscriber_offender_not_subscribed`
+    /// with the subscriber being a delegate.
+    #[tokio::test]
+    async fn cost_pressure_sweep_does_not_evict_a_delegate_held_contract() {
+        let clock = crate::util::time_source::SharedMockTimeSource::new();
+        let manager = HostingManager::with_time_source(
+            DEFAULT_HOSTING_BUDGET_BYTES,
+            std::sync::Arc::new(clock.clone()),
+        );
+        let junk = make_contract_key(1);
+        let delegated = make_contract_key(2);
+        manager.record_contract_access(junk, 121, AccessType::Put, HostingCause::Other);
+        manager.record_contract_access(delegated, 121, AccessType::Put, HostingCause::Other);
+        manager.add_delegate_subscription(&delegated);
+        clock.advance_time(cache::COST_RATE_MIN_WINDOW + Duration::from_secs(1));
+
+        let axes = vec![CostAxisPressure {
+            axis: "exec_cpu_micros_per_sec",
+            total_rate: 100_000.0,
+            floor: cache::EXEC_CPU_PRESSURE_FLOOR_MICROS_PER_SEC,
+            rates: [(*junk.id(), 41_000.0), (*delegated.id(), 58_000.0)]
+                .into_iter()
+                .collect(),
+        }];
+        let result = manager.sweep_expired_hosting_with_cost(&axes);
+        let expired_keys: Vec<ContractKey> = result.expired.iter().map(|(k, _)| *k).collect();
+        assert_eq!(
+            expired_keys,
+            vec![junk],
+            "the delegate-held contract carries a local subscription, so it is \
+             not a cost candidate even though it holds the larger cost share"
+        );
+        assert!(manager.is_hosting_contract(&delegated));
+
+        // Past the termination grace window (recency reset at subscription
+        // termination, invariant 3), as in the sibling test.
+        manager.remove_delegate_subscription(&delegated);
+        clock.advance_time(cache::COST_RATE_MIN_WINDOW + Duration::from_secs(1));
+        let again = manager.sweep_expired_hosting_with_cost(&axes);
+        assert!(
+            again.expired.iter().any(|(k, _)| *k == delegated),
+            "once the delegate's subscription is gone it is an ordinary \
+             zero-demand cost candidate"
+        );
+    }
+
     /// Removing from an untracked contract is a noop; other contracts unaffected.
     #[test]
     fn test_unsubscribe_handler_unknown_contract_is_noop() {
@@ -8057,10 +8414,12 @@ mod tests {
         assert_eq!(manager.hosting_budget_bytes(), GIB);
 
         // Tracker configured but NOT seeded → still None.
-        manager.configure_disk_tracker(
-            std::path::PathBuf::from("/nonexistent/contracts"),
-            std::path::PathBuf::from("/nonexistent/cache"),
-        );
+        manager.configure_disk_tracker(HostingDiskPaths {
+            contracts_dir: std::path::PathBuf::from("/nonexistent/contracts"),
+            wasmtime_cache_dir: std::path::PathBuf::from("/nonexistent/cache"),
+            db_dir: std::path::PathBuf::from("/nonexistent/db"),
+            webapp_cache_dir: std::path::PathBuf::from("/nonexistent/webapp"),
+        });
         assert_eq!(manager.recompute_effective_budget(0), None);
         assert_eq!(manager.hosting_budget_bytes(), GIB);
     }
@@ -8269,6 +8628,97 @@ mod tests {
         );
     }
 
+    /// `Ring` copies each `DiskUsageStats` gauge into two places: the
+    /// `RouterSnapshot` telemetry fields and the dashboard `HostingSnapshot`.
+    /// The fields share types, so a swapped pair (the database size reported
+    /// as state, say) compiles and passes every test that sets the struct
+    /// fields directly. Building a `Ring` here is not practical, so this pins
+    /// the assignment text. Comments are stripped first, so a commented-out
+    /// assignment does not satisfy it, and whitespace is stripped so a rustfmt
+    /// re-wrap cannot rot it. The scrape is cross-file (`ring.rs`), so it
+    /// cannot match its own needles.
+    #[test]
+    fn ring_copies_each_disk_gauge_into_its_own_field() {
+        let ring = strip_comments_and_whitespace(include_str!("../ring.rs"));
+        for (telemetry_field, dashboard_field, gauge) in [
+            (
+                "hosting_disk_state_bytes",
+                "disk_state_bytes",
+                "state_bytes",
+            ),
+            ("hosting_disk_db_bytes", "disk_db_bytes", "db_file_bytes"),
+            ("hosting_disk_wasm_bytes", "disk_wasm_bytes", "wasm_bytes"),
+            (
+                "hosting_disk_compile_cache_bytes",
+                "disk_compile_cache_bytes",
+                "compile_cache_bytes",
+            ),
+            (
+                "hosting_disk_webapp_cache_bytes",
+                "disk_webapp_cache_bytes",
+                "webapp_cache_bytes",
+            ),
+            (
+                "hosting_disk_total_bytes",
+                "disk_total_bytes",
+                "total_bytes",
+            ),
+        ] {
+            // The two reported gauges are already `Option` (None until first
+            // measured); the others are wrapped here.
+            let reported = matches!(gauge, "db_file_bytes" | "webapp_cache_bytes");
+            let telemetry = if reported {
+                format!("snapshot.{telemetry_field}=disk.{gauge};")
+            } else {
+                format!("snapshot.{telemetry_field}=Some(disk.{gauge});")
+            };
+            assert_eq!(
+                ring.matches(&telemetry).count(),
+                1,
+                "ring.rs must set `{telemetry_field}` from `{gauge}` exactly once"
+            );
+            let dashboard = if reported {
+                format!("let{dashboard_field}=disk.and_then(|d|d.{gauge});")
+            } else {
+                format!("let{dashboard_field}=disk.map(|d|d.{gauge});")
+            };
+            assert_eq!(
+                ring.matches(&dashboard).count(),
+                1,
+                "ring.rs must derive `{dashboard_field}` from `{gauge}` exactly once"
+            );
+        }
+    }
+
+    /// `src` with `//` line comments removed first, then `/* */` block
+    /// comments, then all whitespace. Line comments go first so a `/*` inside
+    /// one (`/// contracts_dir/*.wasm`) cannot open a block that swallows code.
+    /// String literals are not special-cased, and an unterminated `/*` drops
+    /// the rest of the file. Either can only remove text, which turns a
+    /// presence check red. An exactly-once count could in principle be satisfied
+    /// if a second, wrong occurrence were hidden behind a `"//"` or `"/*"` in
+    /// a string literal; `ring.rs` has `"//"` literals only in its test code,
+    /// where no needle sits. Do not use
+    /// this for an ABSENCE check, which removed text would satisfy.
+    fn strip_comments_and_whitespace(src: &str) -> String {
+        let no_line: String = src
+            .lines()
+            .map(|line| line.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut no_block = String::with_capacity(no_line.len());
+        let mut rest = no_line.as_str();
+        while let Some(start) = rest.find("/*") {
+            no_block.push_str(&rest[..start]);
+            rest = match rest[start..].find("*/") {
+                Some(end) => &rest[start + end + 2..],
+                None => "",
+            };
+        }
+        no_block.push_str(rest);
+        no_block.chars().filter(|c| !c.is_whitespace()).collect()
+    }
+
     // --- Dashboard disk-usage panel population (follow-up to #4683/#4702) ----
     //
     // `Ring::dashboard_hosting_snapshot` maps `disk_usage_stats()` and
@@ -8297,6 +8747,143 @@ mod tests {
         );
     }
 
+    /// The sweep must re-measure the database directory and webapp cache, not
+    /// only the two budgeted gauges. Pins the CALL SITE in
+    /// `refresh_disk_usage`: deleting either new refresh leaves the tracker's
+    /// own tests green and makes the reported gauge freeze at its seed value.
+    #[test]
+    fn refresh_disk_usage_measures_database_and_webapp_cache() {
+        use std::io::Write;
+        const CHUNK: usize = 64 * 1024;
+
+        // Pseudo-random content so transparent compression cannot collapse
+        // the fixture's allocation.
+        fn write_file(path: &std::path::Path, len: usize) {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let mut state: u32 = 0x9E37_79B9;
+            let bytes: Vec<u8> = (0..len)
+                .map(|_| {
+                    state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    (state >> 24) as u8
+                })
+                .collect();
+            std::fs::File::create(path)
+                .unwrap()
+                .write_all(&bytes)
+                .unwrap();
+        }
+        fn alloc(path: &std::path::Path) -> u64 {
+            let meta = std::fs::metadata(path).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                meta.blocks() * 512
+            }
+            #[cfg(not(unix))]
+            {
+                meta.len()
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let contracts = dir.path().join("contracts");
+        let wasmtime = dir.path().join("wasmtime");
+        let db = dir.path().join("db");
+        let webapp = dir.path().join("webapp");
+        let wasm_file = contracts.join("aaaa.wasm");
+        let cache_file = wasmtime.join("mod.cache");
+        let db_file = db.join("db");
+        let webapp_file = webapp.join("aaaa").join("index.html");
+
+        write_file(&wasm_file, CHUNK);
+        write_file(&cache_file, 2 * CHUNK);
+        write_file(&db_file, 3 * CHUNK);
+        write_file(&webapp_file, 4 * CHUNK);
+
+        let manager = HostingManager::new(1024 * 1024 * 1024);
+        manager.configure_disk_tracker(HostingDiskPaths {
+            contracts_dir: contracts.clone(),
+            wasmtime_cache_dir: wasmtime.clone(),
+            db_dir: db.clone(),
+            webapp_cache_dir: webapp.clone(),
+        });
+        manager.seed_configured_disk_tracker_for_test([(make_contract_key(1), 100)]);
+        let seeded = manager.disk_usage_stats().expect("seeded");
+
+        // Everything grows after the seed by whole 64 KiB chunks, so the growth
+        // is visible to an allocation-based walk on any block size. Only a
+        // re-measure can see it.
+        write_file(&wasm_file, 11 * CHUNK);
+        write_file(&cache_file, 22 * CHUNK);
+        write_file(&db_file, 33 * CHUNK);
+        write_file(&webapp_file, 44 * CHUNK);
+        let (dbf, web) = (alloc(&db_file), alloc(&webapp_file));
+        assert!(
+            Some(dbf) > seeded.db_file_bytes && Some(web) > seeded.webapp_cache_bytes,
+            "every reported gauge must actually grow, or a dropped refresh would \
+             be invisible"
+        );
+
+        manager.refresh_disk_usage();
+
+        let stats = manager.disk_usage_stats().expect("seeded");
+        assert_eq!(
+            stats.db_file_bytes,
+            Some(dbf),
+            "the sweep must re-measure the db"
+        );
+        assert_eq!(
+            stats.webapp_cache_bytes,
+            Some(web),
+            "the sweep must re-measure the webapp cache"
+        );
+        // Budgeted gauges count apparent length, unchanged by #5007.
+        assert_eq!(stats.wasm_bytes, 11 * CHUNK as u64);
+        assert_eq!(stats.compile_cache_bytes, 22 * CHUNK as u64);
+        assert_eq!(stats.total_bytes, 100 + 33 * CHUNK as u64);
+    }
+
+    /// The eviction floor and the published disk budget do not move when the
+    /// measured database directory grows: it is reported, not budgeted (#5853).
+    /// 40 GiB is past the 32 GiB cap, so charging it in the budget's basis
+    /// would raise the budget, and charging it against the budget would
+    /// collapse it; either changes the asserted values.
+    #[test]
+    fn measured_db_size_does_not_change_the_eviction_budget() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let available = 10 * GIB;
+        let rows = [(make_contract_key(1), 3 * GIB)];
+
+        let blind = HostingManager::new(64 * GIB);
+        blind.seed_disk_tracker_for_test(rows);
+        let blind_effective = blind.recompute_effective_budget(available);
+
+        let measured = HostingManager::new(64 * GIB);
+        measured.seed_disk_tracker_for_test(rows);
+        measured.set_db_file_bytes_for_test(40 * GIB);
+        measured.set_webapp_cache_bytes_for_test(20 * GIB);
+        let measured_effective = measured.recompute_effective_budget(available);
+
+        assert!(blind_effective.is_some());
+        assert_eq!(measured_effective, blind_effective);
+        assert_eq!(measured.disk_budget_bytes(), blind.disk_budget_bytes());
+        assert_eq!(
+            measured.hosting_budget_bytes(),
+            blind.hosting_budget_bytes()
+        );
+        // And the inputs really were different, so the equality is not vacuous.
+        assert_eq!(
+            measured.disk_usage_stats().unwrap().db_file_bytes,
+            Some(40 * GIB)
+        );
+        assert_eq!(
+            measured.disk_usage_stats().unwrap().webapp_cache_bytes,
+            Some(20 * GIB)
+        );
+        // Linear region, not a clamp: 0.5 * (3 + 10) GiB.
+        assert_eq!(blind.disk_budget_bytes(), 13 * GIB / 2);
+    }
+
     /// Tracker configured but not yet seeded (the window between
     /// `configure_disk_tracker` and the first successful `seed`): still
     /// `None` / `u64::MAX` — an in-flight seed must not leak a
@@ -8304,10 +8891,12 @@ mod tests {
     #[test]
     fn dashboard_disk_fields_absent_while_unseeded() {
         let manager = HostingManager::new(1024 * 1024 * 1024);
-        manager.configure_disk_tracker(
-            std::path::PathBuf::from("/nonexistent/contracts"),
-            std::path::PathBuf::from("/nonexistent/cache"),
-        );
+        manager.configure_disk_tracker(HostingDiskPaths {
+            contracts_dir: std::path::PathBuf::from("/nonexistent/contracts"),
+            wasmtime_cache_dir: std::path::PathBuf::from("/nonexistent/cache"),
+            db_dir: std::path::PathBuf::from("/nonexistent/db"),
+            webapp_cache_dir: std::path::PathBuf::from("/nonexistent/webapp"),
+        });
         assert!(
             manager.disk_usage_stats().is_none(),
             "configured-but-unseeded tracker → disk_usage_stats must stay None"
