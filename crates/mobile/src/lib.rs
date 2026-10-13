@@ -1,43 +1,87 @@
-//! Embeddable Freenet node for mobile hosts.
+//! Embedded Freenet node for iOS and Android apps.
 //!
-//! `freenet-mobile` runs the same `freenet` node code a desktop runs, inside an
-//! app process, and exposes a small surface to Swift and Kotlin through UniFFI.
-//! It is the phase 1 test vehicle of the Freenet mobile plan: an ordinary peer
-//! that lives only while the app is in the foreground.
+//! One process-wide async runtime owns the node. The host app supplies the
+//! data, config and log directories, starts and stops the node explicitly, and
+//! reaches it through the loopback WebSocket client API on a port the node
+//! picks at start. UniFFI generates the Swift and Kotlin bindings.
 //!
-//! # Embedding contract
-//!
-//! - One process-wide tokio runtime, owned by this crate, drives every node
-//!   built here. The node is constructed inside it so `freenet`'s global
-//!   executor adopts it instead of building its own.
-//! - Paths are always explicit. The host names the data, config and log
-//!   directories in [`MobileProfile`]; nothing falls back to home or temp
-//!   directories (a debug build of `freenet` would otherwise pick, and delete,
-//!   `$TMPDIR/freenet`).
-//! - The node's client API is its loopback websocket. [`MobileProfile::ws_port`]
-//!   fixes the port when set; when it is `None`, the node reserves a free
-//!   loopback port at [`FreenetNode::start`] and reports it through
-//!   [`FreenetNode::api_port`] (`None` before start and after stop). This crate
-//!   talks to the socket over `127.0.0.1:<port>` from inside the same process,
-//!   so every request travels the exact path the node's own tests exercise.
-//!   Tools on the host machine (or the Mac behind an iOS simulator, which
-//!   shares its loopback) can connect to the same port once it is known.
-//! - No process-global handlers are installed by this crate: no signal
-//!   handlers, no abort-on-fatal hooks. Stopping is an explicit [`FreenetNode::stop`].
-//!   (Local mode still runs `freenet`'s own cleanup-on-exit registration, which
-//!   only reacts to SIGINT/SIGTERM.)
-//! - Local and network mode never share stores: `freenet` keys its directories
-//!   by operation mode, and this crate does not migrate between them.
+//! | Module | What it holds |
+//! | --- | --- |
+//! | [`node`] | Start, stop, status, peer count and events |
+//! | [`settings`] | Host-supplied settings and the per-mode store layout |
+//! | [`client`] | Contract operations for custom Swift and Kotlin screens |
+//! | [`bundle`] | Host-served web bundles checked against a SHA-256 manifest |
+//! | [`bridge`] | The WebView JSON bridge, handled the same on both platforms |
+//! | [`conformance`] | The Wasm backend suite, run on the device |
+//! | [`fixtures`] | Shared protocol fixtures compared with desktop |
+//! | [`metrics`] | Memory, CPU and storage measurements |
 
 uniffi::setup_scaffolding!();
 
-mod api;
-mod client;
-mod error;
-mod node;
-mod profile;
+pub mod bridge;
+pub mod bundle;
+pub mod client;
+pub mod conformance;
+pub mod error;
+pub mod fixtures;
+pub mod json;
+mod logging;
+pub mod metrics;
+pub mod node;
+mod runtime;
+pub mod settings;
 
-pub use api::{ContractUpdateListener, GetResult, NodeStatus, init_logging};
-pub use error::MobileError;
-pub use node::FreenetNode;
-pub use profile::{MobileProfile, NodeMode};
+pub use error::{ClientErrorKind, MobileError};
+pub use node::{MobileNode, NodeEvent, NodeEventListener, NodeInfo, NodeState, NodeStatus};
+pub use settings::{GatewayOverride, NodeMode, NodeSettings, WasmBackendChoice};
+
+/// The freenet-stdlib version this build links, from `Cargo.lock`.
+pub const STDLIB_VERSION: &str = env!("FREENET_MOBILE_STDLIB_VERSION");
+
+/// Exactly what this library was built from, for every report.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, uniffi::Record)]
+pub struct BuildInfo {
+    pub mobile_version: String,
+    pub core_version: String,
+    pub core_revision: String,
+    pub stdlib_version: String,
+    pub wasmtime_version: String,
+    pub uniffi_version: String,
+    pub target: String,
+    pub profile: String,
+    pub default_backend: WasmBackendChoice,
+    pub available_backends: Vec<WasmBackendChoice>,
+}
+
+#[uniffi::export]
+pub fn build_info() -> BuildInfo {
+    use freenet::config::WasmBackend;
+    BuildInfo {
+        mobile_version: env!("CARGO_PKG_VERSION").into(),
+        core_version: freenet_core_version(),
+        core_revision: env!("FREENET_MOBILE_CORE_REVISION").into(),
+        stdlib_version: STDLIB_VERSION.into(),
+        wasmtime_version: env!("FREENET_MOBILE_WASMTIME_VERSION").into(),
+        uniffi_version: env!("FREENET_MOBILE_UNIFFI_VERSION").into(),
+        target: env!("FREENET_MOBILE_TARGET").into(),
+        profile: env!("FREENET_MOBILE_PROFILE").into(),
+        default_backend: WasmBackend::default_for_target().into(),
+        available_backends: WasmBackend::ALL
+            .into_iter()
+            .filter(|b| b.is_available())
+            .map(Into::into)
+            .collect(),
+    }
+}
+
+fn freenet_core_version() -> String {
+    // The mobile crate is versioned apart from Core; Core's version is the
+    // workspace's `freenet` package version.
+    const CORE_MANIFEST: &str = include_str!("../../core/Cargo.toml");
+    CORE_MANIFEST
+        .lines()
+        .find_map(|line| line.strip_prefix("version = \""))
+        .and_then(|rest| rest.strip_suffix('"'))
+        .unwrap_or("unknown")
+        .to_owned()
+}

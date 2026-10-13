@@ -57,6 +57,16 @@ impl RuntimeOracle {
     /// This is the `fdev` path and the offline-replay path: no node, no hosted
     /// state, nothing that outlives the check.
     pub async fn standalone(wasm: Vec<u8>, parameters: Vec<u8>) -> Result<Self, OracleBuildError> {
+        Self::standalone_with_backend(wasm, parameters, crate::config::WasmBackend::default()).await
+    }
+
+    /// [`Self::standalone`] on a chosen Wasm backend, so the same contract can
+    /// be checked under Cranelift and Pulley and the results compared.
+    pub async fn standalone_with_backend(
+        wasm: Vec<u8>,
+        parameters: Vec<u8>,
+        backend: crate::config::WasmBackend,
+    ) -> Result<Self, OracleBuildError> {
         let scratch = tempfile::TempDir::new()?;
         let db = crate::contract::storages::Storage::new(scratch.path())
             .await
@@ -91,6 +101,7 @@ impl RuntimeOracle {
         // which is what "throwaway" is supposed to mean.
         let config = crate::wasm_runtime::RuntimeConfig {
             wasmtime_cache_dir: Some(cache_dir),
+            wasm_backend: backend,
             ..Default::default()
         };
         let mut runtime = Runtime::build_with_config(

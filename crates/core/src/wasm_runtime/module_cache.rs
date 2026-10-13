@@ -1127,7 +1127,18 @@ pub const MIN_DEFAULT_MODULE_CACHE_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 /// `default_module_cache_budget_bytes`). Operators who truly need more raise it
 /// explicitly via the config override below (the explicit override is
 /// unclamped).
-pub const MAX_DEFAULT_MODULE_CACHE_BUDGET_BYTES: usize = 4096 * 1024 * 1024;
+///
+/// On 32-bit targets (32-bit ARM Android) 4 GiB does not fit in `usize`, so
+/// the ceiling there is a quarter of the address space.
+pub const MAX_DEFAULT_MODULE_CACHE_BUDGET_BYTES: usize = {
+    const FOUR_GIB: u64 = 4096 * 1024 * 1024;
+    let quarter_of_address_space = usize::MAX as u64 / 4;
+    (if FOUR_GIB < quarter_of_address_space {
+        FOUR_GIB
+    } else {
+        quarter_of_address_space
+    }) as usize
+};
 
 /// Fraction of total system RAM used to size the default contract cache budget.
 ///
@@ -1384,7 +1395,7 @@ fn read_macos_own_rss_bytes() -> Option<usize> {
     // fields with no padding-sensitive invariants or pointers — an all-zero
     // bit pattern is a valid value for every field, entirely overwritten by
     // the FFI call below on success. `mach_task_self()` (unlike
-    // `mach_host_self()`, which allocates a new send right on each call) is
+    // `mach_host_self()`, cached via `macos_cached_host_port()` above) is
     // safe to call on every tick with no caching of its own: `libc`'s own
     // binding for it is literally `unsafe fn mach_task_self() -> mach_port_t
     // { mach_task_self_ }` — a read of a process-global `static` the Mach
@@ -1418,8 +1429,9 @@ fn read_macos_own_rss_bytes() -> Option<usize> {
     macos_task_info_to_rss_bytes(info.resident_size)
 }
 
-/// Pure narrowing behind [`read_macos_own_rss_bytes`], testable on every CI
-/// platform even though the `task_info` FFI call itself only runs on macOS/iOS.
+/// Pure narrowing behind [`read_macos_own_rss_bytes`], split out for the same
+/// reason as [`macos_vm_stats_to_available_bytes`] — testable on every CI
+/// platform even though the `task_info` FFI call itself only runs on macOS.
 #[cfg(any(target_os = "macos", target_os = "ios", test))]
 fn macos_task_info_to_rss_bytes(resident_size: u64) -> Option<usize> {
     usize::try_from(resident_size).ok()
@@ -1447,7 +1459,7 @@ fn parse_meminfo_total_bytes(meminfo: &str) -> Option<usize> {
 
 /// Best-effort read of THIS PROCESS's own live resident memory (RSS), in
 /// bytes: Linux (`/proc/self/status` `VmRSS`), Windows
-/// (`GetProcessMemoryInfo`'s working-set size), and macOS (`task_info`'s
+/// (`GetProcessMemoryInfo`'s working-set size), and macOS/iOS (`task_info`'s
 /// `resident_size`). `None` on any other platform or if the read fails.
 ///
 /// Reported in telemetry as `memory_rss_bytes` (`node::resource_metrics`),
