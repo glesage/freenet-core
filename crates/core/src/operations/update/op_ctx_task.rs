@@ -1857,12 +1857,17 @@ fn seed_sender_summary_from_broadcast(
     // sender population is by definition co-hosts we often don't
     // interest-track. Seeding here lets OUR next broadcast to them be a delta
     // without waiting for a delivered send.
-    op_manager.interest_manager.upsert_peer_summary_from(
+    let outcome = op_manager.interest_manager.upsert_peer_summary_from(
         key,
         &sender_key,
         StateSummary::from(sender_summary_bytes.to_vec()),
         crate::ring::interest::SummaryPopulationSource::InboundBroadcast,
-    ) != crate::ring::interest::SummaryPopulationOutcome::RejectedAtCap
+    );
+    !matches!(
+        outcome,
+        crate::ring::interest::SummaryPopulationOutcome::RejectedAtCap
+            | crate::ring::interest::SummaryPopulationOutcome::RejectedOversized
+    )
 }
 
 /// Inner driver for `BroadcastTo`. Mirrors `update.rs:595-825`.
@@ -7276,7 +7281,7 @@ mod tests {
             "an empty-summary broadcast must still refresh the interest TTL"
         );
         assert_eq!(
-            entry.summary,
+            entry.summary().cloned(),
             Some(StateSummary::from(vec![5u8, 5])),
             "refreshing the TTL must not disturb the cached summary"
         );

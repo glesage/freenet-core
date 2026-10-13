@@ -274,6 +274,71 @@ pub(crate) fn reject_if_contract_banned_on(
     Ok(())
 }
 
+/// Side effects of a contract becoming hosted with its state held locally
+/// (#5780): advertise it to neighbours (so it receives live UPDATE fan-out),
+/// nudge placement, register local hosting (so it joins anti-entropy,
+/// hosting-invariants invariant 1), and send one interest change carrying it
+/// together with any `removed` contracts from the same event.
+///
+/// One helper so every path that forms a host runs the whole sequence: the GET
+/// cache path and the PUT relay store both call it. A path that registered
+/// without announcing left a re-hosted copy unadvertised after its eviction had
+/// retracted the advertisement; one that announced without checking the
+/// contract was still hosted left an advertisement and a hosting flag for a
+/// contract it no longer held.
+///
+/// Callers check `is_hosting_contract` first, and the helper checks again after
+/// the announce, which can wait up to 30s: if the contract was evicted in that
+/// window nothing is registered, so no local-hosting flag or `added` interest
+/// outlives the eviction. The retraction issued then is often a no-op, since
+/// the eviction already removed the advertisement entry; like every hosting
+/// retraction it is best-effort, and a dropped one is healed when a co-host
+/// re-requests our hosted set on the interest heartbeat (~5 min). Neither check
+/// is atomic with eviction: a flag set just before an eviction is cleared and
+/// retracted by the hosting sweep's reconciliation, within
+/// `RECONCILE_MIN_UNUSED_AGE` plus one sweep interval.
+pub(crate) async fn complete_host_formation(
+    op_manager: &OpManager,
+    key: ContractKey,
+    removed: Vec<ContractKey>,
+) {
+    announce_contract_hosted(op_manager, &key).await;
+    // The announce can wait up to 30s; an evicted contract re-hosted or
+    // re-subscribed meanwhile must not be sent as removed after its own
+    // addition went out.
+    let removed: Vec<ContractKey> = removed
+        .into_iter()
+        .filter(|k| {
+            !op_manager.ring.is_hosting_contract(k)
+                && !op_manager.interest_manager.has_local_interest(k)
+        })
+        .collect();
+    if !op_manager.ring.is_hosting_contract(&key) {
+        retract_advertisement_for_evicted_contract(op_manager, &key);
+        if !removed.is_empty() {
+            broadcast_change_interests(op_manager, Vec::new(), removed).await;
+        }
+        return;
+    }
+    // Directed-subscribe placement (#4404): best-effort nudge the node to
+    // consider migrating this freshly-hosted contract toward a closer
+    // neighbor. Dropped silently if the event channel is full; the next
+    // hosting/peer event re-triggers consideration.
+    if let Err(err) = op_manager
+        .try_notify_node_event(crate::message::NodeEvent::ConsiderContractMigration { key })
+    {
+        tracing::debug!(%key, %err, "ConsiderContractMigration emit dropped");
+    }
+    let added = if op_manager.interest_manager.register_local_hosting(&key) {
+        vec![key]
+    } else {
+        Vec::new()
+    };
+    if !added.is_empty() || !removed.is_empty() {
+        broadcast_change_interests(op_manager, added, removed).await;
+    }
+}
+
 /// Announces to neighbors that we're hosting a contract.
 /// This broadcasts to all connected peers so they know to forward UPDATEs to us.
 pub(crate) async fn announce_contract_hosted(op_manager: &OpManager, key: &ContractKey) {
@@ -384,9 +449,15 @@ pub(crate) fn announce_contract_unhosted(op_manager: &OpManager, key: &ContractK
 /// - `is_hosting_contract` — a GET/PUT re-hosted it into the hosting cache.
 /// - `contract_in_use` — a client or downstream subscriber re-registered.
 ///   (These two match guards 1 and 2 in `RuntimePool::remove_contract`.)
-/// - `is_subscribed` — we hold a live upstream subscription lease, so we are
-///   wired into the contract's update mesh and therefore a host under invariant
-///   1, even with no cache entry and no subscriber of our own yet.
+/// - `is_subscribed` — we hold a live upstream subscription lease. A lease is
+///   not demand (it follows hosting); it is checked here because a SUBSCRIBE
+///   installs it before the body fetch and the announce, so a live lease may
+///   mean a host is forming. A lease left on a contract with no host and no
+///   demand is not renewed, so it lapses within one lease period (#5782). The
+///   hosting sweep's reconciliation calls this retraction every pass for each
+///   advertised or tracked contract that has been unhosted and unused for
+///   `RECONCILE_MIN_UNUSED_AGE` and is lease-free, so the advertisement goes
+///   on the first such pass after the lease ends, however it ended.
 ///
 /// The lease check is what makes the ordering guarantee below hold for the
 /// SUBSCRIBE path, whose announce is gated on the body being present ON DISK
@@ -586,6 +657,44 @@ pub(crate) fn record_terminal_consult_outcome(resolved_found: bool) {
     } else {
         crate::config::GlobalTestMetrics::record_terminal_consult_still_not_found();
         crate::node::network_status::record_terminal_consult_still_not_found();
+    }
+}
+
+/// Replay a subscriber-primary eviction's subscription teardown against the
+/// state that lives outside `HostingManager` (#4642 invariant 3, PR #4734 Fix
+/// 1; delegates #4669).
+///
+/// The ONE call every eviction consumer makes for each
+/// `evicted_in_use_teardown` entry (the hosting sweep, GET's
+/// `cache_contract_locally`, PUT's host-formation helper), so the side effects
+/// cannot drift apart between them:
+///
+/// 1. `InterestManager::remove_evicted_in_use` for the downstream peers and
+///    WebSocket clients the teardown removed.
+/// 2. For delegate subscriptions, release THIS node's delegate interest holds
+///    on the contract. Each release decrements the `InterestManager` refcount
+///    and the hosting-side delegate count together, so afterwards
+///    `contract_in_use` is false and reclamation can proceed, exactly as for a
+///    client. Without it a delegate-subscribed contract would be shed from the
+///    cache yet stay in use forever: never reclaimed, and re-subscribed by the
+///    renewal loop, i.e. pinned, which invariant 3 forbids.
+///
+/// Run it BEFORE `unregister_local_hosting`, so that call observes the zeroed
+/// counts and reports full interest loss.
+pub(crate) fn sync_interest_for_evicted_in_use(
+    op_manager: &OpManager,
+    teardown: &crate::ring::EvictedInUseTeardown,
+) {
+    op_manager.interest_manager.remove_evicted_in_use(
+        &teardown.key,
+        &teardown.downstream_peers,
+        teardown.local_client_count,
+    );
+    if teardown.delegate_subscription_count > 0 {
+        crate::wasm_runtime::delegate_interest::release_contract_for_node(
+            teardown.key.id(),
+            op_manager.node_identity,
+        );
     }
 }
 
@@ -789,6 +898,8 @@ pub(crate) async fn has_contract(
         | crate::contract::ContractHandlerEvent::GetSummaryResponse { .. }
         | crate::contract::ContractHandlerEvent::GetDeltaQuery { .. }
         | crate::contract::ContractHandlerEvent::GetDeltaResponse { .. }
+        | crate::contract::ContractHandlerEvent::GetStateAndSummaryQuery { .. }
+        | crate::contract::ContractHandlerEvent::GetStateAndSummaryResponse { .. }
         | crate::contract::ContractHandlerEvent::ClientDisconnect { .. }
         | crate::contract::ContractHandlerEvent::EvictContract { .. } => Ok(None),
     }
@@ -1328,6 +1439,73 @@ mod sub_op_subscribe_pin_tests {
              subscribe driver `subscribe::run_client_subscribe` — \
              matches the `maybe_subscribe_child` pattern in \
              `put/op_ctx_task.rs` and `get/op_ctx_task.rs`."
+        );
+    }
+}
+
+/// Behaviour of `retract_advertisement_for_evicted_contract` against a real
+/// `OpManager` (#5782): the hosting sweep calls it every pass for unhosted,
+/// unused contracts, and it must leave the advertisement while this node's own
+/// lease is live and retract it once the lease has ended.
+#[cfg(test)]
+mod retraction_lease_tests {
+    use std::sync::Arc;
+
+    use freenet_stdlib::prelude::{CodeHash, ContractInstanceId, ContractKey};
+
+    async fn op_manager(id: &str) -> Arc<crate::node::OpManager> {
+        let config_args = crate::config::ConfigArgs {
+            id: Some(id.to_string()),
+            mode: Some(crate::contract::OperationMode::Local),
+            ..Default::default()
+        };
+        let node_config =
+            crate::node::NodeConfig::new(config_args.build().await.expect("build Config"))
+                .await
+                .expect("build NodeConfig");
+        let (_notification_rx, notification_tx) = crate::node::event_loop_notification_channel();
+        let (ops_ch_channel, _ch_channel, _wait_for_event) =
+            crate::contract::contract_handler_channel();
+        let connection_manager = crate::ring::ConnectionManager::new(&node_config);
+        let (result_router_tx, _result_router_rx) = tokio::sync::mpsc::channel(100);
+        let task_monitor = crate::node::background_task_monitor::BackgroundTaskMonitor::new();
+        let op_manager = Arc::new(
+            crate::node::OpManager::new(
+                notification_tx,
+                ops_ch_channel,
+                &node_config,
+                crate::tracing::DynamicRegister::new(vec![]),
+                connection_manager,
+                result_router_tx,
+                &task_monitor,
+            )
+            .expect("build OpManager"),
+        );
+        op_manager.ring.attach_op_manager(&op_manager);
+        op_manager
+    }
+
+    #[tokio::test]
+    async fn retraction_waits_for_an_own_lease_to_end() {
+        let op_manager = op_manager("retraction-lease-5782").await;
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([11u8; 32]),
+            CodeHash::new([12u8; 32]),
+        );
+        op_manager.neighbor_hosting.on_contract_hosted(&key);
+        op_manager.ring.subscribe(key);
+
+        super::retract_advertisement_for_evicted_contract(&op_manager, &key);
+        assert!(
+            op_manager.neighbor_hosting.is_hosted_locally(&key),
+            "a live lease keeps the advertisement"
+        );
+
+        op_manager.ring.unsubscribe(&key);
+        super::retract_advertisement_for_evicted_contract(&op_manager, &key);
+        assert!(
+            !op_manager.neighbor_hosting.is_hosted_locally(&key),
+            "once the lease has ended the advertisement is retracted"
         );
     }
 }
@@ -2129,7 +2307,7 @@ mod routing_dataset_call_site_pins {
                 site("drive_client_get_inner", 1, 0, 1, &[]),
                 site("fallback_target", 1, 0, 1, &[]),
                 site("advance_to_next_peer", 1, 0, 1, &[]),
-                site("drive_sub_op_get", 1, 0, 1, &[]),
+                site("sub_op_driver", 1, 0, 1, &[]),
                 site("first_hop_candidate", 1, 0, 1, &[]),
                 site(
                     "relay_advance_to_next_peer",

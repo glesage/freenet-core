@@ -249,9 +249,13 @@ impl Runtime {
         // rather than on a per-field exception.
         let outbound = result?;
 
-        // Reached only on success, which means `execute_wasm_blocking` joined
-        // the guest closure: the guest has finished and nothing else can be
-        // touching the env.
+        // Reached only on success, which means `execute_wasm_blocking` received
+        // the guest's result. The job sends that result only after the guest
+        // closure has returned and dropped its captures, so the guest has
+        // finished and nothing else can be touching the env. (It no longer
+        // joins the blocking thread on the multi-thread path; the send-after-
+        // return ordering is what carries this, see the send site in
+        // `execute_wasm_blocking`.)
         let updated_context = DELEGATE_ENV
             .get(&instance_id)
             .map(|env| env.context.borrow().clone())
@@ -299,6 +303,8 @@ impl Runtime {
             // Appended in stdlib 0.10.0.
             InboundDelegateMsg::UnsubscribeContractResponse(_) => "UnsubscribeContractResponse",
             InboundDelegateMsg::WakeupFired { .. } => "WakeupFired",
+            // Appended in stdlib 0.12.0.
+            InboundDelegateMsg::Lifecycle(_) => "Lifecycle",
             // `InboundDelegateMsg` is `#[non_exhaustive]` (stdlib 0.6.0+).
             // Future variants land here for tracing only — they still flow
             // through the wasm boundary as raw bincode below; classifying
@@ -626,8 +632,9 @@ mod pins {
     /// needs `unsafe`, so nothing else would flag the change.
     ///
     /// Below the `?` the read is reached only on success, which means
-    /// `execute_wasm_blocking` joined the guest closure and the guest is
-    /// provably finished.
+    /// `execute_wasm_blocking` received the guest's result, which the job sends
+    /// only after the guest closure has returned: the guest is provably
+    /// finished.
     /// Source-scrape pin (#5480 review): `DelegateEnvGuard` must be constructed
     /// as a LOCAL of `exec_inbound_with_env`.
     ///

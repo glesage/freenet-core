@@ -14,8 +14,8 @@ use std::sync::Arc;
 
 mod commands;
 use commands::{
-    secrets_cmd::SecretsCliConfig, service::ServiceCommand, uninstall::UninstallCommand,
-    update::UpdateCommand,
+    open_link::OpenCommand, secrets_cmd::SecretsCliConfig, service::ServiceCommand,
+    uninstall::UninstallCommand, update::UpdateCommand,
 };
 
 /// Freenet - A distributed, decentralized, and censorship-resistant platform
@@ -61,6 +61,14 @@ enum Command {
     Update(UpdateCommand),
     /// Completely uninstall Freenet (service, binaries, and optionally data)
     Uninstall(UninstallCommand),
+    /// Open a freenet:// link in your browser, via your local Freenet peer.
+    ///
+    /// This is what the operating system runs when you click a freenet:// link
+    /// (for example "Open in Freenet" on freenet.org/open). It opens
+    /// http://127.0.0.1:<port>/v1/contract/web/<contract-id>/... using the port
+    /// from your Freenet config, or a page explaining that Freenet isn't
+    /// running.
+    Open(OpenCommand),
     /// Manage the node KEK (key encryption key) backend.
     ///
     /// The KEK is the master key that every per-delegate data encryption key
@@ -236,6 +244,14 @@ async fn run_network(config: Config) -> anyhow::Result<()> {
     let clients = serve_client_api(config.ws_api.clone())
         .await
         .with_context(|| "failed to start HTTP/WebSocket client API")?;
+
+    // Register the freenet:// link handler for a managed install whose
+    // registration is missing or stale (#5726). This is how installs that
+    // predate the handler get it: the auto-updater replaces the binary but
+    // never re-runs the installer. Detached and best-effort; it cannot fail,
+    // block or delay the node.
+    commands::url_handler::spawn_self_registration();
+
     tracing::info!("Initializing node configuration");
 
     // Capture before `config` is moved into NodeConfig; threaded to the
@@ -316,11 +332,12 @@ async fn run_network_node_with_signals(
 ) -> anyhow::Result<()> {
     use commands::auto_update::{
         UPDATE_REPOLL_INTERVAL, UPDATE_REPOLL_JITTER_FRACTION, UpdateCheckResult,
-        UpdateNeededError, check_if_update_available, clear_version_mismatch,
+        UpdateNeededError, check_if_update_available, claim_update_attempt, clear_version_mismatch,
         get_open_connection_count, has_reached_max_backoff, has_version_mismatch,
         jittered_repoll_interval, reset_backoff, should_attempt_update, startup_update_check,
         version_mismatch_generation,
     };
+    use commands::update::stage_latest_release;
     use freenet::transport::{clear_urgent_update, get_highest_seen_version, is_urgent_update};
     use tokio::signal;
 
@@ -506,6 +523,10 @@ async fn run_network_node_with_signals(
             return;
         }
 
+        // A release staged for an update this binary already is (#5790) has
+        // served its purpose, however the update was applied.
+        commands::update::discard_stale_staged(build_info::VERSION);
+
         // --- Startup update check (#3864) ---
         //
         // Ask GitHub directly, once at boot, whether a newer release exists.
@@ -527,16 +548,38 @@ async fn run_network_node_with_signals(
         //
         // Fail-open: any GitHub / parse error returns None and the node
         // continues booting normally into the peer-signal loop below.
+        //
+        // A locked-out node (#3934) runs this check only when it can claim its
+        // once-per-cooldown retry. Ungated, every restart after a failed retry
+        // would ask again and exit 42 again, a burst of failed installs a day
+        // bounded only by the GitHub poll budget, which on Windows counts
+        // toward the wrapper's give-up limit. Claimed before logging, so a skip
+        // never reads as a check that ran. `startup_update_check` takes the
+        // claim's token, so the check cannot run without it.
+        let startup_attempt = commands::auto_update::claim_update_attempt();
+        if let Err(reason) = &startup_attempt {
+            tracing::warn!(
+                reason = %reason,
+                "Startup update check skipped: {reason}. Run `freenet update` to update now."
+            );
+        }
+        let startup_check_ran = startup_attempt.is_ok();
         let startup_jitter_secs = freenet::config::GlobalRng::random_u64() % 60;
-        if startup_jitter_secs > 0 {
+        if startup_check_ran && startup_jitter_secs > 0 {
             tokio::time::sleep(std::time::Duration::from_secs(startup_jitter_secs)).await;
         }
-        tracing::info!(
-            current = build_info::VERSION,
-            jitter_secs = startup_jitter_secs,
-            "Startup update check against GitHub"
-        );
-        if let Some(new_version) = startup_update_check(build_info::VERSION).await {
+        let latest = match startup_attempt {
+            Ok(attempt) => {
+                tracing::info!(
+                    current = build_info::VERSION,
+                    jitter_secs = startup_jitter_secs,
+                    "Startup update check against GitHub"
+                );
+                startup_update_check(attempt, build_info::VERSION).await
+            }
+            Err(_) => None,
+        };
+        if let Some(new_version) = latest {
             // #4073: don't auto-update to a version that is locally BLOCKED — a
             // crash-loop known-bad pin OR a version that has repeatedly failed to
             // install (checksum / signature / download / extract). The installer
@@ -555,6 +598,7 @@ async fn run_network_node_with_signals(
                     new_version = %new_version,
                     "Startup check: newer version on GitHub, triggering auto-update"
                 );
+                stage_latest_release(build_info::VERSION).await;
                 #[allow(clippy::let_underscore_must_use)]
                 let _ = update_tx.send(new_version);
                 return;
@@ -577,10 +621,15 @@ async fn run_network_node_with_signals(
         // Do not reword it into a claim about the version, and do not change the
         // leading phrase: scripts/auto-update-canary.sh greps for it, and
         // scripts/auto-update-canary_test.sh pins it against this file.
-        tracing::info!(
-            current = build_info::VERSION,
-            "Startup update check complete: staying on the current version"
-        );
+        //
+        // Only when the check actually ran: a skip above is its own terminal
+        // line, and this one must keep meaning "the check finished".
+        if startup_check_ran {
+            tracing::info!(
+                current = build_info::VERSION,
+                "Startup update check complete: staying on the current version"
+            );
+        }
 
         /// Parse our version string into a (major, minor, patch) tuple for comparison.
         fn parse_our_version() -> Option<(u8, u8, u16)> {
@@ -640,6 +689,7 @@ async fn run_network_node_with_signals(
                             new_version = %new_version,
                             "Urgent update confirmed on GitHub, triggering immediate auto-update"
                         );
+                        stage_latest_release(build_info::VERSION).await;
                         #[allow(clippy::let_underscore_must_use)]
                         let _ = update_tx.send(new_version);
                         return;
@@ -701,6 +751,7 @@ async fn run_network_node_with_signals(
                                         new_version = %new_version,
                                         "Update confirmed on GitHub after stagger, triggering auto-update"
                                     );
+                                    stage_latest_release(build_info::VERSION).await;
                                     #[allow(clippy::let_underscore_must_use)]
                                     let _ = update_tx.send(new_version);
                                     return;
@@ -761,19 +812,33 @@ async fn run_network_node_with_signals(
 
                 // Hard timeout: force exit if isolated with mismatch for too long.
                 if let Some(since) = isolated_mismatch_since {
-                    if since.elapsed() > HARD_EXIT_TIMEOUT {
+                    // A locked-out node (#3934) that cannot claim its retry
+                    // must not exit 42 here either; it restarts the 6h window
+                    // instead, so this is not re-evaluated every tick.
+                    if since.elapsed() > HARD_EXIT_TIMEOUT
+                        && claim_update_attempt()
+                            .inspect_err(|_| isolated_mismatch_since = Some(Instant::now()))
+                            .is_ok()
+                    {
                         tracing::error!(
                             isolated_secs = since.elapsed().as_secs(),
                             "Isolated with version mismatch >6h — forcing exit for auto-update"
                         );
                         clear_version_mismatch();
+                        stage_latest_release(build_info::VERSION).await;
                         #[allow(clippy::let_underscore_must_use)]
                         let _ = update_tx.send("unknown (hard timeout)".to_string());
                         return;
                     }
                 }
 
-                tracing::info!("Version mismatch detected, checking GitHub for updates...");
+                // A locked-out node does not check GitHub here, so saying it
+                // does every 60s tick would be both noise and false.
+                if should_attempt_update() {
+                    tracing::info!("Version mismatch detected, checking GitHub for updates...");
+                } else {
+                    tracing::debug!("Version mismatch detected; auto-update locked out");
+                }
 
                 match check_if_update_available(build_info::VERSION).await {
                     UpdateCheckResult::UpdateAvailable(new_version) => {
@@ -782,6 +847,7 @@ async fn run_network_node_with_signals(
                             new_version = %new_version,
                             "Newer version confirmed on GitHub, triggering auto-update"
                         );
+                        stage_latest_release(build_info::VERSION).await;
                         #[allow(clippy::let_underscore_must_use)]
                         let _ = update_tx.send(new_version);
                         return;
@@ -789,21 +855,32 @@ async fn run_network_node_with_signals(
                     UpdateCheckResult::Skipped if has_reached_max_backoff() => {
                         let open_connections = get_open_connection_count();
                         if open_connections == 0 {
-                            tracing::warn!(
-                                "Max backoff + 0 connections — \
-                                 trusting gateway version signal, exiting for auto-update"
+                            // Claimed like every other self-initiated exit 42,
+                            // so a locked-out node (#3934) cannot loop through
+                            // here. On refusal the mismatch is KEPT rather than
+                            // cleared: the node still knows it is isolated on an
+                            // old version, so its next allowed retry (usually the
+                            // peer-signal check above, once the cooldown passes)
+                            // happens promptly instead of waiting for a re-poll.
+                            if claim_update_attempt().is_ok() {
+                                tracing::warn!(
+                                    "Max backoff + 0 connections — \
+                                     trusting gateway version signal, exiting for auto-update"
+                                );
+                                clear_version_mismatch();
+                                stage_latest_release(build_info::VERSION).await;
+                                #[allow(clippy::let_underscore_must_use)]
+                                let _ = update_tx.send("unknown (gateway mismatch)".to_string());
+                                return;
+                            }
+                        } else {
+                            tracing::info!(
+                                open_connections,
+                                "Max backoff reached but node has connections — \
+                                 clearing version mismatch flag"
                             );
                             clear_version_mismatch();
-                            #[allow(clippy::let_underscore_must_use)]
-                            let _ = update_tx.send("unknown (gateway mismatch)".to_string());
-                            return;
                         }
-                        tracing::info!(
-                            open_connections,
-                            "Max backoff reached but node has connections — \
-                             clearing version mismatch flag"
-                        );
-                        clear_version_mismatch();
                     }
                     UpdateCheckResult::Skipped => {}
                     UpdateCheckResult::RateLimited => {
@@ -870,16 +947,20 @@ async fn run_network_node_with_signals(
                 // re-poll MUST honor the same lockout — otherwise a locked-out
                 // long-running node would exit-42 every interval and make the
                 // supervisor rerun the same failing update, reintroducing the
-                // exact loop the lockout exists to stop. (The boot-time startup
-                // check bypasses the lockout, but only once per restart; a
-                // *recurring* bypass is the regression.) A successful manual
-                // `freenet update` clears the counter and re-enables this path.
-                if should_attempt_update() {
+                // exact loop the lockout exists to stop. The boot-time startup
+                // check honours it too, through the same claim. A successful
+                // manual `freenet update` clears the counter and re-enables this
+                // path, and a locked-out node gets one retry per
+                // UPDATE_LOCKOUT_COOLDOWN, claimed here before it asks GitHub,
+                // so a stable node is not stranded forever.
+                if let Ok(attempt) = claim_update_attempt() {
                     tracing::debug!(
                         current = build_info::VERSION,
                         "Periodic re-poll: checking GitHub directly for a newer release"
                     );
-                    if let Some(new_version) = startup_update_check(build_info::VERSION).await {
+                    if let Some(new_version) =
+                        startup_update_check(attempt, build_info::VERSION).await
+                    {
                         // #4073 (rebase onto #4591/#4593): mirror the boot-time
                         // startup check — never exit-42 to a version that is
                         // locally BLOCKED (crash-loop known-bad pin OR repeatedly
@@ -904,20 +985,22 @@ async fn run_network_node_with_signals(
                                 new_version = %new_version,
                                 "Periodic re-poll: newer version on GitHub, triggering auto-update"
                             );
+                            stage_latest_release(build_info::VERSION).await;
                             #[allow(clippy::let_underscore_must_use)]
                             let _ = update_tx.send(new_version);
                             return;
                         }
                     }
                 } else {
-                    // Once per process, not once per 6h tick: the lockout
-                    // persists until an operator acts, so this is a state to
-                    // announce on each boot rather than a recurring alarm.
-                    // Mirrors the existing `LOCKOUT_WARNED` pattern in
-                    // `check_if_update_available`.
-                    static LOCKOUT_REPORTED: std::sync::atomic::AtomicBool =
-                        std::sync::atomic::AtomicBool::new(false);
-                    if !LOCKOUT_REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    // Once per lockout episode, not once per 6h tick: a failed
+                    // retry raises the failure count, which announces it again.
+                    // Mirrors `LOCKOUT_WARNED_AT` in `check_if_update_available`.
+                    static LOCKOUT_REPORTED_AT: std::sync::atomic::AtomicU32 =
+                        std::sync::atomic::AtomicU32::new(u32::MAX);
+                    let failures = commands::auto_update::get_update_failure_count();
+                    if LOCKOUT_REPORTED_AT.swap(failures, std::sync::atomic::Ordering::Relaxed)
+                        != failures
+                    {
                         // The second state where the update machinery is silently
                         // OFF (#5244). This was `debug!`, which release builds
                         // compile out entirely (`release_max_level_info`), and the
@@ -926,23 +1009,27 @@ async fn run_network_node_with_signals(
                         // node whose peers all share its version, nothing said this
                         // node would never update again.
                         //
-                        // Once per process, mirroring that existing `LOCKOUT_WARNED`
-                        // pattern: the condition is permanent until an operator
-                        // acts, so repeating it every 6h forever is noise, and one
-                        // line per restart is enough to find it.
+                        // Once per episode, mirroring `LOCKOUT_WARNED_AT`: the
+                        // condition usually persists until an operator acts, so
+                        // repeating it every 6h is noise.
                         // Names the file as well as the command: the lockout can
                         // also be reached with the counter UNREADABLE, and in that
                         // state `freenet update` cannot clear it (the removal is
                         // best-effort and fails the same way the read did), so
                         // "run freenet update" alone would be advice that does not
                         // work. `--force` bypasses the gate for a one-off recovery.
+                        // Print the directory actually in use: it is not always
+                        // under HOME (see `auto_update::state_dir`).
+                        let state = commands::auto_update::state_dir().map_or_else(
+                            || "the Freenet state directory".to_string(),
+                            |d| d.display().to_string(),
+                        );
                         eprintln!(
                             "Freenet: auto-update is LOCKED OUT on this node (repeated failed \
-                         installs, #3934, or an unreadable failure counter). It will not detect \
-                         or apply any further release until this is cleared: run `freenet \
-                         update` manually, or delete `update_failures` in the Freenet state \
-                         directory (~/.local/state/freenet on Linux). `freenet update --force` \
-                         bypasses the gate for a single run."
+                         installs, #3934, or an unreadable failure counter). After failed installs it \
+                         retries at most once a day; an unreadable counter stays locked until it can be read. Run `freenet \
+                         update` manually, or delete `update_failures` in {state}. `freenet \
+                         update --force` bypasses the gate for a single run."
                         );
                         tracing::warn!(
                             "Periodic re-poll: skipped — auto-update locked out after repeated \
@@ -1452,6 +1539,9 @@ fn freenet_main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        // The link-handler commands need no node directories: skip building
+        // ConfigPaths, which creates them (and has no default in debug builds).
+        Some(Command::Service(ServiceCommand::UrlHandler(cmd))) => cmd.run(),
         Some(Command::Service(cmd)) => {
             // Build only ConfigPaths (directory layout), not the full Config
             // which triggers a remote gateway fetch that fails on fresh
@@ -1479,6 +1569,9 @@ fn freenet_main() -> anyhow::Result<()> {
             cmd.run(build_info::VERSION)
         }
         Some(Command::Uninstall(cmd)) => cmd.run(),
+        // Launched by the OS with an untrusted link from any website: no
+        // config build (it fetches gateways), no node, no setup wizard.
+        Some(Command::Open(cmd)) => cmd.run(cli.config.config_paths.config_dir.as_deref()),
         Some(Command::Secrets(cfg)) => {
             // CLI utility; uses simple current-thread runtime (no
             // multi-thread / blocking-pool tuning needed for IO-light
@@ -2688,6 +2781,64 @@ mod tests {
         );
     }
 
+    /// #5790: every exit for auto-update must first download the release while
+    /// the node is still running. A trigger that sends without staging hands
+    /// the download back to systemd's `ExecStopPost`, whose `TimeoutStopSec`
+    /// kills it on a slow link, and the node restart-loops on the old version.
+    /// The sends stay inline (the canary pins them), so this checks each one
+    /// is directly preceded by the staging call.
+    #[test]
+    fn every_update_trigger_downloads_before_exiting() {
+        let src = strip_line_comments(include_str!("freenet.rs"));
+        let production = src
+            .split_once(concat!("#[cfg(test)]\n", "mod tests {"))
+            .expect("test module not found")
+            .0;
+        let statements: Vec<&str> = production
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with("#["))
+            .collect();
+        // Every send, in whatever form, so a trigger spelled differently from
+        // the `let _ =` form cannot slip past the check below.
+        let all_sends = production.matches(concat!("update_tx", ".send(")).count();
+        let mut sends = 0;
+        for (i, stmt) in statements.iter().enumerate() {
+            if stmt.starts_with(concat!("let _ = update_tx", ".send(")) {
+                sends += 1;
+                assert_eq!(
+                    i.checked_sub(1).map(|p| statements[p]),
+                    Some("stage_latest_release(build_info::VERSION).await;"),
+                    "update trigger `{stmt}` must call stage_latest_release first (#5790)"
+                );
+            }
+        }
+        assert_eq!(
+            sends, 7,
+            "expected the 7 update trigger sites in freenet.rs"
+        );
+        // Stale staged releases are cleared once auto-update is known to be on,
+        // before the startup check can stage a new one.
+        let cleanup = production
+            .find("commands::update::discard_stale_staged(build_info::VERSION);")
+            .expect("the update task must clear stale staged releases (#5790)");
+        let disabled_return = production
+            .find("std::future::pending::<()>().await;")
+            .expect("auto-update-disabled branch not found");
+        let startup_check = production
+            .find("let startup_attempt = commands::auto_update::claim_update_attempt();")
+            .expect("startup update check not found");
+        assert!(
+            disabled_return < cleanup && cleanup < startup_check,
+            "discard_stale_staged must run after the auto-update-disabled return and \
+             before the startup check"
+        );
+        assert_eq!(
+            all_sends, sends,
+            "every send on update_tx must use the checked `let _ =` trigger form"
+        );
+    }
+
     /// #4073: a version pinned known-bad after a crash-loop rollback must never
     /// cause the node to exit for auto-update — the updater would only refuse it,
     /// producing a slow exit-42 restart loop (the Codex finding on the reworked
@@ -2959,7 +3110,8 @@ mod tests {
              the wrapper installs it with no probation marker, so rollback could never \
              fire"
         );
-        // The pin lives under the node's HOME, and `dirs::home_dir()` falls back
+        // The pin lives under the node's HOME whenever that is usable (falling
+        // back to $STATE_DIRECTORY only when it is not), and `dirs::home_dir()` falls back
         // to `getpwuid_r` when $HOME is unset or empty -- so the node writes a
         // pin in an environment where a `[ -n "$HOME" ]` guard sees nothing.
         // systemd exports $HOME only for a unit with `User=`, which the
@@ -3008,8 +3160,8 @@ mod tests {
         assert!(
             has_statement(&nix_src, NODE_STATE_DIR),
             "the Nix supervisor must know about HOME/{NODE_STATE_DIR}: that is where \
-             `auto_update::state_dir()` puts the known-bad pin, NOT $STATE_DIRECTORY, \
-             which the documented systemd unit points somewhere else entirely"
+             `auto_update::state_dir()` puts the known-bad pin whenever HOME is usable, \
+             falling back to $STATE_DIRECTORY only when it is not"
         );
         // ...and the flake must actually build that script, or the assertions
         // above guard a file nothing runs.
@@ -3120,33 +3272,77 @@ mod tests {
         );
     }
 
-    /// Source-scrape pin (#4073 / Codex P2): the periodic re-poll MUST gate on
-    /// `should_attempt_update()` so it honors the persistent auto-update failure
-    /// lockout (#3934). Without the gate, a locked-out long-running node (e.g. a
-    /// non-writable binary path that makes every install fail) would exit-42 once
-    /// per re-poll interval and make the supervisor rerun the same failing
-    /// update, reintroducing the loop the lockout exists to stop. The boot-time
-    /// startup check bypasses the lockout, but only once per restart; the
-    /// recurring re-poll must not.
+    /// Every self-initiated exit 42 must spend the lockout claim first, so a
+    /// node locked out by repeated failed installs (#3934) retries at most once
+    /// per cooldown. The two GitHub checks (boot and periodic re-poll) are
+    /// gated by the type system: `startup_update_check` takes the claim's
+    /// `UpdateAttempt`. The two fallbacks below exit 42 without asking GitHub,
+    /// so they are pinned here instead: each send must sit inside the block
+    /// whose condition spends the claim, and must occur exactly once, so an
+    /// ungated copy elsewhere fails too. The needles are split with `concat!`
+    /// so this file does not grow extra trigger-send sites for
+    /// scripts/auto-update-canary_test.sh's trigger-site count to trip on.
+    /// "Startup update check complete" means the check RAN and finished; the
+    /// release canary (#5222) greps for it on exactly that premise. A startup
+    /// check skipped by the lockout claim logs its own line instead, so the
+    /// completion line must sit inside the block gated on the claim.
     #[test]
-    fn periodic_repoll_respects_update_lockout() {
-        let src = strip_line_comments(include_str!("freenet.rs"));
-        // `should_attempt_update()` (with parens) appears only at the re-poll
-        // gate; the bare name without parens is the `use` import. The re-poll's
-        // GitHub call is the LAST `startup_update_check(...)` in the file (the
-        // first is the boot-time startup check).
-        let gate = src.find("should_attempt_update()").expect(
-            "periodic re-poll must gate on should_attempt_update() to honor the \
-             #3934 auto-update failure lockout",
-        );
-        let repoll_check = src
-            .rfind("startup_update_check(build_info::VERSION).await")
-            .expect("periodic re-poll startup_update_check call not found");
+    fn startup_completion_line_is_not_logged_for_a_skipped_check() {
+        let prod = squeeze(production_region(&strip_line_comments(include_str!(
+            "freenet.rs"
+        ))));
+        let complete = "\"Startupupdatecheckcomplete:stayingonthecurrentversion\"";
+        assert_eq!(prod.matches(complete).count(), 1);
         assert!(
-            gate < repoll_check,
-            "the should_attempt_update() lockout gate must precede the periodic \
-             re-poll's startup_update_check call, so a locked-out node does not \
-             exit-42 in a loop (#4073 / #3934)"
+            braced_block(&prod, "ifstartup_check_ran{").contains(complete),
+            "the startup completion line must only log when the lockout claim allowed the check"
+        );
+    }
+
+    #[test]
+    fn fallback_update_exits_are_gated_on_the_lockout_claim() {
+        let prod = squeeze(production_region(&strip_line_comments(include_str!(
+            "freenet.rs"
+        ))));
+        for (opener, send) in [
+            (
+                "ifsince.elapsed()>HARD_EXIT_TIMEOUT&&claim_update_attempt()\
+                 .inspect_err(|_|isolated_mismatch_since=Some(Instant::now())).is_ok(){",
+                concat!("update_tx", ".send(\"unknown(hardtimeout)\".to_string())"),
+            ),
+            (
+                "ifclaim_update_attempt().is_ok(){",
+                concat!(
+                    "update_tx",
+                    ".send(\"unknown(gatewaymismatch)\".to_string())"
+                ),
+            ),
+        ] {
+            assert_eq!(
+                prod.matches(send).count(),
+                1,
+                "expected exactly one `{send}`; a second one would bypass the claim"
+            );
+            assert!(
+                braced_block(&prod, opener).contains(send),
+                "`{send}` must be inside the block gated by claim_update_attempt() (#3934)"
+            );
+        }
+        // ...and a REFUSED claim at max backoff with no connections keeps the
+        // version mismatch: the only clear inside that block is the claimed one.
+        let max_backoff_arm = braced_block(
+            &prod,
+            "UpdateCheckResult::Skippedifhas_reached_max_backoff()=>{",
+        );
+        let isolated = braced_block(max_backoff_arm, "ifopen_connections==0{");
+        assert_eq!(
+            isolated.matches("clear_version_mismatch()").count(),
+            1,
+            "with 0 connections, clear the mismatch only when the claim is granted"
+        );
+        assert!(
+            braced_block(isolated, "ifclaim_update_attempt().is_ok(){")
+                .contains("clear_version_mismatch()")
         );
     }
 }

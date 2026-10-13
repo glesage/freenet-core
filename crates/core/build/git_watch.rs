@@ -433,6 +433,11 @@ mod tests {
             "docs/architecture/contracts/README.md",
             "docker/freenet-node/Dockerfile",
             "docker/freenet-node/release-signing-key.der",
+            // Shared freenet:// link-validation vectors, read only by the
+            // `commands::open_link` tests.
+            "crates/core/tests/data/share-link-vectors.json",
+            // Throwaway TLS fixture, read only by the `util::os_trust` tests.
+            "crates/core/tests/data/tls_native_roots/leaf.der",
         ];
         let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         let src = manifest_dir.join("src").canonicalize().unwrap();

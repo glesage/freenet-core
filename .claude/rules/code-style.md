@@ -133,11 +133,22 @@ actors (clients, network peers) can influence.
      for coverage + hard byte budget + per-entry overhead floor); do not
      hand-roll byte accounting a third time (#4804 wrote it, #4805 shared it)
    → Name any new cache byte budget in
-     contract::executor::declared_cache_ceiling. The hosting budget
-     (ring::hosting::cache::resident_overhead_budget_for) is a RESIDUAL of
-     that sum, so an unnamed budget silently over-grants hosted contracts
-     against memory already committed. Pinned by
-     declared_cache_ceiling_names_every_budget.
+     contract::executor::declared_cache_ceiling (test-only since #5647).
+     Each memory consumer has its own byte budget; the test
+     ring::hosting::cache::tests::declared_caches_plus_hosting_budget_leave_room_for_the_runtime
+     checks that the declared caches plus the hosting budget stay within 75%
+     of the memory limit at the shipped shapes, so an unnamed budget is
+     memory that check never sees. Naming is pinned by TWO tests that catch
+     OPPOSITE things, and citing only the first is how a reader ends up
+     trusting the weaker one: declared_cache_ceiling_names_every_budget
+     validates a hardcoded list, so it catches a summed budget being
+     REMOVED and cannot catch one being ADDED, which is the case that
+     matters for a new budget. declared_cache_ceiling_discovers_every_budget
+     walks the crate for budget-shaped declarations and requires each to be
+     summed or listed in NOT_SUMMED with a written reason. Both read the
+     LABELS of declared_cache_ceiling_terms rather than scraping source
+     text, because a name occurring in the function body does not mean its
+     value entered the total.
 
 WHY: Unbounded collections are amplification vectors.
 An attacker who can register N subscribers or open N channels can

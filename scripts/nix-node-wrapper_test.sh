@@ -34,8 +34,8 @@
 # by symlink instead of by copy. Re-apply any of them and this file must go red.
 #
 # THE SUITE RUNS IN A FAKE $HOME. The wrapper reads the node's known-bad pin
-# from $HOME/.local/state/freenet (`auto_update::state_dir()`, which does NOT
-# use $STATE_DIRECTORY), so every invocation below points HOME at its own temp
+# from $HOME/.local/state/freenet (`auto_update::state_dir()`, which uses HOME
+# whenever it is usable), so every invocation below points HOME at its own temp
 # dir. Without that, this suite would read -- and its verdict would depend on --
 # the rollback state of whatever real peer the developer happens to run.
 set -euo pipefail
@@ -157,8 +157,9 @@ WRAP_UPDATER_TIMEOUT=""
 WRAP_UPDATE_SLEEP=""
 # Version to write into the node's known-bad pin. WRAP_PINNED_BAD writes it in
 # $STATE_DIRECTORY; WRAP_PINNED_BAD_HOME writes it where the NODE itself keeps
-# it ($HOME/.local/state/freenet, `auto_update::state_dir()`), which is the
-# location that actually applies under the documented systemd unit.
+# it when HOME is usable ($HOME/.local/state/freenet, `auto_update::state_dir()`),
+# which is the location that applies under the documented systemd unit (it sets
+# `home`). A node whose HOME is unusable writes it in $STATE_DIRECTORY instead.
 WRAP_PINNED_BAD=""
 WRAP_PINNED_BAD_HOME=""
 
@@ -271,7 +272,8 @@ assert_contains "$LOG" "poststop=42" \
 
 # The two assertions the suite was missing entirely. Run either of these from
 # $FREENET_NIX_SEED_BINARY and the peer can never update again (EROFS on
-# /nix/store, then the MAX_UPDATE_FAILURES lockout), silently and forever.
+# /nix/store, then the MAX_UPDATE_FAILURES lockout, whose daily retry fails the
+# same way), silently.
 assert_eq "$(self_of network)" "$STATE/bin/freenet" \
   "the NODE runs from the writable state dir, never from the read-only /nix/store seed"
 assert_eq "$(self_of update)" "$STATE/bin/freenet" \
@@ -694,8 +696,8 @@ assert_contains "$STDOUT" "KNOWN-BAD" \
 assert_contains "$STDOUT" "liability for the network" \
   "...and the peer left in place is still reported as frozen on every start, so the refusal is not itself a silent dead end"
 
-# ...and in the directory the NODE actually writes it to, which is derived from
-# its home directory (`auto_update::state_dir()`), not from $STATE_DIRECTORY.
+# ...and in the directory the NODE writes it to when its home is usable
+# (`auto_update::state_dir()`), which is not $STATE_DIRECTORY.
 # Under the documented systemd unit those are different paths, so a wrapper that
 # consulted only its own state dir would miss every pin the node ever wrote.
 WRAP_STATE_VERSION="0.2.138" WRAP_STATE_COMMIT="bbbb222-dirty" \

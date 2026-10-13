@@ -12,7 +12,6 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
 };
-use tokio::net::UdpSocket;
 use tokio::sync::mpsc::{self, Receiver, Sender, error::TryRecvError};
 use tokio::time::Instant;
 use tokio::time::{sleep, timeout};
@@ -32,8 +31,8 @@ use crate::ring::PeerKey;
 use crate::ring::{Distance, Location};
 use crate::transport::{
     BroadcastDeliveryOutcome, CongestionControlConfig, ExpectedInboundTracker, PeerConnectionApi,
-    Socket, TransportError, TransportKeypair, TransportPublicKey, create_connection_handler,
-    global_bandwidth::GlobalBandwidthManager, peer_connection::StreamId,
+    Socket, TransportError, TransportKeypair, TransportPublicKey, UdpTransportSocket,
+    create_connection_handler, global_bandwidth::GlobalBandwidthManager, peer_connection::StreamId,
 };
 use crate::util::time_source::{DynTimeSource, InstantTimeSrc};
 use crate::{
@@ -227,6 +226,18 @@ impl P2pBridge {
             log_register: Arc::new(event_register),
             gateways,
         }
+    }
+
+    /// A bridge whose outbound messages land on `sender`, for tests that drive
+    /// the real send path and read what it put on the wire.
+    #[cfg(test)]
+    pub(crate) fn new_for_test(sender: Sender<P2pBridgeEvent>, op_manager: Arc<OpManager>) -> Self {
+        Self::new(
+            sender,
+            op_manager,
+            crate::tracing::DynamicRegister::new(vec![]),
+            Arc::new(Vec::new()),
+        )
     }
 
     /// Wake any drivers whose downstream peer just disconnected.
@@ -1223,6 +1234,8 @@ impl P2pConnManager {
             .ring
             .connection_manager
             .try_set_own_addr(advertised_addr);
+        #[cfg(not(feature = "simulation_tests"))]
+        let broadcast_spacing = bridge.op_manager.broadcast_spacing.clone();
 
         // Uptime is measured from here — the last step of node construction,
         // immediately before the event loop starts serving. Reading `now()` once
@@ -1280,13 +1293,15 @@ impl P2pConnManager {
             broadcast_retries: HashMap::new(),
             broadcast_no_target_streak: HashMap::new(),
             #[cfg(not(feature = "simulation_tests"))]
-            broadcast_queue: super::broadcast_queue::BroadcastQueue::new(),
+            broadcast_queue: super::broadcast_queue::BroadcastQueue::with_spacing(
+                broadcast_spacing,
+            ),
         })
     }
 
-    /// Runs the event listener with `UdpSocket` (production mode).
+    /// Runs the event listener with `UdpTransportSocket` (production mode).
     ///
-    /// This is a convenience wrapper around `run_event_listener_with_socket<UdpSocket>`.
+    /// This is a convenience wrapper around `run_event_listener_with_socket<UdpTransportSocket>`.
     #[allow(clippy::too_many_arguments)]
     #[tracing::instrument(name = "network_event_listener", fields(peer = %self.bridge.op_manager.ring.connection_manager.pub_key), skip_all)]
     pub async fn run_event_listener(
@@ -1296,7 +1311,7 @@ impl P2pConnManager {
         notification_channel: EventLoopNotificationsReceiver,
         node_controller: Receiver<NodeEvent>,
     ) -> anyhow::Result<Infallible> {
-        self.run_event_listener_with_socket::<UdpSocket>(
+        self.run_event_listener_with_socket::<UdpTransportSocket>(
             op_manager,
             client_wait_for_transaction,
             notification_channel,
@@ -1308,7 +1323,7 @@ impl P2pConnManager {
     /// Runs the event listener with a configurable socket type.
     ///
     /// This is the generic version that allows using different socket implementations:
-    /// - `UdpSocket` for production
+    /// - `UdpTransportSocket` for production
     /// - `InMemorySocket` for testing
     ///
     /// The socket type only affects connection establishment. Once connections are

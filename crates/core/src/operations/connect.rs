@@ -10,9 +10,11 @@
 //!   but can be any known peer)
 //! - **Acceptor**: A peer that agrees to connect with the joiner
 //!
-//! ## Critical Behavior: Accept Only at Terminus
+//! ## Critical Behavior: Accept at (or Near) the Terminus
 //!
-//! **Relays only ACCEPT when they can't forward to a closer peer** (terminus). This means:
+//! **Relays ACCEPT when they can't forward to a closer peer** (terminus). Relays within
+//! `NEAR_TERMINUS_DISTANCE` of the target may also accept probabilistically while still
+//! forwarding (near-terminus acceptance). For a single request:
 //!
 //! ```text
 //! Joiner sends ConnectRequest targeting location 0.3
@@ -30,9 +32,11 @@
 //! Relay C (loc=0.31) ──> ACCEPTS (at terminus - no closer peer to forward to)
 //! ```
 //!
-//! The joiner typically receives ONE ConnectResponse from the terminus peer. To get multiple
-//! connections, the joiner sends multiple ConnectRequests (potentially targeting different
-//! locations). This ensures connections are naturally local (short ring distance).
+//! The joiner typically receives one ConnectResponse from the terminus, plus one more for
+//! each near-terminus relay that also accepted. To get multiple connections, the joiner sends multiple ConnectRequests
+//! targeting different locations. Terminus acceptance makes the acceptor land near the
+//! joiner's `desired_location`; the choice of `desired_location` (see "Why Target Location
+//! Matters") is what shapes the distance distribution of the joiner's connections.
 //!
 //! ## Message Flow
 //!
@@ -49,27 +53,28 @@
 //! 3. First relay fills in `joiner.peer_addr` and sends `ObservedAddress` back to joiner
 //! 4. Subsequent relays see the already-filled address
 //!
-//! ## Acceptance Criteria: Accept Only at Terminus
+//! ## Acceptance Criteria
 //!
-//! Relays only accept connect requests when they're at the routing terminus - meaning they
-//! can't forward to a peer closer to the target location. This naturally creates local
-//! connections without arbitrary distance thresholds.
+//! Relays accept connect requests at the routing terminus - meaning they can't forward to a
+//! peer closer to the target location - so the acceptor is near `desired_location` rather
+//! than whichever relay the request happened to pass through. If the terminus declines
+//! (e.g. the joiner is already connected or pending there, or it is at capacity), the
+//! request routes uphill, bounded by `uphill_budget`, and a peer farther from the target
+//! may accept instead.
 //!
-//! **Algorithm:**
+//! **Algorithm** (`RelayState::step`):
 //! 1. First, check if we can forward to a closer peer via `select_next_hop()`
-//! 2. If we CAN forward: forward only (don't accept)
-//! 3. If we CAN'T forward (terminus): accept if `should_accept()` allows
+//! 2. If we CAN forward: forward. If we are within `NEAR_TERMINUS_DISTANCE` of the target,
+//!    also accept with a probability that grows as we get closer, if `should_accept()` allows
+//! 3. If we CAN'T forward (terminus): accept if `should_accept()` allows, otherwise route
+//!    uphill. A relay that has already forwarded never also accepts at terminus.
 //!
-//! `should_accept()` still uses capacity-based evaluation:
-//! - Below min_connections → **accept**
-//! - At max_connections → **reject**
-//! - Between min and max → use density-based evaluation
-//!
-//! **Why this works for small-world topology:**
-//! - Requests route toward the target location via greedy routing
-//! - Only peers that can't forward further (near the target) accept
-//! - Gateway and early relays forward without accepting
-//! - Result: connections are naturally local (short ring distance)
+//! `should_accept()` (`ConnectionManager::should_accept`) applies capacity limits and the
+//! Kleinberg gap score (see the `topology` module docs):
+//! - At max_connections → **reject** (except nearest-neighbor lattice edges)
+//! - Below min_connections → accept below 3 open connections, then probabilistically,
+//!   favoring candidates that fill gaps in log-distance coverage
+//! - Between min and max → feed the gap score through the `ConnectionEvaluator`
 //!
 //! ## Routing
 //!
@@ -80,13 +85,22 @@
 //!
 //! ## Why Target Location Matters
 //!
-//! If the joiner targets their own location, the request routes toward peers near them on the
-//! ring. With accept-only-at-terminus, only the peer closest to the target (who can't forward
-//! further) accepts. This naturally creates local connections.
+//! The small-world (Kleinberg 1/d) structure comes from WHICH locations a peer targets, not
+//! from terminus acceptance itself. Terminus acceptance only ensures each new connection
+//! lands near its target; target selection and acceptance scoring together aim for
+//! connections spread roughly uniformly in log-distance (the 1/d distribution).
 //!
-//! To build multiple connections, the joiner sends multiple ConnectRequests. Early in bootstrap
-//! (0-4 connections), peers target their own location to build local neighborhoods. Later,
-//! density-based targeting is used to optimize for request patterns.
+//! In `join_ring_request` (used for gateway joins, cached-peer reconnects and the startup
+//! loop):
+//! - Fewer than `GAP_TARGET_THRESHOLD` (3) connections: target the peer's own location, with
+//!   jitter after consecutive failures (and an occasional widened step once jitter saturates)
+//! - `GAP_TARGET_THRESHOLD` or more: target the midpoint of the largest gap in the peer's
+//!   connection distances in log-distance space (`small_world_rand::gap_target`), falling
+//!   back to jitter if there are fewer than 3 distinct neighbor locations
+//!
+//! Ring maintenance (`TopologyManager::adjust_topology`, executed by `Ring::acquire_new`)
+//! chooses its own targets: own location and evenly spaced ring locations during bootstrap,
+//! then directional gap targets (see the `topology` module docs).
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -647,17 +661,18 @@ impl RelayState {
             }
         }
 
-        // ACCEPT ONLY AT TERMINUS: Relays only accept when they can't forward to a closer peer.
-        // This naturally creates local connections because only peers near the target accept.
+        // ACCEPT AT TERMINUS: Relays accept when they can't forward to a closer peer, so the
+        // acceptor is near the joiner's desired_location (if the terminus declines, the
+        // request routes uphill below).
         //
         // Algorithm:
         // 1. First, check if we can forward to a closer peer
-        // 2. If we can forward: forward only (don't accept)
+        // 2. If we can forward: forward, and if we're within NEAR_TERMINUS_DISTANCE of the
+        //    target, also accept probabilistically
         // 3. If we can't forward (terminus): accept if should_accept() allows
         //
-        // This prevents early relays (gateway, first hops) from accepting connections that
-        // would be non-local on the ring. Only peers that are actually close to the target
-        // (and thus can't forward further) will accept.
+        // This prevents early relays (gateway, first hops) from accepting connections far
+        // from the requested target, which would defeat the joiner's target selection.
 
         let can_forward = self.forwarded_to.is_none() && self.request.ttl > 0;
         let next_hop = if can_forward {
@@ -729,7 +744,7 @@ impl RelayState {
             }
         }
 
-        // Only accept at terminus (can't forward to a closer peer)
+        // Strict-terminus acceptance (can't forward to a closer peer)
         // IMPORTANT: Also check that we haven't already forwarded - once we forward,
         // we're committed to that path and should not also accept. This prevents
         // the "double-accept" bug where a retry call could trigger acceptance
@@ -1678,6 +1693,13 @@ pub(crate) async fn join_ring_request(
         apply_bootstrap_jitter(base_location)
     };
     let tx = Transaction::new::<ConnectMsg>();
+    // #5858: one join attempt, counted toward
+    // `bootstrap_connect_attempts_before_first_connection`. Deliberately here
+    // and not in `start_client_connect`, which also serves the gateway version
+    // probe, lattice probes and ring acquisition. Gateways never "join".
+    if !op_manager.ring.is_gateway() {
+        crate::node::network_status::record_bootstrap_connect_attempt();
+    }
     op_ctx_task::start_client_connect(
         tx,
         gateway.clone(),
@@ -1686,6 +1708,7 @@ pub(crate) async fn join_ring_request(
         own,
         desired_location,
         overall_timeout,
+        op_ctx_task::ClientConnectKind::Standard,
     )
     .await
 }
@@ -1730,6 +1753,7 @@ pub(crate) async fn gateway_version_probe(
         own,
         desired_location,
         None,
+        op_ctx_task::ClientConnectKind::Standard,
     )
     .await
 }
@@ -2251,15 +2275,24 @@ mod tests {
 
     /// Build a minimal but real `OpManager` for driving the join loop.
     async fn bootstrap_test_op_manager(id: &str, own_addr: &str) -> Arc<OpManager> {
+        bootstrap_test_op_manager_with(id, own_addr, false).await
+    }
+
+    async fn bootstrap_test_op_manager_with(
+        id: &str,
+        own_addr: &str,
+        is_gateway: bool,
+    ) -> Arc<OpManager> {
         let config_args = crate::config::ConfigArgs {
             id: Some(id.to_string()),
             mode: Some(crate::contract::OperationMode::Local),
             ..Default::default()
         };
-        let node_config =
+        let mut node_config =
             crate::node::NodeConfig::new(config_args.build().await.expect("build Config"))
                 .await
                 .expect("build NodeConfig");
+        node_config.is_gateway = is_gateway;
         let (_notification_rx, notification_tx) = crate::node::event_loop_notification_channel();
         let (ops_ch_channel, _ch_channel, _wait_for_event) =
             crate::contract::contract_handler_channel();
@@ -2445,6 +2478,235 @@ mod tests {
                 "a node that never reached min_connections must report no latency, \
              while still being present in the snapshot"
             );
+        });
+    }
+
+    fn first_conn_stats() -> crate::node::network_status::BootstrapChurnStats {
+        crate::node::network_status::bootstrap_churn_counts().expect("initialized")
+    }
+
+    /// Short-timeout `join_ring_request`: the result is irrelevant (nothing
+    /// answers), only whether the attempt was counted.
+    async fn dial(gateway: &PeerKeyLocation, op_manager: &OpManager) {
+        join_ring_request(gateway, op_manager, Some(Duration::from_millis(100)))
+            .await
+            .ok();
+    }
+
+    /// #5858: `connect_attempts_before_first_connection` counts exactly one
+    /// per `join_ring_request` that issues a CONNECT, and nothing else. The
+    /// gateway version probe goes through the same `start_client_connect` and
+    /// must NOT count (it is not an attempt to obtain a first connection), nor
+    /// may a join refused before it issues (`UnwantedConnection`). Lattice
+    /// probes and ring acquisition do not pass through `join_ring_request`.
+    #[test]
+    fn join_attempts_counted_once_per_dial_and_not_for_probes() {
+        with_network_status_lock(async {
+            let op_manager =
+                bootstrap_test_op_manager("first-conn-5858-attempts", "127.0.0.1:14858").await;
+            let (gw_a, gw_b, gw_c, gw_d) = (
+                bootstrap_gateway(24858),
+                bootstrap_gateway(24859),
+                bootstrap_gateway(24860),
+                bootstrap_gateway(24861),
+            );
+            assert_eq!(
+                first_conn_stats().connect_attempts_before_first_connection,
+                0
+            );
+
+            dial(&gw_a, &op_manager).await;
+            assert_eq!(
+                first_conn_stats().connect_attempts_before_first_connection,
+                1,
+                "one dial, one attempt"
+            );
+            dial(&gw_b, &op_manager).await;
+            assert_eq!(
+                first_conn_stats().connect_attempts_before_first_connection,
+                2,
+                "a second dial adds exactly one"
+            );
+
+            tokio::time::timeout(
+                Duration::from_millis(300),
+                gateway_version_probe(&gw_c, &op_manager),
+            )
+            .await
+            .ok();
+            assert_eq!(
+                first_conn_stats().connect_attempts_before_first_connection,
+                2,
+                "a gateway version probe is not a join attempt"
+            );
+
+            // A join refused before it issues anything is not an attempt.
+            let cm = &op_manager.ring.connection_manager;
+            let addr_d = gw_d.socket_addr().expect("gateway has an address");
+            assert!(cm.add_connection(
+                Location::from_address(&addr_d),
+                addr_d,
+                gw_d.pub_key().clone(),
+                false
+            ));
+            let refused =
+                join_ring_request(&gw_d, &op_manager, Some(Duration::from_millis(100))).await;
+            assert!(
+                matches!(
+                    refused,
+                    Err(OpError::ConnError(
+                        crate::node::ConnectionError::UnwantedConnection
+                    ))
+                ),
+                "test setup: joining an already-connected gateway must be refused, got {refused:?}"
+            );
+            assert_eq!(
+                first_conn_stats().connect_attempts_before_first_connection,
+                2,
+                "a refused join is not an attempt"
+            );
+        });
+    }
+
+    /// #5858 wiring through the REAL ring add path on a joiner: the first
+    /// accepted `Ring::add_connection_reporting` records the latency and
+    /// freezes the attempt count; dropping to zero connections and rejoining,
+    /// or dialling again, moves neither.
+    #[test]
+    fn first_ring_connection_recorded_by_ring_add_and_never_reset() {
+        with_network_status_lock(async {
+            let op_manager =
+                bootstrap_test_op_manager("first-conn-5858-joiner", "127.0.0.1:14859").await;
+            assert_eq!(first_conn_stats().time_to_first_ring_connection, None);
+
+            dial(&bootstrap_gateway(24862), &op_manager).await;
+            assert_eq!(
+                first_conn_stats().connect_attempts_before_first_connection,
+                1
+            );
+            assert_eq!(
+                first_conn_stats().time_to_first_ring_connection,
+                None,
+                "a dial alone is not a connection"
+            );
+
+            let kp = TransportKeypair::new();
+            let peer = crate::node::PeerId::new(
+                kp.public().clone(),
+                "127.0.0.3:25858".parse().expect("addr"),
+            );
+            let outcome = op_manager
+                .ring
+                .add_connection_reporting(Location::new(0.25), peer.clone(), false)
+                .await;
+            assert!(outcome.added, "test setup: ring must accept the connection");
+            let first = first_conn_stats()
+                .time_to_first_ring_connection
+                .expect("the first accepted ring add must record the latency");
+
+            // Drop to zero connections, rejoin, dial again.
+            op_manager.ring.prune_connection(peer).await;
+            assert_eq!(op_manager.ring.open_connections(), 0);
+            let kp2 = TransportKeypair::new();
+            let peer2 = crate::node::PeerId::new(
+                kp2.public().clone(),
+                "127.0.0.4:25859".parse().expect("addr"),
+            );
+            assert!(
+                op_manager
+                    .ring
+                    .add_connection_reporting(Location::new(0.75), peer2, false)
+                    .await
+                    .added
+            );
+            dial(&bootstrap_gateway(24863), &op_manager).await;
+
+            let b = first_conn_stats();
+            assert_eq!(
+                b.time_to_first_ring_connection,
+                Some(first),
+                "a drop to zero and a rejoin must not reset the first-connection latency"
+            );
+            assert_eq!(
+                b.connect_attempts_before_first_connection, 1,
+                "attempts after the first connection are not counted"
+            );
+        });
+    }
+
+    /// #5858: a REJECTED ring add must not record a first connection. The ring
+    /// is filled to its hard ceiling through the `ConnectionManager` directly
+    /// (which does not touch the telemetry), so the one add through
+    /// `Ring::add_connection_reporting` is the rejected one.
+    #[test]
+    fn rejected_ring_add_does_not_record_first_connection() {
+        with_network_status_lock(async {
+            let op_manager =
+                bootstrap_test_op_manager("first-conn-5858-rejected", "127.0.0.1:14860").await;
+            let cm = &op_manager.ring.connection_manager;
+            let mut filled = 0usize;
+            loop {
+                let kp = TransportKeypair::new();
+                let addr: SocketAddr = format!("127.0.0.5:{}", 30000 + filled)
+                    .parse()
+                    .expect("addr");
+                let loc = Location::new(((filled % 997) as f64 + 0.5) / 997.0);
+                if !cm.add_connection(loc, addr, kp.public().clone(), false) {
+                    break;
+                }
+                filled += 1;
+                assert!(filled < 1000, "ring never reached its ceiling");
+            }
+            assert!(filled >= cm.max_connections, "test setup: ring is full");
+            assert_eq!(first_conn_stats().time_to_first_ring_connection, None);
+
+            let kp = TransportKeypair::new();
+            let peer = crate::node::PeerId::new(
+                kp.public().clone(),
+                "127.0.0.6:25860".parse().expect("addr"),
+            );
+            let outcome = op_manager
+                .ring
+                .add_connection_reporting(Location::new(0.123), peer, false)
+                .await;
+            assert!(!outcome.added, "test setup: the ring must reject this add");
+            assert_eq!(
+                first_conn_stats().time_to_first_ring_connection,
+                None,
+                "a rejected add is not a connection"
+            );
+        });
+    }
+
+    /// #5858: a gateway never records either field: its "first connection" is
+    /// whenever some joiner dials it, which says nothing about join latency.
+    #[test]
+    fn gateway_records_neither_first_connection_nor_attempts() {
+        with_network_status_lock(async {
+            let op_manager =
+                bootstrap_test_op_manager_with("first-conn-5858-gateway", "127.0.0.1:14861", true)
+                    .await;
+            assert!(
+                op_manager.ring.is_gateway(),
+                "test setup: node is a gateway"
+            );
+
+            dial(&bootstrap_gateway(24864), &op_manager).await;
+            let kp = TransportKeypair::new();
+            let peer = crate::node::PeerId::new(
+                kp.public().clone(),
+                "127.0.0.7:25861".parse().expect("addr"),
+            );
+            assert!(
+                op_manager
+                    .ring
+                    .add_connection_reporting(Location::new(0.5), peer, false)
+                    .await
+                    .added
+            );
+            let b = first_conn_stats();
+            assert_eq!(b.time_to_first_ring_connection, None);
+            assert_eq!(b.connect_attempts_before_first_connection, 0);
         });
     }
 

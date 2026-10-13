@@ -43,7 +43,7 @@ use freenet_stdlib::prelude::*;
 use crate::client_events::HostResult;
 use crate::config::{GlobalExecutor, OPERATION_TTL};
 use crate::contract::{ContractHandlerEvent, StoreResponse};
-use crate::message::{NetMessage, NetMessageV1, NodeEvent, Transaction};
+use crate::message::{NetMessage, NetMessageV1, Transaction};
 use crate::node::NetworkBridge;
 use crate::node::OpManager;
 #[rustfmt::skip]
@@ -176,13 +176,19 @@ pub(crate) async fn start_client_get(
     };
     GlobalExecutor::spawn(async move {
         let _inflight_guard = inflight_guard;
-        run_client_get(
-            op_manager,
-            client_tx,
-            instance_id,
-            return_contract_code,
-            subscribe,
-            blocking_subscribe,
+        // Lets the streaming phases extend this op's shutdown-drain
+        // deadline as they make progress (#5838, `note_client_op_progress`).
+        let drain = _inflight_guard.drain_handle();
+        crate::node::with_client_op_drain(
+            drain,
+            run_client_get(
+                op_manager,
+                client_tx,
+                instance_id,
+                return_contract_code,
+                subscribe,
+                blocking_subscribe,
+            ),
         )
         .await;
     });
@@ -459,6 +465,7 @@ async fn drive_client_get_inner(
         asked_hops: Vec::new(),
         guesses_exhausted: false,
         first_hop_pin: None,
+        pinned_only: false,
     };
 
     let (loop_result, streaming_assembly) = drive_get_with_assembly_retry(
@@ -944,6 +951,10 @@ struct GetRetryDriver<'a> {
     /// Cleared by every `advance`, so it applies to the attempt it was chosen
     /// for, and to that attempt's local infra retries.
     first_hop_pin: Option<SocketAddr>,
+    /// Ask only the pinned first hop: `advance` exhausts instead of routing
+    /// onward. For a fetch from one specific holder, where routing toward the
+    /// key is known to find nothing (#5846, stranded-holder recovery).
+    pinned_only: bool,
 }
 
 /// Terminal value for the GET driver.
@@ -1153,6 +1164,12 @@ impl RetryDriver for GetRetryDriver<'_> {
     fn advance(&mut self) -> AdvanceOutcome {
         // A pin is chosen for one attempt: the one this call sets up.
         self.first_hop_pin = None;
+        if self.pinned_only {
+            // A pinned-only GET's budget is its one target, so its give-up is
+            // reported as the retry budget being spent.
+            self.exhaustion_reason = Some(crate::tracing::GetExhaustionReason::RetryBudget);
+            return AdvanceOutcome::Exhausted;
+        }
         let reason = match advance_to_next_peer(
             self.op_manager,
             &self.instance_id,
@@ -1474,9 +1491,9 @@ async fn drive_get_with_assembly_retry(
     driver: &mut GetRetryDriver<'_>,
     emit_route_failure_on_retry: bool,
     // Hosting attribution for the streamed store this wrapper performs. Both the
-    // client driver and the sub-op driver use this wrapper, and the stream store
-    // is unconditionally `is_client_requester = true`, so the flag cannot tell
-    // them apart — the caller names itself instead. Telemetry only.
+    // client driver and the sub-op driver use this wrapper, so the caller names
+    // itself. It also decides the store's `is_client_requester`: only
+    // `ClientGet` marks local client access (#5846).
     cause: crate::ring::HostingCause,
 ) -> (RetryLoopOutcome<Terminal>, AssemblyOutcome) {
     let mut attempt_tx = first_tx;
@@ -1853,6 +1870,26 @@ fn synthetic_key(instance_id: &ContractInstanceId) -> ContractKey {
     ContractKey::from_id_and_code(*instance_id, CodeHash::new([0u8; 32]))
 }
 
+/// Whether a local `GetQuery` reply holds both state and code for `key`,
+/// stored under the same full key (#5782). `ContractKey` equality ignores the
+/// code hash, so the stored key's code hash is compared explicitly: a reply
+/// with the right instance and a different code hash does not count.
+fn stored_state_and_code_match(
+    stored: &Result<ContractHandlerEvent, crate::contract::ContractError>,
+    key: &ContractKey,
+) -> bool {
+    matches!(
+        stored,
+        Ok(ContractHandlerEvent::GetResponse {
+            key: Some(stored_key),
+            response: Ok(StoreResponse {
+                state: Some(_),
+                contract: Some(_),
+            }),
+        }) if stored_key.code_hash() == key.code_hash()
+    )
+}
+
 /// Store the fetched contract state in the local executor and run
 /// the originator-side hosting side effects. Mirrors the legacy
 /// `process_message` Response{Found} branch at `get.rs:2218-2450`.
@@ -1884,17 +1921,18 @@ fn synthetic_key(instance_id: &ContractInstanceId) -> ContractKey {
 ///    `get.rs:2260-2262, :2353-2355, :3056-3058`
 ///    all gate the call on `is_original_requester =
 ///    upstream_addr.is_none()`.
-/// 4. **Newly-hosted announcement** — only runs when the local
-///    store actually transitioned from no-state to has-state
-///    (i.e., `access_result.is_new && put_persisted`). NOT gated on
+/// 4. **Newly-hosted announcement** — runs through
+///    `operations::complete_host_formation` when this access newly hosts
+///    the contract with its state held locally, whether persisted now or
+///    already on disk with its code, and it is still hosted (`forms_host`,
+///    #5780). NOT gated on
 ///    `is_client_requester`; legacy announces on any first-time relay
 ///    cache too (`get.rs:2278, 2370`).
 ///
 /// `cause` names WHY this store may begin hosting (client GET, relay transit,
-/// or a sub-op fetch). It is TELEMETRY ONLY and is threaded from the call site
-/// because only the call site knows which driver it is: `is_client_requester`
-/// cannot stand in for it, since the streaming originator path passes `true`
-/// for BOTH the client and the sub-op driver.
+/// or a sub-op fetch). Here it is telemetry only, threaded from the call site
+/// because only the call site knows which driver it is (the streamed path
+/// derives `is_client_requester` from it; see `assemble_and_cache_stream`).
 // NAMING LANDMINE: "cache"/"store" here means HOSTING, not a lesser cache tier. A
 // peer stores a contract because a GET routed through it, and a routed GET is a
 // demand signal, so the peer HOSTS the contract (WASM+state, kept fresh in the
@@ -2028,18 +2066,18 @@ async fn cache_contract_locally(
     // `peer_contracts` / `local_client_count` entries survive and mis-target
     // UPDATE broadcasts / inflate upstream interest counts (PR #4734 Fix 1).
     for teardown in &access_result.evicted_in_use_teardown {
-        op_manager.interest_manager.remove_evicted_in_use(
-            &teardown.key,
-            &teardown.downstream_peers,
-            teardown.local_client_count,
-        );
+        crate::operations::sync_interest_for_evicted_in_use(op_manager, teardown);
     }
 
     let mut removed_contracts = Vec::new();
     for (evicted_key, expected_generation) in &access_result.evicted {
-        if op_manager
-            .interest_manager
-            .unregister_local_hosting(evicted_key)
+        // Skip if re-hosted since the eviction decision (#5780): the
+        // re-host registered it, and unregistering here would take a
+        // hosted contract out of anti-entropy.
+        if !op_manager.ring.is_hosting_contract(evicted_key)
+            && op_manager
+                .interest_manager
+                .unregister_local_hosting(evicted_key)
         {
             removed_contracts.push(*evicted_key);
         }
@@ -2049,15 +2087,39 @@ async fn cache_contract_locally(
         crate::operations::reclaim_evicted_contract(op_manager, *evicted_key, *expected_generation);
     }
 
+    // A re-host from state already on disk forms a host only if the contract
+    // code is on disk too: a partial reclamation can delete the code and leave
+    // the state, and `state_matches` reads the state alone (#5782). Checked
+    // only on this branch, and only while still hosted, since it loads the
+    // WASM. It reads the code on disk and ignores code carried by the GET:
+    // restoring missing code from the GET is #5784. The stored key's code
+    // hash must match the key being hosted: `ContractKey` equality ignores
+    // the code hash, so a reply with the right instance and a wrong code hash
+    // would otherwise be registered and advertised under a malformed key.
+    let rehost_has_code =
+        if access_result.is_new && state_matches && op_manager.ring.is_hosting_contract(&key) {
+            let stored = op_manager
+                .notify_contract_handler(ContractHandlerEvent::GetQuery {
+                    instance_id: *key.id(),
+                    return_contract_code: true,
+                })
+                .await;
+            stored_state_and_code_match(&stored, &key)
+        } else {
+            false
+        };
+    let forms_host = access_result.is_new
+        && (put_persisted || rehost_has_code)
+        && op_manager.ring.is_hosting_contract(&key);
     // Reconcile-controller SHADOW comparison (keystone step-2, #4642),
     // HOST-FORMATION site (GET cache path). About to (conditionally) announce
     // hosting; does the controller agree? Focused on `Announce`. Actual =
     // `{Announce}` iff production announces a NOT-yet-advertised host this event
-    // (`is_new && put_persisted` AND not already advertised — the announce is
+    // (`forms_host` AND not already advertised — the announce is
     // idempotent), else `{}`. Built BEFORE the announce so `is_advertised`
     // reflects the pre-announce state. DRIVES NOTHING.
     {
-        let will_announce = access_result.is_new && put_persisted;
+        let will_announce = forms_host;
         op_manager.record_reconcile_shadow_event(
             crate::node::network_status::ReconcileShadowSite::HostFormation,
             &key,
@@ -2072,26 +2134,15 @@ async fn cache_contract_locally(
         );
     }
 
-    // (4) Newly-hosted announcement gates on BOTH first-time access
-    // AND the fact that we actually persisted new state. Without
-    // persistence there's nothing to announce hosting for.
-    if access_result.is_new && put_persisted {
-        crate::operations::announce_contract_hosted(op_manager, &key).await;
-        // Directed-subscribe placement (#4404): best-effort nudge the node to
-        // consider migrating this freshly-hosted contract toward a closer
-        // neighbor. Dropped silently if the event channel is full — the next
-        // hosting/peer event re-triggers consideration.
-        if let Err(err) =
-            op_manager.try_notify_node_event(NodeEvent::ConsiderContractMigration { key })
-        {
-            tracing::debug!(%key, %err, "ConsiderContractMigration emit dropped (GET)");
-        }
-        let became_interested = op_manager.interest_manager.register_local_hosting(&key);
-        let added = if became_interested { vec![key] } else { vec![] };
-        if !added.is_empty() || !removed_contracts.is_empty() {
-            crate::operations::broadcast_change_interests(op_manager, added, removed_contracts)
-                .await;
-        }
+    // (4) A fresh host whose state is held locally, either persisted now or
+    // already on disk (`state_matches`, e.g. re-hosted after an eviction that
+    // kept the state), runs the full host-formation sequence: announce,
+    // register, interest change (#5780). Skipped if the contract is no
+    // longer hosted by the time this runs (a concurrent sweep eviction, or
+    // this access evicting the newcomer itself), so a contract being
+    // reclaimed is never re-announced.
+    if forms_host {
+        crate::operations::complete_host_formation(op_manager, key, removed_contracts).await;
     } else if !removed_contracts.is_empty() {
         crate::operations::broadcast_change_interests(op_manager, vec![], removed_contracts).await;
     }
@@ -2100,6 +2151,75 @@ async fn cache_contract_locally(
     // just persisted it. Relay callers gate register_downstream_subscriber on
     // this (register-after-state, step 10 §1a).
     state_matches || put_persisted
+}
+
+/// Await `phase`, calling `on_tick` at once and then once a second while
+/// it is still pending. Used to keep a client GET's shutdown-drain
+/// deadline (#5838) just ahead of a stream phase for exactly as long as
+/// the phase is alive.
+async fn await_with_ticks<T>(
+    phase: impl std::future::Future<Output = T>,
+    mut on_tick: impl FnMut(),
+) -> T {
+    tokio::pin!(phase);
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            result = &mut phase => return result,
+            _ = tick.tick() => on_tick(),
+        }
+    }
+}
+
+/// Drain window refreshed each second while a stream phase is pending
+/// (one tick of spacing plus slack; `note_client_op_progress` adds its
+/// own throttle slack), so the deadline lapses within about 3 s of the
+/// phase ending.
+const PENDING_PHASE_DRAIN_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Await a GET stream `claim`, keeping a client GET's shutdown drain
+/// waiting for it only while the claim is still waiting (#5838). The
+/// claim's own bound is `STREAM_CLAIM_TIMEOUT`; once it resolves, the
+/// extension lapses within [`PENDING_PHASE_DRAIN_WINDOW`], so a stream
+/// that then stalls is not held for. A no-op on the sub-op path, which
+/// has no client-op scope.
+async fn claim_noting_progress<T>(claim: impl std::future::Future<Output = T>) -> T {
+    await_with_ticks(claim, || {
+        crate::node::note_client_op_progress(PENDING_PHASE_DRAIN_WINDOW)
+    })
+    .await
+}
+
+/// Await a stream's `assembly`, noting client-op progress (#5838) when it
+/// starts and whenever `received_fragments` has grown since the last
+/// check (once a second), with the transport's own stall window plus the
+/// check spacing, and with the tail window when assembly succeeds. The
+/// shutdown drain then keeps waiting for a client GET whose body is
+/// streaming in, and stops soon after the stream stalls. A no-op on the
+/// sub-op path, which has no client-op scope.
+async fn assemble_noting_progress<T, E>(
+    assembly: impl std::future::Future<Output = Result<T, E>>,
+    received_fragments: impl Fn() -> usize,
+) -> Result<T, E> {
+    // The transport's own stall rule for an inbound stream, plus the
+    // one-second spacing of the checks below.
+    const FRAGMENT_WINDOW: std::time::Duration = std::time::Duration::from_secs(
+        crate::transport::peer_connection::streaming::STREAM_INACTIVITY_TIMEOUT.as_secs() + 1,
+    );
+    let mut seen: Option<usize> = None;
+    let result = await_with_ticks(assembly, || {
+        let received = received_fragments();
+        if seen.is_none_or(|seen| received > seen) {
+            seen = Some(received);
+            crate::node::note_client_op_progress(FRAGMENT_WINDOW);
+        }
+    })
+    .await;
+    if result.is_ok() {
+        crate::node::note_client_op_phase_end();
+    }
+    result
 }
 
 /// Claim an orphan stream, await assembly, deserialize the payload,
@@ -2146,10 +2266,12 @@ async fn assemble_and_cache_stream(
         });
     }
 
-    let handle = match op_manager
-        .orphan_stream_registry()
-        .claim_or_wait(peer_addr, stream_id, STREAM_CLAIM_TIMEOUT)
-        .await
+    let handle = match claim_noting_progress(op_manager.orphan_stream_registry().claim_or_wait(
+        peer_addr,
+        stream_id,
+        STREAM_CLAIM_TIMEOUT,
+    ))
+    .await
     {
         Ok(h) => h,
         Err(OrphanStreamError::AlreadyClaimed) => {
@@ -2174,24 +2296,25 @@ async fn assemble_and_cache_stream(
         }
     };
 
-    let bytes = match handle.assemble().await {
-        Ok(b) => b,
-        Err(e) => {
-            // Read fragment counts BEFORE building the error (the WHERE
-            // signal). The inactivity / cancelled AGGREGATE counters are
-            // recorded by the transport `StreamHandle::assemble` site itself
-            // (which also covers relay receive paths), so they are NOT
-            // re-recorded here — only the per-op terminal-event cause is
-            // classified from the `StreamError` variant.
-            let fragments_received = Some(handle.received_fragments() as u32);
-            let total_fragments = Some(handle.total_fragments() as u32);
-            return Err(AssemblyFailure::from_failure(
-                &StreamFailure::Assembly(e),
-                fragments_received,
-                total_fragments,
-            ));
-        }
-    };
+    let bytes =
+        match assemble_noting_progress(handle.assemble(), || handle.received_fragments()).await {
+            Ok(b) => b,
+            Err(e) => {
+                // Read fragment counts BEFORE building the error (the WHERE
+                // signal). The inactivity / cancelled AGGREGATE counters are
+                // recorded by the transport `StreamHandle::assemble` site itself
+                // (which also covers relay receive paths), so they are NOT
+                // re-recorded here — only the per-op terminal-event cause is
+                // classified from the `StreamError` variant.
+                let fragments_received = Some(handle.received_fragments() as u32);
+                let total_fragments = Some(handle.total_fragments() as u32);
+                return Err(AssemblyFailure::from_failure(
+                    &StreamFailure::Assembly(e),
+                    fragments_received,
+                    total_fragments,
+                ));
+            }
+        };
 
     // Assembly succeeded: every expected fragment is present.
     let fragments_received = Some(handle.received_fragments() as u32);
@@ -2251,13 +2374,25 @@ async fn assemble_and_cache_stream(
         None
     };
 
-    // This helper runs on the client-driver (originator) side. The relay
-    // driver also claims streams now (the `Terminal::Streaming` arm, #4307),
-    // but it uses its own inline assemble+cache with `local_client_access =
-    // false`; this path is the originator, which IS the client requester, so
-    // the sticky `local_client_access` flag applies here.
-    let state_stored =
-        cache_contract_locally(op_manager, payload.key, state, contract, true, cause).await;
+    // This helper runs on the originator side. The relay driver also claims
+    // streams now (the `Terminal::Streaming` arm, #4307), but it uses its own
+    // inline assemble+cache with `local_client_access = false`. The originator
+    // is the client requester for a client GET, so the sticky
+    // `local_client_access` flag applies there; a sub-op GET (auto-fetch, a
+    // subscribe's body fetch, the stranded-holder recovery) has no client, and
+    // marking it would make every large fetch look like local demand: renewed
+    // and kept from cost eviction for no one (#5846). Its inline path already
+    // passes `false`.
+    let is_client_requester = matches!(cause, crate::ring::HostingCause::ClientGet);
+    let state_stored = cache_contract_locally(
+        op_manager,
+        payload.key,
+        state,
+        contract,
+        is_client_requester,
+        cause,
+    )
+    .await;
     Ok(StreamProgress {
         fragments_received,
         total_fragments,
@@ -2575,7 +2710,11 @@ pub(crate) fn start_sub_op_get(
 /// Used by `OpManager::try_auto_fetch_contract` when an UPDATE
 /// broadcast fails because the recipient lacks the contract's
 /// parameters: the directed target is the UPDATE sender, who is
-/// known to host the contract. If the directed peer responds
+/// known to host the contract. Also used by `subscribe::fetch_contract_if_missing`
+/// with a directed holder (a relay subscribe fetching from the peer that
+/// answered `Subscribed`). The target is pinned as the first attempt's first
+/// hop (#5846; before that the loopback relay ranked its own first hop and the
+/// target was never asked). If the directed peer responds
 /// `NotFound`, the retry loop falls back to `k_closest_potentially_hosting`
 /// just like a regular sub-op GET.
 pub(crate) fn start_targeted_sub_op_get(
@@ -2606,6 +2745,59 @@ pub(crate) fn start_targeted_sub_op_get(
     tx
 }
 
+/// Spawn a sub-operation GET that asks `target` and NO other peer, returning
+/// the outcome. For a fetch from one specific holder where routing toward the
+/// key is already known to find nothing: the stranded-holder recovery
+/// (#5846), which pulls state back from the subscribe's requester. A routed
+/// fallback there would only send futile GETs into the empty key region.
+///
+/// The whole fetch, streaming included, is cancelled at `deadline`.
+/// `on_done(found)` runs when the fetch ends, before the outcome is sent and
+/// before `keep_alive` (the caller's fetch slot) is dropped, so whatever it
+/// records is in place before the slot can be reused; the slot is never freed
+/// while its fetch still runs.
+///
+/// "Nobody else" holds for this node's retry loop. Two narrow exceptions: if
+/// `target` stops being a routing candidate before the attempt (disconnects,
+/// turns transient) our loopback relay sends the one attempt to its own best
+/// candidate instead; and if `target` has no copy it serves, its relay forwards
+/// once more (plus up to `MAX_TERMINAL_CONSULT_HOSTS` advertised hosts), since
+/// the request carries HTL 2, the smallest that lets `target` check its own
+/// store, and those hops answer on HTL 0 without checking theirs.
+pub(crate) fn start_pinned_sub_op_get<G: Send + 'static>(
+    op_manager: &OpManager,
+    instance_id: ContractInstanceId,
+    target: PeerKeyLocation,
+    deadline: std::time::Duration,
+    on_done: impl FnOnce(bool) + Send + 'static,
+    keep_alive: G,
+) -> (Transaction, tokio::sync::oneshot::Receiver<SubOpGetOutcome>) {
+    let op_manager = Arc::new(op_manager.clone());
+    let tx = Transaction::new::<GetMsg>();
+    let (out_tx, out_rx) = tokio::sync::oneshot::channel();
+    GlobalExecutor::spawn(async move {
+        let _keep_alive = keep_alive;
+        let _completion_guard = SubOpGetCompletionGuard {
+            op_manager: op_manager.clone(),
+            tx,
+        };
+        let outcome = match tokio::time::timeout(
+            deadline,
+            drive_sub_op_get(&op_manager, tx, instance_id, true, Some(target), true),
+        )
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(_elapsed) => SubOpGetOutcome::NotFound(PINNED_FETCH_DEADLINE_CAUSE.to_string()),
+        };
+        on_done(matches!(outcome, SubOpGetOutcome::Found(_)));
+        // Receiver drop is acceptable: the caller may have given up.
+        #[allow(clippy::let_underscore_must_use)]
+        let _ = out_tx.send(outcome);
+    });
+    (tx, out_rx)
+}
+
 async fn run_sub_op_get(
     op_manager: Arc<OpManager>,
     tx: Transaction,
@@ -2626,6 +2818,7 @@ async fn run_sub_op_get(
         instance_id,
         return_contract_code,
         initial_target,
+        false,
     )
     .await;
 
@@ -2671,19 +2864,46 @@ impl Drop for SubOpGetCompletionGuard {
     }
 }
 
-async fn drive_sub_op_get(
-    op_manager: &Arc<OpManager>,
+/// The `NotFound` cause a pinned fetch reports when its deadline cancelled it,
+/// so a caller can tell a cut-off fetch from a target that had nothing.
+pub(crate) const PINNED_FETCH_DEADLINE_CAUSE: &str = "pinned fetch exceeded its deadline";
+
+/// HTL of a pinned-only sub-op GET; see `sub_op_driver`.
+const PINNED_ONLY_HTL: usize = 2;
+
+/// The retry driver for a sub-op GET. `initial_target`, when given, is pinned
+/// as the first attempt's first hop; otherwise the first hop is the ring's
+/// closest candidate, as for any GET. With `pinned_only` the GET asks that
+/// target and nobody else.
+fn sub_op_driver<'a>(
+    op_manager: &'a Arc<OpManager>,
     tx: Transaction,
     instance_id: ContractInstanceId,
-    return_contract_code: bool,
     initial_target: Option<PeerKeyLocation>,
-) -> SubOpGetOutcome {
-    let htl = op_manager.ring.max_hops_to_live;
+    pinned_only: bool,
+) -> GetRetryDriver<'a> {
+    // A pinned-only fetch needs only the target to look at its own store: the
+    // attempt goes loopback relay (2) -> target (1), and a target with nothing
+    // to serve forwards to a hop that answers on HTL 0 instead of walking on.
+    let htl = if pinned_only {
+        PINNED_ONLY_HTL
+    } else {
+        op_manager.ring.max_hops_to_live
+    };
 
     let mut tried: Vec<std::net::SocketAddr> = Vec::new();
     if let Some(own_addr) = op_manager.ring.connection_manager.get_own_addr() {
         tried.push(own_addr);
     }
+    // A caller-named target must be PINNED as the first attempt's first hop.
+    // The attempt is sent to our own loopback relay, which otherwise picks the
+    // first hop by ring ranking and never consults `current_target`, so a
+    // "targeted" GET went greedily toward the key (#5846: a stranded-holder
+    // recovery fetching from the requester was routed away from it). The pin
+    // covers the first attempt only; `advance` clears it, so a target that
+    // answers NotFound falls back to ordinary routing as documented on
+    // `start_targeted_sub_op_get`.
+    let first_hop_pin = initial_target.as_ref().and_then(|peer| peer.socket_addr());
     let initial_target = initial_target.or_else(|| {
         op_manager
             .ring
@@ -2720,7 +2940,7 @@ async fn drive_sub_op_get(
         },
     };
 
-    let mut driver = GetRetryDriver {
+    GetRetryDriver {
         op_manager,
         instance_id,
         htl,
@@ -2742,8 +2962,20 @@ async fn drive_sub_op_get(
         not_found_hops: Vec::new(),
         asked_hops: Vec::new(),
         guesses_exhausted: false,
-        first_hop_pin: None,
-    };
+        first_hop_pin,
+        pinned_only,
+    }
+}
+
+async fn drive_sub_op_get(
+    op_manager: &Arc<OpManager>,
+    tx: Transaction,
+    instance_id: ContractInstanceId,
+    return_contract_code: bool,
+    initial_target: Option<PeerKeyLocation>,
+    pinned_only: bool,
+) -> SubOpGetOutcome {
+    let mut driver = sub_op_driver(op_manager, tx, instance_id, initial_target, pinned_only);
 
     let (loop_result, streaming_assembly) = drive_get_with_assembly_retry(
         op_manager,
@@ -4471,11 +4703,11 @@ where
                 // Found payloads). `is_client_requester=false` so this node
                 // does NOT set `mark_local_client_access` — the sticky flag
                 // belongs to the upstream client-originating node, not a
-                // forwarder. `announce_contract_hosted` DOES fire when
-                // `access_result.is_new && put_persisted` so first-time
-                // hosting at a relay is still broadcast (matches legacy
-                // `get.rs:2370` which announces on any first-time relay
-                // cache).
+                // forwarder. The host-formation sequence (announce included)
+                // DOES run when this cache newly hosts the contract with its
+                // state held locally (`forms_host`), so first-time hosting at
+                // a relay is still broadcast (matches legacy `get.rs:2370`,
+                // which announces on any first-time relay cache).
                 let state_present =
                     cache_contract_locally(op_manager, key, state, contract, false, hosting_cause)
                         .await;
@@ -4892,6 +5124,50 @@ where
 mod tests {
     use super::*;
 
+    fn stored_reply(
+        stored_key: Option<ContractKey>,
+        with_code: bool,
+    ) -> Result<ContractHandlerEvent, crate::contract::ContractError> {
+        let contract = with_code.then(|| {
+            ContractContainer::Wasm(ContractWasmAPIVersion::V1(WrappedContract::new(
+                std::sync::Arc::new(ContractCode::from(vec![1u8, 2, 3])),
+                Parameters::from(vec![]),
+            )))
+        });
+        Ok(ContractHandlerEvent::GetResponse {
+            key: stored_key,
+            response: Ok(StoreResponse {
+                state: Some(WrappedState::new(vec![7u8])),
+                contract,
+            }),
+        })
+    }
+
+    /// A state-only re-host forms a host only if the stored copy has code
+    /// and was stored under the same full key, code hash included (#5782).
+    #[test]
+    fn stored_state_and_code_match_requires_code_and_the_same_code_hash() {
+        let id = ContractInstanceId::new([5u8; 32]);
+        let key = ContractKey::from_id_and_code(id, CodeHash::new([6u8; 32]));
+        let other_code = ContractKey::from_id_and_code(id, CodeHash::new([9u8; 32]));
+        assert!(stored_state_and_code_match(
+            &stored_reply(Some(key), true),
+            &key
+        ));
+        assert!(
+            !stored_state_and_code_match(&stored_reply(Some(other_code), true), &key),
+            "same instance, different code hash"
+        );
+        assert!(
+            !stored_state_and_code_match(&stored_reply(Some(key), false), &key),
+            "no code on disk"
+        );
+        assert!(
+            !stored_state_and_code_match(&stored_reply(None, true), &key),
+            "no stored key"
+        );
+    }
+
     fn dummy_key() -> ContractKey {
         ContractKey::from_id_and_code(ContractInstanceId::new([1u8; 32]), CodeHash::new([2u8; 32]))
     }
@@ -4981,7 +5257,8 @@ mod tests {
 
         for entry in [
             "async fn drive_client_get_inner",
-            "async fn drive_sub_op_get",
+            // The sub-op driver's initial pick lives in its constructor.
+            "fn sub_op_driver<'a>(",
             "fn advance_to_next_peer",
             "fn relay_advance_to_next_peer",
         ] {
@@ -5691,6 +5968,7 @@ mod tests {
             asked_hops: Vec::new(),
             guesses_exhausted: false,
             first_hop_pin: None,
+            pinned_only: false,
         };
 
         assert!(
@@ -6036,10 +6314,158 @@ mod tests {
             "GET eviction handler must consume access_result.evicted_in_use_teardown"
         );
         assert!(
-            body.contains("remove_evicted_in_use"),
-            "GET eviction handler must call interest_manager.remove_evicted_in_use \
-             to sync the InterestManager after a subscribed eviction"
+            body.contains("operations::sync_interest_for_evicted_in_use("),
+            "GET eviction handler must call operations::sync_interest_for_evicted_in_use \
+             to sync the InterestManager (and release delegate demand) after a \
+             subscribed eviction"
         );
+    }
+
+    /// Code-only, whitespace-free text of `src`: comment lines dropped and all
+    /// whitespace removed, so a pin matches the code whatever rustfmt does to
+    /// its layout and is never satisfied by a commented-out line.
+    fn code_only(src: &str) -> String {
+        src.lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .flat_map(|line| line.chars())
+            .filter(|c| !c.is_whitespace())
+            .collect()
+    }
+
+    /// #5780: a GET that re-hosts a contract whose state was already on disk
+    /// (`state_matches`) must form a host exactly like one that persisted new
+    /// state, through the shared helper, and only if the newcomer is still
+    /// hosted (a concurrent eviction can remove it before this runs).
+    #[test]
+    fn cache_contract_locally_forms_a_host_whenever_state_is_held() {
+        let body = code_only(extract_fn_body(
+            production_source(),
+            "async fn cache_contract_locally(",
+        ));
+        let gate = concat!(
+            "letforms_host=access_result.is_new&&(put_persisted||rehost_has_code)",
+            "&&op_manager.ring.is_hosting_contract(&key);"
+        );
+        // A state-only re-host must also find the code on disk: the query
+        // asks for the code and only a returned contract counts.
+        let check = body
+            .split_once("letrehost_has_code=")
+            .expect("rehost_has_code")
+            .1
+            .split_once("letforms_host=")
+            .expect("forms_host after rehost_has_code")
+            .0;
+        assert!(
+            check.starts_with(concat!(
+                "ifaccess_result.is_new&&state_matches&&op_manager.ring.is_hosting_contract(&key)",
+                "{letstored=op_manager.notify_contract_handler(ContractHandlerEvent::GetQuery{",
+                "instance_id:*key.id(),return_contract_code:true,})"
+            )) && check.contains("stored_state_and_code_match(&stored,&key)"),
+            "a state-only re-host must check the contract code is present, under the same key"
+        );
+        assert!(
+            body.contains(gate),
+            "forms_host must require is_new, held state and still hosted"
+        );
+        let call = concat!(
+            "ifforms_host{crate::operations::",
+            "complete_host_formation("
+        );
+        assert!(
+            body.contains(call),
+            "a forming host must run the shared host-formation helper"
+        );
+    }
+
+    /// #5780: the shared host-formation helper runs the whole sequence, so no
+    /// caller can register without advertising (or the reverse).
+    #[test]
+    fn complete_host_formation_runs_announce_register_and_interest_change() {
+        const OPS: &str = include_str!("../../operations.rs");
+        let body = code_only(extract_fn_body(
+            OPS,
+            "pub(crate) async fn complete_host_formation(",
+        ));
+        // Order: announce, then the re-check (which returns early), then the
+        // migration nudge and the registration.
+        let pos = |needle: &str| {
+            body.find(needle)
+                .unwrap_or_else(|| panic!("complete_host_formation must contain `{needle}`"))
+        };
+        let announce = pos(concat!(
+            "announce_contract_hosted(",
+            "op_manager,&key).await;"
+        ));
+        let recheck = pos(concat!(
+            "if!op_manager.ring.is_hosting_contract(&key){",
+            "retract_"
+        ));
+        let bail = pos(concat!(
+            "broadcast_change_interests(op_manager,Vec::new(),removed)",
+            ".await;}return;}"
+        ));
+        let register = pos(concat!("interest_manager.", "register_local_hosting(&key)"));
+        assert!(announce < recheck && recheck < bail && bail < register);
+        for leg in [
+            concat!("announce_contract_hosted(", "op_manager,&key).await;"),
+            // re-checked after the announce await; an eviction there is retracted
+            concat!(
+                "if!op_manager.ring.is_hosting_contract(&key){",
+                "retract_advertisement_for_evicted_contract(op_manager,&key);"
+            ),
+            concat!("interest_manager.", "register_local_hosting(&key)"),
+            concat!(
+                "broadcast_change_interests(",
+                "op_manager,added,removed).await;"
+            ),
+        ] {
+            assert!(
+                body.contains(leg),
+                "complete_host_formation must contain `{leg}`"
+            );
+        }
+    }
+
+    /// #5780: the PUT relay store forms its host through the shared helper,
+    /// and only while the contract is still hosted, so a concurrent eviction
+    /// cannot leave an advertisement and a local-hosting flag behind.
+    #[test]
+    fn relay_put_store_forms_a_host_only_while_still_hosted() {
+        const PUT: &str = include_str!("../put/op_ctx_task.rs");
+        let put = code_only(extract_fn_body(PUT, "async fn relay_put_store_locally("));
+        assert!(put.contains(concat!(
+            "ifop_manager.ring.is_hosting_contract(&key){crate::operations::",
+            "complete_host_formation(op_manager,key,removed_contracts).await;}"
+        )));
+        for inlined in [
+            concat!("announce_contract_", "hosted("),
+            concat!("interest_manager.", "register_local_hosting("),
+        ] {
+            assert!(!put.contains(inlined), "PUT must not inline `{inlined}`");
+        }
+    }
+
+    /// #5780: the GET and PUT eviction loops must not unregister a contract
+    /// that has been re-hosted since the eviction decision.
+    #[test]
+    fn eviction_loops_skip_unregister_for_a_rehosted_contract() {
+        let get = code_only(extract_fn_body(
+            production_source(),
+            "async fn cache_contract_locally(",
+        ));
+        // The guard, and the retraction push gated on its result.
+        assert!(get.contains(concat!(
+            "if!op_manager.ring.is_hosting_contract(evicted_key)&&op_manager",
+            ".interest_manager.unregister_local_hosting(evicted_key){",
+            "removed_contracts.push(*evicted_key);"
+        )));
+        const PUT: &str = include_str!("../put/op_ctx_task.rs");
+        let put = code_only(extract_fn_body(PUT, "async fn relay_put_store_locally("));
+        assert!(put.contains(concat!(
+            "if!op_manager.ring.is_hosting_contract(&evicted_key)&&op_manager",
+            ".interest_manager.unregister_local_hosting(&evicted_key){",
+            "removed_contracts.push(evicted_key);"
+        )));
     }
 
     /// Piece E (demand-driven hosting): GET-auto-subscribe was REMOVED.
@@ -6548,6 +6974,138 @@ mod tests {
         );
     }
 
+    /// #5838: a client GET's stream claim keeps the drain waiting only
+    /// while it is pending. Once it resolves, the extension must lapse
+    /// within a couple of seconds, so a stream that then stalls is not
+    /// held for the whole drain (the round-6 review finding).
+    #[tokio::test(start_paused = true)]
+    async fn claim_wait_holds_the_drain_only_while_pending() {
+        use crate::node::op_state_manager_test_support::{admit_test_client_op, deadlines};
+        use std::time::Duration;
+
+        let registry = deadlines();
+        let guard = admit_test_client_op(&registry);
+        tokio::time::advance(Duration::from_secs(100)).await;
+        let t0 = tokio::time::Instant::now();
+
+        let mid = Arc::new(parking_lot::Mutex::new(None));
+        let observer = {
+            let mid = mid.clone();
+            let registry = registry.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep_until(t0 + Duration::from_millis(10_500)).await;
+                *mid.lock() = registry.latest_deadline();
+            })
+        };
+        crate::node::with_client_op_drain(
+            guard.drain_handle(),
+            claim_noting_progress(tokio::time::sleep(Duration::from_secs(20))),
+        )
+        .await;
+        let resolved = tokio::time::Instant::now();
+        observer.await.unwrap();
+
+        assert!(
+            mid.lock().unwrap() > t0 + Duration::from_millis(10_500),
+            "a pending claim must keep the deadline ahead of now"
+        );
+        let after = registry.latest_deadline().unwrap();
+        assert!(
+            after <= resolved + Duration::from_secs(3),
+            "once the claim resolves the extension must lapse within ~3 s \
+             (2 s window + 1 s note slack), not run on to the claim's own \
+             60 s bound"
+        );
+    }
+
+    /// #5838: starting assembly, each check that sees new fragments, and
+    /// success must each extend a client GET's shutdown-drain deadline by
+    /// the progress window; checks that see no new fragments must not.
+    #[tokio::test(start_paused = true)]
+    async fn assembly_notes_client_op_progress_only_while_fragments_arrive() {
+        use crate::node::op_state_manager_test_support::{
+            TAIL_WINDOW, admit_test_client_op, deadlines,
+        };
+        const FRAGMENT_WINDOW: Duration = Duration::from_secs(
+            crate::transport::peer_connection::streaming::STREAM_INACTIVITY_TIMEOUT.as_secs() + 1,
+        );
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        let registry = deadlines();
+        let guard = admit_test_client_op(&registry);
+        tokio::time::advance(Duration::from_secs(100)).await;
+        let stale = registry.latest_deadline().unwrap();
+
+        let fragments = Arc::new(AtomicUsize::new(0));
+        let feeder = {
+            let fragments = fragments.clone();
+            tokio::spawn(async move {
+                // Fragments for 5 s, then a stall until completion at 26 s.
+                for _ in 0..5 {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    fragments.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+        };
+        let t0 = tokio::time::Instant::now();
+        let observed = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let observer = {
+            let observed = observed.clone();
+            let registry = registry.clone();
+            tokio::spawn(async move {
+                // 7.5 s, not 6 s: clear of the tick that may note the fifth
+                // fragment, so the stall sample cannot race it.
+                for at in [500, 7_500, 24_000] {
+                    tokio::time::sleep_until(t0 + Duration::from_millis(at)).await;
+                    observed.lock().push((
+                        tokio::time::Instant::now(),
+                        registry.latest_deadline().unwrap(),
+                    ));
+                }
+            })
+        };
+        let assembly = async {
+            tokio::time::sleep(Duration::from_secs(26)).await;
+            Ok::<_, ()>(())
+        };
+        let counter = fragments.clone();
+        crate::node::with_client_op_drain(
+            guard.drain_handle(),
+            assemble_noting_progress(assembly, move || counter.load(Ordering::SeqCst)),
+        )
+        .await
+        .unwrap();
+        let done = tokio::time::Instant::now();
+        feeder.await.unwrap();
+        observer.await.unwrap();
+
+        let observed = observed.lock().clone();
+        let (_, deadline_start) = observed[0];
+        assert!(
+            deadline_start > stale && deadline_start >= t0 + FRAGMENT_WINDOW,
+            "starting assembly must extend the deadline before any fragment arrives"
+        );
+        let (_, deadline_flowing) = observed[1];
+        assert!(
+            deadline_flowing >= t0 + Duration::from_secs(4) + FRAGMENT_WINDOW,
+            "fragments must keep the deadline a fragment window ahead"
+        );
+        let (at_stall, deadline_stall) = observed[2];
+        assert_eq!(
+            deadline_stall, deadline_flowing,
+            "no fragments arrived between 7.5 s and 24 s, so the deadline must not move"
+        );
+        assert!(
+            deadline_stall < at_stall,
+            "a stalled stream must age out of the drain"
+        );
+        assert!(
+            registry.latest_deadline().unwrap() >= done + TAIL_WINDOW,
+            "a completed assembly must give the tail its window"
+        );
+    }
+
     /// Bug #1 follow-through: `assemble_and_cache_stream` must claim
     /// the stream by `(peer_addr, stream_id)`, await assembly, and
     /// check the key matches before caching. The source-scrape
@@ -6563,8 +7121,9 @@ mod tests {
             "assemble_and_cache_stream must claim the stream via \
              orphan_stream_registry().claim_or_wait()"
         );
+        // Assembly runs through `assemble_noting_progress` (#5838).
         assert!(
-            body.contains(".assemble()") && body.contains(".await"),
+            body.contains("assemble_noting_progress(handle.assemble()") && body.contains(".await"),
             "assemble_and_cache_stream must await stream assembly"
         );
         assert!(
@@ -7929,10 +8488,10 @@ mod tests {
 
     /// The `client_driver`-side callsite (drive_client_get_inner's
     /// InlineFound arm) must pass `true`. Streaming assembly
-    /// (`assemble_and_cache_stream`) also must pass `true` — the stream
-    /// is only claimed by the client driver.
+    /// (`assemble_and_cache_stream`) serves both the client driver and the
+    /// sub-op driver, so it passes `true` only for a client GET (#5846).
     #[test]
-    fn client_driver_and_streaming_callsites_pass_is_client_requester_true() {
+    fn client_driver_and_streaming_callsites_mark_client_access_only_for_a_client() {
         let src = production_source();
         // Client driver InlineFound arm.
         let drive_body = extract_fn_body(src, "async fn drive_client_get_inner(");
@@ -7965,10 +8524,15 @@ mod tests {
             .filter(|c| !c.is_whitespace())
             .collect();
         assert!(
-            stream_normalized.contains("true"),
-            "assemble_and_cache_stream must pass `true` for is_client_requester \
-             (stream is only claimed by the client-originating driver). Call \
-             window: {stream_window}"
+            stream_normalized.contains("is_client_requester,"),
+            "assemble_and_cache_stream must pass `is_client_requester` (true for \
+             a client GET, false for a sub-op GET). Call window: {stream_window}"
+        );
+        assert!(
+            stream_body.contains(
+                "let is_client_requester = matches!(cause, crate::ring::HostingCause::ClientGet);"
+            ),
+            "only a client GET's streamed store may mark local client access"
         );
     }
 
@@ -8596,6 +9160,7 @@ mod route_attempt_driver_tests {
             asked_hops: Vec::new(),
             guesses_exhausted: false,
             first_hop_pin: None,
+            pinned_only: false,
         }
     }
 
@@ -9097,6 +9662,7 @@ mod route_attempt_driver_tests {
             instance_id,
             false,
             Some(peers[0].clone()),
+            false,
         )
         .await;
         assert!(
@@ -11024,6 +11590,12 @@ mod route_attempt_driver_tests {
         /// Ring peers, by ring order, given one routing event of their own
         /// before the GET, after the outside ones.
         history_for: Vec<usize>,
+        /// Run a sub-op GET targeted at this ring peer (by ring order), as
+        /// `start_targeted_sub_op_get` does, instead of a client GET.
+        sub_op_target: Option<usize>,
+        /// With `sub_op_target`: ask only the target, as
+        /// `start_pinned_sub_op_get` does.
+        pinned_only: bool,
     }
 
     /// The outcome of a scripted-ring GET.
@@ -11196,7 +11768,23 @@ mod route_attempt_driver_tests {
             },
         );
         let client_tx = Transaction::new::<GetMsg>();
-        let mut driver = driver_as_client(&op_manager, client_tx, instance_id);
+        let mut driver = match setup.sub_op_target {
+            Some(i) => {
+                let target = ring_peers
+                    .iter()
+                    .find(|p| addr(p) == order[i])
+                    .cloned()
+                    .expect("a ring peer");
+                sub_op_driver(
+                    &op_manager,
+                    client_tx,
+                    instance_id,
+                    Some(target),
+                    setup.pinned_only,
+                )
+            }
+            None => driver_as_client(&op_manager, client_tx, instance_id),
+        };
         let (outcome, _) = run(&op_manager, client_tx, &mut driver).await;
         let hops = hops.lock().clone();
         let pins = pins.lock().clone();
@@ -11616,6 +12204,200 @@ mod route_attempt_driver_tests {
         assert!(run.done, "the pinned peer answers: {:?}", run.hops);
     }
 
+    /// A targeted sub-op GET asks its target first (#5846). The attempt goes
+    /// to our own loopback relay, which picks the first hop by ring ranking
+    /// unless the retry loop pins one, so before the fix a "targeted" GET went
+    /// to the peer closest to the key and never to the target. Three peers; the
+    /// target is the FARTHEST from the key, so ranking alone never picks it
+    /// first, and it answers Found.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_targeted_sub_op_get_asks_its_target_first() {
+        use Scripted as S;
+        let run = run_scripted_ring(
+            "get-targeted-sub-op",
+            vec![vec![S::NotFound], vec![S::NotFound], vec![S::Found]],
+            RingSetup {
+                sub_op_target: Some(2),
+                ..RingSetup::default()
+            },
+        )
+        .await;
+        let target = run.order[2];
+        assert_eq!(
+            run.hops,
+            vec![target],
+            "the first attempt goes to the target"
+        );
+        assert_eq!(run.pins, vec![Some(target)]);
+        assert!(run.done, "the target answers: {:?}", run.hops);
+    }
+
+    /// The pin covers the first attempt only: a target that answers NotFound
+    /// is not asked again, and the next attempt is routed as usual, as
+    /// `start_targeted_sub_op_get` documents.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_targeted_sub_op_get_falls_back_to_routing_after_a_not_found() {
+        use Scripted as S;
+        let run = run_scripted_ring(
+            "get-targeted-sub-op-fallback",
+            vec![vec![S::Found], vec![S::NotFound], vec![S::NotFound]],
+            RingSetup {
+                sub_op_target: Some(2),
+                ..RingSetup::default()
+            },
+        )
+        .await;
+        assert_eq!(
+            run.hops,
+            vec![run.order[2], run.order[0]],
+            "target first, then the ring's closest candidate"
+        );
+        assert_eq!(run.pins, vec![Some(run.order[2]), None]);
+        assert!(run.done, "the routed attempt finds it: {:?}", run.hops);
+    }
+
+    /// A pinned-only sub-op GET (the stranded-holder recovery fetch, #5846)
+    /// asks its target and nobody else: when the target answers NotFound it
+    /// gives up rather than route toward a key region already known to be
+    /// empty. The closer peers here would answer Found, so a fallback would
+    /// show up as a second hop and a success.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_pinned_only_sub_op_get_asks_its_target_and_nobody_else() {
+        use crate::tracing::GetExhaustionReason::RetryBudget;
+        use Scripted as S;
+        let run = run_scripted_ring(
+            "get-pinned-only-sub-op",
+            vec![vec![S::Found], vec![S::Found], vec![S::NotFound]],
+            RingSetup {
+                sub_op_target: Some(2),
+                pinned_only: true,
+                ..RingSetup::default()
+            },
+        )
+        .await;
+        assert_eq!(run.hops, vec![run.order[2]], "only the target is asked");
+        assert!(!run.done, "a NotFound from the target ends the GET");
+        assert_eq!(run.exhausted, Some(RetryBudget));
+    }
+
+    /// A pinned fetch is cancelled at its deadline even when its target never
+    /// answers, and the caller's slot (`keep_alive`) lives exactly as long as
+    /// the fetch: held while it runs, released when it ends (#5846). A slot
+    /// freed while the fetch still ran would let a slow peer pile up fetches.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_pinned_sub_op_get_is_cancelled_at_its_deadline_and_holds_its_slot_until_then() {
+        let (op_manager, rx, peers, _guards) =
+            op_manager_with_peers("get-pinned-deadline", 1).await;
+        let target = peers[0].clone();
+        let hop = target.clone();
+        let _served = serve_attempts(
+            op_manager.clone(),
+            rx,
+            crate::message::TransactionType::Get,
+            move |_, _, _| Step {
+                hop: Some(hop.clone()),
+                answer: Answer::Never,
+            },
+        );
+        let slot = Arc::new(());
+        let held = Arc::downgrade(&slot);
+        let done: Arc<parking_lot::Mutex<Option<(bool, bool)>>> = Arc::default();
+        let seen_done = done.clone();
+        let held_at_done = held.clone();
+        let deadline = std::time::Duration::from_secs(5);
+        let (_tx, outcome) = start_pinned_sub_op_get(
+            &op_manager,
+            ContractInstanceId::new([91u8; 32]),
+            target,
+            deadline,
+            move |found| {
+                *seen_done.lock() = Some((found, held_at_done.upgrade().is_some()));
+            },
+            slot,
+        );
+
+        tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+        assert!(
+            held.upgrade().is_some(),
+            "the slot is held while the fetch runs"
+        );
+
+        let outcome = outcome.await.expect("the fetch reports an outcome");
+        assert!(
+            matches!(&outcome, SubOpGetOutcome::NotFound(cause) if cause == PINNED_FETCH_DEADLINE_CAUSE),
+            "the deadline ends the fetch: {outcome:?}"
+        );
+        tokio::task::yield_now().await;
+        assert!(
+            held.upgrade().is_none(),
+            "the slot is released when the fetch ends"
+        );
+        assert_eq!(
+            *done.lock(),
+            Some((false, true)),
+            "on_done reports the failure while the slot is still held, so what it \
+             records is in place before the slot can be reused"
+        );
+    }
+
+    /// `start_pinned_sub_op_get` really runs pinned-only: when its target
+    /// answers NotFound it does not go on to the other peer, which would have
+    /// answered Found. Two peers; each hop is picked by the real loopback-relay
+    /// selection.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn start_pinned_sub_op_get_does_not_fall_back_after_a_not_found() {
+        let (op_manager, rx, peers, _guards) = op_manager_with_peers("get-pinned-entry", 2).await;
+        let instance_id = ContractInstanceId::new([92u8; 32]);
+        let target = peers[1].clone();
+        let target_addr = addr(&target);
+        let view = op_manager.clone();
+        let htls = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let seen_htls = htls.clone();
+        let served = serve_attempts(
+            op_manager.clone(),
+            rx,
+            crate::message::TransactionType::Get,
+            move |_, msg, _| {
+                if let NetMessage::V1(NetMessageV1::Get(GetMsg::Request { htl, .. })) = msg {
+                    seen_htls.lock().push(*htl);
+                }
+                let (peer, peer_addr) =
+                    loopback_relay_pick(&view, msg).expect("the relay finds a candidate");
+                let answer = if peer_addr == target_addr {
+                    Answer::Reply(not_found(msg, instance_id))
+                } else {
+                    Answer::Reply(found(msg, instance_id))
+                };
+                Step {
+                    hop: Some(peer),
+                    answer,
+                }
+            },
+        );
+        let (_tx, outcome) = start_pinned_sub_op_get(
+            &op_manager,
+            instance_id,
+            target,
+            std::time::Duration::from_secs(120),
+            |_| {},
+            (),
+        );
+        let outcome = outcome.await.expect("the fetch reports an outcome");
+        assert!(
+            matches!(outcome, SubOpGetOutcome::NotFound(_)),
+            "a pinned-only fetch must not route on to another peer: {outcome:?}"
+        );
+        assert_eq!(served.load(Ordering::SeqCst), 1, "only the target is asked");
+        assert_eq!(
+            *htls.lock(),
+            // Literal on purpose: 2 is the smallest HTL that lets the target
+            // check its own store (loopback relay 2 -> target 1); anything
+            // larger lets a target with nothing to serve start a routed walk.
+            vec![2],
+            "a pinned fetch carries only enough HTL for the target to check its store"
+        );
+    }
+
     /// A callback dropped on this node is retried on the same peer without
     /// spending the retry budget, and it does not count as an attempt on the
     /// peer either: no verdict came from it. One peer: its first attempt ends
@@ -11914,7 +12696,7 @@ mod route_attempt_driver_tests {
         let body = |sig: &str| production_fn_body(src, sig);
         let client = body("async fn drive_client_get_inner(");
         assert!(client.contains("recorder: RouteAttemptRecorder::new("));
-        let sub_op = body("async fn drive_sub_op_get(");
+        let sub_op = body("fn sub_op_driver<'a>(");
         assert!(sub_op.contains("recorder: RouteAttemptRecorder::disabled("));
         let relay = body("async fn drive_relay_get_inner<CB>(");
         let loopback = relay

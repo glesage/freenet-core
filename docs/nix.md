@@ -101,9 +101,10 @@ One honest residual: the wrapper cannot see the node's auto-update failure
 lockout, and re-seeding would not clear it if it could. The lockout is a counter
 file in the node's own state directory, not a property of the binary. It does not
 gate the wrapper's own `freenet update` (which clears the counter on a successful
-install), so it only stops the node's in-process update re-poll — which means a
-locked-out peer that never crashes also never updates. Closing that would mean
-making update decisions in shell, which this wrapper deliberately does not do.
+install), so it only stops the node's in-process update re-poll. The node lets
+that lockout expire a day after the last failure, so a locked-out peer that
+never crashes still gets one attempt a day; the wrapper needs no update logic of
+its own for that.
 
 The supervisor itself (`nix/freenet-node.sh`) is a faithful port of the systemd
 unit the node generates for itself (`generate_user_service_file`,
@@ -167,8 +168,48 @@ this landed silently gets you a worse updater, not an older copy of this one.
 After the first update the tag stops mattering: the state-dir binary is a real
 release, and the node tracks releases from then on.
 
+## The NixOS module
+
+The flake exports `nixosModules.default`, which runs the unit below for you
+(first shipped in the release after v0.2.139):
+
+```nix
+{
+  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+  inputs.freenet.url = "github:freenet/freenet-core/vX.Y.Z";
+
+  outputs = { nixpkgs, freenet, ... }: {
+    nixosConfigurations.myhost = nixpkgs.lib.nixosSystem {
+      system = "x86_64-linux";
+      modules = [
+        ./configuration.nix
+        freenet.nixosModules.default
+        { services.freenet-node.enable = true; }
+      ];
+    };
+  };
+}
+```
+
+| Option | Default | |
+|---|---|---|
+| `services.freenet-node.enable` | `false` | Run the supervised, self-updating peer as `freenet-node.service`. |
+| `services.freenet-node.package` | the flake's `freenet-node` | Must provide `bin/freenet-node`. The bare `freenet` package has no supervisor. |
+| `services.freenet-node.extraArgs` | `[ ]` | Passed through to `freenet network`. |
+
+It is `services.freenet-node`, not `services.freenet`: nixpkgs already uses
+`services.freenet` as an alias for `services.hyphanet`, the unrelated Java
+Freenet now called Hyphanet.
+
+State lives in `/var/lib/freenet` (mode 0700, since the config directory holds
+the node's keys), which is also the `freenet` user's home. The default package
+is the flake's own, built with the pinned toolchain, not `pkgs.freenet-node`
+from the overlay. `nix build .#checks.x86_64-linux.nixos-module` boots a VM
+running the module (`nix/module-test.nix`).
+
 ## Running it under systemd on NixOS
 
+This is what the module does, for anyone writing their own unit.
 `freenet-node` is the process to supervise. It already handles the node's exit
 codes internally, so the surrounding unit should be plain:
 
@@ -187,7 +228,13 @@ systemd.services.freenet-node = {
     User = "freenet";
     Group = "freenet";
     # /var/lib/freenet. The wrapper seeds the binary under $STATE_DIRECTORY/bin.
-    StateDirectory = "freenet";
+    # "freenet/config" is load-bearing: the node refuses an explicit
+    # --config-dir that does not exist (a typo must not silently create a fresh
+    # identity), so without it the peer exits 1 on "Configuration directory not
+    # found" and crash-loops. data and logs are listed for symmetry; the node
+    # would create those itself. $STATE_DIRECTORY becomes a colon-separated
+    # list; the wrapper takes its first entry, /var/lib/freenet.
+    StateDirectory = [ "freenet" "freenet/config" "freenet/data" "freenet/logs" ];
     # Load-bearing, not a default: the wrapper exits 0 for a stood-down peer
     # as well as for a clean shutdown — notably on exit 43, "another instance
     # already holds the port", where the holder may be a stale orphan (see the
@@ -207,15 +254,14 @@ systemd.services.freenet-node = {
   startLimitIntervalSec = 0;
 };
 
-# Load-bearing, and the part that is easy to leave out. `StateDirectory` is NOT
-# the only writable directory this needs: the node's auto-update state —
-# the crash-probation marker, the known-good rollback snapshot and the
-# known-bad version pin — lives under the service user's HOME
-# (`auto_update::state_dir()` is `dirs::home_dir()/.local/state/freenet`), NOT
-# under $STATE_DIRECTORY. A NixOS user declared without `home` gets
-# `/var/empty`, which is not writable, so `prepare_known_good_for_install` and
-# `begin_probation` both fail and the peer runs with #4073 crash-loop rollback
-# silently OFF — a release that boot-crashes then has nothing to roll it back.
+# Keep `home`. The node's auto-update state — the crash-probation marker, the
+# known-good rollback snapshot and the known-bad version pin — lives under the
+# service user's HOME (`auto_update::state_dir()`), falling back to
+# $STATE_DIRECTORY only when HOME is unusable. Binaries older than that
+# fallback have no such escape: a NixOS user declared without `home` gets
+# `/var/empty`, every write fails, and the peer runs with #4073 crash-loop
+# rollback silently OFF until it updates past them. Seeding from an older tag
+# runs exactly such a binary first, so the line is still worth having.
 users.users.freenet = {
   isSystemUser = true;
   group = "freenet";
@@ -227,11 +273,27 @@ users.groups.freenet = { };
 
 The directories are named explicitly because the node otherwise derives them
 from the service user's home, which a system user may not usefully have. A
-read-only `/nix/store` is fine; **two** things must be writable, and they are
-different directories: the state directory (`$STATE_DIRECTORY`, where the
-wrapper seeds the binary) and the service user's home (where the node keeps its
-auto-update rollback state). This wrapper already has to know they differ — it
-looks for the known-bad pin in both — so an operator does too.
+read-only `/nix/store` is fine. The state directory (`$STATE_DIRECTORY`) must
+be writable, because the wrapper seeds the binary there, and the service
+user's home should be too, because that is where the node keeps its auto-update
+rollback state when it can. The two may be different directories — the wrapper
+looks for the known-bad pin in both.
+
+To run `freenet update` by hand, run it as the service user with the unit's
+environment, so it reads the same state the node does. With `home` set as above
+that is simply:
+
+```bash
+sudo -u freenet /var/lib/freenet/bin/freenet update
+```
+
+On a host where the service user has no usable home, the node keeps its state
+in `$STATE_DIRECTORY`, which only systemd sets. Pass it explicitly
+(`sudo -u freenet STATE_DIRECTORY=/var/lib/freenet /var/lib/freenet/bin/freenet update`),
+or a manual run will neither see the node's known-bad pin nor clear its failure
+counter. The lockout message printed by the node names the directory it is
+using. A manual update replaces the binary but not the running process, so
+restart the service afterwards (`sudo systemctl restart freenet-node`).
 
 Do **not** add `SuccessExitStatus=42 43` or `RestartPreventExitStatus=43` here:
 those belong to a unit supervising `freenet network` directly, and

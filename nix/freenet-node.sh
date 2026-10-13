@@ -73,12 +73,15 @@
 #
 # KNOWN DIVERGENCE -- the #3967 stale-orphan pre-flight is NOT ported.
 #
-#     The unit runs an `ExecStartPre` before every start that finds whoever
-#     holds the port and kills it IF it is an init-adopted orphan (PPID==1)
-#     running a DIFFERENT `Freenet version:` than the binary about to launch.
-#     Without it, an orphaned `freenet network` on an OLD binary can hold the
-#     port forever: the node exits 43 on every start, this wrapper stands down,
-#     and the orphan keeps serving stale assets with nothing to dislodge it.
+#     The unit runs an `ExecStartPre` before every start that kills an
+#     init-adopted orphan (PPID==1) `freenet network` of the same user,
+#     whatever its version (#5187), unless it is a separately configured
+#     instance or another systemd service's main process (see
+#     ORPHAN_REAP_PREFLIGHT in crates/core/src/bin/commands/service/linux.rs).
+#     Without it, an orphaned `freenet network` can hold the port forever: the
+#     node exits 43 on every start, this wrapper stands down, and the orphan
+#     runs unsupervised (on an OLD binary, serving stale assets) with nothing
+#     to dislodge it.
 #     That is a real, unattended-recovery gap and it is recorded here rather
 #     than papered over -- an earlier version of this file asserted the port
 #     holder "is healthy", which is precisely the case #3967 says it is not.
@@ -183,9 +186,10 @@ START_LIMIT_INTERVAL_SECS="${FREENET_NODE_START_LIMIT_INTERVAL_SECS:-120}"
 # path at all: `commands::update::run` never consults `should_attempt_update()`,
 # so the ExecStopPost `freenet update` below runs regardless and clears the
 # counter on a successful install. What the lockout genuinely stops is the
-# node's in-process exit-42 re-poll, so a locked-out peer that never crashes
-# also never updates. That residual is real, and this script cannot close it
-# without making update decisions, which is the one thing it must not do.
+# node's in-process exit-42 re-poll, and the node lets it expire a day after
+# the last failure (`UPDATE_LOCKOUT_COOLDOWN`), so a locked-out peer that never
+# crashes still gets one attempt a day. This script makes no decision about it,
+# which is the one thing it must not do.
 # ---------------------------------------------------------------------------
 
 # `dirs::home_dir()` -- which is what `auto_update::state_dir()` is built from --
@@ -340,10 +344,13 @@ self_update_blocker() {
 # snapshot and no probation marker. So consult it before replacing a peer that
 # is still serving the network.
 #
-# Two directories, because the node resolves this one from its home directory
-# (`auto_update::state_dir()`) and NOT from $STATE_DIRECTORY: under this script's
-# XDG fallback the two are the same path, and under a systemd unit with
-# `StateDirectory=` they are not. Either pinning this version is a refusal.
+# Two directories, because the node (`auto_update::state_dir()`) keeps its
+# state under its home directory whenever that is usable, and only falls back
+# to $STATE_DIRECTORY when it is not (a system user whose home is /var/empty).
+# Under this script's XDG fallback the two are the same path; under a systemd
+# unit with `StateDirectory=` the pin can be in either, and a binary that
+# predates the fallback only ever writes the home one. Either pinning this
+# version is a refusal.
 version_is_pinned_bad() {
     local want="$1" dir pinned
     local dirs=("$state_dir")
