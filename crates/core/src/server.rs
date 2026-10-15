@@ -268,8 +268,112 @@ fn is_ipv6_ula(addr: &std::net::Ipv6Addr) -> bool {
 // `origin_contract` (and now its `connection_scope`) straight through instead.
 
 pub async fn serve_client_api(config: WebsocketApiConfig) -> std::io::Result<[BoxedClient; 2]> {
-    let (gw, ws_proxy) = serve_client_api_in_impl(config, None).await?;
+    let (gw, ws_proxy) = serve_client_api_in_impl(config, None, None).await?;
     Ok([Box::new(gw), Box::new(ws_proxy)])
+}
+
+/// Like [`serve_client_api_with_listener`], for an app that embeds the node
+/// and owns every legitimate local caller. With `secret` set, the client API
+/// answers only callers that prove they belong to the embedding app:
+///
+/// - native clients send `X-Freenet-Embedder: <secret>`;
+/// - the app's web view holds the cookie `freenet-embedder=<secret>`, which it
+///   sends with the shell page load and every first-party request;
+/// - a WebSocket upgrade may instead carry an app auth token that a shell page
+///   loaded with the secret was issued.
+///
+/// Contract web files stay public (they are public contract data), but the
+/// shell page that issues app tokens needs the secret. Other processes on the
+/// device reach nothing else.
+pub async fn serve_client_api_with_embedder_secret(
+    config: WebsocketApiConfig,
+    listener: std::net::TcpListener,
+    secret: String,
+) -> std::io::Result<[BoxedClient; 2]> {
+    let secret = EmbedderSecret(Arc::from(secret));
+    let (gw, ws_proxy) = serve_client_api_in_impl(config, Some(listener), Some(secret)).await?;
+    Ok([Box::new(gw), Box::new(ws_proxy)])
+}
+
+/// The embedding app's per-session secret. See
+/// [`serve_client_api_with_embedder_secret`].
+#[derive(Clone)]
+pub(crate) struct EmbedderSecret(Arc<str>);
+
+/// Header a native embedder client sends its secret in.
+pub const EMBEDDER_SECRET_HEADER: &str = "x-freenet-embedder";
+/// Cookie an embedder's web view sends its secret in.
+pub const EMBEDDER_SECRET_COOKIE: &str = "freenet-embedder";
+
+impl EmbedderSecret {
+    fn matches(&self, presented: &str) -> bool {
+        let (a, b) = (self.0.as_bytes(), presented.as_bytes());
+        // Length is not secret; the bytes are compared in constant time.
+        a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    }
+
+    /// Whether `headers` carry this secret, in the header or the cookie.
+    pub(crate) fn presented_in(&self, headers: &axum::http::HeaderMap) -> bool {
+        if headers
+            .get(EMBEDDER_SECRET_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| self.matches(v))
+        {
+            return true;
+        }
+        headers
+            .get_all(axum::http::header::COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .flat_map(|v| v.split(';'))
+            .filter_map(|pair| pair.trim().split_once('='))
+            .any(|(name, value)| name == EMBEDDER_SECRET_COOKIE && self.matches(value))
+    }
+}
+
+/// Paths under which contract web files are served. The files are public
+/// data; only the shell page, which issues app tokens, needs the secret.
+fn is_contract_web_path(path: &str) -> bool {
+    ["/v1/contract/web/", "/v2/contract/web/"]
+        .iter()
+        .any(|prefix| path.starts_with(prefix))
+}
+
+/// The `authToken` query parameter of a request, if any.
+fn query_auth_token(query: Option<&str>) -> Option<AuthToken> {
+    query?
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .find(|(name, _)| *name == "authToken")
+        .map(|(_, value)| AuthToken::from(value.to_owned()))
+}
+
+/// Admits only callers of the embedding app; see
+/// [`serve_client_api_with_embedder_secret`].
+async fn embedder_gate(
+    Extension(secret): Extension<EmbedderSecret>,
+    Extension(origin_contracts): Extension<client_api::OriginContractMap>,
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let path = req.uri().path();
+    let admitted = secret.presented_in(req.headers())
+        || (is_contract_web_path(path)
+            && !client_api::renders_shell(path, req.uri().query(), req.headers()))
+        || query_auth_token(req.uri().query())
+            .is_some_and(|token| origin_contracts.contains_key(&token));
+    if !admitted {
+        tracing::warn!(
+            path = req.uri().path(),
+            "Rejected a client API request without the embedder secret"
+        );
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            "This node only answers the app that embeds it",
+        )
+            .into_response();
+    }
+    next.run(req).await
 }
 
 /// Like [`serve_client_api`] but reuses a pre-bound TCP listener, avoiding the
@@ -278,7 +382,7 @@ pub async fn serve_client_api_with_listener(
     config: WebsocketApiConfig,
     listener: std::net::TcpListener,
 ) -> std::io::Result<[BoxedClient; 2]> {
-    let (gw, ws_proxy) = serve_client_api_in_impl(config, Some(listener)).await?;
+    let (gw, ws_proxy) = serve_client_api_in_impl(config, Some(listener), None).await?;
     Ok([Box::new(gw), Box::new(ws_proxy)])
 }
 
@@ -290,7 +394,7 @@ pub async fn serve_client_api_with_listener_and_contracts(
     config: WebsocketApiConfig,
     listener: std::net::TcpListener,
 ) -> std::io::Result<([BoxedClient; 2], OriginContractMap)> {
-    let (gw, ws_proxy) = serve_client_api_in_impl(config, Some(listener)).await?;
+    let (gw, ws_proxy) = serve_client_api_in_impl(config, Some(listener), None).await?;
     let origin_contracts = gw.origin_contracts.clone();
     Ok(([Box::new(gw), Box::new(ws_proxy)], origin_contracts))
 }
@@ -303,13 +407,13 @@ pub async fn serve_client_api_for_test(
     client_api::HttpClientApi,
     crate::client_events::websocket::WebSocketProxy,
 )> {
-    serve_client_api_in_impl(config, None).await
+    serve_client_api_in_impl(config, None, None).await
 }
 
 pub(crate) async fn serve_client_api_in(
     config: WebsocketApiConfig,
 ) -> std::io::Result<(HttpClientApi, WebSocketProxy)> {
-    serve_client_api_in_impl(config, None).await
+    serve_client_api_in_impl(config, None, None).await
 }
 
 /// Hostnames and IPs accepted in the HTTP `Host` header for WebSocket connections.
@@ -498,6 +602,7 @@ impl HostAllowlistBuilder {
 async fn serve_client_api_in_impl(
     config: WebsocketApiConfig,
     pre_bound: Option<std::net::TcpListener>,
+    embedder: Option<EmbedderSecret>,
 ) -> std::io::Result<(HttpClientApi, WebSocketProxy)> {
     let ws_socket = (config.address, config.port).into();
 
@@ -528,7 +633,17 @@ async fn serve_client_api_in_impl(
         config.webapp_cache_dir.clone(),
     );
     let (ws_proxy, ws_router) =
-        WebSocketProxy::create_router_with_origin_contracts(gw_router, origin_contracts);
+        WebSocketProxy::create_router_with_origin_contracts(gw_router, origin_contracts.clone());
+    // Outermost of the router's own layers once installed: the embedder gate
+    // runs before any handler. The secret is also an Extension for the shell
+    // page, which checks it before issuing an app token.
+    let ws_router = match embedder {
+        Some(secret) => ws_router
+            .layer(axum::middleware::from_fn(embedder_gate))
+            .layer(Extension(origin_contracts))
+            .layer(Extension(secret)),
+        None => ws_router,
+    };
 
     let allowed_hosts: AllowedHosts = Arc::new(build_allowed_hosts(
         config.address,

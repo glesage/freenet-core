@@ -9,6 +9,11 @@
 //! node from starting. Core also only ever turns `skip_load_from_network` on
 //! from the file, so a file written with gateway overrides would stop a later
 //! start from fetching the public gateway index.
+//!
+//! Network mode without overrides fetches the public gateway index on its
+//! first start. Every later start reads the gateway list that fetch saved, so
+//! an offline or slow network never holds up opening saved contracts and
+//! delegate storage; the running node refreshes the list for the next start.
 
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
@@ -205,9 +210,38 @@ struct LayoutMarker {
     gateway_source: String,
 }
 
-fn gateway_source(settings: &NodeSettings) -> String {
+/// Core's cache of the public gateway index, next to `config.toml`.
+pub(crate) const GATEWAY_CACHE_FILE: &str = "gateways.toml";
+
+/// A saved gateway list from an earlier index fetch, with at least one entry
+/// whose public key file is still there. Core saves absolute key paths, and
+/// iOS moves an app's container on updates, so a list from before a move
+/// names files that are gone; the next start fetches the index again.
+pub(crate) fn has_gateway_cache(config_dir: &Path) -> bool {
+    let Some(gateways) = std::fs::read_to_string(config_dir.join(GATEWAY_CACHE_FILE))
+        .ok()
+        .and_then(|text| text.parse::<toml::Table>().ok())
+        .and_then(|table| table.get("gateways").and_then(|g| g.as_array()).cloned())
+    else {
+        return false;
+    };
+    !gateways.is_empty()
+        && gateways.iter().all(|gateway| {
+            gateway
+                .get("public_key")
+                .and_then(|key| key.as_str())
+                .is_some_and(|key| Path::new(key).is_file())
+        })
+}
+
+fn gateway_source(settings: &NodeSettings, config_dir: &Path) -> String {
     match settings.mode {
         NodeMode::Local => "local".into(),
+        // Core persists `skip_load_from_network` once it is on, so starting
+        // from the cache and fetching the index are separate sources.
+        NodeMode::Network if settings.gateways.is_empty() && has_gateway_cache(config_dir) => {
+            "index-cache".into()
+        }
         NodeMode::Network if settings.gateways.is_empty() => "index".into(),
         NodeMode::Network => {
             let mut entries: Vec<String> = settings
@@ -243,7 +277,7 @@ impl Layout {
             format: 1,
             data_dir: data.clone(),
             mode: settings.mode,
-            gateway_source: gateway_source(settings),
+            gateway_source: gateway_source(settings, &config),
         };
         let discarded_config = discard_stale_config(&config, &expected)?;
         let marker = serde_json::to_vec_pretty(&expected).map_err(MobileError::internal)?;
@@ -340,6 +374,16 @@ pub(crate) fn bind_loopback(preferred: Option<u16>) -> Result<std::net::TcpListe
     })
 }
 
+/// Turn off everything that sends reports, after Core has merged any
+/// persisted config.toml: legacy telemetry, the OpenTelemetry exporter and the
+/// reference ping and interface counters that feed them.
+pub(crate) fn force_reports_off(config: &mut freenet::config::Config) {
+    config.telemetry.enabled = false;
+    config.telemetry.reference_ping_enabled = false;
+    config.telemetry.iface_tx_enabled = false;
+    config.otel.enabled = false;
+}
+
 /// A UDP port that is free right now.
 pub(crate) fn free_udp_port(address: Ipv4Addr) -> Result<u16, MobileError> {
     let socket = UdpSocket::bind((address, 0)).map_err(|e| MobileError::StartFailed {
@@ -400,8 +444,10 @@ pub(crate) fn config_args(
         disable_auto_update: true,
         ..Default::default()
     };
-    // No usage reports leave the phone.
+    // No usage reports leave the phone. `force_reports_off` turns both settings
+    // off again after a persisted config.toml has been merged.
     args.telemetry.enabled = false;
+    args.otel.enabled = Some(false);
 
     args.network_api = match settings.mode {
         NodeMode::Local => {
@@ -429,12 +475,15 @@ pub(crate) fn config_args(
                 .map(GatewayOverride::to_core_arg)
                 .collect::<Result<Vec<_>, _>>()?;
             let use_index = gateways.is_empty();
+            // With overrides Core uses exactly those gateways. Without, the
+            // first start fetches the public gateway index; later starts read
+            // the list it saved, so starting never waits on the index, and the
+            // node refreshes the list in the background.
+            let from_cache = use_index && has_gateway_cache(&layout.config);
             NetworkArgs {
                 network_port: settings.network_port,
                 is_gateway: false,
-                // With overrides Core uses exactly those gateways; without, it
-                // fetches the public gateway index.
-                skip_load_from_network: !use_index,
+                skip_load_from_network: !use_index || from_cache,
                 gateway: (!use_index).then_some(gateways),
                 ..Default::default()
             }
@@ -553,6 +602,48 @@ mod tests {
         let index = Layout::prepare(&s).unwrap();
         assert!(index.discarded_config);
         assert!(!index.config.join("config.toml").exists());
+    }
+
+    #[test]
+    fn later_index_starts_read_the_saved_gateway_list() {
+        let root = tempfile::tempdir().unwrap();
+        let s = settings(root.path(), NodeMode::Network);
+        let first = Layout::prepare(&s).unwrap();
+        let args = config_args(&s, &first, 1).unwrap();
+        assert!(
+            !args.network_api.skip_load_from_network,
+            "first start fetches the index"
+        );
+        std::fs::write(
+            first.config.join("config.toml"),
+            format!("data_dir = {:?}\n", first.data.display().to_string()),
+        )
+        .unwrap();
+
+        // An empty saved list does not count.
+        std::fs::write(first.config.join(GATEWAY_CACHE_FILE), "gateways = []\n").unwrap();
+        assert!(!Layout::prepare(&s).unwrap().discarded_config);
+
+        // A list whose key files are gone, as after iOS moves the container.
+        let key = first.data.join("gw.pub");
+        let list = format!(
+            "[[gateways]]\npublic_key = {:?}\nlocation = 0.5\n\n[gateways.address]\nhostname = \"gw.example\"\n",
+            key.display().to_string()
+        );
+        std::fs::write(first.config.join(GATEWAY_CACHE_FILE), &list).unwrap();
+        assert!(!Layout::prepare(&s).unwrap().discarded_config);
+        let args = config_args(&s, &first, 1).unwrap();
+        assert!(
+            !args.network_api.skip_load_from_network,
+            "a stale list fetches the index"
+        );
+
+        std::fs::write(&key, "ab".repeat(32)).unwrap();
+        let cached = Layout::prepare(&s).unwrap();
+        assert!(cached.discarded_config, "the index-mode config is replaced");
+        let args = config_args(&s, &cached, 1).unwrap();
+        assert!(args.network_api.skip_load_from_network);
+        assert!(args.network_api.gateway.is_none());
     }
 
     #[test]
