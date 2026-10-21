@@ -22,9 +22,7 @@ use crate::ring::{ConnectionManager, PeerKeyLocation};
 use crate::router::Router;
 use std::collections::HashMap;
 
-use crate::transport::{
-    InboundConnectionHandler, OutboundConnectionHandler, PeerConnection, PeerConnectionApi,
-};
+use crate::transport::{InboundAcceptor, OutboundConnector, PeerConnectionApi};
 
 /// Events emitted by the handshake driver.
 ///
@@ -106,6 +104,8 @@ pub(crate) enum Command {
         peer: PeerKeyLocation,
         transaction: Transaction,
         transient: bool,
+        /// Why this dial is made (telemetry only).
+        origin: crate::transport::NatAttemptOrigin,
     },
     /// Register expectation for an inbound connection from `peer`.
     ExpectInbound {
@@ -147,9 +147,9 @@ pub(crate) struct HandshakeHandler {
 
 impl HandshakeHandler {
     #[allow(clippy::too_many_arguments)]
-    pub fn new<S: crate::transport::Socket>(
-        inbound: InboundConnectionHandler<S>,
-        outbound: OutboundConnectionHandler<S>,
+    pub fn new(
+        inbound: Box<dyn InboundAcceptor>,
+        outbound: Arc<dyn OutboundConnector>,
         _connection_manager: ConnectionManager,
         _router: Arc<RwLock<Router>>,
         _this_location: Option<Location>,
@@ -187,12 +187,15 @@ struct ExpectedInbound {
     transient: bool, // TODO: rename to transient in protocol once we migrate terminology
 }
 
+/// Matches accepted connections to the connect operations that expect them,
+/// by socket address. Node-side bookkeeping, distinct from the transport's
+/// expected-IP set (`InboundExpectations`).
 #[derive(Default)]
-struct ExpectedInboundTracker {
+struct InboundMatcher {
     entries: HashMap<SocketAddr, ExpectedInbound>,
 }
 
-impl ExpectedInboundTracker {
+impl InboundMatcher {
     fn register(
         &mut self,
         peer: PeerKeyLocation,
@@ -250,22 +253,22 @@ impl ExpectedInboundTracker {
     }
 }
 
-async fn run_driver<S: crate::transport::Socket>(
-    mut inbound: InboundConnectionHandler<S>,
-    outbound: OutboundConnectionHandler<S>,
+async fn run_driver(
+    mut inbound: Box<dyn InboundAcceptor>,
+    outbound: Arc<dyn OutboundConnector>,
     mut commands_rx: mpsc::Receiver<Command>,
     events_tx: mpsc::Sender<Event>,
     peer_ready: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) {
     use tokio::select;
 
-    let mut expected_inbound = ExpectedInboundTracker::default();
+    let mut expected_inbound = InboundMatcher::default();
 
     loop {
         select! {
             command = commands_rx.recv() => match command {
-                Some(Command::Connect { peer, transaction, transient }) => {
-                    spawn_outbound(outbound.clone(), events_tx.clone(), peer, transaction, transient, peer_ready.clone());
+                Some(Command::Connect { peer, transaction, transient, origin }) => {
+                    spawn_outbound(outbound.clone(), events_tx.clone(), peer, transaction, transient, origin, peer_ready.clone());
                 }
             Some(Command::ExpectInbound { peer, transaction, transient }) => {
                     expected_inbound.register(peer, transaction, transient /* transient */);
@@ -338,7 +341,7 @@ async fn run_driver<S: crate::transport::Socket>(
                                 Event::InboundConnection {
                                     transaction,
                                     peer,
-                                    connection: Box::new(conn),
+                                    connection: conn,
                                     transient,
                                 },
                                 INBOUND_FORWARD_TIMEOUT,
@@ -372,50 +375,25 @@ async fn run_driver<S: crate::transport::Socket>(
     }
 }
 
-fn spawn_outbound<S: crate::transport::Socket>(
-    outbound: OutboundConnectionHandler<S>,
+fn spawn_outbound(
+    outbound: Arc<dyn OutboundConnector>,
     events_tx: mpsc::Sender<Event>,
     peer: PeerKeyLocation,
     transaction: Transaction,
     transient: bool,
+    origin: crate::transport::NatAttemptOrigin,
     peer_ready: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) {
     GlobalExecutor::spawn(async move {
-        let peer_for_connect = peer.clone();
-        let mut handler = outbound;
-        let addr = peer_for_connect
-            .socket_addr()
-            .expect("Connect requires known peer address");
-        let connect_future = handler
-            .connect(peer_for_connect.pub_key.clone(), addr)
-            .await;
-        let result: Result<PeerConnection<S>, ConnectionError> =
-            match tokio::time::timeout(Duration::from_secs(10), connect_future).await {
-                Ok(res) => res.map_err(|err| err.into()),
-                Err(_) => Err(ConnectionError::Timeout),
-            };
-
-        // Only mark peer as ready after a successful connection
-        if result.is_ok() {
-            if let Some(flag) = &peer_ready {
-                flag.store(true, std::sync::atomic::Ordering::SeqCst);
-            }
-        }
-
-        let event = match result {
-            Ok(connection) => Event::OutboundEstablished {
-                transaction,
-                peer: peer.clone(),
-                connection: Box::new(connection),
-                transient,
-            },
-            Err(error) => Event::OutboundFailed {
-                transaction,
-                peer: peer.clone(),
-                error,
-                transient,
-            },
-        };
+        let event = connect_outbound(
+            &*outbound,
+            peer,
+            transaction,
+            transient,
+            origin,
+            peer_ready.as_deref(),
+        )
+        .await;
 
         // channel-safety: ok — this runs in a detached per-connection task
         // (GlobalExecutor::spawn), NOT on the event loop or the run_driver
@@ -428,11 +406,59 @@ fn spawn_outbound<S: crate::transport::Socket>(
     });
 }
 
+/// How long the handshake stage of an outbound connect may take. It does not
+/// cover handing the attempt to the transport, as before (see
+/// [`OutboundConnector`]); that unbounded stage is #5947.
+const OUTBOUND_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Run one outbound connect to `peer` and report it as the event the driver
+/// emits. Sets `peer_ready` only on success.
+async fn connect_outbound(
+    outbound: &dyn OutboundConnector,
+    peer: PeerKeyLocation,
+    transaction: Transaction,
+    transient: bool,
+    origin: crate::transport::NatAttemptOrigin,
+    peer_ready: Option<&std::sync::atomic::AtomicBool>,
+) -> Event {
+    let addr = peer
+        .socket_addr()
+        .expect("Connect requires known peer address");
+    let connect_future = outbound.connect(peer.pub_key.clone(), addr, origin).await;
+    let result: Result<Box<dyn PeerConnectionApi>, ConnectionError> =
+        match tokio::time::timeout(OUTBOUND_CONNECT_TIMEOUT, connect_future).await {
+            Ok(res) => res.map_err(|err| err.into()),
+            Err(_) => Err(ConnectionError::Timeout),
+        };
+
+    // Only mark peer as ready after a successful connection
+    if result.is_ok() {
+        if let Some(flag) = peer_ready {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    match result {
+        Ok(connection) => Event::OutboundEstablished {
+            transaction,
+            peer,
+            connection,
+            transient,
+        },
+        Err(error) => Event::OutboundFailed {
+            transaction,
+            peer,
+            error,
+            transient,
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::operations::connect::ConnectMsg;
-    use crate::transport::TransportKeypair;
+    use crate::transport::{TransportError, TransportKeypair};
     use std::net::{IpAddr, Ipv4Addr};
 
     fn make_peer(port: u16) -> PeerKeyLocation {
@@ -441,9 +467,386 @@ mod tests {
         PeerKeyLocation::new(keypair.public().clone(), addr)
     }
 
+    /// A connection that does nothing; only its identity as a
+    /// `Box<dyn PeerConnectionApi>` matters to these tests.
+    struct NullConnection(SocketAddr);
+
+    impl PeerConnectionApi for NullConnection {
+        fn remote_addr(&self) -> SocketAddr {
+            self.0
+        }
+
+        fn remote_version(&self) -> Option<(u8, u8, u16)> {
+            None
+        }
+
+        fn send_bytes(
+            &mut self,
+            _data: Vec<u8>,
+        ) -> Pin<Box<dyn std::future::Future<Output = Result<(), TransportError>> + Send + '_>>
+        {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn recv(
+            &mut self,
+        ) -> Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, TransportError>> + Send + '_>>
+        {
+            Box::pin(std::future::pending())
+        }
+
+        fn set_inbound_stream_registry(
+            &mut self,
+            _registry: Arc<dyn crate::transport::InboundStreamRegistry>,
+        ) {
+        }
+
+        fn send_stream_data(
+            &mut self,
+            _stream_id: crate::transport::StreamId,
+            _data: bytes::Bytes,
+            _metadata: Option<bytes::Bytes>,
+            _completion_tx: Option<
+                tokio::sync::oneshot::Sender<crate::transport::StreamSendOutcome>,
+            >,
+            _progress: Option<Arc<dyn crate::transport::StreamProgressObserver>>,
+        ) -> Pin<Box<dyn std::future::Future<Output = Result<(), TransportError>> + Send + '_>>
+        {
+            unreachable!("not used by these tests")
+        }
+
+        fn pipe_stream_data(
+            &mut self,
+            _outbound_stream_id: crate::transport::StreamId,
+            _inbound_handle: crate::transport::IncomingStream,
+            _metadata: Option<bytes::Bytes>,
+            _progress: Option<Arc<dyn crate::transport::StreamProgressObserver>>,
+        ) -> Pin<Box<dyn std::future::Future<Output = Result<(), TransportError>> + Send + '_>>
+        {
+            unreachable!("not used by these tests")
+        }
+    }
+
+    /// An `InboundAcceptor` that yields whatever the test sends it, and
+    /// `None` once the test drops the sender.
+    struct ChannelAcceptor(mpsc::Receiver<Box<dyn PeerConnectionApi>>);
+
+    impl InboundAcceptor for ChannelAcceptor {
+        fn next_connection(&mut self) -> crate::transport::NextConnection<'_> {
+            Box::pin(self.0.recv())
+        }
+    }
+
+    /// A `Connect` command reaches the connector with its origin.
+    #[tokio::test(start_paused = true)]
+    async fn run_driver_passes_the_connect_commands_origin_to_the_connector() {
+        let (_conn_tx, conn_rx) = mpsc::channel(4);
+        let (cmd_tx, cmd_rx) = mpsc::channel(4);
+        let (event_tx, mut event_rx) = mpsc::channel(4);
+        let connector = Arc::new(ScriptedConnector {
+            enqueue: Duration::ZERO,
+            handshake: Handshake::Succeeds,
+            origins: Default::default(),
+        });
+        let driver = GlobalExecutor::spawn(run_driver(
+            Box::new(ChannelAcceptor(conn_rx)),
+            connector.clone(),
+            cmd_rx,
+            event_tx,
+            None,
+        ));
+        cmd_tx
+            .send(Command::Connect {
+                peer: make_peer(4310),
+                transaction: Transaction::new::<ConnectMsg>(),
+                transient: false,
+                origin: crate::transport::NatAttemptOrigin::Gateway,
+            })
+            .await
+            .unwrap();
+        let Some(Event::OutboundEstablished { .. }) = event_rx.recv().await else {
+            panic!("expected OutboundEstablished");
+        };
+        assert_eq!(
+            *connector.origins.lock(),
+            vec![crate::transport::NatAttemptOrigin::Gateway]
+        );
+        driver.abort();
+    }
+
+    /// The accept loop, driven through `Box<dyn InboundAcceptor>`: an
+    /// expected connection is reported with its peer, transaction and
+    /// transient flag; an unexpected one with none of them; each accept marks
+    /// the peer ready; and the driver stops when the acceptor yields `None`.
+    #[tokio::test(start_paused = true)]
+    async fn run_driver_reports_accepted_connections_and_stops_with_the_acceptor() {
+        let (conn_tx, conn_rx) = mpsc::channel(4);
+        let (cmd_tx, cmd_rx) = mpsc::channel(4);
+        let (event_tx, mut event_rx) = mpsc::channel(4);
+        let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let driver = GlobalExecutor::spawn(run_driver(
+            Box::new(ChannelAcceptor(conn_rx)),
+            Arc::new(ScriptedConnector {
+                enqueue: Duration::ZERO,
+                handshake: Handshake::Hangs,
+                origins: Default::default(),
+            }),
+            cmd_rx,
+            event_tx,
+            Some(ready.clone()),
+        ));
+
+        let expected = make_peer(4300);
+        let expected_addr = expected.socket_addr().unwrap();
+        let tx = Transaction::new::<ConnectMsg>();
+        cmd_tx
+            .send(Command::ExpectInbound {
+                peer: expected.clone(),
+                transaction: Some(tx),
+                transient: true,
+            })
+            .await
+            .unwrap();
+        // Let the driver register the expectation before anything arrives.
+        tokio::time::sleep(Duration::from_millis(1)).await;
+
+        conn_tx
+            .send(Box::new(NullConnection(expected_addr)))
+            .await
+            .ok()
+            .unwrap();
+        let Some(Event::InboundConnection {
+            transaction,
+            peer,
+            connection,
+            transient,
+        }) = event_rx.recv().await
+        else {
+            panic!("expected an InboundConnection");
+        };
+        assert_eq!(peer, Some(expected));
+        assert_eq!(transaction, Some(tx));
+        assert!(transient);
+        assert_eq!(connection.remote_addr(), expected_addr);
+        assert!(ready.load(std::sync::atomic::Ordering::SeqCst));
+
+        let stranger: SocketAddr = "192.0.2.9:4301".parse().unwrap();
+        conn_tx
+            .send(Box::new(NullConnection(stranger)))
+            .await
+            .ok()
+            .unwrap();
+        let Some(Event::InboundConnection {
+            transaction,
+            peer,
+            connection,
+            transient,
+        }) = event_rx.recv().await
+        else {
+            panic!("expected an InboundConnection");
+        };
+        assert_eq!(peer, None);
+        assert_eq!(transaction, None);
+        assert!(!transient);
+        assert_eq!(connection.remote_addr(), stranger);
+        ready.store(false, std::sync::atomic::Ordering::SeqCst);
+        // Read only after the event, which the driver sends after setting it.
+        conn_tx
+            .send(Box::new(NullConnection(stranger)))
+            .await
+            .ok()
+            .unwrap();
+        assert!(event_rx.recv().await.is_some());
+        assert!(
+            ready.load(std::sync::atomic::Ordering::SeqCst),
+            "every accept marks the peer ready, not only the first"
+        );
+
+        drop(conn_tx);
+        driver.await.expect("the driver ends cleanly");
+        assert!(event_rx.recv().await.is_none(), "the driver has stopped");
+    }
+
+    /// What a scripted connector's handshake stage does.
+    #[derive(Clone, Copy)]
+    enum Handshake {
+        Succeeds,
+        Fails,
+        Hangs,
+    }
+
+    /// An `OutboundConnector` whose two stages are scripted: the first
+    /// takes `enqueue` (virtual time), the second does `handshake`.
+    struct ScriptedConnector {
+        enqueue: Duration,
+        handshake: Handshake,
+        /// The origin each `connect` was called with.
+        origins: parking_lot::Mutex<Vec<crate::transport::NatAttemptOrigin>>,
+    }
+
+    impl OutboundConnector for ScriptedConnector {
+        // Two stages by design: see `OutboundConnector::connect`.
+        #[allow(clippy::async_yields_async)]
+        fn connect(
+            &self,
+            _remote_public_key: crate::transport::TransportPublicKey,
+            remote_addr: SocketAddr,
+            origin: crate::transport::NatAttemptOrigin,
+        ) -> Pin<
+            Box<dyn std::future::Future<Output = crate::transport::PendingConnection> + Send + '_>,
+        > {
+            self.origins.lock().push(origin);
+            let (enqueue, handshake) = (self.enqueue, self.handshake);
+            Box::pin(async move {
+                tokio::time::sleep(enqueue).await;
+                let pending: crate::transport::PendingConnection = match handshake {
+                    Handshake::Succeeds => Box::pin(async move {
+                        Ok(Box::new(NullConnection(remote_addr)) as Box<dyn PeerConnectionApi>)
+                    }),
+                    Handshake::Fails => Box::pin(async {
+                        Err(TransportError::ConnectionEstablishmentFailure {
+                            cause: "refused".into(),
+                        })
+                    }),
+                    Handshake::Hangs => Box::pin(std::future::pending()),
+                };
+                pending
+            })
+        }
+    }
+
+    struct ConnectRun {
+        event: Event,
+        peer: PeerKeyLocation,
+        transaction: Transaction,
+        ready: bool,
+        elapsed: Duration,
+        /// The origins the connector was called with.
+        origins: Vec<crate::transport::NatAttemptOrigin>,
+    }
+
+    /// The origin `run_connect` dials with; any variant would do, as long as
+    /// the connector sees exactly it.
+    const RUN_ORIGIN: crate::transport::NatAttemptOrigin =
+        crate::transport::NatAttemptOrigin::RingPeerNoTransport;
+
+    /// Run `connect_outbound` against a scripted connector.
+    async fn run_connect(enqueue: Duration, handshake: Handshake) -> ConnectRun {
+        let connector = ScriptedConnector {
+            enqueue,
+            handshake,
+            origins: Default::default(),
+        };
+        let ready = std::sync::atomic::AtomicBool::new(false);
+        let peer = make_peer(4200);
+        let transaction = Transaction::new::<ConnectMsg>();
+        let start = tokio::time::Instant::now();
+        let event = connect_outbound(
+            &connector,
+            peer.clone(),
+            transaction,
+            true,
+            RUN_ORIGIN,
+            Some(&ready),
+        )
+        .await;
+        ConnectRun {
+            event,
+            peer,
+            transaction,
+            ready: ready.load(std::sync::atomic::Ordering::SeqCst),
+            elapsed: start.elapsed(),
+            origins: connector.origins.into_inner(),
+        }
+    }
+
+    /// A completed handshake becomes `OutboundEstablished` carrying the peer,
+    /// transaction and transient flag, and marks the peer ready.
+    #[tokio::test(start_paused = true)]
+    async fn outbound_connect_success_is_established_and_marks_ready() {
+        let run = run_connect(Duration::ZERO, Handshake::Succeeds).await;
+        let Event::OutboundEstablished {
+            transaction,
+            peer,
+            connection,
+            transient,
+        } = run.event
+        else {
+            panic!("expected OutboundEstablished, got {:?}", run.event);
+        };
+        assert_eq!(peer, run.peer);
+        assert_eq!(transaction, run.transaction);
+        assert_eq!(connection.remote_addr(), run.peer.socket_addr().unwrap());
+        assert!(transient);
+        assert!(run.ready, "a successful connect marks the peer ready");
+        assert_eq!(
+            run.origins,
+            vec![RUN_ORIGIN],
+            "the connector gets the dial's origin, once"
+        );
+    }
+
+    /// A failed handshake becomes `OutboundFailed` with the transport error
+    /// converted as before, and does not mark the peer ready.
+    #[tokio::test(start_paused = true)]
+    async fn outbound_connect_failure_is_failed_and_leaves_ready_unset() {
+        let run = run_connect(Duration::ZERO, Handshake::Fails).await;
+        let Event::OutboundFailed {
+            transaction,
+            peer,
+            error,
+            transient,
+        } = run.event
+        else {
+            panic!("expected OutboundFailed, got {:?}", run.event);
+        };
+        assert_eq!(peer, run.peer);
+        assert_eq!(transaction, run.transaction);
+        assert!(transient);
+        let expected = ConnectionError::from(TransportError::ConnectionEstablishmentFailure {
+            cause: "refused".into(),
+        });
+        assert!(
+            matches!(error, ConnectionError::TransportError(_)),
+            "{error:?}"
+        );
+        assert_eq!(error.to_string(), expected.to_string());
+        assert!(!run.ready);
+    }
+
+    /// A handshake that never finishes fails as `Timeout` after exactly the
+    /// connect timeout.
+    #[tokio::test(start_paused = true)]
+    async fn outbound_connect_that_hangs_times_out_after_ten_seconds() {
+        let run = run_connect(Duration::ZERO, Handshake::Hangs).await;
+        let Event::OutboundFailed { error, .. } = run.event else {
+            panic!("expected OutboundFailed, got {:?}", run.event);
+        };
+        assert!(matches!(error, ConnectionError::Timeout), "{error:?}");
+        assert_eq!(run.elapsed, Duration::from_secs(10));
+        assert!(!run.ready);
+    }
+
+    /// Pins CURRENT behaviour, not a requirement: the timeout covers only the
+    /// handshake stage, so an attempt that waits longer than the timeout to
+    /// be queued still connects. That leaves a stalled listener able to hang
+    /// the connect forever; when #5947 bounds the enqueue stage, change this
+    /// test to assert the bound.
+    #[tokio::test(start_paused = true)]
+    async fn outbound_connect_enqueue_stage_is_not_yet_under_the_timeout() {
+        let run = run_connect(Duration::from_secs(15), Handshake::Succeeds).await;
+        assert!(
+            matches!(run.event, Event::OutboundEstablished { .. }),
+            "{:?}",
+            run.event
+        );
+        assert_eq!(run.elapsed, Duration::from_secs(15));
+        assert!(run.ready);
+    }
+
     #[test]
     fn tracker_returns_registered_entry_exactly_once() {
-        let mut tracker = ExpectedInboundTracker::default();
+        let mut tracker = InboundMatcher::default();
         let peer = make_peer(4100);
         let addr = peer.socket_addr().unwrap();
         let tx = Transaction::new::<ConnectMsg>();
@@ -460,7 +863,7 @@ mod tests {
 
     #[test]
     fn tracker_drop_removes_entry() {
-        let mut tracker = ExpectedInboundTracker::default();
+        let mut tracker = InboundMatcher::default();
         let peer = make_peer(4200);
         let addr = peer.socket_addr().unwrap();
         tracker.register(peer.clone(), None, false);
@@ -473,7 +876,7 @@ mod tests {
 
     #[test]
     fn tracker_overwrites_existing_expectation() {
-        let mut tracker = ExpectedInboundTracker::default();
+        let mut tracker = InboundMatcher::default();
         let peer = make_peer(4300);
         let addr = peer.socket_addr().unwrap();
         tracker.register(peer.clone(), None, false);
@@ -491,7 +894,7 @@ mod tests {
 
     #[test]
     fn tracker_keeps_peers_separate_on_same_ip() {
-        let mut tracker = ExpectedInboundTracker::default();
+        let mut tracker = InboundMatcher::default();
         let peer_a = make_peer(4400);
         let peer_b = make_peer(4401);
         let addr_a = peer_a.socket_addr().unwrap();

@@ -677,7 +677,7 @@ pub(crate) mod driver_test_support {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use freenet_stdlib::prelude::WrappedState;
+    use freenet_stdlib::prelude::{StateSummary, WrappedState};
 
     use crate::contract::{ContractHandlerEvent, StoreResponse};
     use crate::message::{MessageStats, NetMessage};
@@ -759,6 +759,19 @@ pub(crate) mod driver_test_support {
 
     fn rejects_stores(id: &str) -> bool {
         store_rejections().contains(id)
+    }
+
+    fn summary_answerers() -> &'static dashmap::DashSet<String> {
+        static ANSWERERS: std::sync::OnceLock<dashmap::DashSet<String>> =
+            std::sync::OnceLock::new();
+        ANSWERERS.get_or_init(dashmap::DashSet::new)
+    }
+
+    /// Make the stub contract handler of the test node built with `id` answer
+    /// a `GetSummaryQuery` for the stored contract (its summary is the stored
+    /// state's bytes). By default that query is left unanswered.
+    pub(crate) fn answer_summaries(id: &str) {
+        summary_answerers().insert(id.to_string());
     }
 
     /// The pre-#5657 non-router inputs for `peer`: its `peer_health`
@@ -860,9 +873,6 @@ pub(crate) mod driver_test_support {
     /// [`op_manager_with_peers_and_store`], with the event-loop channels
     /// sized `channel_capacity` (`None`: the default). A small capacity lets
     /// a test hold a dispatch up.
-    // The stub contract handler answers two events and leaves every other
-    // variant unanswered on purpose, so its wildcard arm is the point.
-    #[allow(clippy::wildcard_enum_match_arm)]
     pub(crate) async fn op_manager_with_peers_and_store_on(
         id: &str,
         peers: usize,
@@ -874,15 +884,70 @@ pub(crate) mod driver_test_support {
         Box<dyn std::any::Any>,
         LocalStore,
     ) {
+        build_op_manager(id, peers, channel_capacity, &[]).await
+    }
+
+    /// [`op_manager_with_peers_and_store`] for a node with NO ring connections
+    /// and `gateway` configured, i.e. a freshly-bootstrapped node whose ops
+    /// take the bootstrap-gateway fallback (#4361).
+    pub(crate) async fn op_manager_with_gateway(
+        id: &str,
+        gateway: PeerKeyLocation,
+    ) -> (
+        Arc<OpManager>,
+        tokio::sync::mpsc::Receiver<OpExecutionPayload>,
+        Box<dyn std::any::Any>,
+        LocalStore,
+    ) {
+        let (op_manager, rx, _no_peers, guards, store) =
+            build_op_manager(id, 0, None, std::slice::from_ref(&gateway)).await;
+        (op_manager, rx, guards, store)
+    }
+
+    // The stub contract handler answers two events and leaves every other
+    // variant unanswered on purpose, so its wildcard arm is the point.
+    #[allow(clippy::wildcard_enum_match_arm)]
+    async fn build_op_manager(
+        id: &str,
+        peers: usize,
+        channel_capacity: Option<usize>,
+        gateways: &[PeerKeyLocation],
+    ) -> (
+        Arc<OpManager>,
+        tokio::sync::mpsc::Receiver<OpExecutionPayload>,
+        Vec<PeerKeyLocation>,
+        Box<dyn std::any::Any>,
+        LocalStore,
+    ) {
+        // A non-gateway node with a configured gateway and no ring connections
+        // makes the ring's maintenance task dial that gateway
+        // (`join_ring_request`), and every such dial bumps the process-global
+        // `network_status` first-connection counter. Tests asserting on that
+        // counter (`join_attempts_counted_once_per_dial_and_not_for_probes`)
+        // hold `TEST_GLOBAL_STATE_LOCK`, so this node must hold it too for as
+        // long as its maintenance task can run, i.e. until the returned
+        // guards drop. Taken before the `OpManager` exists so no dial can
+        // precede it. Nodes without a gateway never dial and stay parallel.
+        let global_state = (!gateways.is_empty()).then(|| {
+            crate::node::network_status::TEST_GLOBAL_STATE_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        });
         let config_args = crate::config::ConfigArgs {
             id: Some(id.to_string()),
             mode: Some(crate::contract::OperationMode::Local),
             ..Default::default()
         };
-        let node_config =
+        let mut node_config =
             crate::node::NodeConfig::new(config_args.build().await.expect("build Config"))
                 .await
                 .expect("build NodeConfig");
+        node_config.gateways.extend(gateways.iter().map(|gw| {
+            crate::node::InitPeerNode::new(
+                gw.clone(),
+                Location::from_address(&gw.socket_addr().unwrap()),
+            )
+        }));
         let (notification_rx, notification_tx) = match channel_capacity {
             Some(capacity) => crate::node::event_loop_notification_channel_with_capacity(capacity),
             None => crate::node::event_loop_notification_channel(),
@@ -937,6 +1002,25 @@ pub(crate) mod driver_test_support {
                         };
                         let _answered = ch_channel.send_to_sender(id, response).await;
                     }
+                    ContractHandlerEvent::GetSummaryQuery { key }
+                        if summary_answerers().contains(&node_id) =>
+                    {
+                        let stored = handler_store
+                            .lock()
+                            .clone()
+                            .filter(|(stored_key, _)| *stored_key == key);
+                        let response = ContractHandlerEvent::GetSummaryResponse {
+                            key,
+                            summary: stored
+                                .map(|(_, state)| StateSummary::from(state.as_ref().to_vec()))
+                                .ok_or_else(|| {
+                                    crate::contract::ExecutorError::other(anyhow::anyhow!(
+                                        "no stored state to summarize"
+                                    ))
+                                }),
+                        };
+                        let _answered = ch_channel.send_to_sender(id, response).await;
+                    }
                     // Every other event is deliberately left unanswered,
                     // whatever its variant.
                     _ => ch_channel.drop_waiting_response(id),
@@ -983,6 +1067,7 @@ pub(crate) mod driver_test_support {
             wait_for_event,
             result_router_rx,
             task_monitor,
+            global_state,
         ));
         (op_manager, op_execution_receiver, added, guards, store)
     }

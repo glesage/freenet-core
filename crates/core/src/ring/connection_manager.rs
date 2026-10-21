@@ -1224,10 +1224,9 @@ impl ConnectionManager {
     /// evidence), except at the cap: there our own cap refuses every
     /// non-lattice acceptor, and a peer at max would otherwise never sleep. A
     /// lattice edge that could not be connected, for any reason (a failed hole
-    /// punch, or our own refusal at the cap, whose outbound pre-flight check
-    /// does not exempt lattice edges, #5827), is recorded as a failed hit, and the
-    /// scheduler re-checks on its retry ladder. Returns whether a miss was
-    /// recorded.
+    /// punch, or our own refusal once the over-cap ceiling is used up), is
+    /// recorded as a failed hit, and the scheduler re-checks on its retry ladder.
+    /// Returns whether a miss was recorded.
     pub(crate) fn record_lattice_probe_result(
         &self,
         loc: Location,
@@ -1383,9 +1382,10 @@ impl ConnectionManager {
     /// victim), bringing the node back to `max_connections`.
     ///
     /// This is the SINGLE over-cap admission predicate shared by every gate that
-    /// can add a ring connection: `should_accept`, the two connection-lifecycle
-    /// promotion gates (`p2p_protoc/connection_lifecycle.rs`), and
-    /// [`Self::add_connection`]. Keeping the decision in one place is deliberate —
+    /// can add a ring connection: `should_accept`, the three connection-lifecycle
+    /// cap gates (`p2p_protoc/connection_lifecycle.rs`: the outbound pre-flight
+    /// check in `handle_connect_peer` and both promotion gates, through
+    /// [`Self::refuses_connection_at_cap`]), and [`Self::add_connection`]. Keeping the decision in one place is deliberate —
     /// before it was wired through the lifecycle gates, mechanism 3's over-cap
     /// displacement was inert on the real CONNECT path (the gates rejected at
     /// `>= max_connections` first).
@@ -1436,6 +1436,26 @@ impl ConnectionManager {
     /// the ESTABLISHED count regardless.
     pub(crate) fn admits_lattice_edge_over_cap(&self, loc: Location) -> bool {
         self.admits_lattice_edge_over_cap_in(&self.connections_by_location.read(), loc)
+    }
+
+    /// Whether a connection to a peer at `loc` must be refused to respect
+    /// `max_connections`: at or over the cap, unless the peer would be a new
+    /// per-side nearest lattice edge within the over-cap ceiling
+    /// ([`Self::admits_lattice_edge_over_cap`]).
+    ///
+    /// The one predicate shared by the outbound pre-flight check in
+    /// `handle_connect_peer` and both promotion gates
+    /// (`p2p_protoc/connection_lifecycle.rs`), so every gate applies the same
+    /// lattice exemption. They need not reach the same answer for the same
+    /// candidate: the over-cap ceiling counts pending reservations, and when we
+    /// are the acceptor the candidate's own reservation is still held at the
+    /// pre-flight check (as in `should_accept`) but already released at the
+    /// promotion gate in `handle_successful_connection`, so the pre-flight check
+    /// can refuse one slot earlier than that gate.
+    /// Before #5827 the pre-flight check had no lattice exemption, so a peer at
+    /// max refused its own lattice probe's acceptor before NAT traversal began.
+    pub(crate) fn refuses_connection_at_cap(&self, loc: Location) -> bool {
+        self.connection_count() >= self.max_connections && !self.admits_lattice_edge_over_cap(loc)
     }
 
     /// [`Self::admits_lattice_edge_over_cap`] evaluated against an ALREADY-HELD
@@ -2052,6 +2072,12 @@ impl ConnectionManager {
         *self.own_addr.lock() = Some(addr);
     }
 
+    /// Forgets this node's address, as for a fresh joiner (test-only).
+    #[cfg(test)]
+    pub(crate) fn clear_own_addr_for_test(&self) {
+        *self.own_addr.lock() = None;
+    }
+
     pub fn prune_alive_connection(&self, addr: SocketAddr) -> Option<Location> {
         self.prune_connection(addr, true)
     }
@@ -2084,10 +2110,29 @@ impl ConnectionManager {
         }; // pending_reservations lock released
 
         // Phase 2: Remove corresponding location_for_peer entries so
-        // has_connection_or_pending() returns false for these addresses.
+        // has_connection_or_pending() returns false for these addresses. A
+        // reservation can be promoted to an established connection between the
+        // two phases (overlapping bootstrap rounds, #5858); that peer's mapping
+        // is ACTUAL state now and must stay. Checked under location_for_peer
+        // (#1) then connections_by_location (#2), the documented order. This
+        // narrows the race but cannot close it: an add can still land between
+        // its own two locks after this check. `prune_connection` removes the
+        // ghost such an interleaving leaves (an established entry with no
+        // mapping), which closes the residue.
         if !removed.is_empty() {
             let mut location_for_peer = self.location_for_peer.write();
+            let connections = self.connections_by_location.read();
             for addr in &removed {
+                let established = location_for_peer.get(addr).is_some_and(|loc| {
+                    connections.get(loc).is_some_and(|conns| {
+                        conns
+                            .iter()
+                            .any(|c| c.location.socket_addr() == Some(*addr))
+                    })
+                });
+                if established {
+                    continue;
+                }
                 location_for_peer.remove(addr);
                 tracing::debug!(
                     addr = %addr,
@@ -2096,6 +2141,33 @@ impl ConnectionManager {
             }
         }
     }
+
+    /// Clears the pending reservations a bootstrap round made: for each
+    /// `(addr, sent)`, the reservation at `addr` only if it was created within
+    /// [`Self::OWNED_RESERVATION_WINDOW`] after the round sent its CONNECT
+    /// there. A reservation made later at the same address belongs to another
+    /// attempt and is left alone (#5858).
+    pub fn clear_owned_reservations(&self, owned: &[(SocketAddr, Instant)]) {
+        let addrs: Vec<SocketAddr> = {
+            let pending = self.pending_reservations.read();
+            owned
+                .iter()
+                .filter(|(addr, sent)| {
+                    pending.get(addr).is_some_and(|(_, created)| {
+                        *created >= *sent
+                            && created.duration_since(*sent) <= Self::OWNED_RESERVATION_WINDOW
+                    })
+                })
+                .map(|(addr, _)| *addr)
+                .collect()
+        };
+        self.clear_pending_reservations_for(&addrs);
+    }
+
+    /// How soon after a round sends its CONNECT the reservation it makes is
+    /// created: the join reserves the gateway first thing, so seconds cover a
+    /// busy runtime.
+    const OWNED_RESERVATION_WINDOW: Duration = Duration::from_secs(5);
 
     /// Get the duration of an existing connection by address in milliseconds.
     /// Returns None if the connection doesn't exist.
@@ -2114,6 +2186,26 @@ impl ConnectionManager {
             }
         }
         None
+    }
+
+    /// Bytes `(sent, received)` on the ring connection to `addr` since it
+    /// joined the ring (see [`super::Connection::bytes_since_connect`]). `None` if
+    /// there is no such connection.
+    pub fn get_connection_bytes(
+        &self,
+        addr: SocketAddr,
+        current: Option<(u64, u64)>,
+    ) -> Option<(Option<u64>, Option<u64>)> {
+        let loc = {
+            let locations_for_peer = self.location_for_peer.read();
+            locations_for_peer.get(&addr).cloned()?
+        };
+        let conns = self.connections_by_location.read();
+        conns
+            .get(&loc)?
+            .iter()
+            .find(|conn| conn.location.socket_addr() == Some(addr))
+            .map(|conn| conn.bytes_since_connect(current))
     }
 
     /// Add a connection to the ring topology. Returns `true` if the connection
@@ -2147,10 +2239,11 @@ impl ConnectionManager {
         // over-max ceiling (`admits_lattice_edge_over_cap`, see
         // LATTICE_OVERMAX_SLACK). The over-max topology prune sheds a non-lattice
         // connection on the next maintenance tick (lattice edges are protected
-        // there), bringing the node back to max. The two connection-lifecycle
-        // promotion gates apply the SAME predicate before reaching here, so a
-        // lattice edge is no longer silently dropped at the cap on the real
-        // CONNECT path.
+        // there), bringing the node back to max. The three connection-lifecycle
+        // cap gates (the outbound pre-flight check and both promotion gates)
+        // apply the SAME predicate before reaching here, through
+        // `refuses_connection_at_cap`, so a lattice edge is no longer silently
+        // dropped at the cap on the real CONNECT path.
         //
         // F4 (atomicity): the cap count-check, the over-cap admission check, the
         // relocation removal, and the insert all run under ONE held
@@ -2389,6 +2482,32 @@ impl ConnectionManager {
 
         let Some(loc) = locations_for_peer.remove(&addr) else {
             if is_alive {
+                // No mapping, but an established entry may still exist (its
+                // mapping lost to a concurrent reservation cleanup between an
+                // add's two locks). Remove it rather than leave a ghost
+                // connection that blocks zero-connection recovery.
+                let cbl = &mut *self.connections_by_location.write();
+                let ghost = cbl.iter().find_map(|(loc, conns)| {
+                    conns
+                        .iter()
+                        .any(|c| c.location.socket_addr() == Some(addr))
+                        .then_some(*loc)
+                });
+                if let Some(loc) = ghost {
+                    tracing::warn!(
+                        addr = %addr,
+                        "prune_connection: removing an established connection with no location mapping"
+                    );
+                    if let Some(bucket) = cbl.get_mut(&loc) {
+                        bucket.retain(|c| c.location.socket_addr() != Some(addr));
+                        if bucket.is_empty() {
+                            cbl.remove(&loc);
+                        }
+                    }
+                    drop(locations_for_peer);
+                    self.forget_pruned_peer(addr);
+                    return Some(loc);
+                }
                 tracing::debug!("no location found for peer, skip pruning");
                 return None;
             } else {
@@ -2420,16 +2539,21 @@ impl ConnectionManager {
             self.pending_reservations.write().remove(&addr);
         }
 
-        // Clean up readiness state for the pruned peer
-        self.ready_peers.remove(&addr);
-
-        // Clean up connection timestamp for optimistic readiness
-        self.connected_since.write().remove(&addr);
-
-        // Clean up health tracking for the pruned peer
-        self.peer_health.lock().remove_peer(addr);
+        self.forget_pruned_peer(addr);
 
         Some(loc)
+    }
+
+    /// Per-peer state every prune of an established connection clears,
+    /// shared by the normal path and the no-mapping (ghost) path so they
+    /// cannot drift apart.
+    fn forget_pruned_peer(&self, addr: SocketAddr) {
+        // Readiness state
+        self.ready_peers.remove(&addr);
+        // Connection timestamp for optimistic readiness
+        self.connected_since.write().remove(&addr);
+        // Health tracking
+        self.peer_health.lock().remove_peer(addr);
     }
 
     /// Test-only: push a raw [`Connection`] straight into
@@ -2869,6 +2993,16 @@ impl ConnectionManager {
         *count
     }
 
+    /// The consecutive connect failure count as of `now`, with the same decay
+    /// as [`Self::increment_connect_jitter_failures`] but nothing recorded.
+    pub fn connect_jitter_failures_at(&self, now: Instant) -> u32 {
+        let (count, last_failure) = *self.connect_jitter_failures.lock();
+        let decay_steps = last_failure.map_or(0, |ts| {
+            (now.duration_since(ts).as_secs() / Self::JITTER_DECAY_INTERVAL.as_secs()) as u32
+        });
+        count.saturating_sub(decay_steps)
+    }
+
     /// Reset consecutive connect failure counter (called on successful connect).
     pub fn reset_connect_jitter_failures(&self) {
         let mut guard = self.connect_jitter_failures.lock();
@@ -3039,6 +3173,74 @@ mod tests {
 
     fn make_addr(port: u16) -> SocketAddr {
         SocketAddr::from(([127, 0, 0, 1], port))
+    }
+
+    /// A reservation promoted to an established connection between the two
+    /// phases of a reservation cleanup keeps its mapping (Codex P1): otherwise
+    /// a later prune finds no location and leaves a ghost connection.
+    #[test]
+    fn reservation_cleanup_keeps_the_mapping_of_a_promoted_connection() {
+        let cm = make_connection_manager(Some(make_addr(7200)), 2, 50, false);
+        let addr = make_addr(7201);
+        let loc = Location::new(0.3);
+        cm.inject_reservation(addr, loc, Instant::now());
+        // Promoted while the reservation is still recorded (the cleanup's
+        // first phase then removes it).
+        assert!(cm.add_connection(loc, addr, TransportKeypair::new().public().clone(), false));
+        cm.pending_reservations
+            .write()
+            .insert(addr, (loc, Instant::now()));
+        cm.clear_pending_reservations_for(&[addr]);
+        assert!(cm.is_in_ring(addr));
+        assert!(
+            cm.location_for_peer.read().contains_key(&addr),
+            "an established connection's mapping is actual state"
+        );
+        assert!(cm.prune_alive_connection(addr).is_some());
+        assert_eq!(cm.connection_count(), 0, "no ghost connection left behind");
+    }
+
+    /// An established connection that lost its mapping anyway (an add
+    /// interleaved between its two locks) is still pruned.
+    #[test]
+    fn pruning_removes_an_established_connection_without_a_mapping() {
+        let cm = make_connection_manager(Some(make_addr(7300)), 2, 50, false);
+        let addr = make_addr(7301);
+        assert!(cm.add_connection(
+            Location::new(0.4),
+            addr,
+            TransportKeypair::new().public().clone(),
+            false
+        ));
+        cm.location_for_peer.write().remove(&addr);
+        assert!(cm.connected_since.read().contains_key(&addr));
+        assert!(cm.prune_alive_connection(addr).is_some());
+        assert_eq!(cm.connection_count(), 0);
+        assert!(!cm.is_in_ring(addr));
+        assert!(
+            !cm.connected_since.read().contains_key(&addr),
+            "a ghost prune clears the same per-peer state as a normal one"
+        );
+    }
+
+    /// A bootstrap round clears only the reservation its own CONNECT made: one
+    /// made later at the same gateway by another attempt stays (#5858).
+    #[test]
+    fn owned_reservations_clear_only_the_rounds_own() {
+        let cm = make_connection_manager(Some(make_addr(7100)), 2, 50, false);
+        let (ours, later) = (make_addr(7101), make_addr(7102));
+        let sent = Instant::now();
+        cm.inject_reservation(ours, Location::new(0.1), sent + Duration::from_millis(5));
+        cm.inject_reservation(later, Location::new(0.2), sent + Duration::from_secs(60));
+        cm.clear_owned_reservations(&[(ours, sent), (later, sent)]);
+        assert!(
+            !cm.has_connection_or_pending(ours),
+            "the round's own reservation is cleared"
+        );
+        assert!(
+            cm.pending_reservations.read().contains_key(&later),
+            "a later attempt's reservation at the same gateway is left alone"
+        );
     }
 
     fn age_reservation(cm: &ConnectionManager, addr: SocketAddr, age: Duration) {
@@ -4140,8 +4342,8 @@ mod tests {
     /// admits any strictly-closer per-side nearest — a TIGHTEN of a filled side OR
     /// a FILL of an empty one — within the over-max ceiling. A candidate no closer
     /// than the current per-side nearest (a farther non-lattice peer) is never
-    /// admissible. It is the exact decision both connection-lifecycle promotion
-    /// gates apply on the real CONNECT path (see the source-scrape pin below).
+    /// admissible. It is the exact decision the connection-lifecycle cap gates
+    /// apply on the real CONNECT path (see the source-scrape pin below).
     #[test]
     fn admits_lattice_edge_over_cap_predicate() {
         let _nn_guard = NnLatticeOverrideGuard;
@@ -4680,26 +4882,160 @@ mod tests {
         );
     }
 
-    /// Source-scrape pin (B1 regression guard): BOTH connection-lifecycle
-    /// promotion gates must apply the shared `admits_lattice_edge_over_cap`
-    /// exception to their `>= max_connections` reject. Without this a lattice edge
-    /// is silently dropped at the cap on the real CONNECT path and mechanism 3's
-    /// at-capacity displacement is inert — the exact defect the external review
-    /// caught (the over-max unit test passed only because it bypassed the gate).
-    /// If a future refactor drops the exception from a gate, this fails instead of
-    /// silently regressing.
+    /// Source-scrape pin (B1 regression guard, extended for #5827): EACH
+    /// connection-lifecycle cap gate must refuse at the cap through the shared
+    /// `refuses_connection_at_cap`, which carries the lattice exemption. The
+    /// gates are the transient-promotion gate and the outbound pre-flight check
+    /// in `handle_connect_peer`, and the promotion gate in
+    /// `handle_successful_connection`. Without the exemption a lattice edge is
+    /// silently dropped at the cap on the real CONNECT path and mechanism 3's
+    /// at-capacity displacement is inert: the exact defect the external review
+    /// caught for the promotion gates (the over-max unit test passed only
+    /// because it bypassed the gate), and that #5827 found still open in the
+    /// pre-flight check.
+    ///
+    /// Each gate is checked inside its own function, between an anchor before
+    /// it and its own refusal log line, so a call at one gate cannot stand in
+    /// for a missing one at another. Comments (line, trailing and block) are
+    /// stripped so prose or a commented-out call cannot satisfy the pin, and a
+    /// bare
+    /// `>= connection_manager.max_connections` cap test in code (the pre-#5827
+    /// pre-flight shape) fails it outright.
     #[test]
     fn lifecycle_gates_apply_lattice_over_cap_predicate() {
         const LIFECYCLE_SRC: &str =
             include_str!("../node/network_bridge/p2p_protoc/connection_lifecycle.rs");
-        let hits = LIFECYCLE_SRC
-            .matches("admits_lattice_edge_over_cap(loc)")
-            .count();
+
+        /// The body of the function whose signature starts with `signature`,
+        /// braces included. Panics rather than returning a wrong slice: a
+        /// missing anchor or unbalanced braces fail the pin loudly.
+        fn fn_body<'a>(src: &'a str, signature: &str) -> &'a str {
+            let start = src
+                .find(signature)
+                .unwrap_or_else(|| panic!("`{signature}` not found in connection_lifecycle.rs"));
+            let open = start
+                + src[start..]
+                    .find('{')
+                    .unwrap_or_else(|| panic!("`{signature}` has no body"));
+            let mut depth = 0usize;
+            for (i, b) in src.as_bytes()[open..].iter().enumerate() {
+                match b {
+                    b'{' => depth += 1,
+                    b'}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return &src[open..=open + i];
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            panic!("unbalanced braces in the body of `{signature}`")
+        }
+
+        /// The text of `body` from `from` up to (not including) the first `to`
+        /// after it.
+        fn region<'a>(body: &'a str, from: &str, to: &str) -> &'a str {
+            let start = body
+                .find(from)
+                .unwrap_or_else(|| panic!("gate anchor `{from}` not found in its function"));
+            let len = body[start..]
+                .find(to)
+                .unwrap_or_else(|| panic!("gate log line `{to}` not found after `{from}`"));
+            &body[start..start + len]
+        }
+
+        /// Whether `call` appears in CODE in `region`: `/* .. */` comments and
+        /// everything after `//` on a line are stripped first, so a commented
+        /// out call cannot satisfy the pin. (A `//` inside a string literal
+        /// also cuts the line; that can only make the pin fail, never pass.)
+        fn code_calls(region: &str, call: &str) -> bool {
+            let mut code = String::with_capacity(region.len());
+            let mut rest = region;
+            while let Some(open) = rest.find("/*") {
+                code.push_str(&rest[..open]);
+                rest = match rest[open..].find("*/") {
+                    Some(close) => &rest[open + close + 2..],
+                    None => "",
+                };
+            }
+            code.push_str(rest);
+            code.lines()
+                .map(|l| l.split("//").next().unwrap_or(""))
+                .any(|l| l.contains(call))
+        }
+
+        const CALL: &str = "connection_manager.refuses_connection_at_cap(loc)";
+        let connect_peer = fn_body(LIFECYCLE_SRC, "async fn handle_connect_peer(");
+        let successful = fn_body(LIFECYCLE_SRC, "async fn handle_successful_connection(");
+        let gates = [
+            (
+                "handle_connect_peer transient-promotion gate",
+                region(
+                    connect_peer,
+                    "connection_manager.drop_transient(peer_addr)",
+                    "connect_peer: rejecting transient promotion to enforce cap",
+                ),
+            ),
+            (
+                "handle_connect_peer outbound pre-flight check (#5827)",
+                region(
+                    connect_peer,
+                    "Pre-flight max_connections check",
+                    "connect_peer: skipping connection — at max_connections",
+                ),
+            ),
+            (
+                "handle_successful_connection promotion gate",
+                region(
+                    successful,
+                    "if promote_to_ring {",
+                    "handle_successful_connection: rejecting new connection to enforce cap",
+                ),
+            ),
+        ];
+        for (gate, region) in gates {
+            assert!(
+                code_calls(region, CALL),
+                "the {gate} must refuse at the cap through `{CALL}`"
+            );
+        }
+
         assert!(
-            hits >= 2,
-            "both lifecycle promotion cap-gates must apply \
-             admits_lattice_edge_over_cap(loc); found {hits} call site(s)"
+            !code_calls(LIFECYCLE_SRC, ">= connection_manager.max_connections"),
+            "a cap gate compares against max_connections without the lattice \
+             exemption; route it through refuses_connection_at_cap (#5827)"
         );
+    }
+
+    /// #5827: at `max_connections` the shared cap predicate refuses an ordinary
+    /// candidate but lets a strictly-closer per-side nearest lattice edge
+    /// through, within the over-cap ceiling. This is the decision the outbound
+    /// pre-flight check now makes.
+    #[test]
+    fn refuses_connection_at_cap_exempts_lattice_edges() {
+        let _nn_guard = NnLatticeOverrideGuard;
+        set_nn_lattice_enabled(true);
+        let own = Location::new(0.5);
+        let cm = make_connection_manager(Some(make_addr(8000)), 1, 4, false);
+        cm.update_location(Some(own));
+        let keypair = TransportKeypair::new();
+        for (i, loc) in [0.4, 0.6, 0.1, 0.9].into_iter().enumerate() {
+            assert!(cm.add_connection(
+                Location::new(loc),
+                make_addr(8001 + i as u16),
+                keypair.public().clone(),
+                false
+            ));
+        }
+        assert_eq!(cm.connection_count(), 4);
+        // Not a lattice edge: farther than the held successor (0.6).
+        assert!(cm.refuses_connection_at_cap(Location::new(0.7)));
+        // A tighter successor than 0.6: the exemption applies.
+        assert!(!cm.refuses_connection_at_cap(Location::new(0.55)));
+        // Below the cap nothing is refused.
+        assert!(cm.prune_alive_connection(make_addr(8003)).is_some());
+        assert!(!cm.refuses_connection_at_cap(Location::new(0.7)));
     }
 
     #[test]

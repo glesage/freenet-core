@@ -185,6 +185,64 @@ from CI runners (which would perturb timing-sensitive multi-node
 tests — see PR #4292 root-cause). The shadow aggregator is
 always-on; only reference-ping is gated.
 
+### Transport-redesign baseline telemetry (`transport_snapshot`)
+
+`TRANSPORT_METRICS` carries period counters for loss and ACK overhead
+(`packets_sent`, `packets_retransmitted`, `packets_abandoned`,
+`rto_expiries`, `tlp_probes`, `standalone_ack_*`), NAT failure causes
+(`nat_fail_*`, which sum to `nat_traversal_failed_error + _version` with a
+different version/non-version split, plus up to 8 per-attempt
+`nat_fail_samples` per period with the sub-reason and what the attempt saw;
+OUTBOUND traversals only), an endpoint-dependent-mapping signal
+(`observed_addr_*`: each handshake ack's view of our address, compared only
+across DIFFERENT reporters in the same address family, IPv4-mapped v6
+treated as v4; counts only, never the address; per period, so it resets; a
+NAT rebinding between two reporters' reports is indistinguishable from
+EDM), final-ACK timing (`transfers_acked`, `*_transfer_ack_time_ms`) and
+the listener-to-connection queue (`inbound_queue_depth_hwm`, `_drops`) and
+inbound stream refusals / evictions by reason (`inbound_stream_<label>`, one
+per `InboundStreamOutcome`; the never-reset twin feeds the opt-in OTel
+`freenet.transport.inbound_stream_limits`, which must not observe the period
+counters), NAT traversals by why they were started (`nat_attempts_<label>`,
+`nat_established_<label>`, one per `NatAttemptOrigin`, and `origin` on each
+`nat_fail_samples` entry; the origin is threaded internally from each
+`NodeEvent::ConnectPeer` through `OutboundConnector::connect` and
+`ConnectionStart`, never on the wire; a dial to a configured gateway is
+always `gateway`, and `ring_peer_no_transport` is the event loop's dial to a
+ring peer whose transport was lost, since cached-peer joins never dial
+(#5954)), intro packets a non-gateway drops as unknown (`stray_intro_<label>`:
+the exact address's traversal timed out (no_response, undecryptable or
+incomplete; not other failures) in the last 10 s,
+a traversal to another port of the IP is running (endpoint-dependent mapping
+OR another peer behind the same IP, e.g. CGNAT; it cannot tell them apart), or
+neither; the recent failures are a listener-owned table bounded by count and
+TTL, and early evictions are counted in `stray_intro_failures_evicted`) and CONNECT
+joiner dial-queue waits (`dial_queue_wait_<label>`, coarse buckets around the
+3 s punch window). Each label set is declared once in a `labelled_counters!`
+list, so a new variant needs a snapshot field. Hot
+path writes are single relaxed atomics; `SentPacketTracker` keeps an
+`rto_expiries` count and a bounded per-stream final-ACK watch, both
+observation only.
+
+`CONN_RTT_REGISTRY` (`rolling_rtt_stats.rs`) holds one `ConnRttGauge` per live
+connection (owned by `RollingRttStatsHandle`) for the snapshot's
+cross-connection SRTT / min-RTT percentiles. A connection's snapshot SRTT may
+be an unloaded keep-alive value; for bufferbloat analysis use the per-transfer
+`final_srtt_ms` vs `min_rtt_ms` on `transfer_completed`. Same rule as the shadow
+registry: written from the recv loop, read only by telemetry, NEVER by the
+data path.
+
+Transfer events take `final_srtt_ms` and `total_timeouts` from the
+connection's sent-packet tracker, not the congestion controller (FixedRate
+reports zero RTT/loss), add `min_rtt_ms` and `peak_flightsize_bytes`
+(queueing delay), and report cwnd as null when the controller has no
+bounded window. `Ring::prune_connection` and `NodeEvent::DropConnection`
+take a `DisconnectReason`: pass the real cause (`Timeout` for the idle
+timeout, `NetworkError` for transport failures, `Pruned` only for local
+topology management; the full list is on `DisconnectReason`). Disconnect
+byte totals are this connection's: the ring `Connection` records the
+per-peer totals when it joins and the event reports the difference.
+
 ### Dashboard bandwidth sampler (#5152)
 
 `transport/bandwidth_history.rs` runs one more always-on 1 Hz task
@@ -276,12 +334,22 @@ the aggregator tasks. They exist only for the staged rollout in
 
 ```
 NAT traversal:
-  1. Send multiple intro packets — `NAT_TRAVERSAL_MAX_ATTEMPTS` (40 in release builds, 10 under `cfg(test)`) at a 200 ms cadence, capped by a 3 s `overall_deadline` (so ~15 attempts at production settings)
+  1. Send multiple intro packets — `NAT_TRAVERSAL_MAX_ATTEMPTS` (40 in release builds, 10 under `cfg(test)`) at a ~250 ms cadence (200 ms receive wait + 50 ms `INITIAL_INTERVAL`), capped by a 3 s `overall_deadline` (so ~12 attempts at production settings)
   2. Use exponential backoff: 50ms → 300ms → 1s → 5s
   3. First relay observes external address (ObservedAddress msg)
   4. Rate limit: 1 intro packet/second per source IP
   5. Gateway ramp-up: 5/s for 30s, 20/s for 2min, unlimited after
      (prevents thundering herd after gateway restart)
+
+Handshake send failures (#5871):
+  → In the intro resend loop a failed `send_to` counts as a lost datagram,
+    not an abort. When the attempt runs to its deadline, it ends with
+    `SendFailed` if the last send failed, and the final warn carries
+    `failed_sends` and the last OS error either way.
+  → The gateway success ack and the joiner's final ack are one-shot and fail
+    via `SendFailed` at once. The best-effort version-mismatch ack only
+    logs, so the peer is still recorded as outdated.
+  → Never map a send error to `ChannelClosed`.
 
 Restart detection (all peers, not just gateways):
   → If an intro packet arrives on an established connection, attempt
@@ -487,10 +555,104 @@ Streaming path:
 ### WHEN implementing fragment reassembly
 
 ```
-USE: LockFreeStreamBuffer (OnceLock<Bytes> array)
+USE: LockFreeStreamBuffer (AtomicPtr<Bytes> slots, 256-slot chunks
+     allocated on first insert; construction allocates only the chunk table)
   - contiguous_fragments: AtomicU32 for frontier tracking
+  - Completion is measured in BYTES: received == total_size and every
+    inserted fragment contiguous. Never use a fragment count.
+  - Inserts past total_size are rejected, and so are empty fragments
+    other than #1: older senders leave fragment #1 empty when
+    embedded metadata fills the packet, and those peers can still connect.
+  - A taken slot holds the TAKEN marker: empty to readers, a duplicate to
+    inserts, filled to the frontier.
   - Lock-free insertion
   - Ordered delivery to consumer
+
+Three stream types, never mixed:
+  - inbound_stream::InboundStream: the UDP transport's reassembler for its
+    OWN streams (oversized messages, StreamId::next_transport_internal).
+    Transport-internal.
+  - StreamHandle (with StreamRegistry): the UDP transport's handle for
+    caller-named streams (StreamId::next). Transport-internal.
+  - boundary::IncomingStream: what the registry, operations and node see.
+    Above the transport, use only this; it wraps a StreamHandle today.
+Never feed one stream to both reassembly paths.
+
+Above the transport:
+  - Match a stream to the connection that received it by its opaque
+    boundary::StreamIdentity (IncomingStream::is), never by its buffer.
+  - Read a stream incrementally with IncomingStream::chunks(). It has NO
+    inactivity timer (bring your own), ends after its first Err, and its end
+    does not prove the byte total was reached (#5445): count bytes yourself.
+
+WHEN piping a stream onward (pipe_stream):
+  Re-chunk the input (Rechunk in outbound_stream.rs). The receiver gives a
+  stream ceil(total / FRAGMENT_PAYLOAD_SIZE) + 1 slots and refuses empty
+  fragments other than #1, so every fragment but #1 and the last must be
+  exactly full. Fragment #1 is the first chunk as received when it fits (a
+  UDP-received stream keeps its exact boundaries); a longer first chunk is
+  cut to leave room for this hop's metadata, as send_stream does.
+```
+
+### WHEN admitting or sending a stream
+
+```
+Stream length limits (streaming.rs):
+  MAX_STREAM_TOTAL_BYTES = MAX_STATE_SIZE + WEBSOCKET_MAX_MESSAGE_SIZE
+                           + envelope margin
+  check_declared_stream_length(): 0 and > MAX_STREAM_TOTAL_BYTES are invalid
+
+Receiver: every new stream passes check_declared_stream_length() and the
+per-connection InboundStreamBudget (inbound_budget.rs) BEFORE any state is
+created from its declared length.
+  - Limits: MAX_INBOUND_STREAMS_PER_CONNECTION streams and
+    MAX_INBOUND_STREAM_BYTES_PER_CONNECTION bytes (one maximum-size
+    stream's cost plus headroom for ordinary streams).
+  - A stream's cost is ChargeOverhead::cost(declared): its length, a fixed
+    per-stream amount, and PER_FRAGMENT_OVERHEAD for every fragment number
+    its length allows. Admission (check) and the charge use the same cost.
+  - Both reassembly paths hold fragments as received and assemble once on
+    completion: the memory held is the fragments received.
+  - The bound is per connection; node-wide fairness is deferred to the
+    transport redesign (exception recorded in bug-prevention-patterns.md;
+    the flat constants are in executor.rs NOT_SUMMED).
+  - A refused stream id is remembered (inbound_budget::RefusedStreams) until
+    the age limit for its length, and its later fragments are dropped
+    without being counted again. Do not use a forgetting cache. If a
+    refusal cannot be remembered, the connection is closed. Refusals do not
+    change ACK or dedup behaviour.
+  - Completed streams are remembered (completed_inbound_streams) so a late
+    retransmission does not start them again.
+  - A charge is released only when ALL reassembly state is gone (observed
+    via Weak: buffer clones for operations streams, the recv_stream task
+    for legacy ones). Do not release on a single map removal.
+  - Evicting a legacy stream cancels it through its LegacyStreamToken;
+    dropping the sender alone is not enough.
+  - Incomplete streams are evicted when idle or older than
+    max_inbound_stream_age(declared), which scales with the length and is
+    not refreshed by traffic; both paths, on the timeout_check tick, before
+    the idle streaming-handle sweep. Never make the age limit a flat
+    constant. "Complete" means all bytes contiguous, not a byte count. Only
+    newly stored bytes refresh idleness.
+  - On connection drop, its unclaimed operations streams are removed from
+    the orphan registry.
+  - Every refusal, eviction and refusal-related close is counted by reason
+    in TRANSPORT_METRICS (cumulative_inbound_stream_outcomes, OTel
+    freenet.transport.inbound_stream_limits) and per period in the
+    transport_snapshot inbound_stream_<label> fields. A new reason is added
+    once, in the InboundStreamOutcome labelled_counters! list; it then needs a
+    snapshot field.
+  - A complete operations stream is retired from streaming_handles and the
+    registry at once, so only its consumers hold the charge.
+  - LockFreeStreamBuffer::insert claims the slot BEFORE reserving bytes, so
+    concurrent duplicates return Ok(false) without touching the reservation;
+    a taken slot holds TAKEN, so fragments at or below the contiguous
+    frontier are duplicates even after a reader has taken them.
+
+Sender: send_stream / pipe_stream return OutboundStreamInvalidLength
+(stream-scoped, NOT transient) for a length the receiver would refuse.
+send_stream does not embed metadata in fragment #1 unless at least one
+payload byte still fits; no fragment is ever empty.
 ```
 
 ## Testing Checklist

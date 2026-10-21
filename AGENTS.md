@@ -136,12 +136,23 @@ See .claude/rules/bug-prevention-patterns.md — this has shipped twice.
 ### WHEN writing cleanup/GC logic
 
 ```
-Cleanup exemptions MUST be time-bounded.
+Cleanup exemptions MUST be bounded, by time or by a lifecycle event
+such as connection close.
 
 Any condition that exempts an entry from garbage collection
-(is_transient, has_pending, etc.) MUST either:
-  1. Expire via TTL, OR
-  2. Be overridden by an absolute age threshold
+(is_transient, has_pending, etc.) MUST end by one of:
+  1. A TTL, or an absolute age threshold that overrides it, OR
+  2. A lifecycle event that always happens and that the entry cannot
+     trigger or postpone itself, such as the owning connection closing.
+     Check that every way the owner can end (clean close, error,
+     dropped task) triggers it.
+
+A condition the entry can renew for itself (re-sending a request,
+refreshing a lease) does not bound it.
+
+A connection that is held open indefinitely is not yet bounded at the
+connection level (#5922). An entry bounded only by connection close inherits that
+gap; say so where the entry is defined.
 
 WHY: Unbounded exemptions create permanent GC blind spots.
 This is a recurring meta-pattern where a fix introduces cleanup with
@@ -197,8 +208,8 @@ v0.2.57 release, and they have DIFFERENT remedies:
 1. **Bump PR gets 0 check-runs.** No `pull_request` event fires, so `ci.yml`
    never runs and its required checks never turn green. `ci.yml` has no
    `workflow_dispatch`, so it cannot be started by hand. The old workaround,
-   closing and reopening the PR, breaks `wait_for_pr` polling
-   (`release.yml:285`), whose `release_sha` output `verify_publishable` and
+   closing and reopening the PR, breaks the polling in `release.yml`'s
+   `wait_for_pr` job, whose `release_sha` output `verify_publishable` and
    `create_release` depend on.
 2. **`release.published` does not fire downstream workflows.** Those DO expose
    `workflow_dispatch`, so they can be triggered per step by hand.

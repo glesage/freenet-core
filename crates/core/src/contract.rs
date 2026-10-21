@@ -1618,6 +1618,15 @@ where
                     );
                     return DelegateRunOutcome::Failed(err);
                 }
+                // Caused by the request; the executor already logged it once
+                // at warn with the key.
+                if err.is_params_mismatch() {
+                    tracing::debug!(
+                        delegate_key = %delegate_key,
+                        "Delegate request refused: parameters do not match the delegate key"
+                    );
+                    return DelegateRunOutcome::Failed(err);
+                }
                 tracing::error!(
                     delegate_key = %delegate_key,
                     error = %err,
@@ -2510,10 +2519,12 @@ where
         //   SendDelegateMessage in response, it is filtered out (not delivered). This
         //   prevents infinite recursion between delegates. We use execute_delegate_request
         //   (not the full delivery loop) for the same reason.
-        // - Target delegate receives empty params because params are not stored in the
-        //   delegate registry — they are passed per-request at the API layer. If a target
-        //   delegate's process() relies on params, the caller must use ApplicationMessages
-        //   directly. This is a known v1 limitation.
+        // - Target delegate runs with the params IT was registered with on this node
+        //   (`registered_delegate_params`, #5616), never the caller's and never empty
+        //   ones: a delegate key is `BLAKE3(code_hash ‖ params)`, so other params would
+        //   run a different instance of the target. A target whose params this node
+        //   cannot establish (unregistered, or its registration record is missing or
+        //   corrupt) is not run; the message is dropped and logged.
         // - The caller's delegate key is passed as `caller_delegate` so the receiver
         //   sees `MessageOrigin::Delegate(caller_key)` and can authorize on it
         //   (issue #3860). The runtime attests this identity — the calling delegate
@@ -2534,12 +2545,6 @@ where
 
             for msg in delegate_messages {
                 let target_key = msg.target.clone();
-                let inbound = vec![InboundDelegateMsg::DelegateMessage(msg)];
-                let target_req = DelegateRequest::ApplicationMessages {
-                    key: target_key.clone(),
-                    params: Parameters::from(Vec::new()),
-                    inbound,
-                };
                 // PER-DELEGATE EXCLUSION, second door (#5544 B2).
                 //
                 // This is the SECOND call site of `execute_delegate_request`,
@@ -2579,6 +2584,31 @@ where
                     );
                     continue;
                 }
+
+                // The TARGET's registered params (#5616): see the design notes
+                // above. Same rule as the notification path, for the same
+                // reason: no established params, no run.
+                let target_params = match contract_handler
+                    .executor()
+                    .registered_delegate_params(&target_key)
+                {
+                    Ok(params) => params,
+                    Err(reason) => {
+                        tracing::warn!(
+                            from_delegate = %delegate_key,
+                            target_delegate = %target_key,
+                            %reason,
+                            "Dropped an inter-delegate message: cannot establish the \
+                             parameters the target was registered with (#5616)"
+                        );
+                        continue;
+                    }
+                };
+                let target_req = DelegateRequest::ApplicationMessages {
+                    key: target_key.clone(),
+                    params: target_params,
+                    inbound: vec![InboundDelegateMsg::DelegateMessage(msg)],
+                };
 
                 match contract_handler
                     .executor()
@@ -4438,30 +4468,65 @@ async fn handle_delegate_notification<CH, P>(
         "Delivering contract notification to delegate"
     );
 
-    // TTL SWEEP OF THE delegate->apps REGISTRY, AT THE TOP, BEFORE ANY EXIT.
+    // SWEEP OF THE delegate->apps REGISTRY, AT THE TOP, BEFORE ANY EXIT.
     //
-    // `sweep_expired` is the registry's only production caller and is what
-    // time-bounds the map per the AGENTS.md GC-exemption rule. #5263 placed it
-    // before its execution-failure return, reasoning that a delegate which
-    // fails on EVERY invocation must not disable the only GC. That reasoning
+    // This is the only production call site of `sweep_closed`, which is what
+    // reaps registrations whose connection ended without a clean disconnect,
+    // for every delegate rather than only the one being notified. #5263 placed
+    // it before its execution-failure return, reasoning that a delegate which
+    // fails on EVERY invocation must not disable the only sweep. That reasoning
     // is right and #5544 adds two more ways to leave this function that its
     // author could not have known about: the delegate is already parked and
     // this notification is queued, or this run itself parks. Both returned
     // without sweeping.
     //
-    // A parked delegate recovers — every park terminates, and the resumed run
-    // sweeps — so the effect was a DELAY of about one park lifetime rather
-    // than #5263's unbounded loss. But that bound depends on the park
-    // machinery working, and a backstop must not be conditional on the thing
-    // it backs up. Hoisting to the top makes "on every exit" true by position
-    // rather than by argument, which is also the only form a reader can check
-    // at a glance.
+    // The effect was a DELAY until the next notification that took a sweeping
+    // exit, rather than #5263's unbounded loss: every park terminates, but the
+    // resumed run does not sweep (see below). That bound depends on the park
+    // machinery working and on further notifications arriving, and a backstop
+    // must not be conditional on the thing it backs up. Hoisting to the top
+    // makes "on every exit" true by position rather than by argument, which is
+    // also the only form a reader can check at a glance.
     //
-    // `route_notification_outbound` sweeps too, covering the resume path where
-    // this frame is long gone. The overlap is deliberate: `sweep_expired` is a
-    // `retain` over a `DashMap` and is idempotent, so a second call is cheap
-    // and the redundancy costs less than a missed exit.
-    delegate_app_registry::sweep_expired();
+    // On the resume path, where this frame is long gone,
+    // `route_notification_outbound` prunes closed registrations only for the
+    // delegate it routes for, and only when the run produced an
+    // `ApplicationMessage` to route, because that is when `route_to_apps` runs.
+    delegate_app_registry::sweep_closed();
+
+    // THE DELEGATE'S REGISTERED PARAMETERS, NOT EMPTY ONES (#5616).
+    //
+    // A delegate key is `BLAKE3(code_hash ‖ params)` and the params are handed
+    // to `process()`. This run has no client to supply them, and it used to
+    // pass empty ones, so a parameterized delegate (per room, per user) ran as
+    // a different instance of itself, with no error and no log line. The
+    // params go into `req`, so a run queued behind a park and a run that parks
+    // and resumes (`Continuation::params`) carry them too.
+    //
+    // No established params means NO RUN. Running with empty ones instead is
+    // the silent misbehaviour this fixes; skipping is the notification
+    // pipeline's documented best-effort contract (a dropped notification), and
+    // it is logged with the reason. In practice that is an unregistered
+    // delegate (whose run would fail as `Missing` anyway) or a parameterized
+    // delegate whose registration record is missing or damaged, which its
+    // next registration normally repairs.
+    let params = match contract_handler
+        .executor()
+        .registered_delegate_params(&delegate_key)
+    {
+        Ok(params) => params,
+        Err(reason) => {
+            tracing::warn!(
+                delegate = %delegate_key,
+                contract = %contract_id,
+                %reason,
+                "Dropped a contract notification: cannot establish the parameters \
+                 the delegate was registered with, and running it with any others \
+                 would run a different instance of it (#5616)"
+            );
+            return;
+        }
+    };
 
     // Unwrap the Arc — if this is the last subscriber the state moves without cloning,
     // otherwise a clone is made (unavoidable since ContractNotification owns the state).
@@ -4477,7 +4542,7 @@ async fn handle_delegate_notification<CH, P>(
 
     let req = DelegateRequest::ApplicationMessages {
         key: delegate_key.clone(),
-        params: Parameters::from(vec![]),
+        params,
         inbound,
     };
 
@@ -4586,7 +4651,8 @@ async fn handle_delegate_notification<CH, P>(
     match outcome {
         // Notification-driven run: no client responder to stash. The residual
         // messages are routed by `handle_delegate_resume` when the park
-        // resolves. The TTL sweep has already run at the top of this function.
+        // resolves. The registry sweep has already run at the top of this
+        // function.
         DelegateRunOutcome::Parked => {}
         // Nothing to propagate: a notification has no client waiting. Already
         // logged inside `handle_delegate_with_contract_requests` (#5263).
@@ -7877,13 +7943,13 @@ mod tests {
         );
     }
 
-    /// Pin: the delegate->apps TTL sweep must not be skippable by ANY exit
+    /// Pin: the delegate->apps registry sweep must not be skippable by ANY exit
     /// from the notification path.
     ///
-    /// PROHIBITION (from #5263, restated behaviourally and WIDENED): the sweep
-    /// is the registry's only production caller and is what time-bounds the map
-    /// per the AGENTS.md GC-exemption rule. It must not become conditional on
-    /// the delegate doing anything in particular.
+    /// PROHIBITION (from #5263, restated behaviourally and WIDENED): this is the
+    /// only production call site of the sweep, which is what reaps registrations
+    /// whose connection died without a clean disconnect. It must not become
+    /// conditional on the delegate doing anything in particular.
     ///
     /// The original asserted the sweep appears before "the execution-failure
     /// early return" — anchoring on one named exit, because that was the only
@@ -7912,7 +7978,7 @@ mod tests {
     /// also occur in this function's own text, which `include_str!` pulls in
     /// (see #5450).
     #[test]
-    fn ttl_sweep_precedes_every_exit_from_the_notification_path() {
+    fn registry_sweep_precedes_every_exit_from_the_notification_path() {
         let full = include_str!("contract.rs");
         let cutoff = full
             .find("\nmod tests {")
@@ -7953,7 +8019,7 @@ mod tests {
             .join("\n");
 
         let sweep = code
-            .find("delegate_app_registry::sweep_expired()")
+            .find("delegate_app_registry::sweep_closed()")
             .expect("the notification path must sweep the delegate->apps registry");
 
         // EVERY way out of this function, not one named one. `return` covers
@@ -7968,8 +8034,8 @@ mod tests {
 
         assert!(
             sweep < first_exit,
-            "the TTL sweep must precede EVERY exit from the notification path, \
-             not just the execution-failure one. It is the registry's only GC \
+            "the registry sweep must precede EVERY exit from the notification path, \
+             not just the execution-failure one. It is the registry's only sweep \
              and must not be conditional on how this invocation happens to \
              leave — #5263's case was a delegate failing every time; #5544 \
              added a delegate PARKING every time. sweep at {sweep}, first exit \
@@ -12751,57 +12817,82 @@ mod hol_4391_tests {
         }
     }
 
-    /// P4b: the notification path must actually RUN the delegate->apps TTL
-    /// sweep, not merely contain it.
+    /// P4b: the notification path must actually RUN the delegate->apps
+    /// registry sweep, not merely contain it.
     ///
-    /// `sweep_expired` is that registry's ONLY garbage collection — the
-    /// AGENTS.md GC-exemption bound rests on it — and the sibling source pin
-    /// checks where the call SITS. Wrapping it in `if black_box(false) { .. }`
-    /// with its position unchanged leaves that pin green while nothing is ever
-    /// reaped, which a mutation campaign demonstrated. Position cannot express
+    /// `sweep_closed` is that registry's ONLY garbage collection for delegates
+    /// that are not being routed to, and the sibling source pin checks where
+    /// the call SITS. Wrapping it in `if black_box(false) { .. }` with its
+    /// position unchanged leaves that pin green while nothing is ever reaped,
+    /// which a mutation campaign demonstrated. Position cannot express
     /// conditionality.
     ///
     /// So this drives the path and observes the consequence: a registration
-    /// older than `REGISTRATION_TTL` is gone afterwards. `route_to_apps`
-    /// returning 0 is the observation, and the assertion BEFORE the sweep is
-    /// what stops it passing vacuously — the registration must be live first,
-    /// or "nothing was delivered" proves nothing.
+    /// whose connection went away without a clean disconnect is gone
+    /// afterwards. It is observed through `registration_count`, NOT
+    /// `route_to_apps`: routing prunes a closed channel itself, so a zero from
+    /// it would pass with the sweep deleted. The live-delivery assertion BEFORE
+    /// the sweep stops the test passing vacuously.
     ///
-    /// FALSIFY by making the sweep conditional, or deleting it.
+    /// A second, LIVE registration sits beside it for the same span and must
+    /// still deliver afterwards (#5920). An earlier version of this test kept
+    /// its receiver alive and asserted the registration was reaped after a
+    /// 30-minute TTL, which pinned the bug: an app that registered once and
+    /// then only listened stopped receiving pushes while still connected.
+    ///
+    /// FALSIFY by making the sweep conditional, or deleting it (the dead
+    /// registration survives), or by expiring registrations on age again (the
+    /// live one is reaped).
+    // `serial` as well as `TEST_GUARD`: the registry's own unit tests call
+    // `sweep_closed` directly under `serial`, and a concurrent sweep from one of
+    // them could reap `dead_key` and pass this test with the call deleted.
+    // This narrows that window rather than closing it: other notification
+    // tests (`capability_loop_tests`) sweep under neither lock. That can only
+    // ever make this test pass spuriously under a mutation, never fail.
     #[tokio::test(start_paused = true)]
+    #[serial_test::serial]
     async fn the_notification_path_actually_runs_the_registry_sweep() {
         let _guard = TEST_GUARD.lock().await;
         let (mut handler, _send) = build_handler(vec![]).await;
 
-        // A delegate key of its own, so a parallel test's registrations in this
-        // process-global registry cannot be confused for this one's.
-        let key = DelegateKey::new(
+        // Delegate keys of their own, so a parallel test's registrations in
+        // this process-global registry cannot be confused for these.
+        let dead_key = DelegateKey::new(
             [0x5b; 32],
             freenet_stdlib::prelude::CodeHash::new([0x5b; 32]),
         );
-        let (tx, _rx) = tokio::sync::mpsc::channel(4);
-        assert!(
-            delegate_app_registry::register_app(
-                &key,
-                crate::client_events::ClientId::next(),
-                delegate_app_registry::AppIdentity::Local,
-                tx,
-            ),
-            "the registration must be accepted, or this test measures nothing"
+        let live_key = DelegateKey::new(
+            [0x5c; 32],
+            freenet_stdlib::prelude::CodeHash::new([0x5c; 32]),
         );
+        let (dead_tx, dead_rx) = tokio::sync::mpsc::channel(4);
+        let (live_tx, mut live_rx) = tokio::sync::mpsc::channel(4);
+        for (key, tx) in [(&dead_key, dead_tx), (&live_key, live_tx)] {
+            assert!(
+                delegate_app_registry::register_app(
+                    key,
+                    crate::client_events::ClientId::next(),
+                    delegate_app_registry::AppIdentity::Local,
+                    tx,
+                ),
+                "the registration must be accepted, or this test measures nothing"
+            );
+        }
         assert_eq!(
             delegate_app_registry::route_to_apps(
-                &key,
+                &dead_key,
                 Ok(freenet_stdlib::client_api::HostResponse::Ok)
             ),
             1,
-            "COUNTERFACTUAL: the registration must be live before the sweep, or \
-             a later zero would prove nothing"
+            "COUNTERFACTUAL: the registration must be live before its connection \
+             goes away, or a later zero would prove nothing"
         );
 
-        // Past the TTL, so the sweep has something to reap.
-        tokio::time::advance(delegate_app_registry::REGISTRATION_TTL + Duration::from_secs(1))
-            .await;
+        // The connection ends without a clean disconnect event.
+        drop(dead_rx);
+        // Far past the 30-minute TTL this registry used to apply, with no
+        // further request from the live app.
+        tokio::time::advance(Duration::from_secs(24 * 60 * 60)).await;
 
         // Any notification drives the path; this one is for an unrelated
         // delegate, which is the point — the sweep is the registry's GC and
@@ -12819,15 +12910,22 @@ mod hol_4391_tests {
         .await;
 
         assert_eq!(
+            delegate_app_registry::registration_count(&dead_key),
+            0,
+            "the notification path must RUN the registry sweep, not merely \
+             contain it: this registration's channel is closed and nothing else \
+             reaps the delegate->apps registry for an unrouted delegate"
+        );
+        assert_eq!(
             delegate_app_registry::route_to_apps(
-                &key,
+                &live_key,
                 Ok(freenet_stdlib::client_api::HostResponse::Ok)
             ),
-            0,
-            "the notification path must RUN the TTL sweep, not merely contain \
-             it: this registration is past REGISTRATION_TTL and nothing else \
-             reaps the delegate->apps registry"
+            1,
+            "a connected app must survive the sweep however long it has been idle \
+             (#5920)"
         );
+        assert!(live_rx.try_recv().is_ok());
     }
 
     /// P5b: the executor answering a delegate request with a variant that is
@@ -13120,6 +13218,209 @@ mod hol_4391_tests {
         gate.add_permits(1);
         let _ = tokio::time::timeout(Duration::from_secs(5), parked).await;
         handle.abort();
+    }
+
+    /// A contract notification for `key`, as the executor's fan-out builds it.
+    fn notification_for(key: &DelegateKey) -> executor::DelegateNotification {
+        executor::DelegateNotification {
+            delegate_key: key.clone(),
+            contract_id: ContractInstanceId::new([0x16; 32]),
+            new_state: Arc::new(WrappedState::new(b"changed".to_vec())),
+        }
+    }
+
+    /// #5616: a contract-notification run enters the delegate with the
+    /// parameters it was REGISTERED with — on its first leg, on the leg that
+    /// resumes after it parks, AND on a second notification that queued behind
+    /// that park and drains after it — rather than empty ones.
+    ///
+    /// Empty params for a parameterized delegate are refused by the runtime
+    /// (`Runtime::prepare_delegate_call`), so a run built with them would
+    /// fail rather than run as the delegate it names. The resume leg rides `Continuation::params` and the
+    /// queued run rides `PendingRun::Notification { req }`, both taken from
+    /// the request built here, so both are asserted too.
+    ///
+    /// FALSIFY by restoring `params: Parameters::from(vec![])` in
+    /// `handle_delegate_notification`: every observation becomes empty.
+    #[tokio::test]
+    async fn a_notification_run_gets_the_registered_params_on_every_leg_5616() {
+        let _guard = TEST_GUARD.lock().await;
+        let (mut handler, _send) = build_handler(vec![]).await;
+        let rt = handler.runtime_mut();
+        let observations = rt.delegate_observations.clone();
+        let key = DelegateKey::new(
+            [0x56; 32],
+            freenet_stdlib::prelude::CodeHash::new([0x16; 32]),
+        );
+        rt.registered_params
+            .lock()
+            .unwrap()
+            .insert(key.clone(), Some(b"room-7".to_vec()));
+        // First leg parks on a prompt; the resumed leg finishes; then the
+        // notification that queued behind the park drains and finishes.
+        let script = rt.delegate_script.clone();
+        script.lock().unwrap().push_back(prompt_outbound().into());
+        script.lock().unwrap().push_back(Vec::new().into());
+        script.lock().unwrap().push_back(Vec::new().into());
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut park = delegate_park::DelegateParkCtx::new(tx);
+        let prompter = Arc::new(crate::contract::user_input::AutoApprovePrompter);
+
+        handle_delegate_notification(
+            &mut handler,
+            notification_for(&key),
+            &prompter,
+            Some(&mut park),
+        )
+        .await;
+        assert!(park.is_parked(&key), "the first leg must park");
+        handle_delegate_notification(
+            &mut handler,
+            notification_for(&key),
+            &prompter,
+            Some(&mut park),
+        )
+        .await;
+        let resume = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the off-loop task must deliver a resume")
+            .expect("resume channel open");
+        handle_delegate_resume(&mut handler, &mut park, &prompter, resume).await;
+
+        let seen = observations.lock().unwrap().clone();
+        assert_eq!(seen.len(), 3, "three runs, got {seen:?}");
+        assert_eq!(seen[0].inbound_kinds, vec!["ContractNotification"]);
+        assert_eq!(seen[1].inbound_kinds, vec!["UserResponse"]);
+        assert_eq!(seen[2].inbound_kinds, vec!["ContractNotification"]);
+        for (leg, obs) in ["first", "resumed", "queued"].iter().zip(&seen) {
+            assert_eq!(
+                obs.params,
+                b"room-7".to_vec(),
+                "the {leg} leg of a notification run must get the delegate's \
+                 registered params (#5616)"
+            );
+        }
+    }
+
+    /// #5616: a notification for a delegate whose parameters this node cannot
+    /// establish is NOT run — rather than run with empty ones, which is a
+    /// different delegate instance.
+    ///
+    /// FALSIFY by falling back to empty params on `Err`: the delegate is
+    /// entered once with `[]`.
+    #[tokio::test]
+    async fn a_notification_is_not_run_without_provable_params_5616() {
+        let _guard = TEST_GUARD.lock().await;
+        let (mut handler, _send) = build_handler(vec![]).await;
+        let rt = handler.runtime_mut();
+        let observations = rt.delegate_observations.clone();
+        let script = rt.delegate_script.clone();
+        script.lock().unwrap().push_back(Vec::new().into());
+        let key = DelegateKey::new(
+            [0x57; 32],
+            freenet_stdlib::prelude::CodeHash::new([0x16; 32]),
+        );
+        rt.registered_params
+            .lock()
+            .unwrap()
+            .insert(key.clone(), None);
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut park = delegate_park::DelegateParkCtx::new(tx);
+        let prompter = Arc::new(crate::contract::user_input::AutoApprovePrompter);
+        handle_delegate_notification(
+            &mut handler,
+            notification_for(&key),
+            &prompter,
+            Some(&mut park),
+        )
+        .await;
+
+        assert!(
+            observations.lock().unwrap().is_empty(),
+            "the delegate must not be entered without provable params (#5616)"
+        );
+        assert_eq!(
+            script.lock().unwrap().len(),
+            1,
+            "no run consumed the script"
+        );
+    }
+
+    /// #5616, second door: an inter-delegate message enters the TARGET with
+    /// the target's own registered params, and is dropped when the node cannot
+    /// establish them. It used to pass empty params, under a comment claiming
+    /// params were not stored anywhere (they are, in the `.reg` record).
+    ///
+    /// FALSIFY by restoring `params: Parameters::from(Vec::new())` on the
+    /// hop: B is entered with `[]`.
+    #[tokio::test]
+    async fn an_inter_delegate_message_runs_the_target_with_its_registered_params_5616() {
+        for (target_params, expect_entered) in
+            [(Some(b"target-params".to_vec()), true), (None, false)]
+        {
+            let _guard = TEST_GUARD.lock().await;
+            let (mut handler, send) = build_handler(vec![]).await;
+            let rt = handler.runtime_mut();
+            let observations = rt.delegate_observations.clone();
+            let key_a =
+                DelegateKey::new([0x58; 32], freenet_stdlib::prelude::CodeHash::new([8; 32]));
+            let key_b =
+                DelegateKey::new([0x59; 32], freenet_stdlib::prelude::CodeHash::new([9; 32]));
+            rt.registered_params
+                .lock()
+                .unwrap()
+                .insert(key_b.clone(), target_params.clone());
+            // A (client-driven) messages B; B's run, if delivered, is empty.
+            let script = rt.delegate_script.clone();
+            script.lock().unwrap().push_back(
+                vec![OutboundDelegateMsg::SendDelegateMessage(
+                    freenet_stdlib::prelude::DelegateMessage::new(
+                        key_b.clone(),
+                        key_a.clone(),
+                        b"ping".to_vec(),
+                    ),
+                )]
+                .into(),
+            );
+            script.lock().unwrap().push_back(Vec::new().into());
+
+            let handle = GlobalExecutor::spawn(contract_handling(
+                handler,
+                crate::contract::user_input::AutoApprovePrompter,
+            ));
+            let resp = tokio::time::timeout(
+                Duration::from_secs(5),
+                send.send_to_handler(delegate_event(&key_a)),
+            )
+            .await
+            .expect("A's request must complete");
+            assert!(resp.is_ok(), "A's client must be answered, got {resp:?}");
+            handle.abort();
+
+            let entered_b: Vec<_> = observations
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|o| o.delegate_key == key_b)
+                .cloned()
+                .collect();
+            if expect_entered {
+                assert_eq!(entered_b.len(), 1, "the hop must reach B once");
+                assert_eq!(
+                    entered_b[0].params,
+                    b"target-params".to_vec(),
+                    "the hop must run B with B's registered params (#5616)"
+                );
+            } else {
+                assert!(
+                    entered_b.is_empty(),
+                    "B must not be entered without provable params (#5616), got \
+                     {entered_b:?}"
+                );
+            }
+        }
     }
 
     /// A continuation standing in for a delegate parked on a prompt.

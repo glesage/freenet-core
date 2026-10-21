@@ -20,6 +20,7 @@ use futures::{
 };
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
+use recv_errors::{RecvErrorAction, RecvErrorLog, RecvErrorPause, RecvErrorTracker};
 use tokio::{
     net::UdpSocket,
     sync::{mpsc, oneshot},
@@ -29,7 +30,7 @@ use tracing::{Instrument, span};
 use version_cmp::PROTOC_VERSION;
 
 use super::{
-    Socket, TransportError,
+    Socket, TransportError, UdpError, UdpErrorKind,
     congestion_control::{CongestionControl, CongestionControlConfig},
     crypto::{TransportKeypair, TransportPublicKey},
     global_bandwidth::GlobalBandwidthManager,
@@ -43,6 +44,8 @@ use super::{
 };
 use crate::simulation::{RealTime, TimeSource, VirtualTime};
 use crate::transport::in_memory_socket::get_socket_virtual_time;
+use crate::transport::metrics::NatAttemptOrigin;
+use stray_intro::RecentTraversalFailures;
 
 // Constants for interval increase
 const INITIAL_INTERVAL: Duration = Duration::from_millis(50);
@@ -161,6 +164,52 @@ pub async fn create_connection_handler<S: Socket>(
     ),
     TransportError,
 > {
+    bind_udp_listener::<S>(
+        keypair,
+        listen_host,
+        listen_port,
+        is_gateway,
+        UdpTransportConfig {
+            bandwidth_limit,
+            global_bandwidth,
+            ledbat_min_ssthresh,
+            congestion_config,
+            ack_version_floor_override,
+        },
+    )
+    .await
+}
+
+/// The UDP transport's tuning knobs, passed by name so that two knobs of the
+/// same type cannot be swapped by position.
+#[derive(Default)]
+pub(crate) struct UdpTransportConfig {
+    /// Per-connection bandwidth limit in bytes/sec.
+    pub(crate) bandwidth_limit: Option<usize>,
+    /// Shared bandwidth manager.
+    pub(crate) global_bandwidth: Option<Arc<GlobalBandwidthManager>>,
+    /// Minimum slow-start threshold for LEDBAT.
+    pub(crate) ledbat_min_ssthresh: Option<usize>,
+    /// Congestion control config (defaults to FixedRate).
+    pub(crate) congestion_config: Option<CongestionControlConfig>,
+    /// The #5161 version-carrying-ack floor override; `None` in production.
+    pub(crate) ack_version_floor_override: Option<(u8, u8, u16)>,
+}
+
+type UdpListenerParts<S> = (
+    OutboundConnectionHandler<S>,
+    InboundConnectionHandler<S>,
+    tokio::task::JoinHandle<TransportError>,
+);
+
+/// Bind the UDP socket and start its listener.
+async fn bind_udp_listener<S: Socket>(
+    keypair: TransportKeypair,
+    listen_host: IpAddr,
+    listen_port: u16,
+    is_gateway: bool,
+    config: UdpTransportConfig,
+) -> Result<UdpListenerParts<S>, TransportError> {
     // Bind the UDP socket to the specified port with retry for transient failures
     let bind_addr: SocketAddr = (listen_host, listen_port).into();
     tracing::debug!(
@@ -183,11 +232,7 @@ pub async fn create_connection_handler<S: Socket>(
         keypair,
         is_gateway,
         (listen_host, listen_port).into(),
-        bandwidth_limit,
-        global_bandwidth,
-        ledbat_min_ssthresh,
-        congestion_config,
-        ack_version_floor_override,
+        config,
     )?;
     Ok((
         och,
@@ -196,6 +241,37 @@ pub async fn create_connection_handler<S: Socket>(
         },
         listen_handle,
     ))
+}
+
+/// Open the UDP transport and return it as the node's [`TransportHandle`]
+/// (`super::TransportHandle`). Binds the same way as
+/// [`create_connection_handler`].
+pub(crate) async fn open_udp_transport<S: Socket>(
+    keypair: TransportKeypair,
+    listen_host: IpAddr,
+    listen_port: u16,
+    is_gateway: bool,
+    config: UdpTransportConfig,
+) -> Result<super::TransportHandle, TransportError> {
+    let (outbound, inbound, listen_task) =
+        bind_udp_listener::<S>(keypair, listen_host, listen_port, is_gateway, config).await?;
+    Ok(udp_transport_handle(outbound, inbound, listen_task))
+}
+
+/// Assemble the handle from the UDP transport's parts. Outbound connect and
+/// expected-inbound registration share one expected-IP set: the tracker is a
+/// view of the connector's set.
+pub(crate) fn udp_transport_handle<S: Socket>(
+    outbound: OutboundConnectionHandler<S>,
+    inbound: InboundConnectionHandler<S>,
+    listen_task: tokio::task::JoinHandle<TransportError>,
+) -> super::TransportHandle {
+    super::TransportHandle {
+        expected_inbound: Arc::new(outbound.expected_inbound_tracker()),
+        connector: Arc::new(outbound),
+        acceptor: Box::new(inbound),
+        listener: Box::pin(async move { super::ListenerExit::from_join(listen_task.await) }),
+    }
 }
 
 /// Bind a socket with retry logic for transient "Address in use" errors.
@@ -228,9 +304,9 @@ async fn bind_socket_with_retry<S: Socket>(
         }
     }
 
-    Err(last_err
-        .map(TransportError::from)
-        .unwrap_or_else(|| TransportError::IO(std::io::ErrorKind::AddrInUse.into())))
+    Err(last_err.map(TransportError::from).unwrap_or_else(|| {
+        TransportError::from(std::io::Error::from(std::io::ErrorKind::AddrInUse))
+    }))
 }
 
 /// Receives  new inbound connections from the network.
@@ -241,6 +317,17 @@ pub struct InboundConnectionHandler<S = UdpSocket, TS: TimeSource = RealTime> {
 impl<S: Send + Sync, TS: TimeSource> InboundConnectionHandler<S, TS> {
     pub async fn next_connection(&mut self) -> Option<PeerConnection<S, TS>> {
         self.new_connection_notifier.recv().await
+    }
+}
+
+impl<S: Socket> super::InboundAcceptor for InboundConnectionHandler<S> {
+    fn next_connection(&mut self) -> super::NextConnection<'_> {
+        // `mpsc::Receiver::recv` is cancel-safe, so the boxed future is too.
+        Box::pin(async move {
+            InboundConnectionHandler::<S>::next_connection(self)
+                .await
+                .map(|conn| Box::new(conn) as Box<dyn super::PeerConnectionApi>)
+        })
     }
 }
 
@@ -269,18 +356,51 @@ type ListenerSetup<S> = (
 
 #[allow(private_bounds)]
 impl<S: Socket> OutboundConnectionHandler<S> {
-    #[allow(clippy::too_many_arguments)]
     fn config_listener(
         socket: Arc<S>,
         keypair: TransportKeypair,
         is_gateway: bool,
         socket_addr: SocketAddr,
-        bandwidth_limit: Option<usize>,
-        global_bandwidth: Option<Arc<GlobalBandwidthManager>>,
-        ledbat_min_ssthresh: Option<usize>,
-        congestion_config: Option<CongestionControlConfig>,
-        ack_version_floor_override: Option<(u8, u8, u16)>,
+        config: UdpTransportConfig,
     ) -> Result<ListenerSetup<S>, TransportError> {
+        let (transport, connection_handler, new_connection_notifier) =
+            Self::new_listener(socket, keypair, is_gateway, socket_addr, config);
+        // Packets are now sent directly to socket from each connection,
+        // bypassing the centralized rate limiter that was causing serialization bottlenecks.
+        // Per-connection rate limiting is handled by TokenBucket and LEDBAT in RemoteConnection.
+        let listen_handle = GlobalExecutor::spawn(RANDOM_U64.scope(
+            {
+                // Use GlobalRng for deterministic simulation
+                let seed = GlobalRng::random_u64();
+                let mut rng = StdRng::seed_from_u64(seed);
+                rng.random()
+            },
+            transport.listen(),
+        ));
+
+        Ok((connection_handler, new_connection_notifier, listen_handle))
+    }
+
+    /// Build the listener (not yet running) and the handles onto it.
+    #[allow(clippy::type_complexity)]
+    fn new_listener(
+        socket: Arc<S>,
+        keypair: TransportKeypair,
+        is_gateway: bool,
+        socket_addr: SocketAddr,
+        config: UdpTransportConfig,
+    ) -> (
+        UdpPacketsListener<S>,
+        OutboundConnectionHandler<S>,
+        mpsc::Receiver<PeerConnection<S>>,
+    ) {
+        let UdpTransportConfig {
+            bandwidth_limit,
+            global_bandwidth,
+            ledbat_min_ssthresh,
+            congestion_config,
+            ack_version_floor_override,
+        } = config;
         let (conn_handler_sender, conn_handler_receiver) = mpsc::channel(100);
         let (new_connection_sender, new_connection_notifier) = mpsc::channel(10);
         let expected_non_gateway = Arc::new(DashSet::new());
@@ -300,6 +420,7 @@ impl<S: Socket> OutboundConnectionHandler<S> {
             global_bandwidth,
             ledbat_min_ssthresh,
             expected_non_gateway: expected_non_gateway.clone(),
+            recent_traversal_failures: RecentTraversalFailures::default(),
             // In simulation the admission ramp must advance with the network's
             // VirtualTime, not only the RealTime source this handler is built with
             // (see `GatewayConnectionRateLimiter::effective_elapsed_nanos`).
@@ -318,21 +439,7 @@ impl<S: Socket> OutboundConnectionHandler<S> {
             send_queue: conn_handler_sender,
             expected_non_gateway,
         };
-
-        // Packets are now sent directly to socket from each connection,
-        // bypassing the centralized rate limiter that was causing serialization bottlenecks.
-        // Per-connection rate limiting is handled by TokenBucket and LEDBAT in RemoteConnection.
-        let listen_handle = GlobalExecutor::spawn(RANDOM_U64.scope(
-            {
-                // Use GlobalRng for deterministic simulation
-                let seed = GlobalRng::random_u64();
-                let mut rng = StdRng::seed_from_u64(seed);
-                rng.random()
-            },
-            transport.listen(),
-        ));
-
-        Ok((connection_handler, new_connection_notifier, listen_handle))
+        (transport, connection_handler, new_connection_notifier)
     }
 
     #[cfg(any(test, feature = "bench"))]
@@ -372,19 +479,38 @@ impl<S: Socket> OutboundConnectionHandler<S> {
             keypair,
             is_gateway,
             socket_addr,
-            bandwidth_limit,
-            None,
-            None,
-            None,
-            ack_version_floor_override,
+            UdpTransportConfig {
+                bandwidth_limit,
+                ack_version_floor_override,
+                ..UdpTransportConfig::default()
+            },
         )?;
         Ok((handler, receiver))
     }
 
+    /// Connect with no node-level origin (tests, benchmarks); the attempt
+    /// is tagged [`NatAttemptOrigin::RingPeerNoTransport`]. The node connects through
+    /// [`super::OutboundConnector::connect`], which carries the real origin.
     pub async fn connect(
         &mut self,
         remote_public_key: TransportPublicKey,
         remote_addr: SocketAddr,
+    ) -> Pin<Box<dyn Future<Output = Result<PeerConnection<S>, TransportError>> + Send>> {
+        self.connect_with_origin(
+            remote_public_key,
+            remote_addr,
+            NatAttemptOrigin::RingPeerNoTransport,
+        )
+        .await
+    }
+
+    /// `OutboundConnector::connect` calls this on a clone, so it must only
+    /// touch `Arc`-shared state.
+    pub(crate) async fn connect_with_origin(
+        &mut self,
+        remote_public_key: TransportPublicKey,
+        remote_addr: SocketAddr,
+        origin: NatAttemptOrigin,
     ) -> Pin<Box<dyn Future<Output = Result<PeerConnection<S>, TransportError>> + Send>> {
         if self.expected_non_gateway.insert(remote_addr.ip()) {
             tracing::debug!(
@@ -401,6 +527,7 @@ impl<S: Socket> OutboundConnectionHandler<S> {
                 ConnectionEvent::ConnectionStart {
                     remote_public_key,
                     open_connection,
+                    origin,
                 },
             ))
             .await
@@ -438,11 +565,38 @@ impl<S: Socket> OutboundConnectionHandler<S> {
     }
 }
 
-/// A handle for registering expected inbound connections.
-///
-/// This is a type-erased wrapper around the expected inbound IP set, allowing
-/// `EventListenerState` to register expected connections without being generic
-/// over the socket type.
+impl<S: Socket> super::OutboundConnector for OutboundConnectionHandler<S> {
+    // Yielding a future from an async block is the point: the first stage
+    // queues the attempt and the second awaits the handshake (see the trait).
+    #[allow(clippy::async_yields_async)]
+    fn connect(
+        &self,
+        remote_public_key: TransportPublicKey,
+        remote_addr: SocketAddr,
+        origin: NatAttemptOrigin,
+    ) -> Pin<Box<dyn Future<Output = super::PendingConnection> + Send + '_>> {
+        // The inherent `connect` takes `&mut self` but mutates nothing; a
+        // clone shares the queue and the expected-IP set.
+        let mut handler = self.clone();
+        Box::pin(async move {
+            let pending = OutboundConnectionHandler::<S>::connect_with_origin(
+                &mut handler,
+                remote_public_key,
+                remote_addr,
+                origin,
+            )
+            .await;
+            let pending: super::PendingConnection = Box::pin(pending.map(|result| {
+                result.map(|conn| Box::new(conn) as Box<dyn super::PeerConnectionApi>)
+            }));
+            pending
+        })
+    }
+}
+
+/// The UDP transport's expected-inbound IP set, shared with the outbound
+/// handler that registers dialled IPs in the same set. The node reaches it
+/// as `Arc<dyn InboundExpectations>`.
 #[derive(Clone)]
 pub struct ExpectedInboundTracker(Arc<DashSet<IpAddr>>);
 
@@ -463,6 +617,12 @@ impl ExpectedInboundTracker {
                 "Registered expected inbound handshake from remote IP"
             );
         }
+    }
+}
+
+impl super::InboundExpectations for ExpectedInboundTracker {
+    fn expect_incoming(&self, remote_addr: SocketAddr) {
+        ExpectedInboundTracker::expect_incoming(self, remote_addr);
     }
 }
 
@@ -514,6 +674,7 @@ impl<S: Socket> OutboundConnectionHandler<S, crate::simulation::VirtualTime> {
             global_bandwidth,
             ledbat_min_ssthresh,
             expected_non_gateway: expected_non_gateway.clone(),
+            recent_traversal_failures: RecentTraversalFailures::default(),
             // This listener's `time_source` is already VirtualTime, so the admission
             // clock needs no override.
             gw_rate_limiter: GatewayConnectionRateLimiter::new(time_source.clone(), None),
@@ -577,7 +738,8 @@ impl<S: Socket> OutboundConnectionHandler<S, crate::simulation::VirtualTime> {
         )
     }
 
-    /// Connect to a remote peer using VirtualTime.
+    /// Connect to a remote peer using VirtualTime. Tagged
+    /// [`NatAttemptOrigin::RingPeerNoTransport`], like the real-time inherent `connect`.
     pub async fn connect(
         &mut self,
         remote_public_key: TransportPublicKey,
@@ -607,6 +769,7 @@ impl<S: Socket> OutboundConnectionHandler<S, crate::simulation::VirtualTime> {
                 ConnectionEvent::ConnectionStart {
                     remote_public_key,
                     open_connection,
+                    origin: NatAttemptOrigin::RingPeerNoTransport,
                 },
             ))
             .await
@@ -670,6 +833,10 @@ struct UdpPacketsListener<S = UdpSocket, T: TimeSource = RealTime> {
     /// IPs expected to connect as regular peers (not gateways).
     /// Used to validate connection attempts and prevent gateway impersonation.
     expected_non_gateway: Arc<DashSet<IpAddr>>,
+    /// Outbound traversals that timed out (failure kind `NoResponse`,
+    /// `Undecryptable` or `Incomplete`) in the last 10 s, to classify stray
+    /// intros (telemetry only). Bounded by size and TTL.
+    recent_traversal_failures: RecentTraversalFailures,
     time_source: T,
     /// Congestion control configuration for new connections.
     /// When None, uses the default configuration (BBR).
@@ -693,7 +860,19 @@ struct UdpPacketsListener<S = UdpSocket, T: TimeSource = RealTime> {
 
 type OngoingConnectionResult<S, T> = Option<
     Result<
-        Result<(RemoteConnection<S, T>, InboundRemoteConnection), (TransportError, SocketAddr)>,
+        Result<
+            (
+                RemoteConnection<S, T>,
+                InboundRemoteConnection,
+                NatAttemptOrigin,
+            ),
+            (
+                TransportError,
+                SocketAddr,
+                Arc<NatAttemptObservation>,
+                NatAttemptOrigin,
+            ),
+        >,
         tokio::task::JoinError,
     >,
 >;
@@ -787,6 +966,29 @@ impl<S, T: TimeSource> ConnectionStateManager<S, T> {
         )
     }
 
+    /// Whether an outbound NAT traversal to any port of `ip` is in progress.
+    /// A range scan over `ip`'s entries only (`SocketAddr` orders by IP
+    /// first, then port), so cheap enough for the listener's drop path.
+    fn has_nat_traversal_to_ip(&self, ip: IpAddr) -> bool {
+        let (low, high) = match ip {
+            IpAddr::V4(v4) => (SocketAddr::from((v4, 0)), SocketAddr::from((v4, u16::MAX))),
+            // Bounds cover every flowinfo / scope id, whether or not the
+            // ordering compares them.
+            IpAddr::V6(v6) => (
+                SocketAddr::V6(std::net::SocketAddrV6::new(v6, 0, 0, 0)),
+                SocketAddr::V6(std::net::SocketAddrV6::new(
+                    v6,
+                    u16::MAX,
+                    u32::MAX,
+                    u32::MAX,
+                )),
+            ),
+        };
+        self.states
+            .range(low..=high)
+            .any(|(_, state)| matches!(state, ConnectionState::NatTraversal { .. }))
+    }
+
     /// Try to send a packet to an established connection.
     /// Returns Ok(true) if sent, Ok(false) if channel full, Err if disconnected.
     fn try_send_established(
@@ -799,8 +1001,20 @@ impl<S, T: TimeSource> ConnectionStateManager<S, T> {
         }) = self.states.get(addr)
         {
             match inbound_packet_sender.try_send(packet) {
-                Ok(()) => Ok(true),
-                Err(mpsc::error::TrySendError::Full(_)) => Ok(false),
+                Ok(()) => {
+                    // Queue gauge (telemetry): two relaxed atomic reads on
+                    // the channel's semaphore plus one fetch_max.
+                    let depth = inbound_packet_sender
+                        .max_capacity()
+                        .saturating_sub(inbound_packet_sender.capacity());
+                    super::TRANSPORT_METRICS
+                        .record_inbound_queue_depth(depth.min(u32::MAX as usize) as u32);
+                    Ok(true)
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    super::TRANSPORT_METRICS.record_inbound_queue_drop();
+                    Ok(false)
+                }
                 Err(mpsc::error::TrySendError::Closed(_)) => {
                     self.mark_closed(addr);
                     Err(())
@@ -842,9 +1056,10 @@ impl<S, T: TimeSource> ConnectionStateManager<S, T> {
     /// per-handshake consumer cannot stall the listener for other peers.
     /// Dropped intro packets are recoverable — `connect_outbound_inner`
     /// retries up to `NAT_TRAVERSAL_MAX_ATTEMPTS` (40 in release builds,
-    /// 10 under `cfg(test)`) at a 200 ms cadence, capped by the 3 s
+    /// 10 under `cfg(test)`) at a ~250 ms cadence (a 200 ms receive wait
+    /// plus the 50 ms `INITIAL_INTERVAL` sleep), capped by the 3 s
     /// `overall_deadline`. So at production settings the remote peer
-    /// fires roughly 15 intro packets during the deadline window — a
+    /// fires roughly 12 intro packets during the deadline window — a
     /// transient channel-full event degrades latency but does not break
     /// the handshake.
     fn try_send_nat_traversal(
@@ -1277,6 +1492,11 @@ pub(super) const NAT_TRAVERSAL_MAX_ATTEMPTS: usize = 40;
 #[cfg(any(test, feature = "bench"))]
 pub(super) const NAT_TRAVERSAL_MAX_ATTEMPTS: usize = 10;
 
+/// How long an outbound hole punch keeps sending before it gives up, whatever
+/// the attempt count. Both sides of a CONNECT punch for this long, so it is
+/// also the window in which the joiner must start dialling an acceptor.
+pub(crate) const NAT_TRAVERSAL_DEADLINE: Duration = Duration::from_secs(3);
+
 impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
     #[tracing::instrument(level = "debug", name = "transport_listener", fields(peer = %self.this_peer_keypair.public), skip_all)]
     async fn listen(mut self) -> TransportError {
@@ -1289,6 +1509,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
         let mut gw_connection_tasks = FuturesUnordered::new();
         let mut outdated_peer: HashMap<SocketAddr, u64> = HashMap::new();
         let mut last_cleanup_nanos = self.time_source.now_nanos();
+        let mut recv_errors = RecvErrorTracker::default();
 
         'outer: loop {
             // DST: Use deterministic_select! for fair but deterministic branch ordering
@@ -1296,6 +1517,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                 recv_result = self.socket_listener.recv_from(&mut buf) => {
                     match recv_result {
                         Ok((size, remote_addr)) => {
+                            recv_errors.on_success();
                             if let Some(time_nanos) = outdated_peer.get(&remote_addr) {
                                 let now_nanos = self.time_source.now_nanos();
                                 if now_nanos.saturating_sub(*time_nanos) < OUTDATED_PEER_EXPIRY.as_nanos() as u64 {
@@ -1560,6 +1782,9 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                 gw_connection_tasks.push(task);
                                 continue;
                             } else {
+                                if packet_data.is_intro_packet() {
+                                    self.count_stray_intro(remote_addr);
+                                }
                                 // Non-gateway peers: mark as expected and wait for the normal peer handshake flow.
                                 self.expected_non_gateway.insert(remote_addr.ip());
                                 tracing::trace!(
@@ -1570,30 +1795,47 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                             }
                         }
                         Err(e) => {
-                            // Transient errors (e.g., ECONNREFUSED on Linux for ICMP port unreachable)
-                            // should not kill the listener. Only fatal errors should exit.
-                            let kind = e.kind();
-                            if matches!(kind, std::io::ErrorKind::ConnectionReset
-                                | std::io::ErrorKind::ConnectionRefused
-                                | std::io::ErrorKind::ConnectionAborted
-                                | std::io::ErrorKind::Interrupted
-                                | std::io::ErrorKind::WouldBlock
-                                | std::io::ErrorKind::TimedOut)
-                            {
-                                tracing::warn!(
-                                    error = ?e,
-                                    error_kind = ?kind,
-                                    "Transient UDP recv_from error, continuing"
-                                );
-                                continue;
+                            // Ending this task force-exits the node, so only an
+                            // error that means the socket itself is unusable may
+                            // do it. Any other error drops this read and the loop
+                            // carries on. See `recv_errors` for the classification.
+                            let verdict = recv_errors.on_error(&e, self.time_source.now_nanos());
+                            let suppressed = match verdict.log {
+                                RecvErrorLog::Emit { suppressed } => Some(suppressed),
+                                RecvErrorLog::Suppress => None,
+                            };
+                            match verdict.action {
+                                RecvErrorAction::Exit => {
+                                    tracing::error!(
+                                        error = ?e,
+                                        error_kind = ?e.kind(),
+                                        os_error = ?e.raw_os_error(),
+                                        class = ?verdict.class,
+                                        suppressed_since_last_log = suppressed.unwrap_or(0),
+                                        bind_addr = %self.this_addr,
+                                        "Fatal UDP recv_from error, listen task exiting"
+                                    );
+                                    return e.into();
+                                }
+                                RecvErrorAction::Continue { pause } => {
+                                    if let Some(suppressed) = suppressed {
+                                        tracing::warn!(
+                                            error = ?e,
+                                            error_kind = ?e.kind(),
+                                            os_error = ?e.raw_os_error(),
+                                            class = ?verdict.class,
+                                            suppressed_since_last_log = suppressed,
+                                            "UDP recv_from error, dropping the read and continuing"
+                                        );
+                                    }
+                                    match pause {
+                                        RecvErrorPause::None => {}
+                                        RecvErrorPause::Yield => tokio::task::yield_now().await,
+                                        RecvErrorPause::Sleep(d) => self.time_source.sleep(d).await,
+                                    }
+                                    continue;
+                                }
                             }
-                            tracing::error!(
-                                error = ?e,
-                                error_kind = ?kind,
-                                bind_addr = %self.this_addr,
-                                "Fatal UDP recv_from error, listen task exiting"
-                            );
-                            return e.into();
                         }
                     }
                 },
@@ -1683,7 +1925,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                     };
                     match task_result {
                         // Successful NAT traversal
-                        Ok((outbound_remote_conn, inbound_remote_connection)) => {
+                        Ok((outbound_remote_conn, inbound_remote_connection, origin)) => {
                             let remote_addr = outbound_remote_conn.remote_addr;
                             self.expected_non_gateway.remove(&remote_addr.ip());
 
@@ -1694,7 +1936,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                             ) {
                                 tracing::info!(peer_addr = %remote_addr, "NAT traversal connection established");
                                 crate::transport::TRANSPORT_METRICS
-                                    .record_nat_traversal_established();
+                                    .record_nat_traversal_established(remote_addr, origin);
                                 if result_sender.send(Ok(outbound_remote_conn)).is_err() {
                                     tracing::debug!(peer_addr = %remote_addr, "NAT traversal result receiver already dropped");
                                 }
@@ -1703,14 +1945,34 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                             }
                         }
                         // Failed NAT traversal
-                        Err((error, remote_addr)) => {
+                        Err((error, remote_addr, observed, origin)) => {
+                            let flags = observed.flags();
+                            let kind = classify_nat_failure(&error, flags);
+                            type O = NatAttemptObservation;
+                            let seen = crate::transport::metrics::NatAttemptSeen {
+                                received_any: flags & O::RECEIVED != 0,
+                                decrypted_any: flags & O::DECRYPTED != 0,
+                                deadline_reached: flags & O::DEADLINE != 0,
+                            };
+                            crate::transport::TRANSPORT_METRICS.record_nat_failure(
+                                remote_addr,
+                                kind,
+                                seen,
+                                origin,
+                            );
+                            self.recent_traversal_failures.record_failure(
+                                remote_addr,
+                                kind,
+                                self.time_source.now_nanos(),
+                                &crate::transport::TRANSPORT_METRICS,
+                            );
                             match &error {
                                 TransportError::ProtocolVersionMismatch { .. } => {
                                     tracing::warn!(%error);
                                     crate::transport::TRANSPORT_METRICS
                                         .record_nat_traversal_failed_version();
                                 }
-                                TransportError::ChannelClosed | TransportError::ConnectionClosed(_) | TransportError::ConnectionEstablishmentFailure { .. } | TransportError::SendFailed(..) | TransportError::OutboundStreamFailed(_) | TransportError::IO(_) | TransportError::Other(_) | TransportError::PubKeyDecryptionError(_) | TransportError::Serialization(_) => {
+                                TransportError::ChannelClosed | TransportError::ConnectionClosed(_) | TransportError::ConnectionEstablishmentFailure { .. } | TransportError::Udp(UdpError(UdpErrorKind::SendFailed(..))) | TransportError::OutboundStreamFailed(_) | TransportError::OutboundStreamInvalidLength(..) | TransportError::Udp(UdpError(UdpErrorKind::IO(_))) | TransportError::Other(_) | TransportError::Udp(UdpError(UdpErrorKind::PubKeyDecryptionError(_))) | TransportError::Udp(UdpError(UdpErrorKind::Serialization(_))) => {
                                     tracing::error!(error = %error, peer_addr = %remote_addr, "Failed NAT traversal");
                                     crate::transport::TRANSPORT_METRICS
                                         .record_nat_traversal_failed_error();
@@ -1739,7 +2001,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                         return TransportError::ConnectionClosed(self.this_addr);
                     };
                     tracing::debug!(peer_addr = %remote_addr, "Received connection event");
-                    let ConnectionEvent::ConnectionStart { remote_public_key, open_connection } = event;
+                    let ConnectionEvent::ConnectionStart { remote_public_key, open_connection, origin } = event;
 
                     // Check for existing NAT traversal in progress
                     if self.connections.has_nat_traversal(&remote_addr) {
@@ -1753,7 +2015,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                     }
 
                     tracing::info!(peer_addr = %remote_addr, "Starting NAT traversal");
-                    let (ongoing_connection, packets_sender) = self.traverse_nat(remote_addr, remote_public_key.clone());
+                    let (ongoing_connection, packets_sender, nat_observation) = self.traverse_nat(remote_addr, remote_public_key.clone());
 
                     if !self.connections.start_nat_traversal(remote_addr, packets_sender, open_connection) {
                         // Rejected AFTER the `has_nat_traversal` guard above: a
@@ -1768,11 +2030,12 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                     // Admitted: a traversal task is now spawned and will emit
                     // exactly one established/failed outcome. Count the attempt
                     // here so the denominator matches the outcomes.
-                    crate::transport::TRANSPORT_METRICS.record_nat_traversal_attempt();
+                    crate::transport::TRANSPORT_METRICS.record_nat_traversal_attempt(remote_addr, origin);
 
                     self.expected_non_gateway.insert(remote_addr.ip());
                     let task = GlobalExecutor::spawn(ongoing_connection
-                        .map_err(move |err| (err, remote_addr))
+                        .map_ok(move |(conn, inbound)| (conn, inbound, origin))
+                        .map_err(move |err| (err, remote_addr, nat_observation, origin))
                         .instrument(span!(tracing::Level::DEBUG, "traverse_nat"))
                     );
                     connection_tasks.push(task);
@@ -1783,6 +2046,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                 } => {
                     self.connections.cleanup_expired();
                     let now_nanos = self.time_source.now_nanos();
+                    self.recent_traversal_failures.prune(now_nanos);
                     last_cleanup_nanos = now_nanos;
 
                     let outdated_cutoff = now_nanos.saturating_sub(OUTDATED_PEER_EXPIRY.as_nanos() as u64);
@@ -1790,6 +2054,19 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                 }
             }
         }
+    }
+
+    /// Count an intro packet dropped because nothing exists for its exact
+    /// address (non-gateways only; telemetry). Bounded cost: a hash lookup
+    /// and a range scan over this IP's entries, no allocation.
+    fn count_stray_intro(&mut self, remote_addr: SocketAddr) {
+        let now_nanos = self.time_source.now_nanos();
+        let kind = stray_intro::classify(
+            self.recent_traversal_failures
+                .failed_recently(remote_addr, now_nanos),
+            self.connections.has_nat_traversal_to_ip(remote_addr.ip()),
+        );
+        crate::transport::TRANSPORT_METRICS.record_stray_intro(remote_addr, kind);
     }
 
     /// Effective floor for emitting the version-carrying ack (#5161): the
@@ -1876,10 +2153,20 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                             crate::transport::signal_urgent_update();
                         }
                         let packet = SymmetricMessage::ack_error(&outbound_key)?;
-                        socket
-                            .send_to(&packet.prepared_send(), remote_addr)
-                            .await
-                            .map_err(|_| TransportError::ChannelClosed)?;
+                        // Best effort: the peer is refused either way, and
+                        // returning the mismatch rather than the send error
+                        // is what makes the listener remember it as outdated.
+                        // Logged at info!: a spoofed-source intro can trigger
+                        // it (see `handshake_send_failed`).
+                        if let Err(err) = socket.send_to(&packet.prepared_send(), remote_addr).await
+                        {
+                            tracing::info!(
+                                peer_addr = %remote_addr,
+                                direction = "inbound",
+                                error = %err,
+                                "Failed to send version-mismatch ack"
+                            );
+                        }
                         return Err(TransportError::ProtocolVersionMismatch {
                             expected: PCK_VERSION.to_string(),
                             actual: reason.to_string(),
@@ -1906,7 +2193,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
             socket
                 .send_to(&outbound_ack_packet.clone().prepared_send(), remote_addr)
                 .await
-                .map_err(|_| TransportError::ChannelClosed)?;
+                .map_err(|err| handshake_send_failed(remote_addr, "inbound", err))?;
 
             // wait until the remote sends the ack packet
             let timeout_result = crate::deterministic_select! {
@@ -1947,7 +2234,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                 SentPacketTracker::new_with_time_source(time_source.clone()),
             ));
 
-            // Initialize congestion controller (BBR by default, configurable for benchmarks)
+            // Initialize congestion controller (FixedRate by default, configurable for benchmarks)
             let congestion_controller = congestion_config
                 .clone()
                 .unwrap_or_default()
@@ -2047,12 +2334,15 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
     ) -> (
         TraverseNatFuture<S, T>,
         mpsc::Sender<PacketData<UnknownEncryption>>,
+        Arc<NatAttemptObservation>,
     ) {
         tracing::debug!(
             peer_addr = %remote_addr,
             direction = "outbound",
             "Starting NAT traversal"
         );
+        let observation = Arc::new(NatAttemptObservation::default());
+        let obs = observation.clone();
 
         #[allow(clippy::large_enum_variant)]
         enum HandshakePhase {
@@ -2070,8 +2360,10 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
             outbound_sym_key: &mut Option<Aes128Gcm>,
             state: &mut HandshakePhase,
             remote_protoc_version: &mut Option<(u8, u8, u16)>,
+            observation: &NatAttemptObservation,
         ) -> Result<(), ()> {
             if let Ok(decrypted_intro_packet) = packet.try_decrypt_asym(transport_secret_key) {
+                observation.set(NatAttemptObservation::DECRYPTED);
                 tracing::debug!(
                     peer_addr = %remote_addr,
                     direction = "outbound",
@@ -2096,6 +2388,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                         *remote_protoc_version = Some(remote_info.version);
                     }
                     Err(reason) => {
+                        observation.set(NatAttemptObservation::VERSION_INCOMPATIBLE);
                         // Track version even on incompatible peers — aids version discovery.
                         let remote_info = version_cmp::parse_version_bytes(&protoc_bytes);
                         crate::transport::report_peer_version(remote_info.version);
@@ -2149,7 +2442,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
             let mut state = HandshakePhase::StartOutbound;
             let mut attempts = 0usize;
             let start_time_nanos = time_source.now_nanos();
-            let overall_deadline = Duration::from_secs(3);
+            let overall_deadline = NAT_TRAVERSAL_DEADLINE;
 
             // Generate symmetric key using GlobalRng for deterministic simulation
             let mut inbound_sym_key_bytes = [0u8; 16];
@@ -2170,6 +2463,15 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
 
             let mut sent_tracker = SentPacketTracker::new_with_time_source(time_source.clone());
 
+            // A failed send is handled like a datagram lost on the wire: the
+            // loop sends again on its next pass, so an error that clears (a
+            // network coming back) does not end the attempt. The error itself
+            // cannot say whether it will clear: a socket bound to [::1] gets
+            // ENETUNREACH for every off-host destination, the same error a
+            // returning network gives (#5871). The deadline bounds both, and
+            // if the last send failed the attempt reports that error.
+            let mut send_failures = HandshakeSendFailures::default();
+
             // NAT traversal: keep sending packets throughout the deadline to maintain NAT bindings.
             // The acceptor may start hole-punching well before the joiner, so we must keep
             // sending until the deadline expires, not just until we've sent MAX_ATTEMPTS packets.
@@ -2185,10 +2487,13 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                 direction = "outbound",
                                 "Sending protocol version and inbound key"
                             );
-                            socket
-                                .send_to(outbound_intro_packet.data(), remote_addr)
-                                .await
-                                .map_err(|_| TransportError::ChannelClosed)?;
+                            send_failures.record(
+                                socket
+                                    .send_to(outbound_intro_packet.data(), remote_addr)
+                                    .await,
+                                remote_addr,
+                                "intro",
+                            );
                             attempts += 1;
                         }
                         HandshakePhase::RemoteInbound => {
@@ -2210,14 +2515,20 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                 remote_protoc_version,
                                 ack_version_floor,
                             )?;
-                            socket
-                                .send_to(our_inbound.data(), remote_addr)
-                                .await
-                                .map_err(|_| TransportError::ChannelClosed)?;
-                            sent_tracker.report_sent_packet(
-                                SymmetricMessage::FIRST_PACKET_ID,
-                                our_inbound.data().into(),
-                            );
+                            // Bookkeeping hygiene only: this tracker is not
+                            // consumed after RemoteInbound (a successful
+                            // completion builds a fresh one), so skipping an
+                            // unsent packet changes no accounting.
+                            if send_failures.record(
+                                socket.send_to(our_inbound.data(), remote_addr).await,
+                                remote_addr,
+                                "ack",
+                            ) {
+                                sent_tracker.report_sent_packet(
+                                    SymmetricMessage::FIRST_PACKET_ID,
+                                    our_inbound.data().into(),
+                                );
+                            }
                             attempts += 1;
                         }
                     }
@@ -2228,6 +2539,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                 };
                 match next_inbound_result {
                     Some(Some(packet)) => {
+                        obs.set(NatAttemptObservation::RECEIVED);
                         tracing::trace!(
                             peer_addr = %remote_addr,
                             direction = "outbound",
@@ -2244,6 +2556,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                 if let Ok(decrypted_packet) =
                                     packet.try_decrypt_sym(&inbound_sym_key)
                                 {
+                                    obs.set(NatAttemptObservation::DECRYPTED);
                                     // Authenticated handshake-completion ACK; meter
                                     // it just like any other authenticated inbound
                                     // packet (#3999).
@@ -2318,6 +2631,15 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                             // ours. So the "we must update to
                                             // talk to this peer" branch is
                                             // unreachable here by construction.
+                                            // The acceptor's view of our
+                                            // external address (telemetry:
+                                            // NAT-mapping signal; the
+                                            // address itself is not exported).
+                                            crate::transport::TRANSPORT_METRICS
+                                                .record_observed_external_addr(
+                                                    remote_addr,
+                                                    my_address,
+                                                );
                                             if let Some(bytes) = acceptor_version_bytes {
                                                 let info = version_cmp::parse_version_bytes(&bytes);
                                                 crate::transport::report_peer_version(info.version);
@@ -2333,14 +2655,23 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                                 inbound_sym_key_bytes,
                                                 remote_addr,
                                             )?;
+                                            // One-shot: nothing later in this
+                                            // attempt re-sends it, so a failure
+                                            // ends the attempt.
                                             socket
                                                 .send_to(ack_packet.data(), remote_addr)
                                                 .await
-                                                .map_err(|_| TransportError::ChannelClosed)?;
+                                                .map_err(|err| {
+                                                    handshake_send_failed(
+                                                        remote_addr,
+                                                        "outbound",
+                                                        err,
+                                                    )
+                                                })?;
                                             let (inbound_sender, inbound_recv) =
                                                 mpsc::channel(INBOUND_CHANNEL_CAPACITY);
 
-                                            // Initialize congestion controller (BBR by default, configurable for benchmarks)
+                                            // Initialize congestion controller (FixedRate by default, configurable for benchmarks)
                                             let congestion_controller = congestion_config
                                                 .clone()
                                                 .unwrap_or_default()
@@ -2468,6 +2799,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                     &mut outbound_sym_key,
                                     &mut state,
                                     &mut remote_protoc_version,
+                                    &obs,
                                 )
                                 .is_ok()
                                 {
@@ -2496,7 +2828,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                 let (inbound_sender, inbound_recv) =
                                     mpsc::channel(INBOUND_CHANNEL_CAPACITY);
 
-                                // Initialize congestion controller (BBR by default, configurable for benchmarks)
+                                // Initialize congestion controller (FixedRate by default, configurable for benchmarks)
                                 let congestion_controller = congestion_config
                                     .clone()
                                     .unwrap_or_default()
@@ -2583,11 +2915,35 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                 time_source.sleep(INITIAL_INTERVAL).await;
             }
 
+            obs.set(NatAttemptObservation::DEADLINE);
             let elapsed_nanos = time_source.now_nanos().saturating_sub(start_time_nanos);
             let elapsed_ms = elapsed_nanos / 1_000_000;
+            // The returned error follows the LAST send: if it failed, the
+            // send error is the most specific explanation available. If it
+            // succeeded, the remote was reachable from our side at the end and
+            // simply did not answer, so the attempt ends as before. Either way
+            // the warn line carries the failure count and the last OS error,
+            // so sends that failed mid-attempt are visible in release builds.
+            if let (true, Some(err)) = (
+                send_failures.last_send_failed,
+                send_failures.last_error.as_ref(),
+            ) {
+                tracing::warn!(
+                    peer_addr = %remote_addr,
+                    attempts,
+                    failed_sends = send_failures.count,
+                    elapsed_ms,
+                    direction = "outbound",
+                    error = %err,
+                    "Outbound handshake failed: sends to the remote are failing"
+                );
+                return Err(TransportError::send_failed(remote_addr, err.kind()));
+            }
             tracing::warn!(
                 peer_addr = %remote_addr,
                 attempts,
+                failed_sends = send_failures.count,
+                last_send_error = %send_failures.last_error_text(),
                 elapsed_ms,
                 direction = "outbound",
                 "Outbound handshake failed: max connection attempts reached"
@@ -2596,8 +2952,239 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                 cause: "max connection attempts reached".into(),
             })
         };
-        (f.boxed(), inbound_from_remote)
+        (f.boxed(), inbound_from_remote, observation)
     }
+}
+
+/// What one outbound NAT traversal attempt saw, for classifying its failure
+/// in telemetry. Set from the traversal task, read once the task has ended.
+#[derive(Default)]
+pub(super) struct NatAttemptObservation(std::sync::atomic::AtomicU8);
+
+impl NatAttemptObservation {
+    /// Any packet arrived from the remote.
+    const RECEIVED: u8 = 1;
+    /// A packet from the remote was decrypted (intro or symmetric).
+    const DECRYPTED: u8 = 1 << 1;
+    /// The remote's intro carried an incompatible protocol version.
+    const VERSION_INCOMPATIBLE: u8 = 1 << 2;
+    /// The attempt ran to its deadline.
+    const DEADLINE: u8 = 1 << 3;
+
+    fn set(&self, flag: u8) {
+        self.0.fetch_or(flag, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn flags(&self) -> u8 {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// Map a failed traversal to exactly one [`NatFailureKind`].
+fn classify_nat_failure(
+    error: &TransportError,
+    flags: u8,
+) -> crate::transport::metrics::NatFailureKind {
+    use crate::transport::metrics::NatFailureKind;
+    type O = NatAttemptObservation;
+    // A known version mismatch is the actionable cause however the attempt
+    // ended (e.g. a later send failure), so it is checked first.
+    if flags & O::VERSION_INCOMPATIBLE != 0 {
+        return NatFailureKind::VersionIncompatible;
+    }
+    match error {
+        TransportError::ProtocolVersionMismatch { .. } => NatFailureKind::VersionIncompatible,
+        TransportError::Udp(UdpError(UdpErrorKind::SendFailed(..))) => NatFailureKind::SendError,
+        TransportError::ChannelClosed
+        | TransportError::ConnectionClosed(_)
+        | TransportError::ConnectionEstablishmentFailure { .. }
+        | TransportError::OutboundStreamFailed(_)
+        | TransportError::OutboundStreamInvalidLength(..)
+        | TransportError::Udp(UdpError(UdpErrorKind::IO(_)))
+        | TransportError::Other(_)
+        | TransportError::Udp(UdpError(UdpErrorKind::PubKeyDecryptionError(_)))
+        | TransportError::Udp(UdpError(UdpErrorKind::Serialization(_))) => {
+            if flags & O::DEADLINE == 0 {
+                NatFailureKind::Other
+            } else if flags & O::RECEIVED == 0 {
+                NatFailureKind::NoResponse
+            } else if flags & O::DECRYPTED == 0 {
+                NatFailureKind::Undecryptable
+            } else {
+                NatFailureKind::Incomplete
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod nat_failure_classification_tests {
+    use super::*;
+    use crate::transport::metrics::NatFailureKind;
+
+    type O = NatAttemptObservation;
+
+    fn deadline() -> TransportError {
+        TransportError::ConnectionEstablishmentFailure {
+            cause: "max connection attempts reached".into(),
+        }
+    }
+
+    #[test]
+    fn classification_table() {
+        let addr: SocketAddr = "192.0.2.1:1".parse().unwrap();
+        let cases = [
+            (deadline(), O::DEADLINE, NatFailureKind::NoResponse),
+            (
+                deadline(),
+                O::DEADLINE | O::RECEIVED,
+                NatFailureKind::Undecryptable,
+            ),
+            (
+                deadline(),
+                O::DEADLINE | O::RECEIVED | O::DECRYPTED,
+                NatFailureKind::Incomplete,
+            ),
+            (
+                deadline(),
+                O::DEADLINE | O::RECEIVED | O::DECRYPTED | O::VERSION_INCOMPATIBLE,
+                NatFailureKind::VersionIncompatible,
+            ),
+            (
+                TransportError::ProtocolVersionMismatch {
+                    expected: "a".into(),
+                    actual: "b".into(),
+                },
+                0,
+                NatFailureKind::VersionIncompatible,
+            ),
+            (
+                TransportError::send_failed(addr, std::io::ErrorKind::NetworkUnreachable),
+                O::DEADLINE,
+                NatFailureKind::SendError,
+            ),
+            // An error before the deadline (channel closed, bad ack) is not a
+            // reachability verdict, whatever was received.
+            (
+                TransportError::ConnectionClosed(addr),
+                O::RECEIVED,
+                NatFailureKind::Other,
+            ),
+            (deadline(), O::RECEIVED, NatFailureKind::Other),
+            // A version-incompatible remote is classified as such even when
+            // the attempt ended before its deadline.
+            (
+                TransportError::ConnectionClosed(addr),
+                O::RECEIVED | O::DECRYPTED | O::VERSION_INCOMPATIBLE,
+                NatFailureKind::VersionIncompatible,
+            ),
+            // ...and even when the attempt then ended on a failed send.
+            (
+                TransportError::send_failed(addr, std::io::ErrorKind::NetworkUnreachable),
+                O::DEADLINE | O::RECEIVED | O::DECRYPTED | O::VERSION_INCOMPATIBLE,
+                NatFailureKind::VersionIncompatible,
+            ),
+        ];
+        for (error, flags, expected) in cases {
+            assert_eq!(
+                classify_nat_failure(&error, flags),
+                expected,
+                "{error:?} / {flags:#b}"
+            );
+        }
+    }
+
+    #[test]
+    fn observation_flags_accumulate() {
+        let o = NatAttemptObservation::default();
+        assert_eq!(o.flags(), 0);
+        o.set(O::RECEIVED);
+        o.set(O::DEADLINE);
+        o.set(O::RECEIVED);
+        assert_eq!(o.flags(), O::RECEIVED | O::DEADLINE);
+    }
+}
+
+/// Send failures seen during one `traverse_nat` attempt (#5871).
+#[derive(Default)]
+struct HandshakeSendFailures {
+    /// Failed sends so far in this attempt.
+    count: usize,
+    /// The most recent OS error, kept after a later send succeeds so the
+    /// attempt's final log line can still name it.
+    last_error: Option<std::io::Error>,
+    /// Whether the most recent send failed. Decides the returned error.
+    last_send_failed: bool,
+}
+
+impl HandshakeSendFailures {
+    /// Record one send's outcome. Returns true if the send succeeded.
+    fn record(
+        &mut self,
+        result: std::io::Result<usize>,
+        remote_addr: SocketAddr,
+        packet: &'static str,
+    ) -> bool {
+        match result {
+            Ok(_) => {
+                self.last_send_failed = false;
+                true
+            }
+            Err(err) => {
+                tracing::debug!(
+                    peer_addr = %remote_addr,
+                    direction = "outbound",
+                    packet,
+                    error = %err,
+                    "Handshake send failed, re-sending on the next pass"
+                );
+                self.count += 1;
+                self.last_send_failed = true;
+                self.last_error = Some(err);
+                false
+            }
+        }
+    }
+
+    fn last_error_text(&self) -> String {
+        self.last_error
+            .as_ref()
+            .map_or_else(|| "none".to_string(), ToString::to_string)
+    }
+}
+
+/// Turn a failed handshake `send_to` into the error the handshake returns.
+///
+/// Logs the full OS error first, with the destination, because `SendFailed`
+/// keeps only its `ErrorKind`, and some kinds (`Uncategorized`) name nothing.
+/// Before #5871 these sends mapped every error to `ChannelClosed` and the OS
+/// error was lost. No consumer of a handshake result classifies it with
+/// `is_transient`; that predicate is for established connections.
+///
+/// Inbound (gateway) failures log at `info!`: an unauthenticated intro with a
+/// spoofed source address can trigger them, limited only by the per-IP intro
+/// rate limit, so they must not flood the warn level.
+fn handshake_send_failed(
+    remote_addr: SocketAddr,
+    direction: &'static str,
+    err: std::io::Error,
+) -> TransportError {
+    if direction == "inbound" {
+        tracing::info!(
+            peer_addr = %remote_addr,
+            direction,
+            error = %err,
+            "Handshake send failed"
+        );
+    } else {
+        tracing::warn!(
+            peer_addr = %remote_addr,
+            direction,
+            error = %err,
+            "Handshake send failed"
+        );
+    }
+    TransportError::send_failed(remote_addr, err.kind())
 }
 
 /// Build the success ack for a peer whose protocol version we have just parsed
@@ -2768,6 +3355,8 @@ pub(crate) enum ConnectionEvent<S = UdpSocket, TS: TimeSource = RealTime> {
     ConnectionStart {
         remote_public_key: TransportPublicKey,
         open_connection: oneshot::Sender<Result<RemoteConnection<S, TS>, TransportError>>,
+        /// Why the node started this attempt (telemetry only).
+        origin: NatAttemptOrigin,
     },
 }
 
@@ -2775,6 +3364,8 @@ struct InboundRemoteConnection {
     inbound_packet_sender: mpsc::Sender<PacketData<UnknownEncryption>>,
 }
 
+mod recv_errors;
+mod stray_intro;
 mod version_cmp;
 
 /// Smoke tests pinning the contract the transport layer relies on from
@@ -2822,12 +3413,15 @@ pub mod mock_transport {
             TransportError::ChannelClosed
             | TransportError::ConnectionClosed(_)
             | TransportError::ConnectionEstablishmentFailure { .. }
-            | TransportError::SendFailed(..)
+            | TransportError::Udp(UdpError(UdpErrorKind::SendFailed(..)))
             | TransportError::OutboundStreamFailed(_)
-            | TransportError::IO(_)
+            | TransportError::OutboundStreamInvalidLength(..)
+            | TransportError::Udp(UdpError(UdpErrorKind::IO(_)))
             | TransportError::Other(_)
-            | TransportError::PubKeyDecryptionError(_)
-            | TransportError::Serialization(_) => panic!("Expected ProtocolVersionMismatch error"),
+            | TransportError::Udp(UdpError(UdpErrorKind::PubKeyDecryptionError(_)))
+            | TransportError::Udp(UdpError(UdpErrorKind::Serialization(_))) => {
+                panic!("Expected ProtocolVersionMismatch error")
+            }
         }
 
         let err_msg_no_version = "remote is using a different protocol version".to_string();
@@ -2838,21 +3432,44 @@ pub mod mock_transport {
             TransportError::ChannelClosed
             | TransportError::ConnectionClosed(_)
             | TransportError::ProtocolVersionMismatch { .. }
-            | TransportError::SendFailed(..)
+            | TransportError::Udp(UdpError(UdpErrorKind::SendFailed(..)))
             | TransportError::OutboundStreamFailed(_)
-            | TransportError::IO(_)
+            | TransportError::OutboundStreamInvalidLength(..)
+            | TransportError::Udp(UdpError(UdpErrorKind::IO(_)))
             | TransportError::Other(_)
-            | TransportError::PubKeyDecryptionError(_)
-            | TransportError::Serialization(_) => {
+            | TransportError::Udp(UdpError(UdpErrorKind::PubKeyDecryptionError(_)))
+            | TransportError::Udp(UdpError(UdpErrorKind::Serialization(_))) => {
                 panic!("Expected ConnectionEstablishmentFailure error")
             }
         }
     }
 
     /// Channel mapping for mock socket communication between peers.
-    /// Packet format: (source_addr, data, available_at_nanos)
-    /// available_at_nanos = VirtualTime when packet becomes available (0 = immediate)
-    pub type Channels = Arc<DashMap<SocketAddr, mpsc::UnboundedSender<(SocketAddr, Vec<u8>, u64)>>>;
+    pub type Channels = Arc<DashMap<SocketAddr, mpsc::UnboundedSender<InboundPacket>>>;
+
+    /// A datagram on its way to a `MockSocket`.
+    pub struct InboundPacket {
+        from: SocketAddr,
+        data: Vec<u8>,
+        /// VirtualTime at which the packet becomes available (0 = immediate).
+        available_at_nanos: u64,
+        /// Tie-break between equal arrival times: the link model's own
+        /// scheduling order, or the global send order without a link model.
+        order: u64,
+    }
+
+    /// Send order for sockets without a link model.
+    static SEND_ORDER: AtomicU64 = AtomicU64::new(0);
+
+    /// How many queued packets `recv_from` moves off its channel per pass
+    /// (code-style.md, per-iteration caps). It bounds the work of one pass, so
+    /// a sender on another runtime thread cannot keep the loop draining
+    /// indefinitely. The cost: delivery is in arrival order among parked
+    /// packets only, so a due packet may be delivered ahead of one still in
+    /// the channel that was due earlier. On the current-thread runtime the
+    /// WAN bench uses, nothing is sent while the loop runs, so this cannot
+    /// happen there.
+    const MAX_INBOUND_DRAIN: usize = 64;
 
     /// Policy for simulating packet loss in mock transport.
     #[derive(Default, Clone)]
@@ -2881,7 +3498,7 @@ pub mod mock_transport {
     /// Mock socket implementation for testing transport without real network I/O.
     pub struct MockSocket {
         /// Inbound packets: (source_addr, data, available_at_nanos)
-        inbound: Mutex<mpsc::UnboundedReceiver<(SocketAddr, Vec<u8>, u64)>>,
+        inbound: Mutex<mpsc::UnboundedReceiver<InboundPacket>>,
         this: SocketAddr,
         packet_drop_policy: PacketDropPolicy,
         packet_delay_policy: PacketDelayPolicy,
@@ -2891,6 +3508,40 @@ pub mod mock_transport {
         /// Optional VirtualTime for instant delay simulation in benchmarks.
         /// When set, packet delivery waits until VirtualTime reaches available_at_nanos.
         virtual_time: Option<crate::simulation::VirtualTime>,
+        /// When set, the link model decides every packet's fate and replaces
+        /// the drop and delay policies. Requires `virtual_time`.
+        link: Option<Arc<crate::transport::link_model::LinkModel>>,
+        /// Packets taken off `inbound` whose arrival time has not come yet,
+        /// ordered by (arrival, order). Held on the socket so a `recv_from`
+        /// cancelled while waiting (the listener polls it inside a
+        /// `select!`) loses nothing, and ordered by arrival so a packet from
+        /// one peer never waits behind a later-arriving one from another.
+        /// Packets from one source never reorder: each is held to no earlier
+        /// than the previous one from that source, which matters for
+        /// `PacketDelayPolicy::Uniform` (the link model is FIFO per path
+        /// already).
+        pending_inbound: std::sync::Mutex<PendingInbound>,
+    }
+
+    /// A VirtualTime sleep kept across `recv_from` calls.
+    type PendingSleep = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+
+    /// A parked inbound packet: (arrival nanos, order, source, bytes).
+    type ParkedPacket = std::cmp::Reverse<(u64, u64, SocketAddr, Vec<u8>)>;
+
+    /// See `MockSocket::pending_inbound`.
+    #[derive(Default)]
+    struct PendingInbound {
+        heap: std::collections::BinaryHeap<ParkedPacket>,
+        last_arrival_from: std::collections::HashMap<SocketAddr, u64>,
+        /// The sleep for the earliest parked packet, kept across calls so a
+        /// re-entered or cancelled `recv_from` reuses it instead of
+        /// registering another VirtualTime wakeup for the same deadline.
+        /// When an earlier packet arrives and the deadline changes, the old
+        /// sleep is dropped but its wakeup stays registered (VirtualTime has
+        /// no deregistration): it costs one extra driver step and a spurious
+        /// wake when its deadline passes, nothing else.
+        wait: Option<(u64, PendingSleep)>,
     }
 
     impl MockSocket {
@@ -2915,6 +3566,8 @@ pub mod mock_transport {
                 )),
                 channels,
                 virtual_time: None,
+                link: None,
+                pending_inbound: std::sync::Mutex::new(PendingInbound::default()),
             }
         }
 
@@ -2943,6 +3596,8 @@ pub mod mock_transport {
                 )),
                 channels,
                 virtual_time: time_source,
+                link: None,
+                pending_inbound: std::sync::Mutex::new(PendingInbound::default()),
             }
         }
     }
@@ -2953,28 +3608,66 @@ pub mod mock_transport {
         }
 
         async fn recv_from(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
-            // Wait for a packet from the channel
-            let Some((remote, packet, available_at_nanos)) =
-                self.inbound.try_lock().unwrap().recv().await
-            else {
-                tracing::error!(this = %self.this, "connection closed");
-                return Err(std::io::ErrorKind::ConnectionAborted.into());
-            };
-
-            // Wait until the packet is available (simulates transit delay)
-            // This registers a VirtualTime wakeup that auto-advance will process
-            if let Some(ref vt) = self.virtual_time {
-                if available_at_nanos > 0 {
-                    vt.sleep_until(available_at_nanos).await;
+            // Cancel-safe: every packet taken off the channel is parked in
+            // `pending_inbound` before any await, and leaves it only when it
+            // is delivered. Only this socket's listener calls recv_from.
+            let mut inbound = self.inbound.try_lock().unwrap();
+            loop {
+                for _ in 0..MAX_INBOUND_DRAIN {
+                    let Ok(packet) = inbound.try_recv() else {
+                        break;
+                    };
+                    self.park_inbound(packet);
+                }
+                let next_at = self
+                    .pending()
+                    .heap
+                    .peek()
+                    .map(|std::cmp::Reverse((at, ..))| *at);
+                match (next_at, &self.virtual_time) {
+                    (Some(at), Some(vt)) if at > vt.now_nanos() => {
+                        // Wait for its arrival time, unless something that
+                        // may arrive earlier comes in first. `biased` keeps
+                        // the polling order fixed for reproducibility.
+                        let mut closed = false;
+                        tokio::select! {
+                            biased;
+                            packet = inbound.recv() => match packet {
+                                Some(packet) => self.park_inbound(packet),
+                                None => closed = true,
+                            },
+                            _ = self.wait_until(vt, at) => {}
+                        }
+                        if closed {
+                            self.wait_until(vt, at).await;
+                        }
+                    }
+                    (Some(_), _) => {
+                        let Some(std::cmp::Reverse((_, _, remote, packet))) =
+                            self.pending().heap.pop()
+                        else {
+                            continue;
+                        };
+                        buf[..packet.len()].copy_from_slice(&packet[..]);
+                        return Ok((packet.len(), remote));
+                    }
+                    (None, _) => match inbound.recv().await {
+                        Some(packet) => self.park_inbound(packet),
+                        None => {
+                            tracing::error!(this = %self.this, "connection closed");
+                            return Err(std::io::ErrorKind::ConnectionAborted.into());
+                        }
+                    },
                 }
             }
-
-            // Deliver the packet
-            buf[..packet.len()].copy_from_slice(&packet[..]);
-            Ok((packet.len(), remote))
         }
 
         async fn send_to(&self, buf: &[u8], target: SocketAddr) -> std::io::Result<usize> {
+            if self.link.is_some() {
+                let result = self.send_via_link(buf, target);
+                tokio::task::yield_now().await;
+                return result;
+            }
             let (delay, available_at_nanos) = self.compute_delay_and_timestamp();
 
             // Send packet with delivery timestamp (don't advance VirtualTime here)
@@ -2992,12 +3685,82 @@ pub mod mock_transport {
         }
 
         fn send_to_blocking(&self, buf: &[u8], target: SocketAddr) -> std::io::Result<usize> {
+            if self.link.is_some() {
+                return self.send_via_link(buf, target);
+            }
             let (_delay, available_at_nanos) = self.compute_delay_and_timestamp();
             self.send_packet_internal(buf, target, available_at_nanos)
         }
     }
 
     impl MockSocket {
+        fn pending(&self) -> std::sync::MutexGuard<'_, PendingInbound> {
+            self.pending_inbound
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+        }
+
+        fn park_inbound(&self, packet: InboundPacket) {
+            let mut pending = self.pending();
+            let last = pending.last_arrival_from.entry(packet.from).or_insert(0);
+            let at = packet.available_at_nanos.max(*last);
+            *last = at;
+            pending.heap.push(std::cmp::Reverse((
+                at,
+                packet.order,
+                packet.from,
+                packet.data,
+            )));
+        }
+
+        /// Resolves once VirtualTime reaches `at`, reusing the sleep left by
+        /// an earlier call for the same deadline.
+        fn wait_until<'a>(
+            &'a self,
+            vt: &'a crate::simulation::VirtualTime,
+            at: u64,
+        ) -> impl std::future::Future<Output = ()> + 'a {
+            std::future::poll_fn(move |cx| {
+                let mut pending = self.pending();
+                if pending.wait.as_ref().map(|(deadline, _)| *deadline) != Some(at) {
+                    pending.wait = Some((at, vt.sleep_until(at)));
+                }
+                let Some((_, sleep)) = pending.wait.as_mut() else {
+                    return std::task::Poll::Pending;
+                };
+                let ready = sleep.as_mut().poll(cx);
+                if ready.is_ready() {
+                    pending.wait = None;
+                }
+                ready
+            })
+        }
+
+        /// Route a packet through the link model, which decides whether and
+        /// when it arrives. A dropped packet still reports success, like UDP.
+        fn send_via_link(&self, buf: &[u8], target: SocketAddr) -> std::io::Result<usize> {
+            let (Some(link), Some(vt)) = (&self.link, &self.virtual_time) else {
+                return Err(std::io::ErrorKind::Unsupported.into());
+            };
+            assert!(self.this != target, "cannot send to self");
+            // No socket at the target: nothing to deliver to, so the link
+            // does not record a delivery that never happens.
+            let Some(sender) = self.channels.get(&target).map(|v| v.value().clone()) else {
+                return Ok(0);
+            };
+            for arrival in link.on_send(vt.now_nanos(), self.this, target, buf) {
+                sender
+                    .send(InboundPacket {
+                        from: self.this,
+                        data: buf.to_vec(),
+                        available_at_nanos: arrival.at_nanos,
+                        order: arrival.seq,
+                    })
+                    .map_err(|_| std::io::ErrorKind::ConnectionAborted)?;
+            }
+            Ok(buf.len())
+        }
+
         /// Compute delay and delivery timestamp based on packet delay policy.
         fn compute_delay_and_timestamp(&self) -> (Duration, u64) {
             let delay = match &self.packet_delay_policy {
@@ -3056,7 +3819,12 @@ pub mod mock_transport {
                 return Ok(0);
             };
             sender
-                .send((self.this, buf.to_vec(), available_at_nanos))
+                .send(InboundPacket {
+                    from: self.this,
+                    data: buf.to_vec(),
+                    available_at_nanos,
+                    order: SEND_ORDER.fetch_add(1, Ordering::Relaxed),
+                })
                 .map_err(|_| std::io::ErrorKind::ConnectionAborted)?;
             Ok(buf.len())
         }
@@ -3254,6 +4022,11 @@ pub mod mock_transport {
         .await
     }
 
+    /// One port allocator for every mock-peer constructor, so peers built by
+    /// different constructors never share an address (a collision could let
+    /// an address-keyed assertion pass on another test's traffic).
+    static MOCK_PEER_PORT: AtomicU16 = AtomicU16::new(25000);
+
     #[allow(clippy::too_many_arguments)]
     async fn create_mock_peer_internal(
         packet_drop_policy: PacketDropPolicy,
@@ -3273,11 +4046,9 @@ pub mod mock_transport {
         ),
         anyhow::Error,
     > {
-        static PORT: AtomicU16 = AtomicU16::new(25000);
-
         let peer_keypair = TransportKeypair::new();
         let peer_pub = peer_keypair.public.clone();
-        let port = PORT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let port = MOCK_PEER_PORT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let socket = Arc::new(
             MockSocket::new(
                 packet_drop_policy,
@@ -3333,6 +4104,7 @@ pub mod mock_transport {
             bandwidth_limit,
             time_source,
             None,
+            None,
         )
         .await
     }
@@ -3351,6 +4123,7 @@ pub mod mock_transport {
         bandwidth_limit: Option<usize>,
         time_source: Option<crate::simulation::VirtualTime>,
         congestion_config: Option<CongestionControlConfig>,
+        link: Option<Arc<crate::transport::link_model::LinkModel>>,
     ) -> Result<
         (
             TransportPublicKey,
@@ -3362,25 +4135,23 @@ pub mod mock_transport {
         ),
         anyhow::Error,
     > {
-        static PORT: AtomicU16 = AtomicU16::new(25000);
-
         let peer_keypair = TransportKeypair::new();
         let peer_pub = peer_keypair.public.clone();
-        let port = PORT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let port = MOCK_PEER_PORT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
         // Use provided time source or create a new one
         let vt = time_source.unwrap_or_default();
 
-        let socket = Arc::new(
-            MockSocket::with_time_source(
-                packet_drop_policy,
-                packet_delay_policy,
-                (Ipv4Addr::LOCALHOST, port).into(),
-                channels,
-                Some(vt.clone()),
-            )
-            .await,
-        );
+        let mut socket = MockSocket::with_time_source(
+            packet_drop_policy,
+            packet_delay_policy,
+            (Ipv4Addr::LOCALHOST, port).into(),
+            channels,
+            Some(vt.clone()),
+        )
+        .await;
+        socket.link = link;
+        let socket = Arc::new(socket);
 
         // Use the same VirtualTime for both MockSocket and protocol layer
         let (peer_conn, inbound_conn) = OutboundConnectionHandler::new_test_with_congestion_config(
@@ -3402,8 +4173,9 @@ pub mod mock_transport {
 
     /// Create a mock peer connection with VirtualTime and custom congestion control.
     ///
-    /// This function supports selecting the congestion control algorithm (BBR or LEDBAT)
-    /// for benchmarking purposes. Pass `None` for `congestion_config` to use the default (BBR).
+    /// This function supports selecting the congestion control algorithm
+    /// for benchmarking purposes. Pass `None` for `congestion_config` to use the
+    /// default (`CongestionControlAlgorithm::default()`, FixedRate).
     ///
     /// Returns the peer's public key, outbound connection handler, and socket address.
     pub async fn create_mock_peer_with_congestion_config(
@@ -3425,9 +4197,214 @@ pub mod mock_transport {
             None,
             Some(time_source),
             congestion_config,
+            None,
         )
         .await
         .map(|(pk, (o, _), s)| (pk, o, s))
+    }
+
+    /// Create a mock peer whose every packet goes through `link`, a shared
+    /// [`LinkModel`](crate::transport::link_model::LinkModel) that applies a
+    /// bottleneck queue, propagation delay, loss and scheduled spikes on
+    /// virtual time. The socket's own drop and delay policies are unused.
+    pub async fn create_mock_peer_with_link_model(
+        link: Arc<crate::transport::link_model::LinkModel>,
+        channels: Channels,
+        time_source: crate::simulation::VirtualTime,
+        congestion_config: Option<CongestionControlConfig>,
+    ) -> anyhow::Result<(
+        TransportPublicKey,
+        OutboundConnectionHandler<MockSocket, crate::simulation::VirtualTime>,
+        SocketAddr,
+    )> {
+        create_mock_peer_internal_vt_with_congestion(
+            PacketDropPolicy::ReceiveAll,
+            PacketDelayPolicy::NoDelay,
+            false,
+            channels,
+            None,
+            Some(time_source),
+            congestion_config,
+            Some(link),
+        )
+        .await
+        .map(|(pk, (o, _), s)| (pk, o, s))
+    }
+
+    #[cfg(test)]
+    mod link_socket_tests {
+        use futures::FutureExt;
+
+        use super::*;
+        use crate::simulation::VirtualTime;
+        use crate::transport::link_model::{HostLink, LinkEvent, LinkModel, Loss};
+
+        async fn linked_socket(
+            channels: &Channels,
+            vt: &VirtualTime,
+            link: &Arc<LinkModel>,
+        ) -> (MockSocket, SocketAddr) {
+            let port = MOCK_PEER_PORT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let addr: SocketAddr = (Ipv4Addr::LOCALHOST, port).into();
+            let mut socket = MockSocket::with_time_source(
+                PacketDropPolicy::ReceiveAll,
+                PacketDelayPolicy::NoDelay,
+                addr,
+                channels.clone(),
+                Some(vt.clone()),
+            )
+            .await;
+            socket.link = Some(link.clone());
+            (socket, addr)
+        }
+
+        fn fixture() -> (VirtualTime, Arc<LinkModel>, Channels) {
+            let link = LinkModel::new(
+                HostLink {
+                    uplink_bps: 0,
+                    queue_bytes: 0,
+                    one_way_delay: Duration::from_millis(100),
+                    loss: Loss::None,
+                },
+                1,
+            );
+            (VirtualTime::new(), Arc::new(link), Arc::new(DashMap::new()))
+        }
+
+        /// The listener polls `recv_from` inside a `select!`, so it is
+        /// routinely dropped while waiting for a packet's arrival time.
+        #[tokio::test]
+        async fn recv_from_keeps_a_packet_when_cancelled_mid_wait() {
+            let (vt, link, channels) = fixture();
+            let (a, a_addr) = linked_socket(&channels, &vt, &link).await;
+            let (b, b_addr) = linked_socket(&channels, &vt, &link).await;
+            a.send_to(b"hello", b_addr).await.unwrap();
+            let mut buf = [0u8; 64];
+            assert!(
+                b.recv_from(&mut buf).now_or_never().is_none(),
+                "not due for 100 ms"
+            );
+            vt.advance(Duration::from_millis(100));
+            let (n, from) = b
+                .recv_from(&mut buf)
+                .now_or_never()
+                .expect("due now, and must not have been lost by the cancelled call")
+                .unwrap();
+            assert_eq!((&buf[..n], from), (&b"hello"[..], a_addr));
+        }
+
+        /// `PacketDelayPolicy::Uniform` draws an independent delay per packet,
+        /// but packets from one source must still arrive in the order sent.
+        #[tokio::test]
+        async fn uniform_delay_keeps_each_sources_order() {
+            let vt = VirtualTime::new();
+            let channels: Channels = Arc::new(DashMap::new());
+            let mut sockets = Vec::new();
+            for _ in 0..2 {
+                let port = MOCK_PEER_PORT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let addr: SocketAddr = (Ipv4Addr::LOCALHOST, port).into();
+                let socket = MockSocket::with_time_source(
+                    PacketDropPolicy::ReceiveAll,
+                    PacketDelayPolicy::Uniform {
+                        min: Duration::from_millis(1),
+                        max: Duration::from_millis(100),
+                    },
+                    addr,
+                    channels.clone(),
+                    Some(vt.clone()),
+                )
+                .await;
+                sockets.push((socket, addr));
+            }
+            let (a, _) = &sockets[0];
+            let (b, b_addr) = &sockets[1];
+            for i in 0..50u8 {
+                a.send_to(&[i], *b_addr).await.unwrap();
+            }
+            vt.advance(Duration::from_millis(200));
+            let mut buf = [0u8; 8];
+            let got: Vec<u8> = (0..50)
+                .map(|_| {
+                    let (n, _) = b.recv_from(&mut buf).now_or_never().expect("due").unwrap();
+                    assert_eq!(n, 1);
+                    buf[0]
+                })
+                .collect();
+            assert_eq!(got, (0..50).collect::<Vec<u8>>());
+        }
+
+        /// Re-entering `recv_from` for the same not-yet-due packet reuses one
+        /// VirtualTime wakeup instead of registering a new one each time.
+        #[tokio::test]
+        async fn waiting_recv_from_registers_one_wakeup_per_deadline() {
+            let (vt, link, channels) = fixture();
+            let (a, _) = linked_socket(&channels, &vt, &link).await;
+            let (b, b_addr) = linked_socket(&channels, &vt, &link).await;
+            a.send_to(b"x", b_addr).await.unwrap();
+            let mut buf = [0u8; 8];
+            let before = vt.pending_wakeup_count();
+            for _ in 0..10 {
+                assert!(b.recv_from(&mut buf).now_or_never().is_none());
+            }
+            assert_eq!(vt.pending_wakeup_count(), before + 1);
+        }
+
+        /// Equal arrival times are ordered by the link model's sequence
+        /// number, not by the order the packets reached the channel (two
+        /// concurrent `send_to` calls can enqueue in the opposite order to
+        /// the one the model decided).
+        #[tokio::test]
+        async fn equal_arrivals_follow_the_models_order_not_the_channels() {
+            let (vt, link, channels) = fixture();
+            let (_b, b_addr) = linked_socket(&channels, &vt, &link).await;
+            let b = &_b;
+            // A sorts after C by address, so neither address nor channel
+            // order can produce the expected result; only `order` can.
+            let a_addr: SocketAddr = (Ipv4Addr::LOCALHOST, 2).into();
+            let c_addr: SocketAddr = (Ipv4Addr::LOCALHOST, 1).into();
+            let tx = channels.get(&b_addr).unwrap().value().clone();
+            for (from, data, order) in [(c_addr, b"second", 8), (a_addr, b"first!", 7)] {
+                tx.send(InboundPacket {
+                    from,
+                    data: data.to_vec(),
+                    available_at_nanos: 100,
+                    order,
+                })
+                .unwrap();
+            }
+            vt.advance(Duration::from_nanos(100));
+            let mut buf = [0u8; 8];
+            for (want, from) in [(&b"first!"[..], a_addr), (&b"second"[..], c_addr)] {
+                let (n, got_from) = b.recv_from(&mut buf).now_or_never().expect("due").unwrap();
+                assert_eq!((&buf[..n], got_from), (want, from));
+            }
+        }
+
+        /// FIFO is per path: a packet from one peer must not wait behind a
+        /// later-arriving packet from another.
+        #[tokio::test]
+        async fn a_delayed_packet_does_not_block_another_peers_earlier_one() {
+            let (vt, link, channels) = fixture();
+            let (a, a_addr) = linked_socket(&channels, &vt, &link).await;
+            let (b, b_addr) = linked_socket(&channels, &vt, &link).await;
+            let (c, c_addr) = linked_socket(&channels, &vt, &link).await;
+            link.schedule(LinkEvent::DelaySpike {
+                start: Duration::ZERO,
+                duration: Duration::from_secs(1),
+                extra_delay: Duration::from_secs(1),
+                from: Some(a_addr),
+            });
+            a.send_to(b"late", b_addr).await.unwrap();
+            c.send_to(b"early", b_addr).await.unwrap();
+            let mut buf = [0u8; 64];
+            vt.advance(Duration::from_millis(100));
+            let (n, from) = b.recv_from(&mut buf).now_or_never().expect("due").unwrap();
+            assert_eq!((&buf[..n], from), (&b"early"[..], c_addr));
+            assert!(b.recv_from(&mut buf).now_or_never().is_none());
+            vt.advance(Duration::from_secs(1));
+            let (n, from) = b.recv_from(&mut buf).now_or_never().expect("due").unwrap();
+            assert_eq!((&buf[..n], from), (&b"late"[..], a_addr));
+        }
     }
 
     // Test infrastructure for multi-peer communication tests (reserved for future use)
@@ -3834,6 +4811,227 @@ pub mod mock_transport {
             joiner_view.is_some(),
             crate_at_or_above_floor,
             "joiner's view of the gateway version must follow the production floor exactly"
+        );
+        Ok(())
+    }
+
+    /// The joiner learns its external address from the gateway's handshake
+    /// ack, and that report reaches the NAT-mapping telemetry. Asserted on
+    /// this test's gateway address, so concurrent tests cannot satisfy it.
+    #[tokio::test]
+    async fn gateway_ack_reports_observed_external_addr() -> anyhow::Result<()> {
+        let channels = Arc::new(DashMap::new());
+        let (_peer_pub, mut peer, _peer_addr) =
+            create_mock_peer(Default::default(), channels.clone()).await?;
+        let (gw_pub, (_oc, mut gw_conn), gw_addr) =
+            create_mock_gateway(Default::default(), channels).await?;
+        let gw = GlobalExecutor::spawn(async move {
+            tokio::time::timeout(Duration::from_secs(10), gw_conn.recv())
+                .await?
+                .ok_or(anyhow::anyhow!("no connection"))
+                .map(|_| ())
+        });
+        let joiner = GlobalExecutor::spawn(async move {
+            let conn = peer.connect(gw_pub, gw_addr).await;
+            let _connection = tokio::time::timeout(Duration::from_secs(60), conn).await??;
+            Ok::<_, anyhow::Error>(())
+        });
+        let (j, g) = tokio::try_join!(joiner, gw)?;
+        j?;
+        g?;
+        assert!(
+            crate::transport::TRANSPORT_METRICS.observed_addr_reported_by(gw_addr),
+            "the gateway ack's view of our address must be recorded, with the gateway as reporter"
+        );
+        Ok(())
+    }
+
+    /// Through the real handler path: a traversal to a peer that never
+    /// answers fails at its deadline and is classified as no-response.
+    /// Asserted on this test's (unique) remote address, so concurrent tests
+    /// cannot satisfy it; the classification itself is pinned by
+    /// `classification_table`.
+    #[tokio::test]
+    async fn unanswered_nat_traversal_is_classified_no_response() -> anyhow::Result<()> {
+        let channels = Arc::new(DashMap::new());
+        let (_peer_pub, mut peer, _peer_addr) =
+            create_mock_peer(Default::default(), channels).await?;
+        let silent_addr: SocketAddr = "10.255.0.9:9".parse().unwrap();
+        let silent_pub = TransportKeypair::new().public().clone();
+        let conn = peer.connect(silent_pub, silent_addr).await;
+        let result = tokio::time::timeout(Duration::from_secs(30), conn).await?;
+        assert!(
+            result.is_err(),
+            "nobody answers, so the traversal must fail"
+        );
+        assert_eq!(
+            crate::transport::TRANSPORT_METRICS.nat_failures_for(silent_addr),
+            vec![crate::transport::metrics::NatFailureKind::NoResponse],
+            "exactly one failure, classified as no-response"
+        );
+        Ok(())
+    }
+
+    /// Polls `done` every 10 ms until it holds, failing after 10 s.
+    #[cfg(test)]
+    async fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !done() {
+            assert!(tokio::time::Instant::now() < deadline, "timed out: {what}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Through the real handler path: the origin given to the connector is
+    /// the one the admitted attempt and its failure are recorded under.
+    #[tokio::test]
+    async fn nat_attempt_is_recorded_under_its_origin() -> anyhow::Result<()> {
+        use crate::transport::metrics::NatAttemptOrigin;
+        let channels = Arc::new(DashMap::new());
+        let (_peer_pub, mut peer, _peer_addr) =
+            create_mock_peer(Default::default(), channels).await?;
+        let silent_addr: SocketAddr = "10.255.0.10:9".parse().unwrap();
+        let silent_pub = TransportKeypair::new().public().clone();
+        let conn = peer
+            .connect_with_origin(silent_pub, silent_addr, NatAttemptOrigin::ConnectAcceptor)
+            .await;
+        let result = tokio::time::timeout(Duration::from_secs(30), conn).await?;
+        assert!(result.is_err(), "nobody answers");
+        let metrics = &crate::transport::TRANSPORT_METRICS;
+        assert_eq!(
+            metrics.nat_attempt_origins_for(silent_addr),
+            vec![NatAttemptOrigin::ConnectAcceptor]
+        );
+        assert_eq!(
+            metrics.nat_failure_origins_for(silent_addr),
+            vec![NatAttemptOrigin::ConnectAcceptor]
+        );
+        Ok(())
+    }
+
+    /// Through the real handler path: when both sides punch, each records
+    /// the attempt and its establishment under the origin it dialled with.
+    #[tokio::test]
+    async fn established_traversal_is_recorded_under_its_origin() -> anyhow::Result<()> {
+        use crate::transport::metrics::NatAttemptOrigin;
+        let channels = Arc::new(DashMap::new());
+        let (a_pub, mut a, a_addr) = create_mock_peer(Default::default(), channels.clone()).await?;
+        let (b_pub, mut b, b_addr) = create_mock_peer(Default::default(), channels).await?;
+        let to_a = GlobalExecutor::spawn(async move {
+            let conn = b
+                .connect_with_origin(a_pub, a_addr, NatAttemptOrigin::ConnectAcceptor)
+                .await;
+            let conn = tokio::time::timeout(Duration::from_secs(30), conn).await??;
+            Ok::<_, anyhow::Error>(conn)
+        });
+        let to_b = GlobalExecutor::spawn(async move {
+            let conn = a
+                .connect_with_origin(b_pub, b_addr, NatAttemptOrigin::ConnectJoiner)
+                .await;
+            let conn = tokio::time::timeout(Duration::from_secs(30), conn).await??;
+            Ok::<_, anyhow::Error>(conn)
+        });
+        let (x, y) = tokio::try_join!(to_a, to_b)?;
+        // Held until both sides have established.
+        let (_x, _y) = (x?, y?);
+        let metrics = &crate::transport::TRANSPORT_METRICS;
+        // Each attempt is logged under its remote: B dialled A, A dialled B.
+        assert_eq!(
+            metrics.nat_attempt_origins_for(a_addr),
+            vec![NatAttemptOrigin::ConnectAcceptor]
+        );
+        assert_eq!(
+            metrics.nat_established_origins_for(a_addr),
+            vec![NatAttemptOrigin::ConnectAcceptor]
+        );
+        assert_eq!(
+            metrics.nat_attempt_origins_for(b_addr),
+            vec![NatAttemptOrigin::ConnectJoiner]
+        );
+        assert_eq!(
+            metrics.nat_established_origins_for(b_addr),
+            vec![NatAttemptOrigin::ConnectJoiner]
+        );
+        Ok(())
+    }
+
+    /// Through the real handler path at a non-gateway: an intro from an
+    /// unknown address is `Other`; one from another port of an IP being
+    /// punched is `SameIpOtherPort`; one from an address whose traversal
+    /// just failed is `AfterDeadline`. A non-intro packet is not counted.
+    /// Asserted per (unique) source address, so concurrent tests cannot
+    /// satisfy it.
+    #[tokio::test]
+    async fn stray_intros_at_a_non_gateway_are_classified() -> anyhow::Result<()> {
+        use crate::transport::crypto::PACKET_TYPE_INTRO;
+        use crate::transport::metrics::{NatAttemptOrigin, StrayIntro};
+        let channels: Channels = Arc::new(DashMap::new());
+        let (_peer_pub, mut peer, peer_addr) =
+            create_mock_peer(Default::default(), channels.clone()).await?;
+        let inject = |from: SocketAddr, first_byte: u8| {
+            let mut data = vec![0u8; 64];
+            data[0] = first_byte;
+            channels
+                .get(&peer_addr)
+                .expect("the peer's inbound channel")
+                .send(InboundPacket {
+                    from,
+                    data,
+                    available_at_nanos: 0,
+                    order: SEND_ORDER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                })
+                .expect("the peer is listening");
+        };
+        let metrics = &crate::transport::TRANSPORT_METRICS;
+        let unknown: SocketAddr = "10.255.1.1:7".parse().unwrap();
+        let not_intro: SocketAddr = "10.255.1.3:7".parse().unwrap();
+        let target: SocketAddr = "10.255.1.2:9".parse().unwrap();
+        let sibling: SocketAddr = "10.255.1.2:10".parse().unwrap();
+
+        inject(not_intro, 0x7f);
+        inject(unknown, PACKET_TYPE_INTRO);
+        wait_until("the unknown intro is counted", || {
+            !metrics.stray_intros_from(unknown).is_empty()
+        })
+        .await;
+
+        let conn = peer
+            .connect_with_origin(
+                TransportKeypair::new().public().clone(),
+                target,
+                NatAttemptOrigin::RingPeerNoTransport,
+            )
+            .await;
+        wait_until("the traversal is admitted", || {
+            !metrics.nat_attempt_origins_for(target).is_empty()
+        })
+        .await;
+        inject(sibling, PACKET_TYPE_INTRO);
+        wait_until("the sibling intro is counted", || {
+            !metrics.stray_intros_from(sibling).is_empty()
+        })
+        .await;
+        let result = tokio::time::timeout(Duration::from_secs(30), conn).await?;
+        assert!(result.is_err(), "nobody answers, so the traversal fails");
+
+        inject(target, PACKET_TYPE_INTRO);
+        wait_until("the late intro is counted", || {
+            !metrics.stray_intros_from(target).is_empty()
+        })
+        .await;
+
+        assert_eq!(metrics.stray_intros_from(unknown), vec![StrayIntro::Other]);
+        assert_eq!(
+            metrics.stray_intros_from(sibling),
+            vec![StrayIntro::SameIpOtherPort]
+        );
+        assert_eq!(
+            metrics.stray_intros_from(target),
+            vec![StrayIntro::AfterDeadline]
+        );
+        assert!(
+            metrics.stray_intros_from(not_intro).is_empty(),
+            "only intro packets are counted"
         );
         Ok(())
     }
@@ -4437,7 +5635,7 @@ pub mod mock_transport {
         assert_eq!(peer_b_conn.remote_addr(), gw_addr);
 
         // The connection should have completed quickly (within the first attempt window)
-        // If the bug exists, this would take multiple retries (16+ attempts at 200ms each = 3+ seconds)
+        // If the bug exists, this would take multiple retries (~12 attempts at ~250ms each = 3 seconds)
         assert!(
             elapsed < Duration::from_secs(2),
             "Connection took {:?}, which suggests multiple retry attempts were needed. \
@@ -4887,5 +6085,781 @@ pub mod mock_transport {
         drop(gw_outbound);
 
         Ok(())
+    }
+
+    /// Wraps a [`MockSocket`] and makes `recv_from` return the queued errors,
+    /// one per call, before it delivers any packet. Lets a test drive the
+    /// listener's receive-error handling with real OS error codes.
+    #[cfg(test)]
+    struct RecvErrorInjectingSocket {
+        inner: MockSocket,
+        errors: std::sync::Mutex<std::collections::VecDeque<std::io::Error>>,
+    }
+
+    #[cfg(test)]
+    impl Socket for RecvErrorInjectingSocket {
+        async fn bind(_addr: SocketAddr) -> Result<Self, std::io::Error> {
+            unimplemented!()
+        }
+
+        async fn recv_from(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+            let injected = self.errors.lock().unwrap().pop_front();
+            if let Some(err) = injected {
+                return Err(err);
+            }
+            self.inner.recv_from(buf).await
+        }
+
+        async fn send_to(&self, buf: &[u8], target: SocketAddr) -> std::io::Result<usize> {
+            self.inner.send_to(buf, target).await
+        }
+
+        fn send_to_blocking(&self, buf: &[u8], target: SocketAddr) -> std::io::Result<usize> {
+            self.inner.send_to_blocking(buf, target)
+        }
+    }
+
+    /// Start a non-gateway listener whose socket first returns `errors`, and
+    /// hand back its listen task so the test can see whether it exited.
+    #[cfg(test)]
+    async fn spawn_listener_with_recv_errors(
+        port: u16,
+        channels: Channels,
+        errors: Vec<std::io::Error>,
+    ) -> (
+        TransportPublicKey,
+        OutboundConnectionHandler<RecvErrorInjectingSocket>,
+        tokio::task::JoinHandle<TransportError>,
+        SocketAddr,
+    ) {
+        let addr: SocketAddr = (Ipv4Addr::LOCALHOST, port).into();
+        let socket = RecvErrorInjectingSocket {
+            inner: MockSocket::new(Default::default(), Default::default(), addr, channels).await,
+            errors: std::sync::Mutex::new(errors.into()),
+        };
+        let keypair = TransportKeypair::new();
+        let public = keypair.public.clone();
+        let (handler, _new_connections, listen_handle) =
+            OutboundConnectionHandler::config_listener(
+                Arc::new(socket),
+                keypair,
+                false,
+                addr,
+                UdpTransportConfig::default(),
+            )
+            .expect("listener setup");
+        (public, handler, listen_handle, addr)
+    }
+
+    /// The UDP listener must survive receive errors that say nothing about the
+    /// socket itself: a message-size error, a network reset or an unreachable
+    /// host/network report (all of which Windows can return from `recv_from`),
+    /// and an error kind the classifier has never heard of. Each used to end
+    /// the listen task, which force-exits the node. After the
+    /// errors the listener must still read packets, shown by completing a
+    /// handshake through it.
+    #[tokio::test]
+    async fn listener_survives_nonfatal_recv_errors_and_keeps_receiving() -> anyhow::Result<()> {
+        let channels: Channels = Arc::new(DashMap::new());
+        let errors = vec![
+            std::io::Error::from_raw_os_error(10040), // WSAEMSGSIZE
+            std::io::Error::from_raw_os_error(10052), // WSAENETRESET
+            std::io::Error::from_raw_os_error(10065), // WSAEHOSTUNREACH
+            std::io::Error::from_raw_os_error(10051), // WSAENETUNREACH
+            std::io::Error::from(std::io::ErrorKind::HostUnreachable),
+            std::io::Error::from(std::io::ErrorKind::NetworkUnreachable),
+            std::io::Error::other("an error the classifier does not know"),
+        ];
+        let (a_pub, mut peer_a, listen_a, a_addr) =
+            spawn_listener_with_recv_errors(47_100, channels.clone(), errors).await;
+        let (b_pub, mut peer_b, b_addr) = create_mock_peer(Default::default(), channels).await?;
+
+        let b_task = GlobalExecutor::spawn(async move {
+            let conn = peer_b.connect(a_pub, a_addr).await;
+            let conn = tokio::time::timeout(Duration::from_secs(10), conn).await??;
+            Ok::<_, anyhow::Error>(conn)
+        });
+        let conn = peer_a.connect(b_pub, b_addr).await;
+        let a_to_b = tokio::time::timeout(Duration::from_secs(10), conn).await??;
+        let b_to_a = b_task.await??;
+        assert_eq!(a_to_b.remote_addr(), b_addr);
+        assert_eq!(b_to_a.remote_addr(), a_addr);
+
+        assert!(
+            !listen_a.is_finished(),
+            "listener must keep running after non-fatal recv errors"
+        );
+        listen_a.abort();
+        Ok(())
+    }
+
+    /// The other half of the contract: an error that means the socket itself
+    /// is gone must still end the listen task, otherwise the node sits alive
+    /// but deaf and is never restarted.
+    #[tokio::test]
+    async fn listener_exits_on_fatal_recv_error() {
+        #[allow(unused_mut)]
+        let mut fatal = vec![
+            (std::io::Error::from_raw_os_error(10038), "WSAENOTSOCK"),
+            (std::io::Error::from_raw_os_error(10058), "WSAESHUTDOWN"),
+            (
+                std::io::Error::from(std::io::ErrorKind::NotConnected),
+                "NotConnected",
+            ),
+        ];
+        #[cfg(unix)]
+        fatal.push((std::io::Error::from_raw_os_error(libc::EBADF), "EBADF"));
+
+        for (i, (err, name)) in fatal.into_iter().enumerate() {
+            let channels: Channels = Arc::new(DashMap::new());
+            let (_pub, _handler, listen, _addr) =
+                spawn_listener_with_recv_errors(47_200 + i as u16, channels, vec![err]).await;
+            let exited = tokio::time::timeout(Duration::from_secs(5), listen).await;
+            assert!(
+                matches!(
+                    exited,
+                    Ok(Ok(TransportError::Udp(UdpError(UdpErrorKind::IO(_)))))
+                ),
+                "{name}: listener must exit with the IO error, got {exited:?}"
+            );
+        }
+    }
+
+    #[cfg(test)]
+    enum RecvStep {
+        /// Advance virtual time by the duration, then fail the read.
+        Error(Duration, std::io::Error),
+        /// Deliver a datagram.
+        Packet(SocketAddr, Vec<u8>),
+    }
+
+    #[cfg(test)]
+    #[derive(Default)]
+    struct ScriptProgress {
+        /// The listener asked for a read after the last step.
+        finished: std::sync::atomic::AtomicBool,
+        /// The listener dropped its socket, i.e. the listen task ended.
+        dropped: std::sync::atomic::AtomicBool,
+    }
+
+    /// A socket whose reads follow a fixed script, advancing a [`VirtualTime`]
+    /// as it goes, so a test can put minutes of receive errors in front of the
+    /// listener instantly. Sends are discarded.
+    #[cfg(test)]
+    struct ScriptedRecvSocket {
+        script: std::sync::Mutex<std::collections::VecDeque<RecvStep>>,
+        time: VirtualTime,
+        progress: Arc<ScriptProgress>,
+    }
+
+    #[cfg(test)]
+    impl Socket for ScriptedRecvSocket {
+        async fn bind(_addr: SocketAddr) -> Result<Self, std::io::Error> {
+            unimplemented!()
+        }
+
+        async fn recv_from(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+            let step = self.script.lock().unwrap().pop_front();
+            match step {
+                Some(RecvStep::Error(elapsed, err)) => {
+                    self.time.advance(elapsed);
+                    Err(err)
+                }
+                Some(RecvStep::Packet(from, data)) => {
+                    buf[..data.len()].copy_from_slice(&data);
+                    Ok((data.len(), from))
+                }
+                None => {
+                    self.progress.finished.store(true, Ordering::SeqCst);
+                    std::future::pending().await
+                }
+            }
+        }
+
+        async fn send_to(&self, buf: &[u8], _target: SocketAddr) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn send_to_blocking(&self, buf: &[u8], _target: SocketAddr) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+    }
+
+    #[cfg(test)]
+    impl Drop for ScriptedRecvSocket {
+        fn drop(&mut self) {
+            self.progress.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Run a VirtualTime listener over `script` and report whether it read
+    /// past the end of the script (`true`) or ended its listen task (`false`).
+    #[cfg(test)]
+    async fn listener_survives_script(script: Vec<RecvStep>) -> bool {
+        run_scripted_listener(script).await.0
+    }
+
+    /// [`listener_survives_script`], also returning the listener's handler so
+    /// a test can see what the listener did with the datagrams it read.
+    #[cfg(test)]
+    async fn run_scripted_listener(
+        script: Vec<RecvStep>,
+    ) -> (
+        bool,
+        OutboundConnectionHandler<ScriptedRecvSocket, VirtualTime>,
+    ) {
+        let time = VirtualTime::new();
+        let progress = Arc::new(ScriptProgress::default());
+        let socket = ScriptedRecvSocket {
+            script: std::sync::Mutex::new(script.into()),
+            time: time.clone(),
+            progress: progress.clone(),
+        };
+        let addr: SocketAddr = (Ipv4Addr::LOCALHOST, 47_300).into();
+        let (handler, _new_connections) =
+            OutboundConnectionHandler::<_, VirtualTime>::config_listener_with_virtual_time(
+                Arc::new(socket),
+                TransportKeypair::new(),
+                false,
+                addr,
+                None,
+                None,
+                None,
+                time,
+                None,
+            )
+            .expect("listener setup");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let finished = progress.finished.load(Ordering::SeqCst);
+            let dropped = progress.dropped.load(Ordering::SeqCst);
+            if finished || dropped {
+                return (finished && !dropped, handler);
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "listener neither finished the script nor exited"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    #[cfg(test)]
+    fn unclassified_errors(count: usize) -> impl Iterator<Item = RecvStep> {
+        (0..count).map(|_| {
+            RecvStep::Error(
+                Duration::from_millis(100),
+                std::io::Error::other("scripted"),
+            )
+        })
+    }
+
+    /// A successful read in the listen loop must reset the error run. 700
+    /// unclassified errors over 70 s, one datagram, then 400 more: without the
+    /// reset the run holds 1000 errors over 100 s and the listener exits.
+    #[tokio::test]
+    async fn listener_successful_read_resets_recv_error_run() {
+        let from: SocketAddr = (Ipv4Addr::LOCALHOST, 47_301).into();
+        let script = unclassified_errors(700)
+            .chain([RecvStep::Packet(from, vec![0u8; 64])])
+            .chain(unclassified_errors(400))
+            .collect();
+        assert!(
+            listener_survives_script(script).await,
+            "the datagram between the two error runs must reset the run"
+        );
+    }
+
+    /// Control for the test above: the same 1100 errors with no datagram
+    /// between them do end the listener, so the survival above is due to the
+    /// read and not to the script being too short to trigger an exit.
+    #[tokio::test]
+    async fn listener_exits_on_persistent_unclassified_recv_errors() {
+        assert!(
+            !listener_survives_script(unclassified_errors(1100).collect()).await,
+            "1100 unclassified errors over 110 s with no read must end the listener"
+        );
+    }
+
+    /// Transient errors never end the listener and never delay it. 13,000 of
+    /// them over 650 s with no successful read, then a datagram, then 7,000
+    /// more: the listener must survive all 20,000 and handle the datagram in
+    /// between. Each error advances virtual time only when the listener asks
+    /// for its next read, so any sleep on this path (which waits on that same
+    /// clock) would stall the listener and fail the test, while the yield the
+    /// long run triggers does not.
+    #[tokio::test]
+    async fn listener_reads_through_long_transient_error_run() {
+        fn transient(count: usize) -> impl Iterator<Item = RecvStep> {
+            (0..count).map(|_| {
+                RecvStep::Error(
+                    Duration::from_millis(50),
+                    std::io::Error::from_raw_os_error(10051), // WSAENETUNREACH
+                )
+            })
+        }
+        let from: SocketAddr = (Ipv4Addr::new(127, 0, 0, 9), 47_302).into();
+        let script = transient(13_000)
+            .chain([RecvStep::Packet(from, vec![0u8; 64])])
+            .chain(transient(7_000))
+            .collect();
+        let (survived, handler) = run_scripted_listener(script).await;
+        assert!(survived, "transient errors must never end the listener");
+        assert!(
+            handler.expected_non_gateway.contains(&from.ip()),
+            "the datagram in the middle of the run must have been handled"
+        );
+    }
+
+    /// The error an AF_INET6 socket bound to `[::1]` returns for every
+    /// off-host destination on Linux (measured), and also what a network
+    /// that is coming back returns: ENETUNREACH, as a real OS error so the
+    /// tests can check its text reaches the log (#5871).
+    #[cfg(test)]
+    fn enetunreach() -> std::io::Error {
+        #[cfg(unix)]
+        {
+            std::io::Error::from_raw_os_error(libc::ENETUNREACH)
+        }
+        #[cfg(not(unix))]
+        {
+            std::io::Error::from_raw_os_error(10051) // WSAENETUNREACH
+        }
+    }
+
+    /// Wraps a [`MockSocket`] and fails with [`enetunreach`] every send for
+    /// which `fail(send_index, packet)` is true. Counts the failed sends.
+    #[cfg(test)]
+    struct SendErrorInjectingSocket {
+        inner: MockSocket,
+        fail: fn(usize, &[u8]) -> bool,
+        sends: AtomicUsize,
+        failures: Arc<AtomicUsize>,
+    }
+
+    #[cfg(test)]
+    impl Socket for SendErrorInjectingSocket {
+        async fn bind(_addr: SocketAddr) -> Result<Self, std::io::Error> {
+            unimplemented!()
+        }
+
+        async fn recv_from(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+            self.inner.recv_from(buf).await
+        }
+
+        async fn send_to(&self, buf: &[u8], target: SocketAddr) -> std::io::Result<usize> {
+            let index = self.sends.fetch_add(1, Ordering::SeqCst);
+            if (self.fail)(index, buf) {
+                self.failures.fetch_add(1, Ordering::SeqCst);
+                return Err(enetunreach());
+            }
+            self.inner.send_to(buf, target).await
+        }
+
+        fn send_to_blocking(&self, buf: &[u8], target: SocketAddr) -> std::io::Result<usize> {
+            self.inner.send_to_blocking(buf, target)
+        }
+    }
+
+    #[cfg(test)]
+    fn is_intro(buf: &[u8]) -> bool {
+        PacketData::<UnknownEncryption, MAX_PACKET_SIZE>::from_buf(buf).is_intro_packet()
+    }
+
+    /// Start a listener on `port` whose sends `fail` selects fail.
+    #[cfg(test)]
+    async fn spawn_listener_with_send_errors(
+        port: u16,
+        is_gateway: bool,
+        channels: Channels,
+        fail: fn(usize, &[u8]) -> bool,
+    ) -> (
+        TransportPublicKey,
+        OutboundConnectionHandler<SendErrorInjectingSocket>,
+        SocketAddr,
+        Arc<AtomicUsize>,
+    ) {
+        let addr: SocketAddr = (Ipv4Addr::LOCALHOST, port).into();
+        let failures = Arc::new(AtomicUsize::new(0));
+        let socket = SendErrorInjectingSocket {
+            inner: MockSocket::new(Default::default(), Default::default(), addr, channels).await,
+            fail,
+            sends: AtomicUsize::new(0),
+            failures: failures.clone(),
+        };
+        let keypair = TransportKeypair::new();
+        let public = keypair.public.clone();
+        let (handler, _new_connections, _listen_handle) =
+            OutboundConnectionHandler::config_listener(
+                Arc::new(socket),
+                keypair,
+                is_gateway,
+                addr,
+                UdpTransportConfig::default(),
+            )
+            .expect("listener setup");
+        (public, handler, addr, failures)
+    }
+
+    /// Wait until some captured line satisfies `pred`, or give up after 10 s.
+    ///
+    /// The capture is thread-local, so the tests using it rely on the default
+    /// current-thread `#[tokio::test]` runtime, which polls the listener and
+    /// handshake tasks on the test's own thread.
+    #[cfg(test)]
+    async fn wait_for_log(
+        logs: &crate::util::test_log_capture::CapturedLogs,
+        pred: impl Fn(&str) -> bool,
+    ) -> Option<String> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(line) = logs.lock().unwrap().iter().find(|l| pred(l)) {
+                return Some(line.clone());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// #5871: when every handshake send fails, the outbound attempt must
+    /// end with an error naming the send failure and the destination, not
+    /// `ChannelClosed` ("transport handler channel closed, socket likely
+    /// closed"), and the OS error itself must reach the log. It must also
+    /// keep re-sending until the attempt's deadline, as it does for a lost
+    /// datagram, rather than giving up on the first failure.
+    #[tokio::test]
+    async fn nat_traversal_send_failure_reports_os_error_not_channel_closed() {
+        let (logs, guard) = crate::util::test_log_capture::install();
+        let channels: Channels = Arc::new(DashMap::new());
+        let (_pub, mut peer, _addr, failures) =
+            spawn_listener_with_send_errors(47_400, false, channels, |_, _| true).await;
+        let remote_addr: SocketAddr = (Ipv4Addr::LOCALHOST, 47_401).into();
+        let remote_pub = TransportKeypair::new().public;
+
+        let conn = peer.connect(remote_pub, remote_addr).await;
+        let result = tokio::time::timeout(Duration::from_secs(10), conn)
+            .await
+            .expect("a failing attempt must end at its deadline, not hang");
+        let err = match result {
+            Ok(_) => panic!("every send failed, so the handshake cannot succeed"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(
+                err,
+                TransportError::Udp(UdpError(UdpErrorKind::SendFailed(addr, std::io::ErrorKind::NetworkUnreachable)))
+                    if addr == remote_addr
+            ),
+            "expected SendFailed({remote_addr}, NetworkUnreachable), got {err:?}"
+        );
+        // The user-visible "Failed NAT traversal" line prints this Display.
+        assert_eq!(
+            err.to_string(),
+            format!("send to {remote_addr} failed: network unreachable")
+        );
+        // NAT_TRAVERSAL_MAX_ATTEMPTS is 10 under cfg(test) at a ~250 ms
+        // cadence; 5 shows sustained re-sending without depending on the
+        // scheduler delivering all 10 before the deadline.
+        assert!(
+            failures.load(Ordering::SeqCst) >= 5,
+            "a send failure must not end the attempt at once; the intro loop \
+             re-sends as for a lost datagram (failures = {})",
+            failures.load(Ordering::SeqCst)
+        );
+
+        let os_error = format!("os error {}", enetunreach().raw_os_error().unwrap());
+        let peer_field = format!("peer_addr={remote_addr}");
+        let line = wait_for_log(&logs, |l| {
+            l.starts_with("WARN") && l.contains(&os_error) && l.contains(&peer_field)
+        })
+        .await;
+        drop(guard);
+        assert!(
+            line.is_some(),
+            "a WARN naming the OS error and the destination must be logged; captured: {:?}",
+            logs.lock().unwrap()
+        );
+    }
+
+    /// #5871, the other half of the retry decision: a send failure that
+    /// clears (a network coming back) must not kill the attempt. The first
+    /// two sends fail; the handshake must still complete.
+    #[tokio::test]
+    async fn nat_traversal_survives_send_failures_that_clear() -> anyhow::Result<()> {
+        let channels: Channels = Arc::new(DashMap::new());
+        let (a_pub, mut peer_a, a_addr, failures) =
+            spawn_listener_with_send_errors(47_410, false, channels.clone(), |i, _| i < 2).await;
+        let (b_pub, mut peer_b, b_addr) = create_mock_peer(Default::default(), channels).await?;
+
+        let b_task = GlobalExecutor::spawn(async move {
+            let conn = peer_b.connect(a_pub, a_addr).await;
+            let conn = tokio::time::timeout(Duration::from_secs(10), conn).await??;
+            Ok::<_, anyhow::Error>(conn)
+        });
+        let conn = peer_a.connect(b_pub, b_addr).await;
+        let a_to_b = tokio::time::timeout(Duration::from_secs(10), conn).await??;
+        let b_to_a = b_task.await??;
+        assert_eq!(a_to_b.remote_addr(), b_addr);
+        assert_eq!(b_to_a.remote_addr(), a_addr);
+        assert_eq!(
+            failures.load(Ordering::SeqCst),
+            2,
+            "the test only means something if the injected failures happened"
+        );
+        Ok(())
+    }
+
+    /// Run one outbound attempt from a listener whose sends `fail` selects,
+    /// at a target that receives every packet and never answers. Returns the
+    /// attempt's error, the number of failed sends, and the captured logs.
+    #[cfg(test)]
+    async fn attempt_against_silent_target(
+        port: u16,
+        fail: fn(usize, &[u8]) -> bool,
+    ) -> (TransportError, usize, Vec<String>) {
+        let (logs, guard) = crate::util::test_log_capture::install();
+        let channels: Channels = Arc::new(DashMap::new());
+        let (_pub, mut peer, _addr, failures) =
+            spawn_listener_with_send_errors(port, false, channels.clone(), fail).await;
+        let remote_addr: SocketAddr = (Ipv4Addr::LOCALHOST, port + 1).into();
+        // Registered in `channels`, so sends to it succeed; nothing reads it.
+        let _silent = MockSocket::new(
+            Default::default(),
+            Default::default(),
+            remote_addr,
+            channels,
+        )
+        .await;
+
+        let conn = peer
+            .connect(TransportKeypair::new().public, remote_addr)
+            .await;
+        let result = tokio::time::timeout(Duration::from_secs(10), conn)
+            .await
+            .expect("the attempt must end at its deadline");
+        drop(guard);
+        let err = match result {
+            Ok(_) => panic!("a target that never answers cannot complete a handshake"),
+            Err(err) => err,
+        };
+        let captured = logs.lock().unwrap().clone();
+        (err, failures.load(Ordering::SeqCst), captured)
+    }
+
+    /// #5871: sends that fail and then recover, followed by a remote that
+    /// never answers, must end as an ordinary unanswered attempt, not as a
+    /// send failure (the last send went out). The failures must still be
+    /// visible: the final warn carries their count and the last OS error.
+    #[tokio::test]
+    async fn nat_traversal_recovered_send_failures_end_as_unanswered_attempt() {
+        let (err, failures, logs) = attempt_against_silent_target(47_450, |i, _| i < 2).await;
+        assert_eq!(failures, 2, "the injected failures must have happened");
+        assert!(
+            matches!(err, TransportError::ConnectionEstablishmentFailure { .. }),
+            "the last send succeeded, so this is not a send failure; got {err:?}"
+        );
+        assert!(
+            !logs
+                .iter()
+                .any(|l| l.contains("sends to the remote are failing")),
+            "must not claim sends are failing after they recovered; captured: {logs:?}"
+        );
+        let os_error = format!("os error {}", enetunreach().raw_os_error().unwrap());
+        assert!(
+            logs.iter().any(|l| l.starts_with("WARN")
+                && l.contains("max connection attempts reached")
+                && l.contains("failed_sends=2")
+                && l.contains(&os_error)),
+            "the final warn must report the 2 failed sends and the OS error; captured: {logs:?}"
+        );
+    }
+
+    /// The mirror of the test above: sends that succeed and then start
+    /// failing end the attempt with the send error, counted in the warn.
+    #[tokio::test]
+    async fn nat_traversal_send_failures_at_the_end_report_send_error() {
+        let (err, failures, logs) = attempt_against_silent_target(47_460, |i, _| i >= 3).await;
+        assert!(failures >= 1, "the injected failures must have happened");
+        assert!(
+            matches!(
+                err,
+                TransportError::Udp(UdpError(UdpErrorKind::SendFailed(
+                    _,
+                    std::io::ErrorKind::NetworkUnreachable
+                )))
+            ),
+            "the last send failed, so the attempt reports it; got {err:?}"
+        );
+        assert!(
+            logs.iter().any(|l| l.starts_with("WARN")
+                && l.contains("sends to the remote are failing")
+                && l.contains(&format!("failed_sends={failures}"))),
+            "the final warn must count the failed sends; captured: {logs:?}"
+        );
+    }
+
+    /// #5871, the one-shot send at the end of the joiner's handshake: the
+    /// joiner's intro reaches the gateway, but its reply to the gateway's ack
+    /// fails. There is nothing left in the attempt to re-send it, so the
+    /// attempt ends at once, with the send error rather than `ChannelClosed`.
+    #[tokio::test]
+    async fn joiner_ack_send_failure_reports_send_error() -> anyhow::Result<()> {
+        let (logs, guard) = crate::util::test_log_capture::install();
+        let channels: Channels = Arc::new(DashMap::new());
+        let (gw_pub, (_gw_handler, _gw_conns), gw_addr) =
+            create_mock_gateway(Default::default(), channels.clone()).await?;
+        let (_pub, mut joiner, _addr, failures) =
+            spawn_listener_with_send_errors(47_420, false, channels, |_, buf| !is_intro(buf)).await;
+
+        let conn = joiner.connect(gw_pub, gw_addr).await;
+        let result = tokio::time::timeout(Duration::from_secs(10), conn).await?;
+        let err = match result {
+            Ok(_) => panic!("the joiner's ack could not be sent, so it must not report success"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(
+                err,
+                TransportError::Udp(UdpError(UdpErrorKind::SendFailed(addr, std::io::ErrorKind::NetworkUnreachable)))
+                    if addr == gw_addr
+            ),
+            "expected SendFailed({gw_addr}, NetworkUnreachable), got {err:?}"
+        );
+        assert_eq!(failures.load(Ordering::SeqCst), 1);
+
+        // Outbound failures are ours to fix, so they log at WARN (inbound
+        // ones, which a spoofed intro can trigger, log at INFO).
+        let os_error = format!("os error {}", enetunreach().raw_os_error().unwrap());
+        let line = wait_for_log(&logs, |l| {
+            l.starts_with("WARN")
+                && l.contains("direction=\"outbound\"")
+                && l.contains(&os_error)
+                && l.contains(&format!("peer_addr={gw_addr}"))
+        })
+        .await;
+        drop(guard);
+        assert!(
+            line.is_some(),
+            "a WARN naming the outbound direction, OS error and gateway must be logged; \
+             captured: {:?}",
+            logs.lock().unwrap()
+        );
+        Ok(())
+    }
+
+    /// #5871, gateway side: when the gateway's ack to a joiner cannot be
+    /// sent, the failed handshake must be logged with the send error and
+    /// the OS error, not as `ChannelClosed`.
+    #[tokio::test]
+    async fn gateway_ack_send_failure_logs_send_error() -> anyhow::Result<()> {
+        let (logs, guard) = crate::util::test_log_capture::install();
+        let channels: Channels = Arc::new(DashMap::new());
+        let (gw_pub, _gw, gw_addr, failures) =
+            spawn_listener_with_send_errors(47_430, true, channels.clone(), |_, _| true).await;
+        let (_pub, mut joiner, joiner_addr) =
+            create_mock_peer(Default::default(), channels).await?;
+
+        let conn = joiner.connect(gw_pub, gw_addr).await;
+        let joiner_task =
+            GlobalExecutor::spawn(tokio::time::timeout(Duration::from_secs(10), conn));
+
+        let send_failed = format!("send to {joiner_addr} failed");
+        let failed_line = wait_for_log(&logs, |l| {
+            l.contains("Failed to establish gateway connection")
+        })
+        .await;
+        let os_error = format!("os error {}", enetunreach().raw_os_error().unwrap());
+        let info_line = wait_for_log(&logs, |l| {
+            l.starts_with("INFO")
+                && l.contains(&os_error)
+                && l.contains(&format!("peer_addr={joiner_addr}"))
+        })
+        .await;
+        joiner_task.abort();
+        drop(guard);
+
+        let failed_line = failed_line.unwrap_or_else(|| {
+            panic!(
+                "the gateway must log the failed handshake; captured: {:?}",
+                logs.lock().unwrap()
+            )
+        });
+        assert!(
+            failed_line.contains(&send_failed),
+            "the failure must name the send error and the joiner, got: {failed_line}"
+        );
+        assert!(
+            !failed_line.contains("channel closed"),
+            "a send error is not a closed channel, got: {failed_line}"
+        );
+        assert!(
+            info_line.is_some(),
+            "an INFO naming the OS error and the joiner must be logged; captured: {:?}",
+            logs.lock().unwrap()
+        );
+        assert!(failures.load(Ordering::SeqCst) >= 1);
+        Ok(())
+    }
+
+    /// #5871, gateway side, version mismatch: the `ack_error` that tells an
+    /// incompatible joiner why it was refused is best effort. If it cannot
+    /// be sent, the handshake must still end as a version mismatch (which is
+    /// what makes the listener remember the peer as outdated), and the send
+    /// error must be logged with the OS error, not reported as
+    /// `ChannelClosed`.
+    #[tokio::test]
+    async fn gateway_version_mismatch_ack_send_failure_still_reports_mismatch() {
+        let (logs, guard) = crate::util::test_log_capture::install();
+        let channels: Channels = Arc::new(DashMap::new());
+        let (gw_pub, _gw, gw_addr, failures) =
+            spawn_listener_with_send_errors(47_440, true, channels.clone(), |_, _| true).await;
+
+        // An old-format 0.0.1 version, below every build's min_compatible.
+        let joiner_addr: SocketAddr = (Ipv4Addr::LOCALHOST, 47_441).into();
+        let raw = MockSocket::new(
+            Default::default(),
+            Default::default(),
+            joiner_addr,
+            channels,
+        )
+        .await;
+        let old_version: [u8; 8] = [0, 0, 1, 0, 0, 0, 0, 0];
+        assert!(version_cmp::is_compatible(&PROTOC_VERSION, &old_version).is_err());
+        let mut intro = [0u8; 8 + 16];
+        intro[..8].copy_from_slice(&old_version);
+        let packet = PacketData::<_, MAX_PACKET_SIZE>::encrypt_with_pubkey(&intro, &gw_pub);
+        raw.send_to(packet.data(), gw_addr).await.unwrap();
+
+        let failed_line = wait_for_log(&logs, |l| {
+            l.contains("Failed to establish gateway connection")
+        })
+        .await;
+        let os_error = format!("os error {}", enetunreach().raw_os_error().unwrap());
+        let info_line = wait_for_log(&logs, |l| {
+            l.starts_with("INFO")
+                && l.contains(&os_error)
+                && l.contains(&format!("peer_addr={joiner_addr}"))
+        })
+        .await;
+        drop(guard);
+
+        let failed_line = failed_line.unwrap_or_else(|| {
+            panic!(
+                "the gateway must log the refused handshake; captured: {:?}",
+                logs.lock().unwrap()
+            )
+        });
+        assert!(
+            failed_line.contains("Version incompatibility"),
+            "an unsendable ack_error must not hide the version mismatch, got: {failed_line}"
+        );
+        assert!(
+            info_line.is_some(),
+            "an INFO naming the OS error and the joiner must be logged; captured: {:?}",
+            logs.lock().unwrap()
+        );
+        assert_eq!(failures.load(Ordering::SeqCst), 1);
     }
 }

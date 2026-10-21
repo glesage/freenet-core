@@ -1008,6 +1008,15 @@ impl Runtime {
             .map(|d| d.code().data().to_vec())
     }
 
+    /// The parameters `key` was registered with on this node. See
+    /// [`super::registered_params`].
+    pub(crate) fn registered_delegate_params(
+        &self,
+        key: &DelegateKey,
+    ) -> Result<Parameters<'static>, super::ParamsUnavailable> {
+        self.delegate_store.registered_params(key)
+    }
+
     /// Check if the runtime is in a healthy state and can execute WASM.
     pub fn is_healthy(&self) -> bool {
         self.engine.is_healthy()
@@ -1571,6 +1580,20 @@ impl Runtime {
         )
     }
 
+    /// Refuse a run of `key` whose `params` do not derive it under
+    /// `code_hash`, which must be the hash from this node's index.
+    pub(super) fn check_delegate_params(
+        key: &DelegateKey,
+        code_hash: &CodeHash,
+        params: &Parameters,
+    ) -> RuntimeResult<()> {
+        if crate::wasm_runtime::key_derives_from(key, code_hash, params) {
+            Ok(())
+        } else {
+            Err(RuntimeInnerError::DelegateParamsMismatch(key.clone()).into())
+        }
+    }
+
     /// Prepare a delegate for execution.
     pub(super) fn prepare_delegate_call(
         &mut self,
@@ -1591,6 +1614,14 @@ impl Runtime {
             .delegate_store
             .code_hash_from_key(key)
             .ok_or_else(|| RuntimeInnerError::DelegateNotFound(key.clone()))?;
+        // A delegate key is `BLAKE3(code_hash ‖ params)` and its secrets are
+        // scoped by the key, so a run must use the params the key commits to.
+        // Checked here, before any module is fetched or compiled, because every
+        // delegate run passes through this function (client requests, re-sends,
+        // resumed parks, and node-started runs, which use registered params).
+        // The code hash is the one from the index, resolved above, never the
+        // one carried inside `key`.
+        Self::check_delegate_params(key, &code_hash, params)?;
         // Lock held only for the lookup + Module clone; always dropped before
         // the compile below (never held across the blocking compile).
         let cached = self

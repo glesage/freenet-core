@@ -12,6 +12,17 @@ pub(crate) mod test;
 #[cfg(test)]
 mod test_correlation;
 pub(crate) mod types;
+
+/// Largest client WebSocket message, and frame, the node accepts (see
+/// `websocket::configure_upgrade`).
+///
+/// Lives here, outside the `websocket` feature gate, because it is also the
+/// only bound on the size of a contract's code: a client PUT carries code,
+/// parameters and state in one message of at most this many bytes. The
+/// transport's inbound stream cap (`streaming::MAX_STREAM_TOTAL_BYTES`) is
+/// derived from it, and that cap must not depend on which features this node
+/// was built with, since the peer sending the stream may differ.
+pub(crate) const WEBSOCKET_MAX_MESSAGE_SIZE: usize = 100 * 1024 * 1024;
 /// Per-user operation/export rate limiting for hosted mode (#4561, P5 of #4381).
 /// Not gated on the `websocket` feature: it has no axum dependency (just
 /// `DashMap` + `tokio::time` + `UserId`) and its `DEFAULT_*` constants are the
@@ -345,7 +356,7 @@ where
                             );
                             (cli_id, Err(ErrorKind::EmptyRing.into()))
                         }
-                        Err(err) => match missing_delegate_client_error(err) {
+                        Err(err) => match typed_delegate_client_error(err) {
                             Ok(typed) => (cli_id, Err(typed)),
                             Err(err) => {
                                 tracing::error!(
@@ -453,11 +464,11 @@ where
                         // (#5727), already warned about once by the executor
                         // loop; logging it here at error would put one line per
                         // probe into the error log used for triage.
-                        if is_missing_delegate_client_error(&err) {
+                        if is_routine_delegate_client_error(&err) {
                             tracing::debug!(
                                 client_id = %cli_id,
                                 error = %err,
-                                "Sending missing-delegate response to client"
+                                "Sending missing-delegate or refused-delegate response to client"
                             );
                         } else {
                             tracing::error!(
@@ -508,7 +519,7 @@ fn delegate_request_outcome(
             Ok(values)
         }
         // Not registered on this node (#5727). Answered with the typed
-        // `DelegateError::Missing` — see `missing_delegate_client_error` — and
+        // `DelegateError::Missing` — see `typed_delegate_client_error` — and
         // NOT logged at error: migration walks probe predecessor delegates that
         // most nodes never ran, so this is routine traffic, not a node fault.
         // The executor loop already warned ("Delegate not found in store").
@@ -521,6 +532,20 @@ fn delegate_request_outcome(
                 delegate = %delegate_key,
                 outcome = "missing",
                 "DelegateRequest for a delegate not registered on this node"
+            );
+            Err(Error::Executor(exec_err))
+        }
+        // Refused: the request's params do not derive the delegate key. Caused
+        // by the request, and already logged once at warn by the executor.
+        Ok(ContractHandlerEvent::DelegateResponse(Err(exec_err)))
+            if exec_err.is_params_mismatch() =>
+        {
+            tracing::debug!(
+                client_id = %client_id,
+                request_id = %request_id,
+                delegate = %delegate_key,
+                outcome = "params_mismatch",
+                "DelegateRequest refused: parameters do not match the delegate key"
             );
             Err(Error::Executor(exec_err))
         }
@@ -564,12 +589,17 @@ fn delegate_request_outcome(
     }
 }
 
-/// Keeps a missing-delegate failure TYPED on its way to the client (#5727).
+/// Keeps a missing-delegate failure (#5727), and the refusal of a request
+/// whose params do not derive the delegate key, TYPED on their way to the
+/// client.
 ///
 /// Returns the client error `freenet local` sends for the same request —
-/// `RequestError::DelegateError(DelegateError::Missing(key))` — when `err` is
-/// that failure, and hands every other error back unchanged for the generic
-/// `OperationError { cause }` flattening.
+/// `RequestError::DelegateError(DelegateError::Missing(key))`, or
+/// `RequestError::DelegateError(DelegateError::ExecutionError(..))` for the
+/// refusal — when `err` is one of those failures, and hands every other error
+/// back unchanged for the generic `OperationError { cause }` flattening. The
+/// refusal is identified by `ExecutorError::is_params_mismatch`, a typed flag,
+/// never by its text.
 ///
 /// Without this the missing-delegate answer would reach a network-mode client
 /// only as a string, so it still could not tell "this delegate is not
@@ -577,9 +607,12 @@ fn delegate_request_outcome(
 /// migration walk over predecessor delegates needs. Deliberately narrow: other
 /// executor request errors keep their current shape.
 #[allow(clippy::wildcard_enum_match_arm)] // see the wildcard arm below
-fn missing_delegate_client_error(err: Error) -> Result<ClientError, Error> {
+fn typed_delegate_client_error(err: Error) -> Result<ClientError, Error> {
     match err {
-        Error::Executor(exec_err) if exec_err.is_missing_delegate() => {
+        Error::Executor(exec_err)
+            if exec_err.is_missing_delegate()
+                || (exec_err.is_request() && exec_err.is_params_mismatch()) =>
+        {
             Ok(ErrorKind::RequestError(exec_err.unwrap_request()).into())
         }
         // The wildcard IS the contract here: every other error, including any
@@ -590,15 +623,25 @@ fn missing_delegate_client_error(err: Error) -> Result<ClientError, Error> {
     }
 }
 
-/// True for the typed missing-delegate client error `missing_delegate_client_error`
-/// produces (#5727), so the send path can keep it out of the error log.
-fn is_missing_delegate_client_error(err: &ClientError) -> bool {
-    matches!(
-        err.kind(),
-        ErrorKind::RequestError(freenet_stdlib::client_api::RequestError::DelegateError(
-            freenet_stdlib::client_api::DelegateError::Missing(_)
-        ))
-    )
+/// True for the typed client errors `typed_delegate_client_error` produces —
+/// a missing delegate (#5727) or a params-mismatch refusal — so the send path
+/// keeps them out of the error log; both were already logged once upstream.
+///
+/// The refusal is matched by variant AND message here because the flag that
+/// identified it does not survive into a `ClientError`. That affects only the
+/// log level: on this path an `ExecutionError` is produced only by
+/// `typed_delegate_client_error`, which decided on the typed flag; every other
+/// executor error reaches the client as `OperationError`.
+#[allow(clippy::wildcard_enum_match_arm)] // every other kind is not routine
+fn is_routine_delegate_client_error(err: &ClientError) -> bool {
+    use freenet_stdlib::client_api::{DelegateError, RequestError};
+    match err.kind() {
+        ErrorKind::RequestError(RequestError::DelegateError(DelegateError::Missing(_))) => true,
+        ErrorKind::RequestError(RequestError::DelegateError(DelegateError::ExecutionError(
+            msg,
+        ))) => msg.starts_with(crate::wasm_runtime::DELEGATE_PARAMS_MISMATCH),
+        _ => false,
+    }
 }
 
 #[inline]
@@ -2576,7 +2619,7 @@ mod delegate_request_outcome_tests {
     /// `RequestError::DelegateError(DelegateError::Missing(key))`, the answer
     /// `freenet local` gives, not as an `OperationError` string and not as an
     /// empty success. Drives both steps the loop in `client_event_handling`
-    /// takes: `delegate_request_outcome` then `missing_delegate_client_error`.
+    /// takes: `delegate_request_outcome` then `typed_delegate_client_error`.
     #[test]
     fn missing_delegate_reaches_the_client_as_typed_missing() {
         use freenet_stdlib::client_api::{DelegateError, RequestError};
@@ -2589,7 +2632,7 @@ mod delegate_request_outcome_tests {
             Some("ApplicationMessages"),
         )
         .expect_err("a missing delegate must not be answered as a success");
-        let client_err = missing_delegate_client_error(err)
+        let client_err = typed_delegate_client_error(err)
             .expect("a missing-delegate error must stay typed for the client");
         let ErrorKind::RequestError(RequestError::DelegateError(DelegateError::Missing(k))) =
             client_err.kind()
@@ -2602,6 +2645,57 @@ mod delegate_request_outcome_tests {
         assert_eq!(k, &key(), "Missing must name the requested delegate");
     }
 
+    /// The refusal of a request whose params do not derive the delegate key
+    /// reaches a network-mode client typed, as it does on `freenet local`:
+    /// `RequestError::DelegateError(DelegateError::ExecutionError(..))` with
+    /// the refusal text (pinned as a literal), not an `OperationError` string.
+    /// The send path treats it as routine (debug), and a delegate's own
+    /// execution error with other text is not.
+    ///
+    /// FALSIFY by dropping `is_params_mismatch()` from
+    /// `typed_delegate_client_error`: the refusal is flattened and this fails.
+    #[test]
+    fn params_mismatch_refusal_reaches_the_client_typed() {
+        use freenet_stdlib::client_api::{DelegateError, RequestError};
+        let exec_err = crate::contract::ExecutorError::test_params_mismatch(key());
+        let err = delegate_request_outcome(
+            Ok(ContractHandlerEvent::DelegateResponse(Err(exec_err))),
+            ClientId::next(),
+            RequestId::new(),
+            &key(),
+            Some("ApplicationMessages"),
+        )
+        .expect_err("a refused request must not be answered as a success");
+        let client_err = typed_delegate_client_error(err)
+            .expect("the params-mismatch refusal must stay typed for the client");
+        let ErrorKind::RequestError(RequestError::DelegateError(DelegateError::ExecutionError(
+            msg,
+        ))) = client_err.kind()
+        else {
+            panic!(
+                "expected RequestError(DelegateError::ExecutionError), got {:?}",
+                client_err.kind()
+            );
+        };
+        assert_eq!(
+            msg.as_ref(),
+            format!(
+                "delegate request parameters do not match the delegate key {}",
+                key()
+            )
+        );
+        assert!(is_routine_delegate_client_error(&client_err));
+
+        // A delegate's own typed execution error is not retyped by this path.
+        let own = Error::Executor(crate::contract::ExecutorError::request(
+            DelegateError::ExecutionError("trap".into()),
+        ));
+        assert!(matches!(
+            typed_delegate_client_error(own),
+            Err(Error::Executor(_))
+        ));
+    }
+
     /// The send path's log-level decision (#5727): only the typed missing
     /// delegate is kept out of the error log; every other client error,
     /// including other delegate errors, still logs at error.
@@ -2611,18 +2705,18 @@ mod delegate_request_outcome_tests {
         let missing: ClientError =
             ErrorKind::RequestError(RequestError::DelegateError(DelegateError::Missing(key())))
                 .into();
-        assert!(is_missing_delegate_client_error(&missing));
+        assert!(is_routine_delegate_client_error(&missing));
         let exec: ClientError = ErrorKind::RequestError(RequestError::DelegateError(
             DelegateError::ExecutionError("trap".into()),
         ))
         .into();
-        assert!(!is_missing_delegate_client_error(&exec));
+        assert!(!is_routine_delegate_client_error(&exec));
         let op: ClientError = ErrorKind::OperationError {
             cause: "missing delegate".into(),
         }
         .into();
         assert!(
-            !is_missing_delegate_client_error(&op),
+            !is_routine_delegate_client_error(&op),
             "must match the typed variant, not text that mentions it"
         );
     }
@@ -2639,7 +2733,7 @@ mod delegate_request_outcome_tests {
         )));
         assert!(
             matches!(
-                missing_delegate_client_error(generic),
+                typed_delegate_client_error(generic),
                 Err(Error::Executor(_))
             ),
             "a generic executor error must be handed back unchanged"
@@ -2649,7 +2743,7 @@ mod delegate_request_outcome_tests {
         ));
         assert!(
             matches!(
-                missing_delegate_client_error(exec_failure),
+                typed_delegate_client_error(exec_failure),
                 Err(Error::Executor(_))
             ),
             "a typed delegate EXECUTION error is not a missing delegate and keeps \
@@ -2657,7 +2751,7 @@ mod delegate_request_outcome_tests {
         );
         assert!(
             matches!(
-                missing_delegate_client_error(Error::EmptyRing),
+                typed_delegate_client_error(Error::EmptyRing),
                 Err(Error::EmptyRing)
             ),
             "a non-executor error must be handed back unchanged"

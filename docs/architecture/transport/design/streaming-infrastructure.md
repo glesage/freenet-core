@@ -62,7 +62,8 @@ The core lock-free buffer using `AtomicPtr<Bytes>` slots. See `streaming_buffer.
 - **Lock-free writes**: insertion is a single atomic CAS on the slot's `AtomicPtr`; unlike `OnceLock`, an `AtomicPtr` slot can be cleared after consumption (`mark_consumed`), enabling progressive memory reclamation
 - **Idempotent inserts**: Duplicates are automatic no-ops
 - **Zero-copy**: Uses `Bytes` for reference-counted data
-- **Pre-allocated**: Buffer size determined by stream header
+- **Lazily allocated slots**: slots are allocated in chunks of 256 as fragments arrive; construction allocates only the chunk table
+- **Byte-accounted completion**: complete when the received payload equals the declared total and all inserted fragments are contiguous; inserts that would exceed the total are rejected, and so are empty fragments other than #1 (older senders may send an empty fragment #1 beside embedded metadata)
 
 **Operations:**
 - `insert(fragment_index, data)` - O(1) lock-free CAS
@@ -72,7 +73,7 @@ The core lock-free buffer using `AtomicPtr<Bytes>` slots. See `streaming_buffer.
 
 #### 2. StreamHandle
 
-Cloneable handle for accessing an inbound stream. See `streaming.rs:107-117`.
+Cloneable handle for accessing an inbound stream. See `StreamHandle` in `streaming.rs`.
 
 **Design Decision**: The buffer is stored outside the lock because:
 1. Fragment insertion is the hot path (high frequency)
@@ -352,8 +353,8 @@ once. See [`.claude/rules/transport.md`](../../../../.claude/rules/transport.md)
 
 A stream abort returns `TransportError::OutboundStreamFailed(peer_addr)`, a
 **stream-scoped** error — NOT `ConnectionClosed`. The connection survives, so
-subsequent streams on it can proceed or retry. The operations layer classifies it
-as a transient send failure (`is_transient_send_failure()`): the idle timeout
+subsequent streams on it can proceed or retry. The node keeps the connection because the
+error does not close it (`closes_connection()` is false): the idle timeout
 remains the sole authority on connection liveness, and the op layer times out and
 retries against another candidate (#4374).
 

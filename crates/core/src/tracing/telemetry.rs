@@ -996,7 +996,10 @@ impl TelemetryWorker {
             peer_id: self.local_peer_id.clone(),
             transaction_id: String::new(), // Not tied to a transaction
             event_type: "transport_snapshot".to_string(),
-            event_data: serde_json::to_value(snapshot).unwrap_or_default(),
+            event_data: serde_json::to_value(snapshot).unwrap_or_else(|error| {
+                tracing::warn!(%error, "Failed to serialize transport snapshot");
+                serde_json::Value::Null
+            }),
             priority: EventPriority::Operational,
         }
     }
@@ -2459,6 +2462,8 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     final_ssthresh_bytes,
                     min_ssthresh_floor_bytes,
                     total_timeouts,
+                    min_rtt_ms,
+                    peak_flightsize_bytes,
                     direction,
                     timestamp,
                 } => {
@@ -2476,6 +2481,8 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                         "final_ssthresh_bytes": final_ssthresh_bytes,
                         "min_ssthresh_floor_bytes": min_ssthresh_floor_bytes,
                         "total_timeouts": total_timeouts,
+                        "min_rtt_ms": min_rtt_ms,
+                        "peak_flightsize_bytes": peak_flightsize_bytes,
                         "direction": format!("{:?}", direction),
                         "timestamp": timestamp,
                     })
@@ -2599,22 +2606,274 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
             }
         }
         EventKind::TransportSnapshot(snapshot) => {
-            serde_json::json!({
-                "type": "transport_snapshot",
-                "transfers_completed": snapshot.transfers_completed,
-                "transfers_failed": snapshot.transfers_failed,
-                "bytes_sent": snapshot.bytes_sent,
-                "bytes_received": snapshot.bytes_received,
-                "avg_transfer_time_ms": snapshot.avg_transfer_time_ms,
-                "peak_throughput_bps": snapshot.peak_throughput_bps,
-                "avg_cwnd_bytes": snapshot.avg_cwnd_bytes,
-                "peak_cwnd_bytes": snapshot.peak_cwnd_bytes,
-                "min_cwnd_bytes": snapshot.min_cwnd_bytes,
-                "slowdowns_triggered": snapshot.slowdowns_triggered,
-                "avg_rtt_us": snapshot.avg_rtt_us,
-                "min_rtt_us": snapshot.min_rtt_us,
-                "max_rtt_us": snapshot.max_rtt_us,
-            })
+            // Explicit field list, so a new snapshot field is exported here
+            // only by a deliberate edit. `transport_snapshot_json_lists_every_field`
+            // fails if this list and the struct drift apart. (Built as a map:
+            // `json!` exceeds the macro recursion limit at this many keys.)
+            let mut m = serde_json::Map::new();
+            m.insert("type".into(), serde_json::json!("transport_snapshot"));
+            m.insert(
+                "transfers_completed".into(),
+                serde_json::json!(snapshot.transfers_completed),
+            );
+            m.insert(
+                "transfers_failed".into(),
+                serde_json::json!(snapshot.transfers_failed),
+            );
+            m.insert("bytes_sent".into(), serde_json::json!(snapshot.bytes_sent));
+            m.insert(
+                "bytes_received".into(),
+                serde_json::json!(snapshot.bytes_received),
+            );
+            m.insert(
+                "avg_transfer_time_ms".into(),
+                serde_json::json!(snapshot.avg_transfer_time_ms),
+            );
+            m.insert(
+                "peak_throughput_bps".into(),
+                serde_json::json!(snapshot.peak_throughput_bps),
+            );
+            m.insert(
+                "avg_cwnd_bytes".into(),
+                serde_json::json!(snapshot.avg_cwnd_bytes),
+            );
+            m.insert(
+                "peak_cwnd_bytes".into(),
+                serde_json::json!(snapshot.peak_cwnd_bytes),
+            );
+            m.insert(
+                "min_cwnd_bytes".into(),
+                serde_json::json!(snapshot.min_cwnd_bytes),
+            );
+            m.insert(
+                "slowdowns_triggered".into(),
+                serde_json::json!(snapshot.slowdowns_triggered),
+            );
+            m.insert(
+                "nat_traversal_attempts".into(),
+                serde_json::json!(snapshot.nat_traversal_attempts),
+            );
+            m.insert(
+                "nat_traversal_established".into(),
+                serde_json::json!(snapshot.nat_traversal_established),
+            );
+            m.insert(
+                "nat_traversal_failed_error".into(),
+                serde_json::json!(snapshot.nat_traversal_failed_error),
+            );
+            m.insert(
+                "nat_traversal_failed_version".into(),
+                serde_json::json!(snapshot.nat_traversal_failed_version),
+            );
+            m.insert("avg_rtt_us".into(), serde_json::json!(snapshot.avg_rtt_us));
+            m.insert("min_rtt_us".into(), serde_json::json!(snapshot.min_rtt_us));
+            m.insert("max_rtt_us".into(), serde_json::json!(snapshot.max_rtt_us));
+            m.insert(
+                "conn_rtt_connections".into(),
+                serde_json::json!(snapshot.conn_rtt_connections),
+            );
+            m.insert(
+                "conn_srtt_p50_us".into(),
+                serde_json::json!(snapshot.conn_srtt_p50_us),
+            );
+            m.insert(
+                "conn_srtt_p90_us".into(),
+                serde_json::json!(snapshot.conn_srtt_p90_us),
+            );
+            m.insert(
+                "conn_srtt_max_us".into(),
+                serde_json::json!(snapshot.conn_srtt_max_us),
+            );
+            m.insert(
+                "conn_min_rtt_p50_us".into(),
+                serde_json::json!(snapshot.conn_min_rtt_p50_us),
+            );
+            m.insert(
+                "conn_min_rtt_p90_us".into(),
+                serde_json::json!(snapshot.conn_min_rtt_p90_us),
+            );
+            m.insert(
+                "conn_min_rtt_max_us".into(),
+                serde_json::json!(snapshot.conn_min_rtt_max_us),
+            );
+            m.insert(
+                "packets_sent".into(),
+                serde_json::json!(snapshot.packets_sent),
+            );
+            m.insert(
+                "packets_retransmitted".into(),
+                serde_json::json!(snapshot.packets_retransmitted),
+            );
+            m.insert(
+                "packets_abandoned".into(),
+                serde_json::json!(snapshot.packets_abandoned),
+            );
+            m.insert(
+                "rto_expiries".into(),
+                serde_json::json!(snapshot.rto_expiries),
+            );
+            m.insert("tlp_probes".into(), serde_json::json!(snapshot.tlp_probes));
+            m.insert(
+                "standalone_ack_packets".into(),
+                serde_json::json!(snapshot.standalone_ack_packets),
+            );
+            m.insert(
+                "standalone_ack_bytes".into(),
+                serde_json::json!(snapshot.standalone_ack_bytes),
+            );
+            m.insert(
+                "nat_fail_no_response".into(),
+                serde_json::json!(snapshot.nat_fail_no_response),
+            );
+            m.insert(
+                "nat_fail_undecryptable".into(),
+                serde_json::json!(snapshot.nat_fail_undecryptable),
+            );
+            m.insert(
+                "nat_fail_version_incompatible".into(),
+                serde_json::json!(snapshot.nat_fail_version_incompatible),
+            );
+            m.insert(
+                "nat_fail_incomplete".into(),
+                serde_json::json!(snapshot.nat_fail_incomplete),
+            );
+            m.insert(
+                "nat_fail_send_error".into(),
+                serde_json::json!(snapshot.nat_fail_send_error),
+            );
+            m.insert(
+                "nat_fail_other".into(),
+                serde_json::json!(snapshot.nat_fail_other),
+            );
+            m.insert(
+                "observed_addr_reports".into(),
+                serde_json::json!(snapshot.observed_addr_reports),
+            );
+            m.insert(
+                "observed_addr_port_changes".into(),
+                serde_json::json!(snapshot.observed_addr_port_changes),
+            );
+            m.insert(
+                "observed_addr_ip_changes".into(),
+                serde_json::json!(snapshot.observed_addr_ip_changes),
+            );
+            m.insert(
+                "transfers_acked".into(),
+                serde_json::json!(snapshot.transfers_acked),
+            );
+            m.insert(
+                "avg_transfer_ack_time_ms".into(),
+                serde_json::json!(snapshot.avg_transfer_ack_time_ms),
+            );
+            m.insert(
+                "max_transfer_ack_time_ms".into(),
+                serde_json::json!(snapshot.max_transfer_ack_time_ms),
+            );
+            m.insert(
+                "inbound_queue_depth_hwm".into(),
+                serde_json::json!(snapshot.inbound_queue_depth_hwm),
+            );
+            m.insert(
+                "inbound_queue_drops".into(),
+                serde_json::json!(snapshot.inbound_queue_drops),
+            );
+            m.insert(
+                "nat_fail_samples".into(),
+                serde_json::json!(snapshot.nat_fail_samples),
+            );
+            m.insert(
+                "nat_fail_samples_dropped".into(),
+                serde_json::json!(snapshot.nat_fail_samples_dropped),
+            );
+            m.insert(
+                "inbound_stream_refused_invalid_length".into(),
+                serde_json::json!(snapshot.inbound_stream_refused_invalid_length),
+            );
+            m.insert(
+                "inbound_stream_refused_connection_bytes".into(),
+                serde_json::json!(snapshot.inbound_stream_refused_connection_bytes),
+            );
+            m.insert(
+                "inbound_stream_refused_connection_streams".into(),
+                serde_json::json!(snapshot.inbound_stream_refused_connection_streams),
+            );
+            m.insert(
+                "inbound_stream_closed_too_many_refusals".into(),
+                serde_json::json!(snapshot.inbound_stream_closed_too_many_refusals),
+            );
+            m.insert(
+                "inbound_stream_evicted_idle".into(),
+                serde_json::json!(snapshot.inbound_stream_evicted_idle),
+            );
+            m.insert(
+                "inbound_stream_evicted_age".into(),
+                serde_json::json!(snapshot.inbound_stream_evicted_age),
+            );
+            m.insert(
+                "nat_attempts_connect_joiner".into(),
+                serde_json::json!(snapshot.nat_attempts_connect_joiner),
+            );
+            m.insert(
+                "nat_attempts_connect_acceptor".into(),
+                serde_json::json!(snapshot.nat_attempts_connect_acceptor),
+            );
+            m.insert(
+                "nat_attempts_gateway".into(),
+                serde_json::json!(snapshot.nat_attempts_gateway),
+            );
+            m.insert(
+                "nat_attempts_ring_peer_no_transport".into(),
+                serde_json::json!(snapshot.nat_attempts_ring_peer_no_transport),
+            );
+            m.insert(
+                "nat_established_connect_joiner".into(),
+                serde_json::json!(snapshot.nat_established_connect_joiner),
+            );
+            m.insert(
+                "nat_established_connect_acceptor".into(),
+                serde_json::json!(snapshot.nat_established_connect_acceptor),
+            );
+            m.insert(
+                "nat_established_gateway".into(),
+                serde_json::json!(snapshot.nat_established_gateway),
+            );
+            m.insert(
+                "nat_established_ring_peer_no_transport".into(),
+                serde_json::json!(snapshot.nat_established_ring_peer_no_transport),
+            );
+            m.insert(
+                "stray_intro_after_deadline".into(),
+                serde_json::json!(snapshot.stray_intro_after_deadline),
+            );
+            m.insert(
+                "stray_intro_same_ip_other_port".into(),
+                serde_json::json!(snapshot.stray_intro_same_ip_other_port),
+            );
+            m.insert(
+                "stray_intro_other".into(),
+                serde_json::json!(snapshot.stray_intro_other),
+            );
+            m.insert(
+                "stray_intro_failures_evicted".into(),
+                serde_json::json!(snapshot.stray_intro_failures_evicted),
+            );
+            m.insert(
+                "dial_queue_wait_lt_100ms".into(),
+                serde_json::json!(snapshot.dial_queue_wait_lt_100ms),
+            );
+            m.insert(
+                "dial_queue_wait_lt_1s".into(),
+                serde_json::json!(snapshot.dial_queue_wait_lt_1s),
+            );
+            m.insert(
+                "dial_queue_wait_lt_3s".into(),
+                serde_json::json!(snapshot.dial_queue_wait_lt_3s),
+            );
+            m.insert(
+                "dial_queue_wait_ge_3s".into(),
+                serde_json::json!(snapshot.dial_queue_wait_ge_3s),
+            );
+            serde_json::Value::Object(m)
         }
         EventKind::InterestSync(interest_sync_event) => {
             use crate::tracing::InterestSyncEvent;
@@ -6229,5 +6488,106 @@ mod tests {
         // It is classified as a (failure) subscribe outcome so dashboards
         // counting paired outcomes recognize it, unlike non-terminal events.
         assert_eq!(event.subscribe_outcome(), Some(false));
+    }
+
+    /// The event-log JSON for `EventKind::TransportSnapshot` lists fields
+    /// explicitly; it must carry exactly the struct's serde keys (plus
+    /// `type`), so neither side can drift silently.
+    #[test]
+    fn transport_snapshot_json_lists_every_field() {
+        let snapshot = crate::transport::metrics::TransportSnapshot::default();
+        let mut expected: std::collections::BTreeSet<String> = serde_json::to_value(&snapshot)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        expected.insert("type".to_string());
+        let actual: std::collections::BTreeSet<String> =
+            event_kind_to_json(&super::super::EventKind::TransportSnapshot(snapshot))
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect();
+        assert_eq!(actual, expected);
+    }
+
+    /// As below, for the NAT-origin, stray-intro and dial-queue counts:
+    /// each is distinct and non-zero, so a swapped or mis-keyed one is caught.
+    #[test]
+    fn transport_snapshot_json_carries_nat_origin_values() {
+        let snapshot = crate::transport::metrics::TransportSnapshot {
+            nat_attempts_connect_joiner: 1,
+            nat_attempts_connect_acceptor: 2,
+            nat_attempts_gateway: 3,
+            nat_attempts_ring_peer_no_transport: 5,
+            nat_established_connect_joiner: 6,
+            nat_established_connect_acceptor: 7,
+            nat_established_gateway: 8,
+            nat_established_ring_peer_no_transport: 10,
+            stray_intro_after_deadline: 11,
+            stray_intro_same_ip_other_port: 12,
+            stray_intro_other: 13,
+            stray_intro_failures_evicted: 18,
+            dial_queue_wait_lt_100ms: 14,
+            dial_queue_wait_lt_1s: 15,
+            dial_queue_wait_lt_3s: 16,
+            dial_queue_wait_ge_3s: 17,
+            ..Default::default()
+        };
+        let reference = serde_json::to_value(&snapshot).unwrap();
+        let json = event_kind_to_json(&super::super::EventKind::TransportSnapshot(snapshot));
+        for (key, expected) in [
+            ("nat_attempts_connect_joiner", 1),
+            ("nat_attempts_connect_acceptor", 2),
+            ("nat_attempts_gateway", 3),
+            ("nat_attempts_ring_peer_no_transport", 5),
+            ("nat_established_connect_joiner", 6),
+            ("nat_established_connect_acceptor", 7),
+            ("nat_established_gateway", 8),
+            ("nat_established_ring_peer_no_transport", 10),
+            ("stray_intro_after_deadline", 11),
+            ("stray_intro_same_ip_other_port", 12),
+            ("stray_intro_other", 13),
+            ("stray_intro_failures_evicted", 18),
+            ("dial_queue_wait_lt_100ms", 14),
+            ("dial_queue_wait_lt_1s", 15),
+            ("dial_queue_wait_lt_3s", 16),
+            ("dial_queue_wait_ge_3s", 17),
+        ] {
+            assert_eq!(json[key], expected, "event-log value for {key}");
+            assert_eq!(json[key], reference[key], "serde value for {key}");
+        }
+    }
+
+    /// The key set is not enough: the event-log JSON must also carry each
+    /// field's VALUE under its own key. The six inbound-stream counts are
+    /// distinct and non-zero so a swapped or mis-keyed one is caught.
+    #[test]
+    fn transport_snapshot_json_carries_inbound_stream_values() {
+        let snapshot = crate::transport::metrics::TransportSnapshot {
+            inbound_stream_refused_invalid_length: 1,
+            inbound_stream_refused_connection_bytes: 2,
+            inbound_stream_refused_connection_streams: 3,
+            inbound_stream_closed_too_many_refusals: 4,
+            inbound_stream_evicted_idle: 5,
+            inbound_stream_evicted_age: 6,
+            ..Default::default()
+        };
+        let reference = serde_json::to_value(&snapshot).unwrap();
+        let json = event_kind_to_json(&super::super::EventKind::TransportSnapshot(snapshot));
+        for (key, expected) in [
+            ("inbound_stream_refused_invalid_length", 1),
+            ("inbound_stream_refused_connection_bytes", 2),
+            ("inbound_stream_refused_connection_streams", 3),
+            ("inbound_stream_closed_too_many_refusals", 4),
+            ("inbound_stream_evicted_idle", 5),
+            ("inbound_stream_evicted_age", 6),
+        ] {
+            assert_eq!(json[key], expected, "event-log value for {key}");
+            assert_eq!(json[key], reference[key], "serde value for {key}");
+        }
     }
 }

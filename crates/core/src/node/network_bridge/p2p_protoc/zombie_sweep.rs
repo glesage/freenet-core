@@ -884,7 +884,7 @@ mod tests {
     use crate::operations::get::GetMsgResult;
     use crate::operations::subscribe::SubscribeMsgResult;
     use crate::operations::test_utils::{make_contract_key, make_test_contract};
-    use crate::transport::peer_connection::StreamId;
+    use crate::transport::StreamId;
     use freenet_stdlib::prelude::{RelatedContracts, StateDelta, StateSummary, WrappedState};
 
     const TTL: Duration = Duration::from_secs(30);
@@ -2426,11 +2426,11 @@ mod tests {
             None
         }
 
-        fn send_message(
+        fn send_bytes(
             &mut self,
-            _msg: NetMessage,
-        ) -> Pin<Box<dyn Future<Output = Result<usize, TransportError>> + Send + '_>> {
-            Box::pin(async { Ok(0) })
+            _data: Vec<u8>,
+        ) -> Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>> {
+            Box::pin(async { Ok(()) })
         }
 
         fn recv(
@@ -2444,9 +2444,9 @@ mod tests {
             })
         }
 
-        fn set_orphan_stream_registry(
+        fn set_inbound_stream_registry(
             &mut self,
-            _registry: Arc<crate::operations::orphan_streams::OrphanStreamRegistry>,
+            _registry: Arc<dyn crate::transport::InboundStreamRegistry>,
         ) {
         }
 
@@ -2456,9 +2456,9 @@ mod tests {
             _data: bytes::Bytes,
             _metadata: Option<bytes::Bytes>,
             _completion_tx: Option<
-                tokio::sync::oneshot::Sender<crate::transport::BroadcastDeliveryOutcome>,
+                tokio::sync::oneshot::Sender<crate::transport::StreamSendOutcome>,
             >,
-            _progress: Option<crate::operations::stream_progress::StreamProgressHandle>,
+            _progress: Option<std::sync::Arc<dyn crate::transport::StreamProgressObserver>>,
         ) -> Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>> {
             Box::pin(async { Ok(()) })
         }
@@ -2466,9 +2466,9 @@ mod tests {
         fn pipe_stream_data(
             &mut self,
             _outbound_stream_id: StreamId,
-            _inbound_handle: crate::transport::peer_connection::streaming::StreamHandle,
+            _inbound_handle: crate::transport::IncomingStream,
             _metadata: Option<bytes::Bytes>,
-            _progress: Option<crate::operations::stream_progress::StreamProgressHandle>,
+            _progress: Option<std::sync::Arc<dyn crate::transport::StreamProgressObserver>>,
         ) -> Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>> {
             Box::pin(async { Ok(()) })
         }

@@ -84,7 +84,7 @@ impl SymmetricMessage {
                 packet_id: u32::MAX,
                 confirm_receipt: vec![],
                 payload: SymmetricMessagePayload::StreamFragment {
-                    stream_id: StreamId::next(),
+                    stream_id: StreamId::next_transport_internal(),
                     total_length_bytes: u64::MAX,
                     fragment_number: u32::MAX,
                     payload: Bytes::new(),
@@ -95,6 +95,31 @@ impl SymmetricMessage {
         });
 
         *OVERHEAD
+    }
+
+    /// Serialized size of a stream fragment as `packet_sending` sends it
+    /// (no piggybacked receipts), computed from the real serialization.
+    pub(crate) fn stream_fragment_size(
+        stream_id: StreamId,
+        total_length_bytes: u64,
+        fragment_number: u32,
+        payload: &Bytes,
+        metadata_bytes: Option<&Bytes>,
+    ) -> u64 {
+        let message = SymmetricMessage {
+            packet_id: 0,
+            confirm_receipt: vec![],
+            payload: SymmetricMessagePayload::StreamFragment {
+                stream_id,
+                total_length_bytes,
+                fragment_number,
+                payload: payload.clone(),
+                metadata_bytes: metadata_bytes.cloned(),
+            },
+        };
+        // Serializing a fixed in-memory value cannot fail; treat a failure
+        // as "does not fit".
+        bincode::serialized_size(&message).unwrap_or(u64::MAX)
     }
 
     pub(crate) fn max_num_of_confirm_receipts_of_noop_message() -> usize {
@@ -460,7 +485,7 @@ mod test {
                 }),
             },
             SymmetricMessagePayload::StreamFragment {
-                stream_id: StreamId::next(),
+                stream_id: StreamId::next_transport_internal(),
                 total_length_bytes: 100,
                 fragment_number: 1,
                 payload: Bytes::from({
@@ -471,7 +496,7 @@ mod test {
                 metadata_bytes: None,
             },
             SymmetricMessagePayload::StreamFragment {
-                stream_id: StreamId::next(),
+                stream_id: StreamId::next_transport_internal(),
                 total_length_bytes: 200,
                 fragment_number: 1,
                 payload: Bytes::from({
@@ -633,7 +658,7 @@ mod test {
             (
                 2,
                 SymmetricMessagePayload::StreamFragment {
-                    stream_id: StreamId::next(),
+                    stream_id: StreamId::next_transport_internal(),
                     total_length_bytes: 1,
                     fragment_number: 0,
                     payload: Bytes::new(),
@@ -748,7 +773,7 @@ mod test {
             packet_id: u32::MAX,
             confirm_receipt: vec![],
             payload: SymmetricMessagePayload::StreamFragment {
-                stream_id: StreamId::next(),
+                stream_id: StreamId::next_transport_internal(),
                 total_length_bytes: u64::MAX,
                 fragment_number: u32::MAX,
                 payload: Bytes::from(vec![0u8; MAX_DATA_SIZE - overhead]),

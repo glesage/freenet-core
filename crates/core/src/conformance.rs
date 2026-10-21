@@ -7,6 +7,13 @@
 //! to repair a state that cannot converge. #5153 measured deployed contracts doing
 //! exactly that.
 //!
+//! One law is checked in a weaker form than the RFC #5320 table states it.
+//! Associativity is reported only when `merge(merge(A, B), C)` and
+//! `merge(A, merge(B, C))` differ and do not heal: converge in one exchange, then
+//! settle at a fixpoint when both groupings and all three inputs are merged back in
+//! (#5915). No contract with bounded retention can satisfy the strict form. See
+//! [`ConformanceProperty::StateAssociativity`].
+//!
 //! This module is the *single* implementation of what "conformance" means. The
 //! offline `fdev verify-merge` harness and the node's opt-in shadow-mode checker both call
 //! [`verify_case`], so the developer-facing answer and the network-facing answer
@@ -35,6 +42,8 @@
 //! - [`capture`] — operator-enabled recording of real contract traffic for replay.
 //! - [`sampler`] — the bounded, restart-safe store of states a peer observed.
 //! - [`focus`] — which contracts a peer watches, and when it moves on.
+//! - [`activity`] — how busy each contract has recently been on this peer, which
+//!   weights focus toward contracts that will actually produce samples (#5913).
 //! - [`shadow`] — the opt-in loop that replays sampled states on a peer and records
 //!   what it would remove, without acting on it.
 //! - [`policy`] — what a peer is permitted to do about a finding. Deletion is the
@@ -103,6 +112,7 @@
 //! The honest summary is that the re-run protects the ACCURACY of the accusation,
 //! not the contract.
 
+pub mod activity;
 pub mod bundle;
 pub mod capture;
 pub mod evidence;

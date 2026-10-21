@@ -24,7 +24,6 @@ use crate::{
 use futures::StreamExt;
 
 use super::StreamId;
-use super::streaming::StreamHandle;
 
 /// Maximum time to wait for congestion window space *per fragment* before aborting a stream
 /// transfer. Resets for each fragment, so a slow-but-progressing transfer won't time out.
@@ -93,6 +92,64 @@ pub(crate) type SerializedStream = Bytes;
 /// The extra byte vs. the original 40 comes from the Option discriminant of `metadata_bytes`.
 const MAX_DATA_SIZE: usize = packet_data::MAX_DATA_SIZE - 41;
 
+/// A congestion window as reported in transfer telemetry: `None` when the
+/// controller has no bounded window. FixedRate outside a loss pause reports
+/// `usize::MAX / 2`, which used to surface as `u32::MAX` after truncation.
+fn reported_cwnd(cwnd: usize) -> Option<u32> {
+    if cwnd >= usize::MAX / 2 {
+        return None;
+    }
+    u32::try_from(cwnd).ok()
+}
+
+/// Per-connection RTT and loss facts for a stream that has just handed its
+/// last fragment to the socket, read from the connection's sent-packet
+/// tracker (not the congestion controller, whose RTT/loss stats are zero
+/// under FixedRate).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StreamEndTelemetry {
+    /// Connection SRTT; `None` until it has a data-ACK RTT sample.
+    final_srtt_ms: Option<u32>,
+    /// Connection minimum RTT; `None` under the same condition. Together
+    /// with `final_srtt_ms` it exposes queueing delay (loaded vs base RTT).
+    min_rtt_ms: Option<u32>,
+    /// RTO expiries on the connection while the transfer ran.
+    rto_expiries: u32,
+}
+
+/// Collect [`StreamEndTelemetry`] and register the stream for final-ACK
+/// timing. A stream whose fragments are all already acknowledged is
+/// published to `TRANSPORT_METRICS` here, since no later receipt batch may
+/// ever come to drain it.
+fn finish_stream_telemetry<T: TimeSource>(
+    sent_packet_tracker: &parking_lot::Mutex<SentPacketTracker<T>>,
+    stream_id: StreamId,
+    start_nanos: u64,
+    rto_expiries_at_start: u64,
+) -> StreamEndTelemetry {
+    let to_ms = |d: Duration| d.as_millis().min(u32::MAX as u128) as u32;
+    let (already_acked, telemetry) = {
+        let mut tracker = sent_packet_tracker.lock();
+        let already_acked = tracker.watch_stream_ack(stream_id, start_nanos);
+        let srtt = tracker.smoothed_rtt();
+        let telemetry = StreamEndTelemetry {
+            final_srtt_ms: srtt.map(to_ms),
+            // The tracker's min RTT holds a 100 ms placeholder until the
+            // first sample, which arrives together with the SRTT.
+            min_rtt_ms: srtt.map(|_| to_ms(tracker.min_rtt())),
+            rto_expiries: tracker
+                .rto_expiries()
+                .saturating_sub(rto_expiries_at_start)
+                .min(u32::MAX as u64) as u32,
+        };
+        (already_acked, telemetry)
+    };
+    if let Some(elapsed_nanos) = already_acked {
+        crate::transport::TRANSPORT_METRICS.record_transfer_acked(elapsed_nanos / 1_000_000);
+    }
+    telemetry
+}
+
 // TODO: unit test
 /// Handles sending a stream that is *not piped*. In the future this will be replaced by
 /// piped streams which start forwarding before the stream has been received.
@@ -112,11 +169,35 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
     congestion_controller: Arc<CongestionController<T>>,
     time_source: T,
     metadata: Option<Bytes>,
-    completion_tx: Option<oneshot::Sender<crate::transport::BroadcastDeliveryOutcome>>,
-    progress: Option<crate::operations::stream_progress::StreamProgressHandle>,
+    completion_tx: Option<oneshot::Sender<crate::transport::StreamSendOutcome>>,
+    progress: Option<Arc<dyn crate::transport::StreamProgressObserver>>,
 ) -> Result<TransferStats, TransportError> {
     let start_time = time_source.now();
+    let start_nanos = time_source.now_nanos();
+    let rto_expiries_at_start = sent_packet_tracker.lock().rto_expiries();
+    // Largest bytes-in-flight on the connection as this stream sent a
+    // fragment (telemetry: queue build-up while it ran).
+    let mut peak_flightsize: usize = 0;
     let bytes_to_send = stream_to_send.len() as u64;
+
+    // Receivers admit only lengths that pass `check_declared_stream_length`.
+    if let Err(rejection) = super::streaming::check_declared_stream_length(bytes_to_send) {
+        tracing::warn!(
+            stream_id = %stream_id.0,
+            peer_addr = %destination_addr,
+            length_bytes = bytes_to_send,
+            max_stream_bytes = super::streaming::MAX_STREAM_TOTAL_BYTES,
+            ?rejection,
+            "Not sending stream: length outside the stream limits"
+        );
+        if let Some(tx) = completion_tx {
+            let _ignored = tx.send(crate::transport::StreamSendOutcome::Dropped);
+        }
+        return Err(TransportError::OutboundStreamInvalidLength(
+            destination_addr,
+            bytes_to_send,
+        ));
+    }
 
     // Emit transfer started telemetry event
     emit_transfer_started(
@@ -133,7 +214,11 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
         cwnd = congestion_controller.current_cwnd(),
         "Sending stream"
     );
-    let total_length_bytes = stream_to_send.len() as u32;
+    // The full stream length, as a u64.
+    let total_length_bytes = bytes_to_send;
+    // Fragment #1 must carry at least one payload byte; metadata too large to
+    // leave room for one is not embedded (it is also sent separately).
+    let metadata = metadata.filter(|meta| 1 + 8 + meta.len() < MAX_DATA_SIZE);
     // Calculate total_packets accounting for fragment #1's reduced payload when
     // metadata is embedded. Without this adjustment, the loop terminates too early
     // and the final bytes of the stream are never sent.
@@ -320,6 +405,9 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
         // Get token before sending (captures send-time state for BBR)
         // This also updates the congestion controller's flightsize
         let token = congestion_controller.on_send_with_token(packet_size);
+        // Sampled after cwnd admission, the token-bucket wait and `on_send`,
+        // so it is bytes actually in flight as this fragment goes out.
+        peak_flightsize = peak_flightsize.max(congestion_controller.flightsize());
 
         if let Err(e) = super::packet_sending(
             destination_addr,
@@ -329,7 +417,7 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
             vec![],
             symmetric_message::StreamFragment {
                 stream_id,
-                total_length_bytes: total_length_bytes as u64,
+                total_length_bytes,
                 fragment_number: next_fragment_number,
                 payload: fragment,
                 metadata_bytes,
@@ -386,7 +474,7 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
             // the queue must NOT treat this as a delivery.
             if let Some(tx) = completion_tx {
                 // Receiver may be dropped if queue timed out; ignore the error.
-                let _ignored = tx.send(crate::transport::BroadcastDeliveryOutcome::Dropped);
+                let _ignored = tx.send(crate::transport::StreamSendOutcome::Dropped);
             }
             return Err(e);
         }
@@ -394,11 +482,12 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
         next_fragment_number += 1;
         sent_so_far += 1;
         if let Some(p) = &progress {
-            // record() reads the handle's OWN clock (the originator's
-            // TimeSource), NOT this connection's time_source — the two have
-            // different epochs and mixing them defeats the inactivity timeout
-            // (#4001 single-epoch invariant; see stream_progress.rs).
-            p.record();
+            // No timestamp is passed: the observer reads its OWN clock (the
+            // originator's TimeSource), NOT this connection's time_source —
+            // the two have different epochs and mixing them defeats the
+            // inactivity timeout (#4001 single-epoch invariant; see
+            // StreamProgressObserver).
+            p.on_fragment_sent();
         }
     }
 
@@ -408,6 +497,14 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
     let ledbat_stats = congestion_controller.ledbat_stats();
     let bbr_stats = congestion_controller.bbr_stats();
     let elapsed = time_source.now().saturating_sub(start_time);
+    let end = finish_stream_telemetry(
+        &sent_packet_tracker,
+        stream_id,
+        start_nanos,
+        rto_expiries_at_start,
+    );
+    let peak_cwnd = reported_cwnd(generic_stats.peak_cwnd);
+    let final_cwnd = reported_cwnd(generic_stats.cwnd);
 
     tracing::debug!(
         stream_id = %stream_id.0,
@@ -432,13 +529,15 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
         } else {
             bytes_to_send * 1000 / elapsed.as_millis().max(1) as u64
         },
-        Some(generic_stats.peak_cwnd as u32),
-        Some(generic_stats.cwnd as u32),
+        peak_cwnd,
+        final_cwnd,
         ledbat_stats.as_ref().map(|s| s.periodic_slowdowns as u32),
-        Some(generic_stats.base_delay.as_millis() as u32),
+        end.final_srtt_ms,
         Some(generic_stats.ssthresh as u32),
         ledbat_stats.as_ref().map(|s| s.min_ssthresh_floor as u32),
-        Some(generic_stats.total_timeouts as u32),
+        Some(end.rto_expiries),
+        end.min_rtt_ms,
+        Some(peak_flightsize.min(u32::MAX as usize) as u32),
         TransferDirection::Send,
     );
 
@@ -447,7 +546,7 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
     // (#4235) — only this case refreshes peer interest / caches the summary.
     if let Some(tx) = completion_tx {
         // Receiver may be dropped if queue timed out; ignore the error.
-        let _ignored = tx.send(crate::transport::BroadcastDeliveryOutcome::Delivered);
+        let _ignored = tx.send(crate::transport::StreamSendOutcome::Delivered);
     }
 
     Ok(TransferStats {
@@ -455,8 +554,8 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
         remote_addr: destination_addr,
         bytes_transferred: bytes_to_send,
         elapsed,
-        peak_cwnd_bytes: generic_stats.peak_cwnd as u32,
-        final_cwnd_bytes: generic_stats.cwnd as u32,
+        peak_cwnd_bytes: peak_cwnd,
+        final_cwnd_bytes: final_cwnd,
         slowdowns_triggered: ledbat_stats
             .as_ref()
             .map(|s| s.periodic_slowdowns as u32)
@@ -467,24 +566,130 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
             .as_ref()
             .map(|s| s.min_ssthresh_floor as u32)
             .unwrap_or(0),
-        total_timeouts: generic_stats.total_timeouts as u32,
+        total_timeouts: end.rto_expiries,
         final_flightsize: generic_stats.flightsize as u32,
         configured_rate: congestion_controller.configured_rate() as u32,
     })
 }
 
+/// Capacity of the pipe's outgoing fragment #1 when the first chunk is longer
+/// than a fragment: room for this hop's own metadata header (#2757) when there
+/// is any and at least one payload byte still fits, reserving exactly what
+/// `send_stream` reserves (the metadata plus its 1-byte option tag and 8-byte
+/// length); otherwise a full fragment.
+fn first_fragment_capacity(metadata: Option<&Bytes>) -> usize {
+    match metadata {
+        Some(meta) if 1 + 8 + meta.len() < MAX_DATA_SIZE => MAX_DATA_SIZE - (1 + 8 + meta.len()),
+        _ => MAX_DATA_SIZE,
+    }
+}
+
+/// Re-chunks an inbound stream into the pipe's outgoing fragment payloads,
+/// whatever chunk sizes the receiving transport delivered.
+///
+/// The receiver gives a stream `ceil(total / FRAGMENT_PAYLOAD_SIZE) + 1`
+/// fragment slots and rejects empty fragments other than #1, so:
+/// - fragment #1 is the first chunk as received if it fits in a fragment
+///   (that keeps a UDP-received stream's boundaries exactly as they were,
+///   including an empty #1 from an older sender); a longer first chunk is
+///   cut at `first_capacity` (see [`first_fragment_capacity`]);
+/// - every later fragment is exactly `FRAGMENT_PAYLOAD_SIZE` bytes except the
+///   last, filled from as many chunks as it takes; empty chunks are dropped.
+///
+/// A UDP-received stream arrives as one chunk per fragment, full except
+/// possibly #1 and the last, so its outgoing fragments are its incoming ones.
+/// State lives in the struct, so dropping a `next()` future loses nothing.
+/// After an `Err` the stream ends.
+struct Rechunk<St> {
+    inner: St,
+    first_capacity: usize,
+    first_sent: bool,
+    buf: bytes::BytesMut,
+    done: bool,
+}
+
+impl<St> Rechunk<St> {
+    fn new(inner: St, first_capacity: usize) -> Self {
+        Self {
+            inner,
+            first_capacity,
+            first_sent: false,
+            buf: bytes::BytesMut::new(),
+            done: false,
+        }
+    }
+}
+
+impl<St> futures::Stream for Rechunk<St>
+where
+    St: futures::Stream<Item = Result<Bytes, super::streaming::StreamError>> + Unpin,
+{
+    type Item = Result<Bytes, super::streaming::StreamError>;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        use super::streaming_buffer::FRAGMENT_PAYLOAD_SIZE;
+        use std::task::Poll;
+        let this = self.get_mut();
+        loop {
+            if this.done {
+                return Poll::Ready(None);
+            }
+            if this.first_sent && this.buf.len() >= FRAGMENT_PAYLOAD_SIZE {
+                return Poll::Ready(Some(Ok(this.buf.split_to(FRAGMENT_PAYLOAD_SIZE).freeze())));
+            }
+            match std::pin::Pin::new(&mut this.inner).poll_next(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Some(Err(e))) => {
+                    this.done = true;
+                    return Poll::Ready(Some(Err(e)));
+                }
+                Poll::Ready(Some(Ok(chunk))) if !this.first_sent => {
+                    this.first_sent = true;
+                    if chunk.len() <= FRAGMENT_PAYLOAD_SIZE {
+                        return Poll::Ready(Some(Ok(chunk)));
+                    }
+                    let mut chunk = chunk;
+                    let first = chunk.split_to(this.first_capacity);
+                    this.buf.extend_from_slice(&chunk);
+                    return Poll::Ready(Some(Ok(first)));
+                }
+                Poll::Ready(Some(Ok(chunk))) => {
+                    // A full chunk with nothing buffered is already a
+                    // fragment (the common UDP case): pass it on uncopied.
+                    if this.buf.is_empty() && chunk.len() == FRAGMENT_PAYLOAD_SIZE {
+                        return Poll::Ready(Some(Ok(chunk)));
+                    }
+                    // Empty chunks are dropped: an empty fragment other
+                    // than #1 is refused by the receiver.
+                    this.buf.extend_from_slice(&chunk);
+                }
+                Poll::Ready(None) => {
+                    this.done = true;
+                    if !this.buf.is_empty() {
+                        return Poll::Ready(Some(Ok(this.buf.split().freeze())));
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Pipes an inbound stream to an outbound connection, forwarding fragments as they arrive.
 ///
 /// Unlike `send_stream` which takes complete data and fragments it, this reads
-/// from a `StreamHandle` and forwards each fragment incrementally. This avoids
-/// full reassembly at intermediate nodes, reducing latency.
+/// an [`IncomingStream`](crate::transport::IncomingStream) chunk by chunk and
+/// forwards it incrementally, re-chunked into fragments by [`Rechunk`]. This
+/// avoids full reassembly at intermediate nodes, reducing latency.
 ///
 /// The outbound stream uses a new `outbound_stream_id` so the receiver sees
 /// a fresh stream. Fragments are sent with the same BBR congestion control
 /// and token bucket rate limiting as `send_stream`.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn pipe_stream<S: super::super::Socket, T: TimeSource>(
-    inbound_handle: StreamHandle,
+    inbound_handle: crate::transport::IncomingStream,
     outbound_stream_id: StreamId,
     last_packet_id: Arc<AtomicU32>,
     socket: Arc<S>,
@@ -495,10 +700,71 @@ pub(super) async fn pipe_stream<S: super::super::Socket, T: TimeSource>(
     congestion_controller: Arc<CongestionController<T>>,
     time_source: T,
     metadata: Option<Bytes>,
-    progress: Option<crate::operations::stream_progress::StreamProgressHandle>,
+    progress: Option<Arc<dyn crate::transport::StreamProgressObserver>>,
 ) -> Result<TransferStats, TransportError> {
+    pipe_chunks(
+        inbound_handle.total_bytes(),
+        inbound_handle.chunks(),
+        outbound_stream_id,
+        last_packet_id,
+        socket,
+        destination_addr,
+        outbound_symmetric_key,
+        sent_packet_tracker,
+        token_bucket,
+        congestion_controller,
+        time_source,
+        metadata,
+        progress,
+    )
+    .await
+}
+
+/// [`pipe_stream`] over any chunk stream of `total_bytes` bytes, re-chunked
+/// into fragments by [`Rechunk`].
+#[allow(clippy::too_many_arguments)]
+async fn pipe_chunks<S, T, C>(
+    total_bytes: u64,
+    chunks: C,
+    outbound_stream_id: StreamId,
+    last_packet_id: Arc<AtomicU32>,
+    socket: Arc<S>,
+    destination_addr: SocketAddr,
+    outbound_symmetric_key: Aes128Gcm,
+    sent_packet_tracker: Arc<parking_lot::Mutex<SentPacketTracker<T>>>,
+    token_bucket: Arc<super::super::token_bucket::TokenBucket<T>>,
+    congestion_controller: Arc<CongestionController<T>>,
+    time_source: T,
+    metadata: Option<Bytes>,
+    progress: Option<Arc<dyn crate::transport::StreamProgressObserver>>,
+) -> Result<TransferStats, TransportError>
+where
+    S: super::super::Socket,
+    T: TimeSource,
+    C: futures::Stream<Item = Result<Bytes, super::streaming::StreamError>> + Unpin,
+{
     let start_time = time_source.now();
-    let total_bytes = inbound_handle.total_bytes();
+    let start_nanos = time_source.now_nanos();
+    let rto_expiries_at_start = sent_packet_tracker.lock().rto_expiries();
+    // See `send_stream`.
+    let mut peak_flightsize: usize = 0;
+
+    // Inbound admission applies the same check; repeated here so a forwarded
+    // stream's declared length is within the limits whatever its source.
+    if let Err(rejection) = super::streaming::check_declared_stream_length(total_bytes) {
+        tracing::warn!(
+            stream_id = %outbound_stream_id.0,
+            peer_addr = %destination_addr,
+            total_bytes,
+            max_stream_bytes = super::streaming::MAX_STREAM_TOTAL_BYTES,
+            ?rejection,
+            "Not piping stream: length outside the stream limits"
+        );
+        return Err(TransportError::OutboundStreamInvalidLength(
+            destination_addr,
+            total_bytes,
+        ));
+    }
 
     emit_transfer_started(
         outbound_stream_id.0 as u64,
@@ -513,7 +779,9 @@ pub(super) async fn pipe_stream<S: super::super::Socket, T: TimeSource>(
         "Piping stream to next hop"
     );
 
-    let mut stream = inbound_handle.stream();
+    // Whatever transport received the stream, forward it as fragments the
+    // receiver accepts (see `Rechunk`).
+    let mut stream = Rechunk::new(chunks, first_fragment_capacity(metadata.as_ref()));
     let mut sent_so_far = 0u64;
     let mut fragment_number = 1u32;
     let mut pending_metadata = metadata;
@@ -694,10 +962,18 @@ pub(super) async fn pipe_stream<S: super::super::Socket, T: TimeSource>(
         // embedding and rely on the separate metadata message instead.
         let metadata_bytes = if fragment_number == 1 {
             if let Some(meta) = pending_metadata.take() {
-                // Note: The 41-byte overhead already includes Option discriminant (1 byte)
-                // and length prefix (8 bytes). Only add the metadata data length.
-                let required_size = payload.len() + 41 + meta.len();
-                if required_size <= packet_data::MAX_DATA_SIZE {
+                // The size of the fragment as it would be serialized with the
+                // metadata embedded, not an estimate: the old
+                // `payload + 41 + meta` left out the metadata's 8-byte length
+                // and could approve an embed that then failed to serialize.
+                let required_size = symmetric_message::SymmetricMessage::stream_fragment_size(
+                    outbound_stream_id,
+                    total_bytes,
+                    fragment_number,
+                    &payload,
+                    Some(&meta),
+                );
+                if required_size <= packet_data::MAX_DATA_SIZE as u64 {
                     Some(meta)
                 } else {
                     tracing::debug!(
@@ -719,6 +995,9 @@ pub(super) async fn pipe_stream<S: super::super::Socket, T: TimeSource>(
 
         let packet_id = last_packet_id.fetch_add(1, std::sync::atomic::Ordering::Release);
         let token = congestion_controller.on_send_with_token(packet_size);
+        // Sampled after cwnd admission, the token-bucket wait and `on_send`,
+        // so it is bytes actually in flight as this fragment goes out.
+        peak_flightsize = peak_flightsize.max(congestion_controller.flightsize());
 
         if let Err(e) = super::packet_sending(
             destination_addr,
@@ -779,17 +1058,55 @@ pub(super) async fn pipe_stream<S: super::super::Socket, T: TimeSource>(
         sent_so_far += packet_size as u64;
         fragment_number += 1;
         if let Some(p) = &progress {
-            // record() reads the handle's OWN clock (the originator's
-            // TimeSource), NOT this connection's time_source — the two have
-            // different epochs and mixing them defeats the inactivity timeout
-            // (#4001 single-epoch invariant; see stream_progress.rs).
-            p.record();
+            // No timestamp is passed: the observer reads its OWN clock (the
+            // originator's TimeSource), NOT this connection's time_source —
+            // the two have different epochs and mixing them defeats the
+            // inactivity timeout (#4001 single-epoch invariant; see
+            // StreamProgressObserver).
+            p.on_fragment_sent();
         }
+    }
+
+    // The inbound stream has ended. Forwarding fewer bytes than the stream
+    // declared is a failed pipe, however cleanly the input ended: the
+    // receiver would wait for the rest until its inactivity timeout. Like the
+    // other input failures above, it fails only this stream (#4345).
+    if sent_so_far != total_bytes {
+        let elapsed = time_source.now().saturating_sub(start_time);
+        tracing::warn!(
+            stream_id = %outbound_stream_id.0,
+            destination = %destination_addr,
+            sent_so_far,
+            total_bytes,
+            "pipe_stream input ended short of its declared total"
+        );
+        emit_transfer_failed(
+            outbound_stream_id.0 as u64,
+            destination_addr,
+            sent_so_far,
+            format!("inbound stream ended short: forwarded {sent_so_far}/{total_bytes} bytes"),
+            elapsed.as_millis() as u64,
+            TransferDirection::Send,
+        );
+        release_aborted_stream_flightsize(
+            outbound_stream_id,
+            sent_packet_tracker.as_ref(),
+            congestion_controller.as_ref(),
+        );
+        return Err(TransportError::OutboundStreamFailed(destination_addr));
     }
 
     let generic_stats = congestion_controller.stats();
     let ledbat_stats = congestion_controller.ledbat_stats();
     let elapsed = time_source.now().saturating_sub(start_time);
+    let end = finish_stream_telemetry(
+        &sent_packet_tracker,
+        outbound_stream_id,
+        start_nanos,
+        rto_expiries_at_start,
+    );
+    let peak_cwnd = reported_cwnd(generic_stats.peak_cwnd);
+    let final_cwnd = reported_cwnd(generic_stats.cwnd);
 
     tracing::debug!(
         stream_id = %outbound_stream_id.0,
@@ -809,13 +1126,15 @@ pub(super) async fn pipe_stream<S: super::super::Socket, T: TimeSource>(
         } else {
             sent_so_far * 1000 / elapsed.as_millis().max(1) as u64
         },
-        Some(generic_stats.peak_cwnd as u32),
-        Some(generic_stats.cwnd as u32),
+        peak_cwnd,
+        final_cwnd,
         ledbat_stats.as_ref().map(|s| s.periodic_slowdowns as u32),
-        Some(generic_stats.base_delay.as_millis() as u32),
+        end.final_srtt_ms,
         Some(generic_stats.ssthresh as u32),
         ledbat_stats.as_ref().map(|s| s.min_ssthresh_floor as u32),
-        Some(generic_stats.total_timeouts as u32),
+        Some(end.rto_expiries),
+        end.min_rtt_ms,
+        Some(peak_flightsize.min(u32::MAX as usize) as u32),
         TransferDirection::Send,
     );
 
@@ -824,8 +1143,8 @@ pub(super) async fn pipe_stream<S: super::super::Socket, T: TimeSource>(
         remote_addr: destination_addr,
         bytes_transferred: sent_so_far,
         elapsed,
-        peak_cwnd_bytes: generic_stats.peak_cwnd as u32,
-        final_cwnd_bytes: generic_stats.cwnd as u32,
+        peak_cwnd_bytes: peak_cwnd,
+        final_cwnd_bytes: final_cwnd,
         slowdowns_triggered: ledbat_stats
             .as_ref()
             .map(|s| s.periodic_slowdowns as u32)
@@ -836,10 +1155,104 @@ pub(super) async fn pipe_stream<S: super::super::Socket, T: TimeSource>(
             .as_ref()
             .map(|s| s.min_ssthresh_floor as u32)
             .unwrap_or(0),
-        total_timeouts: generic_stats.total_timeouts as u32,
+        total_timeouts: end.rto_expiries,
         final_flightsize: generic_stats.flightsize as u32,
         configured_rate: congestion_controller.configured_rate() as u32,
     })
+}
+
+#[cfg(test)]
+mod telemetry_tests {
+    use super::*;
+    use crate::simulation::VirtualTime;
+
+    /// FixedRate's unbounded window (`usize::MAX / 2`) is not a measurement
+    /// and must not surface as `u32::MAX`.
+    #[test]
+    fn reported_cwnd_hides_unbounded_window() {
+        assert_eq!(reported_cwnd(usize::MAX / 2), None);
+        assert_eq!(reported_cwnd(usize::MAX), None);
+        assert_eq!(reported_cwnd(64 * 1024), Some(64 * 1024));
+        assert_eq!(reported_cwnd(0), Some(0));
+    }
+
+    /// Final SRTT comes from the connection's sent-packet tracker (so it is
+    /// populated under FixedRate, whose controller reports zero RTT) and the
+    /// timeout count is the RTO expiries during this transfer only.
+    #[test]
+    fn finish_stream_telemetry_uses_tracker_srtt_and_rto_delta() {
+        let time = VirtualTime::new();
+        let tracker =
+            parking_lot::Mutex::new(SentPacketTracker::new_with_time_source(time.clone()));
+        let none = finish_stream_telemetry(&tracker, StreamId::next_transport_internal(), 0, 0);
+        assert_eq!(
+            (none.final_srtt_ms, none.min_rtt_ms, none.rto_expiries),
+            (None, None, 0),
+            "no RTT sample yet: SRTT and min RTT must be null, not 0 / placeholder"
+        );
+
+        {
+            let mut t = tracker.lock();
+            t.report_sent_packet(1, vec![0u8; 8].into());
+        }
+        time.advance(Duration::from_millis(80));
+        tracker.lock().report_received_receipts(&[1]);
+
+        // Two RTO expiries before the transfer starts, one during it.
+        let force_rto = |id: u32| {
+            tracker.lock().report_sent_packet(id, vec![0u8; 8].into());
+            time.advance(Duration::from_secs(5));
+            loop {
+                let action = tracker.lock().get_resend();
+                match action {
+                    ResendActionForTest::Resend(..) => break,
+                    ResendActionForTest::TlpProbe(..) => continue,
+                    other @ (ResendActionForTest::WaitUntil(_)
+                    | ResendActionForTest::Abandon { .. }) => {
+                        panic!("expected a resend, got {other:?}")
+                    }
+                }
+            }
+            tracker.lock().report_received_receipts(&[id]);
+        };
+        force_rto(2);
+        force_rto(3);
+        let at_start = tracker.lock().rto_expiries();
+        force_rto(4);
+
+        let end =
+            finish_stream_telemetry(&tracker, StreamId::next_transport_internal(), 0, at_start);
+        assert_eq!(end.final_srtt_ms, Some(80));
+        assert_eq!(end.min_rtt_ms, Some(80));
+        assert_eq!(end.rto_expiries, 1);
+    }
+
+    use crate::transport::sent_packet_tracker::ResendAction as ResendActionForTest;
+
+    /// A stream whose fragments were all acknowledged before it registered
+    /// its final-ACK watch is published at once, not left queued until a
+    /// receipt batch that a quiet connection may never get.
+    #[test]
+    fn already_acked_stream_is_published_immediately() {
+        let time = VirtualTime::new();
+        let tracker =
+            parking_lot::Mutex::new(SentPacketTracker::new_with_time_source(time.clone()));
+        let stream = StreamId::next_transport_internal();
+        {
+            let mut t = tracker.lock();
+            t.report_sent_stream_packet_with_size(1, vec![0u8; 8].into(), None, stream, 8);
+            t.report_sent_stream_packet_with_size(2, vec![0u8; 8].into(), None, stream, 8);
+        }
+        time.advance(Duration::from_millis(20));
+        tracker.lock().report_received_receipts(&[1, 2]);
+        let before = crate::transport::TRANSPORT_METRICS.transfers_acked_count();
+        finish_stream_telemetry(&tracker, stream, 0, 0);
+        assert!(
+            crate::transport::TRANSPORT_METRICS.transfers_acked_count() > before,
+            "the completion must reach TRANSPORT_METRICS immediately"
+        );
+        assert!(tracker.lock().take_completed_stream_acks().is_empty());
+    }
 }
 
 #[cfg(test)]
@@ -860,6 +1273,359 @@ mod tests {
     use crate::transport::packet_data::PacketData;
     use crate::transport::token_bucket::TokenBucket;
     use tokio::sync::mpsc;
+
+    /// A stream that ends before reaching its declared total is a failed
+    /// pipe, not a successful one: the receiver would wait for the rest.
+    #[tokio::test]
+    async fn pipe_fails_a_stream_that_ends_short_of_its_total() {
+        use super::super::streaming_buffer::FRAGMENT_PAYLOAD_SIZE as F;
+        let chunks = futures::stream::iter(vec![
+            Ok(Bytes::from(vec![1u8; F])),
+            Ok(Bytes::from(vec![2u8; F])),
+        ]);
+        let (fragments, result) = pipe_and_capture_result(3 * F as u64, chunks, None).await;
+        assert_eq!(fragments.len(), 2, "premise: what arrived was forwarded");
+        assert!(
+            matches!(result, Err(TransportError::OutboundStreamFailed(_))),
+            "a short stream must fail the pipe: {result:?}"
+        );
+    }
+
+    /// Metadata is embedded in a forwarded fragment #1 only when the real
+    /// serialized fragment fits. Here payload + metadata leaves 5 bytes by
+    /// the old `payload + 41 + meta` estimate, but the metadata's 8-byte
+    /// length prefix does not fit: the pipe must skip the embed, not fail.
+    #[tokio::test]
+    async fn pipe_skips_metadata_that_would_overflow_fragment_one() {
+        use super::super::streaming_buffer::FRAGMENT_PAYLOAD_SIZE as F;
+        let meta = Bytes::from(vec![9u8; 40]);
+        let first = F - meta.len() - 5;
+        let expected = payload_of(first + F);
+        let chunks = futures::stream::iter(vec![
+            Ok(Bytes::copy_from_slice(&expected[..first])),
+            Ok(Bytes::copy_from_slice(&expected[first..])),
+        ]);
+        let (fragments, result) =
+            pipe_and_capture_result(expected.len() as u64, chunks, Some(meta)).await;
+        assert!(result.is_ok(), "the pipe must not fail: {result:?}");
+        assert!(
+            !fragments[0].has_metadata,
+            "metadata that does not fit is skipped"
+        );
+        assert_receiver_accepts(&fragments, &expected);
+    }
+
+    /// Yields its chunks with a `Pending` before each one (waking itself),
+    /// so a reader that drops `next()` on `Pending` drops it often.
+    struct HesitantChunks {
+        chunks: std::collections::VecDeque<Bytes>,
+        ready: bool,
+    }
+
+    impl futures::Stream for HesitantChunks {
+        type Item = Result<Bytes, super::super::streaming::StreamError>;
+
+        fn poll_next(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            if !self.ready {
+                self.ready = true;
+                cx.waker().wake_by_ref();
+                return std::task::Poll::Pending;
+            }
+            self.ready = false;
+            std::task::Poll::Ready(self.chunks.pop_front().map(Ok))
+        }
+    }
+
+    /// `Rechunk` read inside `select!`, with `next()` dropped every time its
+    /// input is `Pending`, loses and duplicates nothing.
+    #[tokio::test]
+    async fn rechunk_survives_dropped_next_futures() {
+        use super::super::streaming_buffer::FRAGMENT_PAYLOAD_SIZE as F;
+        use futures::StreamExt;
+        let sizes = [300, 2 * F + 5, 0, F, 100, F - 1, 7];
+        let expected = payload_of(sizes.iter().sum());
+        let mut at = 0;
+        let mut chunks = std::collections::VecDeque::new();
+        for len in sizes {
+            chunks.push_back(Bytes::copy_from_slice(&expected[at..at + len]));
+            at += len;
+        }
+        let mut rechunk = super::Rechunk::new(
+            HesitantChunks {
+                chunks,
+                ready: false,
+            },
+            F,
+        );
+        let (mut out, mut dropped) = (Vec::new(), 0);
+        loop {
+            tokio::select! {
+                biased;
+                item = rechunk.next() => match item {
+                    Some(chunk) => out.push(chunk.expect("no error")),
+                    None => break,
+                },
+                _ = std::future::ready(()) => dropped += 1,
+            }
+        }
+        assert!(dropped > 0, "premise: next() was dropped mid-read");
+        let bytes: Vec<u8> = out.iter().flat_map(|b| b.to_vec()).collect();
+        assert_eq!(bytes, expected, "nothing lost or duplicated");
+        assert_eq!(out[0].len(), 300, "#1 is the first chunk");
+        for piece in &out[1..out.len() - 1] {
+            assert_eq!(piece.len(), F, "middle fragments are full");
+        }
+    }
+
+    /// One outgoing fragment as decoded off the wire.
+    #[derive(Debug)]
+    struct WireFragment {
+        number: u32,
+        total: u64,
+        payload: Bytes,
+        has_metadata: bool,
+    }
+
+    /// Pipe `chunks` (declared `total` bytes) through `pipe_chunks` and decode
+    /// every packet it sends.
+    async fn pipe_and_capture<C>(
+        total: u64,
+        chunks: C,
+        metadata: Option<Bytes>,
+    ) -> Vec<WireFragment>
+    where
+        C: futures::Stream<Item = Result<Bytes, super::super::streaming::StreamError>>
+            + Unpin
+            + Send
+            + 'static,
+    {
+        let (fragments, result) = pipe_and_capture_result(total, chunks, metadata).await;
+        result.expect("pipe succeeds");
+        fragments
+    }
+
+    /// [`pipe_and_capture`], returning the pipe's result instead of
+    /// requiring success.
+    async fn pipe_and_capture_result<C>(
+        total: u64,
+        chunks: C,
+        metadata: Option<Bytes>,
+    ) -> (Vec<WireFragment>, Result<TransferStats, TransportError>)
+    where
+        C: futures::Stream<Item = Result<Bytes, super::super::streaming::StreamError>>
+            + Unpin
+            + Send
+            + 'static,
+    {
+        let (outbound_sender, mut outbound_receiver) = mpsc::channel(1);
+        let time_source = VirtualTime::new();
+        let (congestion_controller, token_bucket) = unthrottled(&time_source);
+        let cipher = random_cipher();
+        let task = GlobalExecutor::spawn(super::pipe_chunks(
+            total,
+            chunks,
+            StreamId::next(),
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(TestSocket::new(outbound_sender)),
+            SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 8080),
+            cipher.clone(),
+            Arc::new(parking_lot::Mutex::new(
+                SentPacketTracker::new_with_time_source(time_source.clone()),
+            )),
+            token_bucket,
+            congestion_controller,
+            time_source,
+            metadata,
+            None,
+        ));
+        let mut fragments = Vec::new();
+        while let Some((_, packet)) = outbound_receiver.recv().await {
+            let decrypted = PacketData::<_, MAX_PACKET_SIZE>::from_buf(packet.as_ref())
+                .try_decrypt_sym(&cipher)
+                .expect("decrypt");
+            let message = SymmetricMessage::deser(decrypted.data()).expect("deser");
+            let SymmetricMessagePayload::StreamFragment {
+                fragment_number,
+                total_length_bytes,
+                payload,
+                metadata_bytes,
+                ..
+            } = message.payload
+            else {
+                panic!("expected a StreamFragment");
+            };
+            fragments.push(WireFragment {
+                number: fragment_number,
+                total: total_length_bytes,
+                payload,
+                has_metadata: metadata_bytes.is_some(),
+            });
+        }
+        let result = task.await.expect("join");
+        (fragments, result)
+    }
+
+    /// What a receiver accepts: numbered from 1, within
+    /// `ceil(total / F) + 1` slots, no empty fragment but #1, every fragment
+    /// but #1 and the last exactly full, and the bytes in order equal to
+    /// `expected`.
+    fn assert_receiver_accepts(fragments: &[WireFragment], expected: &[u8]) {
+        use super::super::streaming_buffer::FRAGMENT_PAYLOAD_SIZE as F;
+        let total = expected.len() as u64;
+        let slots = expected.len().div_ceil(F) + 1;
+        assert!(
+            fragments.len() <= slots,
+            "{} fragments for {slots} slots",
+            fragments.len()
+        );
+        for (i, f) in fragments.iter().enumerate() {
+            assert_eq!(f.number as usize, i + 1, "fragment numbering");
+            assert_eq!(f.total, total, "declared total on every fragment");
+            assert!(f.payload.len() <= F, "fragment {} over capacity", f.number);
+            if f.number > 1 {
+                assert!(!f.payload.is_empty(), "empty fragment {}", f.number);
+            }
+            if f.number > 1 && i + 1 < fragments.len() {
+                assert_eq!(
+                    f.payload.len(),
+                    F,
+                    "non-final fragment {} not full",
+                    f.number
+                );
+            }
+        }
+        let bytes: Vec<u8> = fragments.iter().flat_map(|f| f.payload.to_vec()).collect();
+        assert_eq!(bytes.len() as u64, total, "byte total");
+        assert_eq!(bytes, expected, "bytes in order");
+    }
+
+    /// An independent check: a real receiver-side `StreamHandle` for the
+    /// declared total accepts every fragment and assembles `expected`.
+    async fn assert_real_receiver_assembles(fragments: &[WireFragment], expected: &[u8]) {
+        let receiver =
+            super::super::streaming::StreamHandle::new(StreamId::next(), expected.len() as u64);
+        for f in fragments {
+            receiver
+                .push_fragment(f.number, f.payload.clone())
+                .unwrap_or_else(|e| panic!("receiver refused fragment {}: {e:?}", f.number));
+        }
+        let assembled = tokio::time::timeout(Duration::from_secs(5), receiver.assemble())
+            .await
+            .expect("receiver completes")
+            .expect("receiver assembles");
+        assert_eq!(assembled, expected, "receiver assembled the stream");
+    }
+
+    fn payload_of(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i % 251) as u8).collect()
+    }
+
+    /// A UDP-received stream is forwarded with exactly its incoming fragment
+    /// boundaries, which is what the pipe did before it re-chunked: a short
+    /// #1 (the origin embedded its metadata), full middles, a short last.
+    #[tokio::test]
+    async fn pipe_forwards_a_udp_received_stream_with_its_own_boundaries() {
+        use super::super::streaming_buffer::FRAGMENT_PAYLOAD_SIZE as F;
+        let sizes = [F - 50, F, F, 300];
+        let expected = payload_of(sizes.iter().sum());
+        let handle =
+            super::super::streaming::StreamHandle::new(StreamId::next(), expected.len() as u64);
+        let mut at = 0;
+        for (n, len) in sizes.iter().enumerate() {
+            handle
+                .push_fragment(
+                    n as u32 + 1,
+                    Bytes::copy_from_slice(&expected[at..at + len]),
+                )
+                .unwrap();
+            at += len;
+        }
+        let stream = crate::transport::IncomingStream::from(handle);
+        let fragments = pipe_and_capture(
+            stream.total_bytes(),
+            stream.chunks(),
+            Some(Bytes::from(vec![1u8; 40])),
+        )
+        .await;
+        let out: Vec<_> = fragments.iter().map(|f| f.payload.len()).collect();
+        assert_eq!(out, sizes, "outgoing boundaries equal the incoming ones");
+        assert!(fragments[0].has_metadata, "#1 carries this hop's metadata");
+        assert_receiver_accepts(&fragments, &expected);
+        assert_real_receiver_assembles(&fragments, &expected).await;
+    }
+
+    /// An older sender's empty fragment #1 is forwarded as an empty #1, as
+    /// before.
+    #[tokio::test]
+    async fn pipe_keeps_an_empty_first_fragment_from_an_older_sender() {
+        use super::super::streaming_buffer::FRAGMENT_PAYLOAD_SIZE as F;
+        let expected = payload_of(2 * F);
+        let handle =
+            super::super::streaming::StreamHandle::new(StreamId::next(), expected.len() as u64);
+        handle.push_fragment(1, Bytes::new()).unwrap();
+        handle
+            .push_fragment(2, Bytes::copy_from_slice(&expected[..F]))
+            .unwrap();
+        handle
+            .push_fragment(3, Bytes::copy_from_slice(&expected[F..]))
+            .unwrap();
+        let stream = crate::transport::IncomingStream::from(handle);
+        let fragments = pipe_and_capture(stream.total_bytes(), stream.chunks(), None).await;
+        let out: Vec<_> = fragments.iter().map(|f| f.payload.len()).collect();
+        assert_eq!(out, [0, F, F]);
+        assert_receiver_accepts(&fragments, &expected);
+        assert_real_receiver_assembles(&fragments, &expected).await;
+    }
+
+    /// A stream received in chunks longer than a fragment (as another
+    /// transport would deliver it) goes out as fragments the receiver
+    /// accepts, with fragment #1 sized to carry this hop's metadata.
+    #[tokio::test]
+    async fn pipe_rechunks_long_chunks_into_full_fragments() {
+        use super::super::streaming_buffer::FRAGMENT_PAYLOAD_SIZE as F;
+        let expected = payload_of(3 * F);
+        let handle =
+            super::super::streaming::StreamHandle::new(StreamId::next(), expected.len() as u64);
+        handle
+            .push_fragment(1, Bytes::copy_from_slice(&expected[..2 * F]))
+            .unwrap();
+        handle
+            .push_fragment(2, Bytes::copy_from_slice(&expected[2 * F..]))
+            .unwrap();
+        let stream = crate::transport::IncomingStream::from(handle);
+        let metadata = Bytes::from(vec![1u8; 40]);
+        let fragments =
+            pipe_and_capture(stream.total_bytes(), stream.chunks(), Some(metadata)).await;
+        assert_eq!(
+            fragments[0].payload.len(),
+            F - (1 + 8 + 40),
+            "#1 leaves room for the metadata, as send_stream does"
+        );
+        assert!(fragments[0].has_metadata, "and carries it");
+        assert_receiver_accepts(&fragments, &expected);
+        assert_real_receiver_assembles(&fragments, &expected).await;
+    }
+
+    /// Many short chunks, some empty, are packed into full fragments.
+    #[tokio::test]
+    async fn pipe_packs_short_and_empty_chunks_into_full_fragments() {
+        use super::super::streaming_buffer::FRAGMENT_PAYLOAD_SIZE as F;
+        let expected = payload_of(2 * F + 77);
+        let mut chunks = Vec::new();
+        for (i, piece) in expected.chunks(100).enumerate() {
+            chunks.push(Ok(Bytes::copy_from_slice(piece)));
+            if i % 3 == 0 {
+                chunks.push(Ok(Bytes::new()));
+            }
+        }
+        let fragments =
+            pipe_and_capture(expected.len() as u64, futures::stream::iter(chunks), None).await;
+        assert_receiver_accepts(&fragments, &expected);
+        assert_real_receiver_assembles(&fragments, &expected).await;
+    }
 
     /// Simple test socket that writes to a channel
     struct TestSocket {
@@ -932,7 +1698,7 @@ mod tests {
         ));
 
         let background_task = GlobalExecutor::spawn(send_stream(
-            StreamId::next(),
+            StreamId::next_transport_internal(),
             Arc::new(AtomicU32::new(0)),
             Arc::new(TestSocket::new(outbound_sender)),
             remote_addr,
@@ -968,148 +1734,40 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn test_send_stream_with_bandwidth_limit() -> Result<(), Box<dyn std::error::Error>> {
-        let (outbound_sender, mut outbound_receiver) = mpsc::channel(100);
-        let destination_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 1234));
-        let key = Aes128Gcm::new_from_slice(&[0u8; 16])?;
-        let last_packet_id = Arc::new(AtomicU32::new(0));
-        let stream_id = StreamId::next();
-
-        // Create a large message (10KB)
-        let message = vec![0u8; 10_000];
-
-        // Set bandwidth limit to 100KB/s (100,000 bytes/second)
-        let bandwidth_limit = 100_000;
-
-        // Use real time for integration testing with bandwidth limiting
-        let time_source = RealTime::new();
-        let sent_tracker = Arc::new(parking_lot::Mutex::new(
-            SentPacketTracker::new_with_time_source(time_source.clone()),
-        ));
-
-        // Initialize congestion controller and TokenBucket for test
-        // Use large cwnd since unit tests don't simulate ACKs to reduce flightsize
-        // Use small burst capacity (1KB) to ensure rate limiting is observable
-        let congestion_controller = CongestionControlConfig::from_ledbat_config(LedbatConfig {
-            initial_cwnd: 1_000_000,
-            min_cwnd: 1_000_000,
-            max_cwnd: 1_000_000_000,
-            ..Default::default()
-        })
-        .build_arc();
-        let token_bucket = Arc::new(TokenBucket::new_with_time_source(
-            1_000, // 1KB burst - ensures rate limiting kicks in
-            bandwidth_limit,
-            time_source.clone(),
-        ));
-
-        // Expected: 100KB/s with token bucket rate limiting
-        // Should throttle appropriately
-
-        let start_time = tokio::time::Instant::now();
-
-        // Clone sender for receiver task termination
-        let sender_clone: mpsc::Sender<(SocketAddr, Arc<[u8]>)> = outbound_sender.clone();
-        let key_clone = key.clone();
-
-        // Spawn receiver task to collect packets
-        let receiver_task = GlobalExecutor::spawn(async move {
-            let mut packet_count = 0;
-            let mut total_bytes = 0;
-            while let Some((addr, packet)) = outbound_receiver.recv().await {
-                assert_eq!(addr, destination_addr);
-                packet_count += 1;
-                total_bytes += packet.len();
-
-                // Decrypt and verify it's a stream fragment
-                let packet_data = PacketData::<_, MAX_PACKET_SIZE>::from_buf(&packet);
-                let decrypted = packet_data.try_decrypt_sym(&key_clone).unwrap();
-                let msg = SymmetricMessage::deser(decrypted.data()).unwrap();
-                match msg.payload {
-                    SymmetricMessagePayload::StreamFragment { .. } => {
-                        // Expected
-                    }
-                    SymmetricMessagePayload::AckConnection { .. }
-                    | SymmetricMessagePayload::AckConnectionV2 { .. }
-                    | SymmetricMessagePayload::ShortMessage { .. }
-                    | SymmetricMessagePayload::NoOp
-                    | SymmetricMessagePayload::Ping { .. }
-                    | SymmetricMessagePayload::Pong { .. } => panic!("Expected stream fragment"),
-                }
-            }
-            (packet_count, total_bytes)
-        });
-
-        // Spawn the send_stream task
-        let send_task = GlobalExecutor::spawn(send_stream(
-            stream_id,
-            last_packet_id.clone(),
-            Arc::new(TestSocket::new(outbound_sender)),
-            destination_addr,
-            Bytes::from(message.clone()),
-            key.clone(),
-            sent_tracker.clone(),
-            token_bucket,
-            congestion_controller,
-            time_source,
-            None,
-            None,
-            None,
-        ));
-
-        // Wait for send task to complete
-        send_task.await??;
-        let elapsed = start_time.elapsed();
-
-        // Drop the cloned sender to close the channel
-        drop(sender_clone);
-
-        // Get receiver results
-        let (packet_count, _total_bytes) = receiver_task.await?;
-
-        // Verify we sent the expected number of packets
-        let expected_packets = message.len().div_ceil(MAX_DATA_SIZE);
-        assert_eq!(packet_count, expected_packets);
-
-        // Verify that rate limiting occurred
-        // For 10KB at 100KB/s with 1KB burst:
-        // - First 1KB sent immediately (burst)
-        // - Remaining 9KB at 100KB/s = ~90ms
-        // - Actual timing: ~50-60ms due to concurrent token refill
-        debug!(
-            "Transfer took: {elapsed:?}, packets sent: {packet_count}, expected: {expected_packets}"
-        );
-        debug!("Bytes per packet: ~{MAX_DATA_SIZE}");
-        assert!(
-            elapsed.as_millis() >= 50,
-            "Transfer completed too quickly: {elapsed:?}"
-        );
-
-        Ok(())
+    /// Outcome of one [`run_virtual_stream_transfer`] run.
+    struct VirtualTransfer {
+        /// Raw packets the receiver observed, in order.
+        packets: Vec<Arc<[u8]>>,
+        /// Virtual time that elapsed. Time only moves when the driver
+        /// advances it, and the driver only does so when `send_stream` is
+        /// parked on a `time_source.sleep`, so this is exactly the sum of
+        /// the token-bucket waits and independent of host load.
+        virtual_elapsed: Duration,
+        /// Number of times `send_stream` parked on the clock (each is one
+        /// token-bucket or cwnd wait).
+        sleeps: usize,
     }
 
-    /// Run a single 10KB stream transfer with the given token-bucket
-    /// (burst capacity, rate bytes/s) and return the wall-clock duration plus
-    /// the number of packets the receiver observed.
+    /// Payload size used by [`run_virtual_stream_transfer`].
+    const TRANSFER_LEN: usize = 10_000;
+
+    /// Run a single 10KB stream transfer under [`VirtualTime`] with the given
+    /// token bucket (burst capacity, rate bytes/s).
     ///
-    /// Shared between the rate-limited and unlimited measurements in
-    /// [`test_send_stream_without_bandwidth_limit`] so both paths run through
-    /// identical setup; only the token-bucket parameters differ.
-    async fn measure_stream_transfer(
+    /// Nothing here reads the wall clock: the driver advances virtual time
+    /// to the next pending wakeup whenever the sender is waiting on it, so
+    /// the result depends only on the token-bucket arithmetic (#4163).
+    async fn run_virtual_stream_transfer(
         burst_capacity: usize,
         rate_bytes_per_sec: usize,
-    ) -> Result<(Duration, usize), Box<dyn std::error::Error>> {
+    ) -> Result<VirtualTransfer, Box<dyn std::error::Error>> {
         let (outbound_sender, mut outbound_receiver) = mpsc::channel(100);
         let destination_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 1234));
         let key = Aes128Gcm::new_from_slice(&[0u8; 16])?;
-        let last_packet_id = Arc::new(AtomicU32::new(0));
-        let stream_id = StreamId::next();
 
-        // Create a large message (10KB)
-        let message = vec![0u8; 10_000];
+        let message = vec![0u8; TRANSFER_LEN];
 
-        let time_source = RealTime::new();
+        let time_source = VirtualTime::new();
         let sent_tracker = Arc::new(parking_lot::Mutex::new(
             SentPacketTracker::new_with_time_source(time_source.clone()),
         ));
@@ -1121,98 +1779,166 @@ mod tests {
             max_cwnd: 1_000_000_000,
             ..Default::default()
         })
-        .build_arc();
+        .build_arc_with_time_source(time_source.clone());
         let token_bucket = Arc::new(TokenBucket::new_with_time_source(
             burst_capacity,
             rate_bytes_per_sec,
             time_source.clone(),
         ));
 
-        let start_time = tokio::time::Instant::now();
-
-        // Clone sender for receiver task termination
-        let sender_clone: mpsc::Sender<(SocketAddr, Arc<[u8]>)> = outbound_sender.clone();
-
         // Spawn receiver task to collect packets
         let receiver_task = GlobalExecutor::spawn(async move {
-            let mut packet_count = 0;
-            while let Some((addr, _packet)) = outbound_receiver.recv().await {
+            let mut packets = Vec::new();
+            while let Some((addr, packet)) = outbound_receiver.recv().await {
                 assert_eq!(addr, destination_addr);
-                packet_count += 1;
+                packets.push(packet);
             }
-            packet_count
+            packets
         });
 
-        // Spawn the send_stream task
+        let start_nanos = time_source.now_nanos();
         let send_task = GlobalExecutor::spawn(send_stream(
-            stream_id,
-            last_packet_id.clone(),
+            StreamId::next_transport_internal(),
+            Arc::new(AtomicU32::new(0)),
             Arc::new(TestSocket::new(outbound_sender)),
             destination_addr,
             Bytes::from(message.clone()),
-            key.clone(),
-            sent_tracker.clone(),
+            key,
+            sent_tracker,
             token_bucket,
             congestion_controller,
-            time_source,
+            time_source.clone(),
             None,
             None,
             None,
         ));
 
-        // Wait for send task to complete
+        // Drive virtual time: only advance when the sender is parked on a
+        // sleep, otherwise yield so the sender and receiver can make progress.
+        //
+        // This is deterministic because `VirtualTime::sleep` registers its
+        // wakeup with a fixed deadline when the sleep future is created (not
+        // when it is first polled), and this test runs on tokio's
+        // `current_thread` runtime, so the sender only runs while the driver
+        // is yielding. Whether the driver observes a pending wakeup before or
+        // after the sender has parked, the deadline is the same, so the
+        // virtual elapsed time is the same.
+        //
+        // Guard against a stalled sender: a healthy transfer needs a handful
+        // of iterations per fragment, so exceeding the cap means the sender is
+        // stuck, and should fail loudly instead of hanging CI.
+        const MAX_DRIVER_ITERATIONS: usize = 100_000;
+        let mut sleeps = 0;
+        let mut iterations = 0;
+        while !send_task.is_finished() {
+            iterations += 1;
+            assert!(
+                iterations <= MAX_DRIVER_ITERATIONS,
+                "send_stream did not finish after {MAX_DRIVER_ITERATIONS} driver iterations \
+                 ({sleeps} virtual sleeps, virtual time {:?}): the sender is stalled",
+                Duration::from_nanos(time_source.now_nanos() - start_nanos),
+            );
+            if time_source.advance_to_next_wakeup().is_some() {
+                sleeps += 1;
+            }
+            tokio::task::yield_now().await;
+        }
         send_task.await??;
-        let elapsed = start_time.elapsed();
+        let virtual_elapsed = Duration::from_nanos(time_source.now_nanos() - start_nanos);
 
-        // Drop the cloned sender to close the channel
-        drop(sender_clone);
-
-        // Get receiver results
-        let packet_count = receiver_task.await?;
-
-        // Verify we sent the expected number of packets
+        // The sender (and its socket's channel sender) is dropped, so the
+        // receiver task ends.
+        let packets = receiver_task.await?;
         let expected_packets = message.len().div_ceil(MAX_DATA_SIZE);
-        assert_eq!(packet_count, expected_packets);
+        assert_eq!(packets.len(), expected_packets);
 
-        Ok((elapsed, packet_count))
+        Ok(VirtualTransfer {
+            packets,
+            virtual_elapsed,
+            sleeps,
+        })
+    }
+
+    /// Assert `elapsed` matches the token-bucket pacing of `TRANSFER_LEN`
+    /// bytes after the initial `burst`, within +/-5%. Virtual time is exact, so
+    /// the window only absorbs fragment granularity; a limiter that is 1.5x too
+    /// fast or too slow fails.
+    fn assert_throttled_duration(elapsed: Duration, burst: usize, rate: usize) {
+        let expected = Duration::from_secs_f64((TRANSFER_LEN - burst) as f64 / rate as f64);
+        let (lo, hi) = (expected.mul_f64(0.95), expected.mul_f64(1.05));
+        assert!(
+            (lo..=hi).contains(&elapsed),
+            "throttled transfer took {elapsed:?}, expected {expected:?} (window {lo:?}..={hi:?})"
+        );
     }
 
     #[tokio::test]
-    async fn test_send_stream_without_bandwidth_limit() -> Result<(), Box<dyn std::error::Error>> {
-        // The unlimited path is bounded ABOVE by the rate-limited path, so we
-        // co-measure both transfers and assert a RATIO rather than an absolute
-        // wall-clock cap. An absolute cap (the old `< 50ms`) is inherently
-        // flaky: under CI/CPU pressure the same unthrottled transfer can take
-        // 60-70ms+ even though it is still far faster than a throttled one.
-        // Comparing the two measurements in the same process cancels out that
-        // shared scheduling noise.
+    async fn test_send_stream_with_bandwidth_limit() -> Result<(), Box<dyn std::error::Error>> {
+        // The bucket starts with `burst` tokens and every payload byte is
+        // reserved against it, so the remaining (TRANSFER_LEN - burst) bytes
+        // are paced at `rate`: 9000 B at 100 KB/s = 90 ms of virtual time.
+        let (burst, rate) = (1_000, 100_000);
+        let transfer = run_virtual_stream_transfer(burst, rate).await?;
 
-        // Rate-limited: 10KB over 100KB/s with a 1KB burst. The first 1KB goes
-        // out immediately, the remaining 9KB is paced at 100KB/s (~90ms).
-        let (limited_elapsed, _) = measure_stream_transfer(1_000, 100_000).await?;
+        let key = Aes128Gcm::new_from_slice(&[0u8; 16])?;
+        for packet in &transfer.packets {
+            // Decrypt and verify it's a stream fragment
+            let packet_data = PacketData::<_, MAX_PACKET_SIZE>::from_buf(packet);
+            let decrypted = packet_data.try_decrypt_sym(&key).unwrap();
+            let msg = SymmetricMessage::deser(decrypted.data()).unwrap();
+            match msg.payload {
+                SymmetricMessagePayload::StreamFragment { .. } => {
+                    // Expected
+                }
+                SymmetricMessagePayload::AckConnection { .. }
+                | SymmetricMessagePayload::AckConnectionV2 { .. }
+                | SymmetricMessagePayload::ShortMessage { .. }
+                | SymmetricMessagePayload::NoOp
+                | SymmetricMessagePayload::Ping { .. }
+                | SymmetricMessagePayload::Pong { .. } => panic!("Expected stream fragment"),
+            }
+        }
 
-        // Unlimited: 100KB burst + 1GB/s rate means the token bucket never
-        // throttles; the transfer is bounded only by per-packet processing.
-        let (unlimited_elapsed, _) = measure_stream_transfer(100_000, 1_000_000_000).await?;
-
-        // Sanity floor: rate limiting must actually have an observable effect.
-        // Without this, a regression that silently disabled throttling could
-        // make both timings ~0 and still satisfy the ratio below.
-        assert!(
-            limited_elapsed.as_millis() >= 50,
-            "Rate-limited transfer completed too quickly to be a meaningful \
-             baseline: {limited_elapsed:?}"
+        debug!(
+            "Transfer took (virtual): {:?}, packets sent: {}, sleeps: {}",
+            transfer.virtual_elapsed,
+            transfer.packets.len(),
+            transfer.sleeps
         );
-
-        // Core invariant: the unlimited transfer must be dramatically faster
-        // than the rate-limited one. Use a 4x safety margin so the assertion
-        // tolerates wide platform/scheduling variance while still failing if
-        // the unlimited path ever approaches rate-limited timings.
         assert!(
-            unlimited_elapsed * 4 < limited_elapsed,
-            "Unlimited transfer ({unlimited_elapsed:?}) was not meaningfully \
-             faster than the rate-limited transfer ({limited_elapsed:?}); \
-             expected unlimited * 4 < rate-limited"
+            transfer.sleeps > 0,
+            "rate limiting must have parked the sender on the token bucket"
+        );
+        assert_throttled_duration(transfer.virtual_elapsed, burst, rate);
+
+        Ok(())
+    }
+
+    /// With a bucket that never throttles (100KB burst, 1GB/s) the sender must
+    /// never wait on the clock at all. This asserts the mechanism (no
+    /// token-bucket wait, zero virtual time) rather than comparing wall-clock
+    /// durations, which flaked under CPU load (#4163). The rate-limited run is
+    /// the control: the same harness must observe waits when throttled, so a
+    /// harness that cannot see sleeps cannot pass this test vacuously.
+    #[tokio::test]
+    async fn test_send_stream_without_bandwidth_limit() -> Result<(), Box<dyn std::error::Error>> {
+        let (burst, rate) = (1_000, 100_000);
+        let limited = run_virtual_stream_transfer(burst, rate).await?;
+        assert!(
+            limited.sleeps > 0,
+            "control: the rate-limited run must wait on the token bucket"
+        );
+        assert_throttled_duration(limited.virtual_elapsed, burst, rate);
+
+        let unlimited = run_virtual_stream_transfer(100_000, 1_000_000_000).await?;
+        assert_eq!(
+            unlimited.sleeps, 0,
+            "an unlimited token bucket must never make the sender wait"
+        );
+        assert_eq!(
+            unlimited.virtual_elapsed,
+            Duration::ZERO,
+            "an unlimited transfer must consume no virtual time"
         );
 
         Ok(())
@@ -1253,7 +1979,7 @@ mod tests {
         let token_bucket = Arc::new(TokenBucket::new(1_000_000, 100_000_000));
 
         let send_task = GlobalExecutor::spawn(send_stream(
-            StreamId::next(),
+            StreamId::next_transport_internal(),
             Arc::new(AtomicU32::new(0)),
             Arc::new(TestSocket::new(outbound_sender)),
             remote_addr,
@@ -1290,7 +2016,7 @@ mod tests {
     /// `peer_connection.rs` treats as fatal — tearing the whole connection down
     /// and killing every other operation multiplexed on it, forcing a
     /// re-handshake. The fix returns `TransportError::OutboundStreamFailed`,
-    /// which `is_transient_send_failure()` classifies as non-fatal, so the recv
+    /// which `is_transient()` classifies as non-fatal, so the recv
     /// loop logs and lets the op layer retry while the connection survives (the
     /// idle timeout remains the sole authority on connection liveness).
     ///
@@ -1298,12 +2024,12 @@ mod tests {
     /// 1-byte cwnd (no packet ever fits, so the wait loop never breaks) and
     /// asserts:
     ///   1. the error IS `OutboundStreamFailed` (not `ConnectionClosed`), and
-    ///   2. `is_transient_send_failure()` is `true`, i.e. the recv loop takes
+    ///   2. `is_transient()` is `true`, i.e. the recv loop takes
     ///      the connection-survival arm.
     ///
-    /// Asserting on `is_transient_send_failure()` is the load-bearing check:
+    /// Asserting on `is_transient()` is the load-bearing check:
     /// the recv-loop classification (`peer_connection.rs`) is exactly
-    /// `Err(e) if e.is_transient_send_failure() => /* connection survives */`
+    /// `Err(e) if e.is_transient() => /* connection survives */`
     /// vs the catch-all `Err(e) => return Err(e) /* connection torn down */`.
     /// `send_failure_returns_transient_error` in `peer_connection.rs` exercises
     /// the symmetric SendFailed case the same way. A full `PeerConnection::recv`
@@ -1341,7 +2067,7 @@ mod tests {
         let token_bucket = Arc::new(TokenBucket::new(1_000_000, 100_000_000));
 
         let send_task = GlobalExecutor::spawn(send_stream(
-            StreamId::next(),
+            StreamId::next_transport_internal(),
             Arc::new(AtomicU32::new(0)),
             Arc::new(TestSocket::new(outbound_sender)),
             remote_addr,
@@ -1374,14 +2100,216 @@ mod tests {
             "cwnd timeout must NOT be ConnectionClosed (would kill the connection): {err:?}"
         );
 
-        // (3) The recv loop branches on is_transient_send_failure(); true means
+        // (3) The recv loop branches on is_transient(); true means
         // it logs and lets the op layer retry while the connection survives.
         assert!(
-            err.is_transient_send_failure(),
+            err.is_transient(),
             "cwnd timeout must be classified transient so the connection survives: {err:?}"
         );
 
         Ok(())
+    }
+
+    fn big_cwnd() -> Arc<CongestionController<RealTime>> {
+        CongestionControlConfig::from_ledbat_config(LedbatConfig {
+            initial_cwnd: 1_000_000,
+            min_cwnd: 1_000_000,
+            max_cwnd: 1_000_000_000,
+            ..Default::default()
+        })
+        .build_arc()
+    }
+
+    fn random_cipher() -> Aes128Gcm {
+        let mut key = [0u8; 16];
+        crate::config::GlobalRng::fill_bytes(&mut key);
+        Aes128Gcm::new(&key.into())
+    }
+
+    /// A message longer than `MAX_STREAM_TOTAL_BYTES` is not started: no
+    /// fragment is sent, the broadcast queue is told it was dropped, and the
+    /// error is stream-scoped but NOT transient (a retry fails the same way).
+    #[tokio::test(start_paused = true)]
+    async fn send_stream_refuses_a_stream_above_the_length_cap()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use super::super::streaming::MAX_STREAM_TOTAL_BYTES;
+
+        let (outbound_sender, mut outbound_receiver) = mpsc::channel(100);
+        let remote_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 8080);
+        // Zeroed and never written, so the pages are never touched.
+        let message = Bytes::from(vec![0u8; MAX_STREAM_TOTAL_BYTES as usize + 1]);
+        let (completion_tx, completion_rx) = oneshot::channel();
+
+        let result = send_stream(
+            StreamId::next_transport_internal(),
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(TestSocket::new(outbound_sender)),
+            remote_addr,
+            message,
+            random_cipher(),
+            Arc::new(parking_lot::Mutex::new(SentPacketTracker::new())),
+            Arc::new(TokenBucket::new(1_000_000, 100_000_000)),
+            big_cwnd(),
+            RealTime::new(),
+            None,
+            Some(completion_tx),
+            None,
+        )
+        .await;
+
+        let err = result.expect_err("an over-cap stream must not be sent");
+        assert!(
+            matches!(
+                err,
+                TransportError::OutboundStreamInvalidLength(addr, len)
+                    if addr == remote_addr && len == MAX_STREAM_TOTAL_BYTES + 1
+            ),
+            "got: {err:?}"
+        );
+        assert!(!err.is_transient());
+        assert!(
+            outbound_receiver.try_recv().is_err(),
+            "no fragment of a refused stream may be sent"
+        );
+        assert!(matches!(
+            completion_rx.await,
+            Ok(crate::transport::StreamSendOutcome::Dropped)
+        ));
+        Ok(())
+    }
+
+    /// A message of exactly `MAX_STREAM_TOTAL_BYTES` is sent, and its
+    /// fragments declare the full length as a u64.
+    #[tokio::test(start_paused = true)]
+    async fn send_stream_sends_a_stream_at_the_length_cap() -> Result<(), Box<dyn std::error::Error>>
+    {
+        use super::super::streaming::MAX_STREAM_TOTAL_BYTES;
+
+        let (outbound_sender, mut outbound_receiver) = mpsc::channel(4);
+        let remote_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 8080);
+        let message = Bytes::from(vec![0u8; MAX_STREAM_TOTAL_BYTES as usize]);
+        let cipher = random_cipher();
+
+        let task = GlobalExecutor::spawn(send_stream(
+            StreamId::next_transport_internal(),
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(TestSocket::new(outbound_sender)),
+            remote_addr,
+            message,
+            cipher.clone(),
+            Arc::new(parking_lot::Mutex::new(SentPacketTracker::new())),
+            Arc::new(TokenBucket::new(1_000_000, 100_000_000)),
+            big_cwnd(),
+            RealTime::new(),
+            None,
+            None,
+            None,
+        ));
+
+        let (_, packet) = outbound_receiver
+            .recv()
+            .await
+            .expect("an at-cap stream is sent");
+        let decrypted = PacketData::<_, MAX_PACKET_SIZE>::from_buf(packet.as_ref())
+            .try_decrypt_sym(&cipher)
+            .map_err(|e| e.to_string())?;
+        let SymmetricMessagePayload::StreamFragment {
+            total_length_bytes,
+            fragment_number,
+            ..
+        } = SymmetricMessage::deser(decrypted.data())?.payload
+        else {
+            panic!("expected a stream fragment");
+        };
+        assert_eq!(fragment_number, 1);
+        assert_eq!(total_length_bytes, MAX_STREAM_TOTAL_BYTES);
+        task.abort();
+        Ok(())
+    }
+
+    /// Metadata that would leave fragment #1 no payload is not embedded, so
+    /// every fragment carries payload and the stream arrives intact.
+    #[tokio::test(start_paused = true)]
+    async fn send_stream_never_emits_an_empty_fragment() -> Result<(), Box<dyn std::error::Error>> {
+        for meta_len in [MAX_DATA_SIZE - 10, MAX_DATA_SIZE - 9, MAX_DATA_SIZE] {
+            let (outbound_sender, mut outbound_receiver) = mpsc::channel(100);
+            let remote_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 8080);
+            let message: Vec<u8> = (0..3_000u32).map(|i| i as u8).collect();
+            let cipher = random_cipher();
+            let task = GlobalExecutor::spawn(send_stream(
+                StreamId::next(),
+                Arc::new(AtomicU32::new(0)),
+                Arc::new(TestSocket::new(outbound_sender)),
+                remote_addr,
+                Bytes::from(message.clone()),
+                cipher.clone(),
+                Arc::new(parking_lot::Mutex::new(SentPacketTracker::new())),
+                Arc::new(TokenBucket::new(1_000_000, 100_000_000)),
+                big_cwnd(),
+                RealTime::new(),
+                Some(Bytes::from(vec![9u8; meta_len])),
+                None,
+                None,
+            ));
+            task.await??;
+            let mut received = Vec::new();
+            while let Ok((_, packet)) = outbound_receiver.try_recv() {
+                let decrypted = PacketData::<_, MAX_PACKET_SIZE>::from_buf(packet.as_ref())
+                    .try_decrypt_sym(&cipher)
+                    .map_err(|e| e.to_string())?;
+                let SymmetricMessagePayload::StreamFragment {
+                    payload,
+                    metadata_bytes,
+                    fragment_number,
+                    ..
+                } = SymmetricMessage::deser(decrypted.data())?.payload
+                else {
+                    panic!("expected a stream fragment");
+                };
+                assert!(
+                    !payload.is_empty(),
+                    "meta_len {meta_len}: fragment {fragment_number} is empty"
+                );
+                if let Some(meta) = metadata_bytes {
+                    assert_eq!(fragment_number, 1);
+                    assert!(1 + 8 + meta.len() < MAX_DATA_SIZE);
+                }
+                received.extend_from_slice(&payload);
+            }
+            assert_eq!(received, message, "meta_len {meta_len}");
+        }
+        Ok(())
+    }
+
+    /// `pipe_stream` applies the same length check to the stream it forwards.
+    #[tokio::test(start_paused = true)]
+    async fn pipe_stream_refuses_a_stream_with_an_invalid_length() {
+        use crate::transport::peer_connection::streaming::StreamHandle;
+
+        let (outbound_sender, mut outbound_receiver) = mpsc::channel(4);
+        let remote_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 8080);
+        let result = pipe_stream(
+            StreamHandle::new(StreamId::next(), 0).into(),
+            StreamId::next(),
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(TestSocket::new(outbound_sender)),
+            remote_addr,
+            random_cipher(),
+            Arc::new(parking_lot::Mutex::new(SentPacketTracker::new())),
+            Arc::new(TokenBucket::new(1_000_000, 100_000_000)),
+            big_cwnd(),
+            RealTime::new(),
+            None,
+            None,
+        )
+        .await;
+        let err = result.expect_err("an empty stream must not be forwarded");
+        assert!(
+            matches!(err, TransportError::OutboundStreamInvalidLength(addr, 0) if addr == remote_addr),
+            "got: {err:?}"
+        );
+        assert!(!err.is_transient());
+        assert!(outbound_receiver.try_recv().is_err());
     }
 
     /// Core regression for issue #4345: when an outbound stream aborts on a
@@ -1435,7 +2363,7 @@ mod tests {
 
         let cc_for_send = congestion_controller.clone();
         let send_task = GlobalExecutor::spawn(send_stream(
-            StreamId::next(),
+            StreamId::next_transport_internal(),
             Arc::new(AtomicU32::new(0)),
             Arc::new(TestSocket::new(outbound_sender)),
             remote_addr,
@@ -1507,7 +2435,7 @@ mod tests {
 
         let cc_for_send = congestion_controller.clone();
         let send_task = GlobalExecutor::spawn(send_stream(
-            StreamId::next(),
+            StreamId::next_transport_internal(),
             Arc::new(AtomicU32::new(0)),
             Arc::new(TestSocket::new(outbound_sender)),
             remote_addr,
@@ -1539,7 +2467,7 @@ mod tests {
     }
 
     /// Issue #4235 — producer-side emission: a `send_stream` that runs to a
-    /// successful completion MUST signal `BroadcastDeliveryOutcome::Delivered`
+    /// successful completion MUST signal `StreamSendOutcome::Delivered`
     /// on its `completion_tx`.
     ///
     /// The broadcast queue gates interest-refresh / summary-cache on this exact
@@ -1579,7 +2507,7 @@ mod tests {
 
         let (completion_tx, completion_rx) = oneshot::channel();
         let background_task = GlobalExecutor::spawn(send_stream(
-            StreamId::next(),
+            StreamId::next_transport_internal(),
             Arc::new(AtomicU32::new(0)),
             Arc::new(TestSocket::new(outbound_sender)),
             remote_addr,
@@ -1601,14 +2529,14 @@ mod tests {
         assert!(result.is_ok(), "send_stream should succeed: {result:?}");
         assert_eq!(
             completion_rx.await,
-            Ok(crate::transport::BroadcastDeliveryOutcome::Delivered),
+            Ok(crate::transport::StreamSendOutcome::Delivered),
             "a successful stream MUST signal Delivered (#4235)"
         );
         Ok(())
     }
 
     /// Issue #4235 — producer-side emission: a `send_stream` that fails mid-flight
-    /// (a `packet_sending` error) MUST signal `BroadcastDeliveryOutcome::Dropped`
+    /// (a `packet_sending` error) MUST signal `StreamSendOutcome::Dropped`
     /// on its `completion_tx`, so the broadcast queue releases the permit WITHOUT
     /// refreshing interest or caching the summary.
     ///
@@ -1654,7 +2582,7 @@ mod tests {
         let (completion_tx, completion_rx) = oneshot::channel();
         let cc_handle = congestion_controller.clone();
         let background_task = GlobalExecutor::spawn(send_stream(
-            StreamId::next(),
+            StreamId::next_transport_internal(),
             Arc::new(AtomicU32::new(0)),
             Arc::new(TestSocket::new(outbound_sender)),
             remote_addr,
@@ -1676,7 +2604,7 @@ mod tests {
         );
         assert_eq!(
             completion_rx.await,
-            Ok(crate::transport::BroadcastDeliveryOutcome::Dropped),
+            Ok(crate::transport::StreamSendOutcome::Dropped),
             "a mid-flight send failure MUST signal Dropped (#4235)"
         );
         // #4345 mid-send-failure release: the first fragment's on_send bytes were
@@ -1720,7 +2648,7 @@ mod tests {
         let time_source = RealTime::new();
 
         // One buffered fragment (<= FRAGMENT_PAYLOAD_SIZE, 1130 bytes).
-        let stream_id = StreamId::next();
+        let stream_id = StreamId::next_transport_internal();
         let handle = StreamHandle::new(stream_id, 1000);
         handle
             .push_fragment(1, Bytes::from(vec![0u8; 1000]))
@@ -1740,8 +2668,8 @@ mod tests {
 
         let cc_handle = congestion_controller.clone();
         let pipe_task = GlobalExecutor::spawn(pipe_stream(
-            handle,
-            StreamId::next(),
+            handle.into(),
+            StreamId::next_transport_internal(),
             Arc::new(AtomicU32::new(0)),
             Arc::new(TestSocket::new(outbound_sender)),
             remote_addr,
@@ -1779,7 +2707,7 @@ mod tests {
         let available_payload = MAX_DATA_SIZE.saturating_sub(meta_overhead);
 
         let fragment_with_typical_meta = StreamFragment {
-            stream_id: StreamId::next_operations(),
+            stream_id: StreamId::next(),
             total_length_bytes: 10000,
             fragment_number: 1,
             payload: bytes::Bytes::from(vec![0u8; available_payload]),
@@ -1807,7 +2735,7 @@ mod tests {
         let available_payload_large = MAX_DATA_SIZE.saturating_sub(large_meta_overhead);
 
         let fragment_with_large_meta = StreamFragment {
-            stream_id: StreamId::next_operations(),
+            stream_id: StreamId::next(),
             total_length_bytes: 10000,
             fragment_number: 1,
             payload: bytes::Bytes::from(vec![0u8; available_payload_large]),
@@ -1832,7 +2760,7 @@ mod tests {
 
         // Test Case 3: Fragment #2 (no metadata) should use full MAX_DATA_SIZE
         let fragment_2 = StreamFragment {
-            stream_id: StreamId::next_operations(),
+            stream_id: StreamId::next(),
             total_length_bytes: 10000,
             fragment_number: 2,
             payload: bytes::Bytes::from(vec![0u8; MAX_DATA_SIZE]),
@@ -1878,7 +2806,7 @@ mod tests {
         // so the cwnd wait (CWND_WAIT_TIMEOUT = 3s) fires before the inactivity
         // timeout (STREAM_INACTIVITY_TIMEOUT = 5s).
         // Fragment must be <= FRAGMENT_PAYLOAD_SIZE (1130 bytes).
-        let stream_id = StreamId::next();
+        let stream_id = StreamId::next_transport_internal();
         let handle = StreamHandle::new(stream_id, 10_000);
         handle
             .push_fragment(1, Bytes::from(vec![0u8; 1000]))
@@ -1903,8 +2831,8 @@ mod tests {
 
         let cc_handle = congestion_controller.clone();
         let pipe_task = GlobalExecutor::spawn(pipe_stream(
-            handle,
-            StreamId::next(),
+            handle.into(),
+            StreamId::next_transport_internal(),
             Arc::new(AtomicU32::new(0)),
             Arc::new(TestSocket::new(outbound_sender)),
             remote_addr,
@@ -1940,12 +2868,12 @@ mod tests {
     /// fragment within STREAM_INACTIVITY_TIMEOUT, pipe_stream must fail only
     /// THIS stream — not tear down the DOWNSTREAM connection that carries other
     /// multiplexed ops. Before this PR the site returned ConnectionClosed
-    /// (is_transient_send_failure() == false → recv loop's fatal arm).
+    /// (is_transient() == false → recv loop's fatal arm).
     ///
     /// Drives the stall by registering a StreamHandle with NO fragment ever
     /// pushed, so `stream.next()` stays Pending and the select!'s
     /// inactivity-timeout arm fires. Asserts the error is OutboundStreamFailed,
-    /// is_transient_send_failure() is true, and it is NOT ConnectionClosed.
+    /// is_transient() is true, and it is NOT ConnectionClosed.
     #[tokio::test(start_paused = true)]
     async fn pipe_stream_inactivity_stall_fails_stream_not_connection()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -1965,7 +2893,7 @@ mod tests {
         // the inactivity timeout (STREAM_INACTIVITY_TIMEOUT) fires before any
         // fragment can be sent. The stall is reached before the cwnd loop, so
         // the congestion-control config is irrelevant; use the default.
-        let stream_id = StreamId::next();
+        let stream_id = StreamId::next_transport_internal();
         let handle = StreamHandle::new(stream_id, 10_000);
 
         let congestion_controller = CongestionControlConfig::default().build_arc();
@@ -1974,8 +2902,8 @@ mod tests {
 
         let cc_handle = congestion_controller.clone();
         let pipe_task = GlobalExecutor::spawn(pipe_stream(
-            handle,
-            StreamId::next(),
+            handle.into(),
+            StreamId::next_transport_internal(),
             Arc::new(AtomicU32::new(0)),
             Arc::new(TestSocket::new(outbound_sender)),
             remote_addr,
@@ -2002,7 +2930,7 @@ mod tests {
             "inactivity stall must NOT be ConnectionClosed (would kill the connection): {err:?}"
         );
         assert!(
-            err.is_transient_send_failure(),
+            err.is_transient(),
             "inactivity stall must be classified transient so the connection survives: {err:?}"
         );
         // #4345: the stall fires before any fragment is sent, so the abort's
@@ -2020,11 +2948,11 @@ mod tests {
     /// outbound_stream.rs:471): when the UPSTREAM inbound stream yields an
     /// error, pipe_stream must fail only THIS stream — not the DOWNSTREAM
     /// connection. Before this PR the site returned ConnectionClosed
-    /// (is_transient_send_failure() == false → recv loop's fatal arm).
+    /// (is_transient() == false → recv loop's fatal arm).
     ///
     /// Drives the error by cancelling the StreamHandle so the inbound stream
     /// yields Err(StreamError::Cancelled). Asserts the error is
-    /// OutboundStreamFailed, is_transient_send_failure() is true, and it is NOT
+    /// OutboundStreamFailed, is_transient() is true, and it is NOT
     /// ConnectionClosed.
     #[tokio::test(start_paused = true)]
     async fn pipe_stream_inbound_error_fails_stream_not_connection()
@@ -2044,7 +2972,7 @@ mod tests {
         // Cancel the handle so the inbound stream yields Err(Cancelled). The
         // poll_next cancelled-check fires before any cwnd wait, so the
         // congestion-control config is irrelevant; use the default.
-        let stream_id = StreamId::next();
+        let stream_id = StreamId::next_transport_internal();
         let handle = StreamHandle::new(stream_id, 10_000);
         handle
             .push_fragment(1, Bytes::from(vec![0u8; 1000]))
@@ -2057,8 +2985,8 @@ mod tests {
 
         let cc_handle = congestion_controller.clone();
         let pipe_task = GlobalExecutor::spawn(pipe_stream(
-            handle,
-            StreamId::next(),
+            handle.into(),
+            StreamId::next_transport_internal(),
             Arc::new(AtomicU32::new(0)),
             Arc::new(TestSocket::new(outbound_sender)),
             remote_addr,
@@ -2085,7 +3013,7 @@ mod tests {
             "inbound error must NOT be ConnectionClosed (would kill the connection): {err:?}"
         );
         assert!(
-            err.is_transient_send_failure(),
+            err.is_transient(),
             "inbound error must be classified transient so the connection survives: {err:?}"
         );
         // #4345: the inbound error fires before any fragment is sent, so the
@@ -2096,6 +3024,130 @@ mod tests {
             "pipe_stream inbound-error abort must leave flight size at 0"
         );
 
+        Ok(())
+    }
+
+    /// Counts `on_fragment_sent` calls.
+    #[derive(Default)]
+    struct CountingObserver(std::sync::atomic::AtomicUsize);
+
+    impl crate::transport::StreamProgressObserver for CountingObserver {
+        fn on_fragment_sent(&self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    impl CountingObserver {
+        fn count(&self) -> usize {
+            self.0.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    /// Congestion controller and token bucket large enough that a test stream
+    /// never waits on either.
+    fn unthrottled(
+        time_source: &VirtualTime,
+    ) -> (
+        Arc<CongestionController<VirtualTime>>,
+        Arc<TokenBucket<VirtualTime>>,
+    ) {
+        let congestion_controller = CongestionControlConfig::from_ledbat_config(LedbatConfig {
+            initial_cwnd: 1_000_000,
+            min_cwnd: 1_000_000,
+            max_cwnd: 1_000_000_000,
+            ..Default::default()
+        })
+        .build_arc_with_time_source(time_source.clone());
+        let token_bucket = Arc::new(TokenBucket::new_with_time_source(
+            1_000_000,
+            10_000_000,
+            time_source.clone(),
+        ));
+        (congestion_controller, token_bucket)
+    }
+
+    /// `send_stream` reports progress once per fragment it hands to the
+    /// socket: the operations layer's inactivity timeout relies on it.
+    #[tokio::test]
+    async fn send_stream_reports_progress_once_per_fragment()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (outbound_sender, mut outbound_receiver) = mpsc::channel(1);
+        let time_source = VirtualTime::new();
+        let (congestion_controller, token_bucket) = unthrottled(&time_source);
+        let observer = Arc::new(CountingObserver::default());
+        let task = GlobalExecutor::spawn(send_stream(
+            StreamId::next_transport_internal(),
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(TestSocket::new(outbound_sender)),
+            SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 8080),
+            Bytes::from(vec![7u8; 20_000]),
+            random_cipher(),
+            Arc::new(parking_lot::Mutex::new(
+                SentPacketTracker::new_with_time_source(time_source.clone()),
+            )),
+            token_bucket,
+            congestion_controller,
+            time_source,
+            None,
+            None,
+            Some(observer.clone() as Arc<dyn crate::transport::StreamProgressObserver>),
+        ));
+        let mut packets = 0;
+        while outbound_receiver.recv().await.is_some() {
+            packets += 1;
+        }
+        task.await?.expect("send_stream succeeds");
+        assert!(
+            packets > 1,
+            "premise: a multi-fragment stream, got {packets}"
+        );
+        assert_eq!(observer.count(), packets);
+        Ok(())
+    }
+
+    /// `pipe_stream` reports progress once per fragment it forwards.
+    #[tokio::test]
+    async fn pipe_stream_reports_progress_once_per_fragment()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::transport::peer_connection::streaming::StreamHandle;
+        use crate::transport::peer_connection::streaming_buffer::FRAGMENT_PAYLOAD_SIZE;
+
+        const FRAGMENTS: usize = 4;
+        let handle = StreamHandle::new(
+            StreamId::next_transport_internal(),
+            (FRAGMENTS * FRAGMENT_PAYLOAD_SIZE) as u64,
+        );
+        for n in 1..=FRAGMENTS {
+            handle.push_fragment(n as u32, Bytes::from(vec![7u8; FRAGMENT_PAYLOAD_SIZE]))?;
+        }
+
+        let (outbound_sender, mut outbound_receiver) = mpsc::channel(1);
+        let time_source = VirtualTime::new();
+        let (congestion_controller, token_bucket) = unthrottled(&time_source);
+        let observer = Arc::new(CountingObserver::default());
+        let task = GlobalExecutor::spawn(pipe_stream(
+            handle.into(),
+            StreamId::next_transport_internal(),
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(TestSocket::new(outbound_sender)),
+            SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 8080),
+            random_cipher(),
+            Arc::new(parking_lot::Mutex::new(
+                SentPacketTracker::new_with_time_source(time_source.clone()),
+            )),
+            token_bucket,
+            congestion_controller,
+            time_source,
+            None,
+            Some(observer.clone() as Arc<dyn crate::transport::StreamProgressObserver>),
+        ));
+        let mut packets = 0;
+        while outbound_receiver.recv().await.is_some() {
+            packets += 1;
+        }
+        task.await?.expect("pipe_stream succeeds");
+        assert_eq!(packets, FRAGMENTS, "premise: one packet per fragment");
+        assert_eq!(observer.count(), FRAGMENTS);
         Ok(())
     }
 }

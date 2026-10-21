@@ -54,6 +54,120 @@ use super::streaming_buffer::LockFreeStreamBuffer;
 /// (0.9% of all transfers), turning a sub-second retry into a 30-40s experience.
 pub const STREAM_INACTIVITY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Allowance for the envelope around the largest payloads in
+/// [`MAX_STREAM_TOTAL_BYTES`]: the serialized `NetMessage` / streaming-payload
+/// framing (transaction id, contract key, bincode length prefixes, peer
+/// locations, a state summary). Those are bytes to kilobytes; 8 MiB leaves
+/// orders of magnitude of headroom without materially raising the cap.
+const STREAM_ENVELOPE_MARGIN_BYTES: usize = 8 * 1024 * 1024;
+
+/// Largest total length a single transport stream may declare, in either
+/// direction (158 MiB).
+///
+/// A stream carries one serialized message. The two bounds that limit
+/// message size are:
+///
+/// - **State**: [`MAX_STATE_SIZE`](crate::wasm_runtime::MAX_STATE_SIZE)
+///   (50 MiB), enforced by the executor on every PUT/UPDATE.
+/// - **Everything a client sends in one request** (contract code, parameters,
+///   related contracts, an initial state or delta):
+///   [`WEBSOCKET_MAX_MESSAGE_SIZE`](crate::client_events::WEBSOCKET_MAX_MESSAGE_SIZE)
+///   (100 MiB). Contract code has no limit of its own beyond this.
+///
+/// The largest network messages combine one client request's content with
+/// one state that may have grown since:
+///
+/// - GET response (`GetStreamingPayload`): stored code and parameters plus
+///   the current state.
+/// - Forwarded PUT (`PutStreamingPayload`): the client's code, parameters and
+///   related contracts plus the merged state.
+/// - UPDATE request (`UpdateStreamingPayload`): the client's related contracts
+///   plus the state.
+/// - UPDATE broadcast (`BroadcastStreamingPayload`): a state plus the sender's
+///   summary; summaries are held to `MAX_STATE_SIZE` as well
+///   (`ring::interest::contract_summary_cap`), so at most two states.
+///
+/// So the bound is `WEBSOCKET_MAX_MESSAGE_SIZE + MAX_STATE_SIZE` plus the
+/// envelope margin. No message type batches several contracts' states.
+///
+/// Checked when an inbound stream is admitted and before an outbound one is
+/// started. If either referenced limit is raised, this rises with it; a new
+/// message type that carries more than the combination above needs this
+/// derivation revisited.
+pub(crate) const MAX_STREAM_TOTAL_BYTES: u64 = (crate::wasm_runtime::MAX_STATE_SIZE
+    + crate::client_events::WEBSOCKET_MAX_MESSAGE_SIZE
+    + STREAM_ENVELOPE_MARGIN_BYTES) as u64;
+
+/// Most bytes of inbound streams one connection may hold reassembly state
+/// for at once: one maximum-size stream, charged its declared length plus its
+/// overhead (`inbound_budget::ChargeOverhead`), and 16 MiB for ordinary
+/// streams alongside it.
+///
+/// Streams of independent operations share a connection, so a second large
+/// stream arriving while one is held may be refused; its operation fails
+/// and is retried like any other transfer failure.
+///
+/// Per connection: a node with many connections can hold this much for each.
+/// Charges are dropped with the connection, but an unclaimed buffer can be
+/// kept by the orphan stream registry for up to its 60 s GC interval after
+/// the connection has gone.
+///
+/// A stream is charged when admitted and keeps the charge
+/// until all of its reassembly state has been released (see
+/// `inbound_budget`), including after completion while a consumer still holds
+/// its buffer.
+pub(crate) const MAX_INBOUND_STREAM_BYTES_PER_CONNECTION: u64 =
+    super::inbound_budget::ChargeOverhead::DEFAULT.cost(MAX_STREAM_TOTAL_BYTES) + 16 * 1024 * 1024;
+
+/// Most inbound streams one connection may hold reassembly state for at once.
+///
+/// Bounds the per-stream overhead (handle, registry rows, slot tables) that
+/// the byte allowance does not, for many small streams. A stream counts from
+/// admission until its reassembly state is released: for a legacy stream when
+/// `recv()` takes its message; for an operations stream when its consumers
+/// drop the buffer, since the connection retires its own references as soon
+/// as the stream is complete.
+pub(crate) const MAX_INBOUND_STREAMS_PER_CONNECTION: usize = 1024;
+
+/// Rate an inbound stream's age limit is computed at: 32 KiB/s, below the
+/// 70-160 KB/s seen from slow residential peers. A stream's age limit is its
+/// length at this rate.
+pub(crate) const MIN_INBOUND_STREAM_RATE_BYTES_PER_SEC: u64 = 32 * 1024;
+
+/// Age limit for small streams, whatever their length.
+pub(crate) const MIN_INBOUND_STREAM_AGE: std::time::Duration =
+    std::time::Duration::from_secs(5 * 60);
+
+/// Longest an inbound stream of `total_bytes` may hold reassembly state,
+/// however much traffic it receives: the time it takes at
+/// [`MIN_INBOUND_STREAM_RATE_BYTES_PER_SEC`], and at least
+/// [`MIN_INBOUND_STREAM_AGE`]. About 84 minutes at `MAX_STREAM_TOTAL_BYTES`.
+/// Progress refreshes the idle timeout but not this.
+pub(crate) fn max_inbound_stream_age(total_bytes: u64) -> std::time::Duration {
+    std::time::Duration::from_secs(total_bytes / MIN_INBOUND_STREAM_RATE_BYTES_PER_SEC)
+        .max(MIN_INBOUND_STREAM_AGE)
+}
+
+/// Why a declared stream length was refused. See [`check_declared_stream_length`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StreamLengthRejection {
+    /// A stream must carry at least one byte; no sender produces an empty one.
+    Empty,
+    /// Above [`MAX_STREAM_TOTAL_BYTES`].
+    TooLarge,
+}
+
+/// Validate a stream's declared total length against [`MAX_STREAM_TOTAL_BYTES`].
+pub(crate) fn check_declared_stream_length(total_bytes: u64) -> Result<(), StreamLengthRejection> {
+    if total_bytes == 0 {
+        Err(StreamLengthRejection::Empty)
+    } else if total_bytes > MAX_STREAM_TOTAL_BYTES {
+        Err(StreamLengthRejection::TooLarge)
+    } else {
+        Ok(())
+    }
+}
+
 /// Error type for streaming operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamError {
@@ -117,7 +231,7 @@ impl SyncState {
 /// to read the stream at different rates.
 ///
 /// The design separates the lock-free buffer from synchronization state:
-/// - `buffer`: Lock-free fragment storage using `OnceLock<Bytes>` slots
+/// - `buffer`: Lock-free fragment storage (`AtomicPtr<Bytes>` slots, allocated in chunks)
 /// - `sync`: Cancelled flag and wakers (requires lock)
 ///
 /// Fragment insertion goes directly to the buffer without acquiring any lock,
@@ -141,8 +255,13 @@ impl StreamHandle {
     /// This is public for use by `OrphanStreamRegistry` which needs to create
     /// handles and for transport layer stream registration.
     pub fn new(stream_id: StreamId, total_bytes: u64) -> Self {
+        Self::from_buffer(stream_id, LockFreeStreamBuffer::new(total_bytes))
+    }
+
+    fn from_buffer(stream_id: StreamId, buffer: LockFreeStreamBuffer) -> Self {
+        let total_bytes = buffer.total_bytes();
         Self {
-            buffer: Arc::new(LockFreeStreamBuffer::new(total_bytes)),
+            buffer: Arc::new(buffer),
             sync: Arc::new(parking_lot::RwLock::new(SyncState::new())),
             stream_id,
             total_bytes,
@@ -168,6 +287,21 @@ impl StreamHandle {
     /// Returns the number of fragments received so far.
     pub fn received_fragments(&self) -> usize {
         self.buffer.inserted_count()
+    }
+
+    /// A `Weak` to the fragment buffer: alive while any handle clone is.
+    pub(crate) fn buffer_weak(&self) -> std::sync::Weak<LockFreeStreamBuffer> {
+        Arc::downgrade(&self.buffer)
+    }
+
+    /// Whether this handle's buffer is `buffer`.
+    pub(crate) fn shares_buffer(&self, buffer: &std::sync::Weak<LockFreeStreamBuffer>) -> bool {
+        std::ptr::eq(Arc::as_ptr(&self.buffer), buffer.as_ptr())
+    }
+
+    /// Payload bytes received so far.
+    pub fn received_bytes(&self) -> u64 {
+        self.buffer.received_bytes()
     }
 
     /// Test-only accessor for the underlying buffer's `Arc::strong_count`.
@@ -345,6 +479,11 @@ impl StreamHandle {
         }
     }
 
+    /// Whether the stream has been cancelled.
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.sync.read().cancelled
+    }
+
     /// Cancels the stream, waking all waiters.
     pub(crate) fn cancel(&self) {
         let mut sync = self.sync.write();
@@ -405,11 +544,9 @@ impl StreamHandle {
                 if let Some(data) = self.buffer.assemble() {
                     return Ok(data);
                 }
-                // Don't fail immediately - the overflow fragment may not have arrived yet.
-                // When fragment #1 has reduced payload (metadata embedded), the sender uses
-                // one extra fragment that goes in the overflow slot. is_complete() fires when
-                // min_complete_fragments are contiguous, but actual data may be insufficient
-                // until the overflow fragment arrives. Continue waiting.
+                // `is_complete()` (all bytes received, contiguous) and a failed
+                // assembly should not coincide; if they do (fragments consumed
+                // by a reclaiming reader), keep waiting rather than fail here.
                 tracing::debug!(
                     stream_id = %self.stream_id.0,
                     total_bytes = self.total_bytes,
@@ -541,6 +678,10 @@ impl StreamingInboundStream {
     /// Whether the stream has ended: every advertised byte has been yielded
     /// and slot `next_idx` is empty. See the comment where `poll_next` first
     /// checks it.
+    ///
+    /// Since `is_complete()` is measured in bytes, the `bytes_read` check is
+    /// defence in depth: it keeps this exit tied to what THIS reader yielded,
+    /// not only to what the buffer received.
     fn reached_end(&self, next_idx: u32) -> bool {
         self.handle.buffer.is_complete()
             && self.handle.buffer.get(next_idx).is_none()
@@ -603,8 +744,23 @@ impl Stream for StreamingInboundStream {
         // Lock-free access to buffer
         let total_fragments = self.handle.buffer.total_fragments() as u32;
 
-        // Check if we've read all fragments
+        // Every fragment slot has been read. That is the end only if every
+        // declared byte was read too: a sender that filled the slots with
+        // short payloads leaves the stream short, and ending cleanly here
+        // would report a truncated stream as complete (#5445). Fail the
+        // stream instead. (`assemble()` never completes such a stream
+        // either: it waits for the missing bytes and ends in
+        // `InactivityTimeout`.)
         if next_idx > total_fragments {
+            let declared = self.handle.buffer.total_bytes();
+            if self.bytes_read < declared {
+                return Poll::Ready(Some(Err(StreamError::InvalidFragment {
+                    message: format!(
+                        "stream ended after {} of its {declared} declared bytes",
+                        self.bytes_read
+                    ),
+                })));
+            }
             return Poll::Ready(None); // Stream complete
         }
 
@@ -613,13 +769,10 @@ impl Stream for StreamingInboundStream {
         // overhead in fragment #1) may not be used when fragment #1 has full
         // payload capacity, so it can stay empty forever.
         //
-        // `is_complete()` alone is NOT sufficient to end the stream: it is
-        // `contiguous >= min_complete_fragments`, the BASE fragment count. When
-        // the sender embeds metadata in fragment #1 (fix #2757) that fragment
-        // carries a reduced payload, so the sender emits `base + 1` fragments —
-        // and `is_complete()` therefore fires one fragment EARLY, while the
-        // final overflow fragment is still in flight. Ending here on that signal
-        // truncates the stream: `pipe_stream` (the relay forwarding path, see
+        // The stream ends on the byte count, never on a fragment count: when
+        // the sender embeds metadata in fragment #1 (fix #2757) it emits
+        // `base + 1` fragments, so a count of `base` fires one fragment EARLY.
+        // Ending on a fragment count truncates the stream: `pipe_stream` (the relay forwarding path, see
         // `outbound_stream.rs`) stops forwarding short of the
         // `total_length_bytes` it advertised, and the downstream peer waits in
         // `assemble()` for a fragment that will never be sent until its
@@ -630,17 +783,10 @@ impl Stream for StreamingInboundStream {
         // short). They consume the same buffer and must reach the same
         // conclusion about when a stream has ended.
         //
-        // Scope, precisely: this brings the two paths into agreement at THIS
-        // exit. The `next_idx > total_fragments` exit above is still unguarded,
-        // and a sender that filled every `base + 1` slot with short payloads
-        // would leave through it with `bytes_read < total_bytes` — where
-        // `assemble()` returns `None` (a failure) but this returns
-        // `Ready(None)` (a success), and `pipe_stream` reports a successful
-        // transfer with a short byte count. No conforming sender does that:
-        // `send_stream` fragments `stream_to_send` exactly. Tracked as #5445,
-        // which is where the guard that would make the agreement universal
-        // belongs — it is a production behaviour change and wants its own
-        // review rather than a late addition here.
+        // Both exits end on the byte count: the `next_idx > total_fragments`
+        // exit above returns an error when the slots ran out before the
+        // bytes did (#5445), so neither can report a truncated stream as
+        // complete.
         if self.reached_end(next_idx) {
             return Poll::Ready(None);
         }
@@ -817,7 +963,41 @@ mod tests {
     use futures::StreamExt;
 
     fn make_stream_id() -> StreamId {
-        StreamId::next()
+        StreamId::next_transport_internal()
+    }
+
+    #[test]
+    fn declared_stream_length_bounds() {
+        assert_eq!(
+            check_declared_stream_length(0),
+            Err(StreamLengthRejection::Empty)
+        );
+        assert_eq!(check_declared_stream_length(1), Ok(()));
+        assert_eq!(check_declared_stream_length(MAX_STREAM_TOTAL_BYTES), Ok(()));
+        assert_eq!(
+            check_declared_stream_length(MAX_STREAM_TOTAL_BYTES + 1),
+            Err(StreamLengthRejection::TooLarge)
+        );
+        assert_eq!(
+            check_declared_stream_length(u64::MAX),
+            Err(StreamLengthRejection::TooLarge)
+        );
+    }
+
+    /// The cap must admit the largest legitimate message: a GET response
+    /// carrying a contract's code (bounded only by the client API message
+    /// limit) together with a state at the state maximum. If either limit is
+    /// raised without this following, legitimate transfers start failing.
+    #[test]
+    fn stream_cap_admits_code_plus_state() {
+        let largest_legitimate = (crate::wasm_runtime::MAX_STATE_SIZE
+            + crate::client_events::WEBSOCKET_MAX_MESSAGE_SIZE)
+            as u64;
+        assert!(MAX_STREAM_TOTAL_BYTES > largest_legitimate);
+        // And it is a real bound: well short of what a u32 length, let alone a
+        // u64 one, could ask for.
+        assert!(MAX_STREAM_TOTAL_BYTES < u64::from(u32::MAX));
+        const { assert!(MAX_INBOUND_STREAM_BYTES_PER_CONNECTION > MAX_STREAM_TOTAL_BYTES) };
     }
 
     #[derive(Default)]
@@ -913,6 +1093,39 @@ mod tests {
         for auto_reclaim in [false, true] {
             check_rearmed_listener_arrival(true, auto_reclaim);
         }
+    }
+
+    /// A sender that fills every fragment slot with short payloads leaves
+    /// the stream short of its declared total. Reading it must end in an
+    /// error, not a clean end that looks like a complete stream (#5445).
+    #[tokio::test]
+    async fn stream_filled_short_ends_in_an_error_not_a_clean_end() {
+        use futures::StreamExt;
+        let total = 2 * super::super::streaming_buffer::FRAGMENT_PAYLOAD_SIZE;
+        let handle = StreamHandle::new(make_stream_id(), total as u64);
+        let slots = handle.total_fragments();
+        for n in 1..=slots {
+            handle
+                .push_fragment(n as u32, Bytes::from(vec![n as u8; 100]))
+                .unwrap();
+        }
+        let items: Vec<_> = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            handle.stream().take(slots + 2).collect::<Vec<_>>(),
+        )
+        .await
+        .expect("the stream ends");
+        let read: usize = items
+            .iter()
+            .filter_map(|i| i.as_ref().ok())
+            .map(|b| b.len())
+            .sum();
+        assert!(read < total, "premise: the stream is short");
+        assert!(
+            items.iter().any(|i| i.is_err()),
+            "a short stream must end in an error, got {} chunks and a clean end",
+            items.len()
+        );
     }
 
     #[test]
@@ -1192,7 +1405,7 @@ mod tests {
 
     #[test]
     fn test_stream_handle_fork() {
-        let handle = StreamHandle::new(make_stream_id(), 100);
+        let handle = StreamHandle::new(make_stream_id(), 5);
         handle
             .push_fragment(1, Bytes::from_static(b"hello"))
             .unwrap();
@@ -1811,7 +2024,7 @@ mod tests {
         let id3 = make_stream_id();
 
         // Register multiple streams
-        let handle1 = registry.register(id1, 100);
+        let handle1 = registry.register(id1, b"complete data here!".len() as u64);
         let _handle2 = registry.register(id2, 200);
         let _handle3 = registry.register(id3, 300);
 
@@ -2135,9 +2348,9 @@ mod tests {
     /// Regression test for the overflow fragment race condition.
     ///
     /// When fragment #1 has reduced payload (metadata embedded), the sender uses
-    /// one extra "overflow" fragment. The buffer's is_complete() fires when
-    /// min_complete_fragments are contiguous, but the overflow may not have
-    /// arrived yet. Previously, assemble() returned an error immediately instead
+    /// one extra "overflow" fragment. `is_complete()` once fired when the base
+    /// fragment count was contiguous, before the overflow arrived (it is now
+    /// measured in bytes). Previously, assemble() returned an error immediately instead
     /// of waiting for the overflow fragment, causing "assembly failed" errors
     /// in production (blank pages in River web app).
     #[tokio::test]
@@ -2163,14 +2376,14 @@ mod tests {
         let frag4_data = Bytes::from(vec![4u8; overflow_size]);
 
         // Push base fragments (1, 2, 3) - this triggers is_complete()
-        // since min_complete_fragments = 3
+        // under the old fragment-count completion rule
         handle.push_fragment(1, frag1_data).unwrap();
         handle.push_fragment(2, frag2_data).unwrap();
         handle.push_fragment(3, frag3_data).unwrap();
 
-        // At this point, is_complete() returns true but assemble() would fail
-        // because we only have reduced_payload + 2*FPS < total bytes
-        assert!(handle.is_complete());
+        // Completion is measured in bytes, so the buffer is not complete:
+        // only reduced_payload + 2*FPS < total bytes have arrived.
+        assert!(!handle.is_complete());
         assert!(handle.try_assemble().is_none()); // Not enough data yet
 
         // Start assemble in background - it should NOT fail, it should wait
@@ -2206,8 +2419,8 @@ mod tests {
     /// fixed, and it is the path relays use: `pipe_stream` forwards a GET/PUT
     /// response hop-by-hop via `inbound_handle.stream()`.
     ///
-    /// The mechanism: `is_complete()` is `contiguous >= min_complete_fragments`,
-    /// which is the base fragment count. When the sender embeds metadata in
+    /// The mechanism: `is_complete()` was then `contiguous >= base fragment
+    /// count` (it is now measured in bytes). When the sender embeds metadata in
     /// fragment #1 (fix #2757) that fragment carries a reduced payload, so the
     /// sender emits `base + 1` fragments. `is_complete()` therefore fires one
     /// fragment EARLY — while the final overflow fragment is still in flight.
@@ -2244,9 +2457,9 @@ mod tests {
             .push_fragment(3, Bytes::from(vec![3u8; FRAGMENT_PAYLOAD_SIZE]))
             .unwrap();
 
-        // The buffer reports complete (3 contiguous >= min_complete_fragments)
-        // even though the bytes present are short of `total`.
-        assert!(handle.is_complete());
+        // The bytes present are short of `total`, so the buffer is not
+        // complete (completion is measured in bytes).
+        assert!(!handle.is_complete());
         assert!(handle.try_assemble().is_none());
 
         let waker = futures::task::noop_waker();
@@ -2337,10 +2550,9 @@ mod tests {
         let handle = StreamHandle::new(make_stream_id(), total);
         handle.push_fragment(1, payload.clone()).unwrap();
 
-        // The buffer calls itself complete: one contiguous fragment meets the
-        // base count for a total this small. That is the trap the byte check
-        // exists for.
-        assert!(handle.is_complete());
+        // Completion is measured in bytes, so the buffer does not call itself
+        // complete; the stream must still stall rather than end.
+        assert!(!handle.is_complete());
         assert!(
             handle.try_assemble().is_none(),
             "assemble() must refuse a buffer short of its total — if this ever \

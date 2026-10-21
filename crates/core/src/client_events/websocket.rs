@@ -46,9 +46,11 @@ const WEBSOCKET_PING_INTERVAL: Duration = Duration::from_secs(30);
 /// reads into a buffer already reserved at their full length.
 const WEBSOCKET_READ_BUFFER_SIZE: usize = 16 * 1024;
 
-/// Largest client WebSocket message, and frame, the node accepts (see
-/// `configure_upgrade`).
-const WEBSOCKET_MAX_MESSAGE_SIZE: usize = 100 * 1024 * 1024;
+// Largest client WebSocket message, and frame, the node accepts (see
+// `configure_upgrade`). Defined in the parent module so it is available
+// without the `websocket` feature: the transport derives its stream-size cap
+// from it.
+use super::WEBSOCKET_MAX_MESSAGE_SIZE;
 
 /// Per-client rate limiter for delegate operations.
 ///
@@ -4676,9 +4678,21 @@ mod tests {
         // And the matching subscription callback was delivered to the client's
         // response channel, keyed by the delegate for logging.
         match cb_rx.try_recv() {
-            Ok(HostCallbackResult::SubscriptionChannel { id, key, .. }) => {
+            Ok(HostCallbackResult::SubscriptionChannel { id, key, callback }) => {
                 assert_eq!(id, client_id);
                 assert_eq!(key, delegate_key.to_string());
+                // The callback is the receiving end of the very sender the
+                // registry will hold: once the connection drops it, the
+                // registry's sender reports closed. `delegate_app_registry`'s
+                // closed-channel pruning rests on this pairing.
+                let registered = open_req.notification_channel.as_ref().unwrap();
+                assert!(!registered.is_closed());
+                drop(callback);
+                assert!(
+                    registered.is_closed(),
+                    "the registered sender must be paired with the callback \
+                     receiver handed to the connection"
+                );
             }
             other => panic!(
                 "expected a SubscriptionChannel callback for the delegate request, got {other:?}"
@@ -5131,6 +5145,48 @@ mod tests {
         assert!(
             disconnect_seen,
             "the node must be told the client disconnected"
+        );
+    }
+
+    /// The same for a client that vanishes WITHOUT a close frame, as when its
+    /// process is killed: the socket is simply dropped. The delegate app
+    /// registry relies on this to prune registrations whose connection ended
+    /// without a clean disconnect (see `delegate_app_registry`'s module docs).
+    #[tokio::test]
+    async fn client_vanishing_without_close_frame_drops_listeners() {
+        let mut h = start_ws_harness().await;
+        let sub = h.subscribe("contract-vanish");
+        // Prove the listener is live in the connection's map first.
+        sub.send(tagged_notification("before-vanish"))
+            .await
+            .unwrap();
+        assert!(h.next_notification().await.contains("before-vanish"));
+        let WsHarness {
+            client,
+            // Held, so the node side of the connection stays open and only the
+            // client's departure can end the task.
+            callbacks: _callbacks,
+            mut forwarded,
+            ..
+        } = h;
+        drop(client);
+
+        tokio::time::timeout(WS_STEP, sub.closed())
+            .await
+            .expect("listener receiver not dropped after the client vanished");
+        let disconnect_seen = tokio::time::timeout(WS_STEP, async {
+            while let Some(req) = forwarded.recv().await {
+                if matches!(req, ClientRequest::Disconnect { .. }) {
+                    return true;
+                }
+            }
+            false
+        })
+        .await
+        .expect("timed out waiting for the Disconnect");
+        assert!(
+            disconnect_seen,
+            "the node must be told the client went away"
         );
     }
 }

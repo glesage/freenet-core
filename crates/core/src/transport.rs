@@ -185,6 +185,7 @@ pub fn get_open_connection_count() -> usize {
     OPEN_CONNECTION_COUNT.load(Ordering::SeqCst)
 }
 
+mod boundary;
 pub mod connection_handler;
 mod crypto;
 pub mod in_memory_socket;
@@ -194,6 +195,10 @@ pub mod in_memory_socket;
 /// without real network I/O.
 #[cfg(any(test, feature = "bench"))]
 pub use connection_handler::mock_transport;
+/// Size-aware WAN link model (bottleneck queue, delay, loss, spikes) that
+/// `MockSocket` can route packets through.
+#[cfg(any(test, feature = "bench"))]
+pub mod link_model;
 mod packet_data;
 pub mod peer_connection;
 // todo: optimize trackers
@@ -233,10 +238,11 @@ pub use congestion_control::{
     CongestionControlStats, CongestionController,
 };
 // Re-export transport metrics for periodic telemetry snapshots
+pub(crate) use metrics::NatAttemptOrigin;
 pub use metrics::{TRANSPORT_METRICS, TransportMetrics, TransportSnapshot};
 // Re-export reset functions for deterministic simulation testing
+pub use self::boundary::StreamId;
 pub use packet_data::reset_nonce_counter;
-pub use peer_connection::StreamId;
 
 use std::time::Duration;
 
@@ -255,10 +261,13 @@ pub struct TransferStats {
     /// Time elapsed from start to transmission completion.
     /// Note: This is when we finished SENDING, not when all ACKs arrived.
     pub elapsed: Duration,
-    /// Peak congestion window during transfer (bytes).
-    pub peak_cwnd_bytes: u32,
-    /// Final congestion window at completion (bytes).
-    pub final_cwnd_bytes: u32,
+    /// Peak congestion window during transfer (bytes). `None` when the
+    /// controller has no bounded window (FixedRate outside a loss pause
+    /// reports an effectively infinite cwnd, which is not a measurement).
+    pub peak_cwnd_bytes: Option<u32>,
+    /// Final congestion window at completion (bytes). `None` under the same
+    /// condition as `peak_cwnd_bytes`.
+    pub final_cwnd_bytes: Option<u32>,
     /// Number of LEDBAT slowdowns triggered during transfer.
     pub slowdowns_triggered: u32,
     /// Minimum observed RTT (base delay) at completion.
@@ -270,8 +279,15 @@ pub struct TransferStats {
     /// Effective minimum ssthresh floor (bytes).
     /// This floor prevents ssthresh from collapsing too low during timeouts.
     pub min_ssthresh_floor_bytes: u32,
-    /// Total retransmission timeouts (RTO events) during transfer.
+    /// Retransmission timeouts (per-packet RTO expiries) on this connection
+    /// while the transfer ran, counted by the connection's sent-packet
+    /// tracker so it is populated whatever the congestion controller.
     /// High values indicate severe congestion or path issues.
+    ///
+    /// This is a per-CONNECTION delta, not a per-stream count: an RTO of any
+    /// packet on the connection during the transfer is included, so
+    /// concurrent transfers on one connection each count the same expiries
+    /// and summing across transfers double-counts.
     pub total_timeouts: u32,
     /// Bytes still in flight (sent but not yet ACKed) when transmission completed.
     /// High values relative to bytes_transferred indicate ACK lag.
@@ -324,8 +340,17 @@ impl From<SocketAddr> for ObservedAddr {
     }
 }
 
+pub(crate) use self::boundary::TransportHandle;
+pub(crate) use self::boundary::{
+    CloseReason, InboundAcceptor, InboundExpectations, InboundStreamRegistry, ListenerExit,
+    NextConnection, OutboundConnector, PeerConnectionApi, PendingConnection,
+    StreamProgressObserver, StreamSendOutcome,
+};
+pub use self::boundary::{IncomingChunks, IncomingStream, StreamIdentity};
+#[cfg(test)]
 pub(crate) use self::connection_handler::ExpectedInboundTracker;
 pub use self::connection_handler::create_connection_handler;
+pub(crate) use self::connection_handler::{UdpTransportConfig, open_udp_transport};
 pub use self::crypto::{TransportKeypair, TransportPublicKey};
 pub use self::{
     connection_handler::{InboundConnectionHandler, OutboundConnectionHandler},
@@ -351,30 +376,155 @@ pub enum TransportError {
         "Version incompatibility with gateway\n  Your client version: {actual}\n  Gateway version: {expected}\n  \n  To fix this, update your Freenet client:\n    cargo install --force freenet --version {expected}\n  \n  Or if building from source:\n    git pull && cargo install --path crates/core"
     )]
     ProtocolVersionMismatch { expected: String, actual: String },
-    #[error("send to {0} failed: {1}")]
-    SendFailed(SocketAddr, std::io::ErrorKind),
     #[error("outbound stream to {0} failed (stream-scoped, connection survives)")]
     OutboundStreamFailed(SocketAddr),
-    #[error(transparent)]
-    IO(#[from] std::io::Error),
+    /// An outbound stream was not started because its length is outside
+    /// what a receiver admits (`streaming::check_declared_stream_length`).
+    /// Stream-scoped like [`Self::OutboundStreamFailed`], but not transient:
+    /// the same message fails the same way on every attempt.
+    #[error("outbound stream to {0} not sent: length {1} is outside the stream limits")]
+    OutboundStreamInvalidLength(SocketAddr, u64),
     #[error(transparent)]
     Other(#[from] anyhow::Error),
+    /// An error only the UDP transport produces (a socket send or I/O
+    /// failure, a handshake decryption failure, its own wire encoding).
+    /// Opaque above the transport: classify it with [`Self::scope`].
     #[error(transparent)]
-    PubKeyDecryptionError(#[from] crypto::DecryptionError),
+    Udp(UdpError),
+}
+
+/// An error only the UDP transport produces, inside [`TransportError::Udp`].
+/// Its kind is private to the transport; its Display is the kind's, exactly
+/// as the variants it replaced displayed.
+#[derive(thiserror::Error)]
+#[error(transparent)]
+pub struct UdpError(pub(in crate::transport) UdpErrorKind);
+
+impl std::fmt::Debug for UdpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.0, f)
+    }
+}
+
+/// What went wrong in a [`UdpError`].
+#[derive(Debug, thiserror::Error)]
+pub(in crate::transport) enum UdpErrorKind {
+    /// A UDP `send_to` to this address failed with this error kind. On an
+    /// established connection it is transient: one packet failed and the
+    /// connection survives (see [`TransportError::is_transient`]). When a
+    /// handshake returns it, it is fatal: the connection attempt is over
+    /// (#5871).
+    #[error("send to {0} failed: {1}")]
+    SendFailed(SocketAddr, std::io::ErrorKind),
     #[error(transparent)]
-    Serialization(#[from] bincode::Error),
+    IO(std::io::Error),
+    #[error(transparent)]
+    PubKeyDecryptionError(crypto::DecryptionError),
+    #[error(transparent)]
+    Serialization(bincode::Error),
+}
+
+impl From<UdpErrorKind> for TransportError {
+    fn from(kind: UdpErrorKind) -> Self {
+        TransportError::Udp(UdpError(kind))
+    }
+}
+
+impl From<std::io::Error> for TransportError {
+    fn from(error: std::io::Error) -> Self {
+        UdpErrorKind::IO(error).into()
+    }
+}
+
+impl From<crypto::DecryptionError> for TransportError {
+    fn from(error: crypto::DecryptionError) -> Self {
+        UdpErrorKind::PubKeyDecryptionError(error).into()
+    }
+}
+
+impl From<bincode::Error> for TransportError {
+    fn from(error: bincode::Error) -> Self {
+        UdpErrorKind::Serialization(error).into()
+    }
 }
 
 impl TransportError {
-    /// Returns true if this error is a stream-scoped failure that must NOT
-    /// kill the connection. The idle timeout remains the sole authority on
-    /// connection liveness; a single stalled or failed stream only fails
-    /// that stream, and the operation layer times out and retries against
-    /// another candidate.
+    /// A UDP `send_to` to `addr` failed with `kind`.
+    pub(in crate::transport) fn send_failed(addr: SocketAddr, kind: std::io::ErrorKind) -> Self {
+        UdpErrorKind::SendFailed(addr, kind).into()
+    }
+}
+
+/// What a [`TransportError`] ends, as seen from above the transport.
+///
+/// The node classifies transport errors only through
+/// [`TransportError::closes_connection`] (and [`TransportError::scope`]),
+/// never by matching variants, so a transport with different error variants
+/// needs only to classify its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorScope {
+    /// One send or one stream failed, and a retry may succeed. The connection
+    /// survives: the idle timeout remains the sole authority on its liveness.
+    Transient,
+    /// One stream cannot be sent, and a retry fails the same way. A
+    /// transport must handle these itself (the UDP transport does, in its
+    /// recv loop); if one reaches the node, the node treats it as non-fatal
+    /// and keeps the connection.
+    Stream,
+    /// The connection (or the attempt to make one) is over.
+    Connection,
+}
+
+impl TransportError {
+    /// Classify this error. See [`ErrorScope`].
+    ///
+    /// The match is exhaustive on purpose: a new variant must be classified
+    /// here, not fall into a default.
+    pub fn scope(&self) -> ErrorScope {
+        match self {
+            TransportError::OutboundStreamFailed(..)
+            | TransportError::Udp(UdpError(UdpErrorKind::SendFailed(..))) => ErrorScope::Transient,
+            TransportError::OutboundStreamInvalidLength(..) => ErrorScope::Stream,
+            TransportError::ChannelClosed
+            | TransportError::ConnectionClosed(_)
+            | TransportError::ConnectionEstablishmentFailure { .. }
+            | TransportError::ProtocolVersionMismatch { .. }
+            | TransportError::Other(_)
+            | TransportError::Udp(UdpError(
+                UdpErrorKind::IO(_)
+                | UdpErrorKind::PubKeyDecryptionError(_)
+                | UdpErrorKind::Serialization(_),
+            )) => ErrorScope::Connection,
+        }
+    }
+
+    /// Whether this error ends the connection ([`ErrorScope::Connection`]).
+    /// This is the node's only decision on a transport error: anything
+    /// else, transient or stream-scoped, leaves the connection up.
+    pub fn closes_connection(&self) -> bool {
+        self.scope() == ErrorScope::Connection
+    }
+
+    /// Former name of the transient check, kept for one release.
+    #[deprecated(note = "use closes_connection()/scope()")]
+    pub fn is_transient_send_failure(&self) -> bool {
+        self.scope() == ErrorScope::Transient
+    }
+
+    /// Returns true if this error is a transient failure that must NOT
+    /// kill the connection ([`ErrorScope::Transient`]). The transport's own
+    /// recv loop uses it to tell transient failures from stream-scoped ones
+    /// ([`ErrorScope::Stream`]), which it accounts for differently. The idle timeout
+    /// remains the sole authority on connection liveness; a single stalled
+    /// or failed stream only fails that stream, and the operation layer
+    /// times out and retries against another candidate.
     ///
     /// Covers:
-    /// - [`TransportError::SendFailed`]: a transient UDP send error (e.g.
-    ///   ENETUNREACH) on a single packet.
+    /// - `UdpErrorKind::SendFailed`: a transient UDP send error (e.g.
+    ///   ENETUNREACH) on a single packet of an established connection.
+    ///   The handshake also returns `SendFailed` (#5871), and there it is
+    ///   FATAL: it ends the connection attempt. Do not apply this predicate
+    ///   to the result of a connect; it describes established connections.
     /// - [`TransportError::OutboundStreamFailed`]: any stream-scoped failure
     ///   in `outbound_stream::{send_stream, pipe_stream}` — the
     ///   congestion-window wait exceeding `CWND_WAIT_TIMEOUT`, or (for the
@@ -386,11 +536,8 @@ impl TransportError {
     ///   re-handshake (#4345). The connection stays up and the idle timeout
     ///   decides liveness instead; the op layer times out and retries against
     ///   another candidate.
-    pub fn is_transient_send_failure(&self) -> bool {
-        matches!(
-            self,
-            TransportError::SendFailed(..) | TransportError::OutboundStreamFailed(..)
-        )
+    pub(crate) fn is_transient(&self) -> bool {
+        self.scope() == ErrorScope::Transient
     }
 }
 
@@ -674,143 +821,111 @@ impl Socket for UdpTransportSocket {
     }
 }
 
-// =============================================================================
-// Type-erased peer connection trait
-// =============================================================================
-//
-// This trait abstracts over `PeerConnection<S>` to allow the event loop to work
-// with connections without being generic over the socket type. This enables
-// using the same event loop code for both production (UdpTransportSocket) and testing
-// (InMemorySocket) without propagating generics through the entire codebase.
-
-use crate::message::NetMessage;
-
-/// Outcome carried by the broadcast-queue stream-completion oneshot.
-///
-/// The broadcast queue holds a semaphore permit while a streaming broadcast is
-/// in flight and releases it when the completion signal fires. Historically the
-/// signal was a bare `()` and the queue treated *any* signal as a successful
-/// delivery (issue #4235). That conflated two unrelated facts:
-///
-/// 1. **Permit release** — the permit MUST be released in every terminal case
-///    (delivered, dropped, timed out) so concurrency slots are never leaked.
-/// 2. **Delivery success** — only an actual transfer completion should refresh
-///    the peer's interest TTL and cache its summary.
-///
-/// Several drop paths (peer channel closed, congestion timeout per #4145,
-/// no connection, transport send error) fire the signal purely to release the
-/// permit. Carrying an explicit outcome lets the queue release the permit in
-/// all cases while only treating `Delivered` as a real send.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum BroadcastDeliveryOutcome {
-    /// All stream fragments were transmitted (the last fragment was handed to
-    /// the packet sender). Signaled after the final fragment leaves the sender,
-    /// NOT after a receiver ACK — this path has no end-to-end delivery
-    /// acknowledgement. It is the strongest "the send actually happened" signal
-    /// the broadcast queue can observe, as distinct from the message being
-    /// dropped before/while transmitting.
-    Delivered,
-    /// The stream fragment was dropped before/while transferring (channel
-    /// closed, congestion timeout, no connection, transport send error). The
-    /// permit is released but the message was NOT delivered.
-    Dropped,
-}
-
-/// Type-erased interface for peer connections.
-///
-/// This trait provides the minimal interface needed by `peer_connection_listener`
-/// and related event loop code to communicate with a peer. By boxing connections
-/// as `Box<dyn PeerConnectionApi>`, we avoid making the event loop generic over
-/// the socket type.
-pub(crate) trait PeerConnectionApi: Send {
-    /// Returns the remote peer's socket address.
-    fn remote_addr(&self) -> SocketAddr;
-
-    /// Returns the remote peer's negotiated protocol version, if known.
-    ///
-    /// `None` when the version was not exchanged (e.g. the joiner->gateway
-    /// path whose `AckConnection` carries no version). Callers must treat
-    /// `None` as "unsupported" when gating version-dependent message types.
-    fn remote_version(&self) -> Option<(u8, u8, u16)>;
-
-    /// Sends a network message to the remote peer.
-    ///
-    /// The message is serialized and sent over the transport connection.
-    ///
-    /// Returns the SERIALIZED length of the message. Callers use it to
-    /// attribute outbound bytes by message kind
-    /// ([`outbound_message_mix`][omm]) without serializing a second time just
-    /// to measure. It is the payload the transport was asked to move, not the
-    /// on-wire total (no framing, ACKs or retransmits) — see that module for
-    /// what the difference means.
-    ///
-    /// [omm]: crate::node::network_bridge::outbound_message_mix
-    fn send_message(
-        &mut self,
-        msg: NetMessage,
-    ) -> std::pin::Pin<Box<dyn Future<Output = Result<usize, TransportError>> + Send + '_>>;
-
-    /// Receives raw bytes from the remote peer.
-    ///
-    /// Returns the deserialized message bytes. The caller is responsible for
-    /// deserializing into the appropriate message type.
-    fn recv(
-        &mut self,
-    ) -> std::pin::Pin<Box<dyn Future<Output = Result<Vec<u8>, TransportError>> + Send + '_>>;
-
-    /// Sets the orphan stream registry for handling race conditions between
-    /// stream fragments and metadata messages (RequestStreaming/ResponseStreaming).
-    ///
-    /// This should be called by the node layer after connection establishment,
-    /// before any messages are processed.
-    fn set_orphan_stream_registry(
-        &mut self,
-        registry: std::sync::Arc<crate::operations::orphan_streams::OrphanStreamRegistry>,
-    );
-
-    /// Sends raw stream data to the remote peer using the given operations-level StreamId.
-    ///
-    /// The data is fragmented and sent via the transport's outbound stream mechanism,
-    /// using the provided `stream_id` (which should have the operations marker bit set)
-    /// so that the receiver routes fragments through the orphan registry instead of
-    /// the legacy InboundStream decode path.
-    ///
-    /// If `completion_tx` is provided, it will be signaled when the stream transfer
-    /// completes, carrying a [`BroadcastDeliveryOutcome`] that distinguishes an
-    /// actual delivery from a drop (see #4235). Used by the broadcast queue to
-    /// release its semaphore permit in all cases while only treating a real
-    /// delivery as a successful send.
-    fn send_stream_data(
-        &mut self,
-        stream_id: crate::transport::peer_connection::StreamId,
-        data: bytes::Bytes,
-        metadata: Option<bytes::Bytes>,
-        completion_tx: Option<tokio::sync::oneshot::Sender<BroadcastDeliveryOutcome>>,
-        progress: Option<crate::operations::stream_progress::StreamProgressHandle>,
-    ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>>;
-
-    /// Pipes an inbound stream to the remote peer, forwarding fragments as they arrive.
-    ///
-    /// Unlike `send_stream_data` which takes complete data and fragments it, this reads
-    /// from an existing `StreamHandle` and forwards each fragment incrementally without
-    /// waiting for full reassembly. This enables low-latency forwarding at intermediate nodes.
-    ///
-    /// The `outbound_stream_id` should be created via `StreamId::next_operations()` for
-    /// operations-level routing at the receiver.
-    fn pipe_stream_data(
-        &mut self,
-        outbound_stream_id: crate::transport::peer_connection::StreamId,
-        inbound_handle: crate::transport::peer_connection::streaming::StreamHandle,
-        metadata: Option<bytes::Bytes>,
-        progress: Option<crate::operations::stream_progress::StreamProgressHandle>,
-    ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>>;
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::transport::received_packet_tracker::ReportResult;
     use crate::transport::sent_packet_tracker::ResendAction;
+
+    /// Each UDP-only error displays exactly as the `TransportError` variant
+    /// it replaced did, and classifies the same way.
+    #[test]
+    fn udp_errors_display_and_classify_as_before() {
+        let addr: SocketAddr = "192.0.2.1:4000".parse().unwrap();
+        let kind = io::ErrorKind::NetworkUnreachable;
+        let send = TransportError::send_failed(addr, kind);
+        assert_eq!(send.to_string(), format!("send to {addr} failed: {kind}"));
+        assert_eq!(send.scope(), ErrorScope::Transient);
+
+        let io_error = TransportError::from(io::Error::other("socket gone"));
+        assert_eq!(io_error.to_string(), "socket gone");
+        assert_eq!(io_error.scope(), ErrorScope::Connection);
+
+        let decrypt = TransportError::from(crypto::DecryptionError::DecryptionFailed);
+        assert_eq!(
+            decrypt.to_string(),
+            crypto::DecryptionError::DecryptionFailed.to_string()
+        );
+        assert_eq!(decrypt.scope(), ErrorScope::Connection);
+
+        let serialization = bincode::deserialize::<u64>(&[]).unwrap_err();
+        let expected = serialization.to_string();
+        let encoded = TransportError::from(serialization);
+        assert_eq!(encoded.to_string(), expected);
+        assert_eq!(encoded.scope(), ErrorScope::Connection);
+
+        for error in [&send, &io_error, &decrypt, &encoded] {
+            assert!(matches!(error, TransportError::Udp(_)), "{error:?}");
+        }
+    }
+
+    /// Every variant keeps the decision the node made before errors were
+    /// classified through `scope()`: the node continued on `SendFailed` and
+    /// `OutboundStreamFailed` and closed the connection on everything else.
+    ///
+    /// `expected` is written independently of `scope()`, one row per variant.
+    /// Its match has no wildcard, so adding a variant without a row here does
+    /// not compile.
+    #[test]
+    fn error_scope_preserves_the_transient_decision_for_every_variant() {
+        /// (scope, old `is_transient_send_failure`, closes the connection)
+        fn expected(err: &TransportError) -> (ErrorScope, bool, bool) {
+            match err {
+                TransportError::ChannelClosed => (ErrorScope::Connection, false, true),
+                TransportError::ConnectionClosed(_) => (ErrorScope::Connection, false, true),
+                TransportError::ConnectionEstablishmentFailure { .. } => {
+                    (ErrorScope::Connection, false, true)
+                }
+                TransportError::ProtocolVersionMismatch { .. } => {
+                    (ErrorScope::Connection, false, true)
+                }
+                TransportError::Udp(UdpError(UdpErrorKind::SendFailed(..))) => {
+                    (ErrorScope::Transient, true, false)
+                }
+                TransportError::OutboundStreamFailed(_) => (ErrorScope::Transient, true, false),
+                TransportError::OutboundStreamInvalidLength(..) => {
+                    (ErrorScope::Stream, false, false)
+                }
+                TransportError::Udp(UdpError(UdpErrorKind::IO(_))) => {
+                    (ErrorScope::Connection, false, true)
+                }
+                TransportError::Other(_) => (ErrorScope::Connection, false, true),
+                TransportError::Udp(UdpError(UdpErrorKind::PubKeyDecryptionError(_))) => {
+                    (ErrorScope::Connection, false, true)
+                }
+                TransportError::Udp(UdpError(UdpErrorKind::Serialization(_))) => {
+                    (ErrorScope::Connection, false, true)
+                }
+            }
+        }
+
+        let addr: SocketAddr = "192.0.2.1:4000".parse().unwrap();
+        let cases = [
+            TransportError::ChannelClosed,
+            TransportError::ConnectionClosed(addr),
+            TransportError::ConnectionEstablishmentFailure { cause: "x".into() },
+            TransportError::ProtocolVersionMismatch {
+                expected: "1".into(),
+                actual: "2".into(),
+            },
+            TransportError::send_failed(addr, io::ErrorKind::NetworkUnreachable),
+            TransportError::OutboundStreamFailed(addr),
+            TransportError::OutboundStreamInvalidLength(addr, 0),
+            TransportError::from(io::Error::other("x")),
+            TransportError::Other(anyhow::anyhow!("x")),
+            TransportError::from(crypto::DecryptionError::DecryptionFailed),
+            TransportError::from(bincode::deserialize::<u64>(&[]).unwrap_err()),
+        ];
+        for err in &cases {
+            let (scope, old_transient, closes) = expected(err);
+            assert_eq!(err.scope(), scope, "{err:?}");
+            assert_eq!(err.is_transient(), old_transient, "{err:?}");
+            #[allow(deprecated)]
+            let alias = err.is_transient_send_failure();
+            assert_eq!(alias, old_transient, "{err:?}");
+            assert_eq!(err.closes_connection(), closes, "{err:?}");
+        }
+    }
 
     #[test]
     fn test_packet_send_receive_acknowledge_flow() {

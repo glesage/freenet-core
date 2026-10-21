@@ -75,6 +75,12 @@ retries = 0
 filter = "test(test_ping_blocked_peers)"
 retries = 0
 
+# Concurrent duplicate fragment inserts: a race the test exists to detect would
+# show up as an intermittent failure, which a retry would turn into a pass.
+[[profile.ci.overrides]]
+filter = "test(concurrent_duplicates_never_refuse_a_genuine_fragment)"
+retries = 0
+
 # #5227 graceful-shutdown exit code. The whole subject of this test is a signal
 # race (SIGTERM must reach an installed handler and the process must exit 0), so
 # a retry would be indistinguishable from the regression it exists to catch —
@@ -120,6 +126,15 @@ slow-timeout = { period = "150s", terminate-after = 2 }
 [[profile.ci.overrides]]
 filter = "test(/probation_(is_committed|survives)/)"
 slow-timeout = { period = "300s", terminate-after = 2 }
+retries = 0
+
+# WAN transport bench, regression scenario R1 (death spiral under an RTT
+# spike; crates/core/src/transport/link_model/r1_tests.rs). It runs on virtual
+# time from fixed seeds, so it is deterministic: a retry could only turn a
+# real regression into a green run, the laundering the flaky-tests rule
+# forbids. Each test runs three seeds of an 8 MiB transfer.
+[[profile.ci.overrides]]
+filter = "test(/link_model::r1_tests::/)"
 retries = 0
 
 [profile.nightly]

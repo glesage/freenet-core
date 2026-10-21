@@ -42,9 +42,11 @@ WHEN accepting a new connection (should_accept):
      which the topology maintenance loop's over-max prune sheds next tick
      (protected lattice edges are never the prune victim). Applied via the
      shared predicate admits_lattice_edge_over_cap() in should_accept, in
-     add_connection, AND in BOTH connection-lifecycle promotion gates
-     (p2p_protoc/connection_lifecycle.rs) so the exception is live on the
-     real CONNECT path, not just should_accept. See connection_manager.rs.
+     add_connection, AND in all three connection-lifecycle cap gates (the
+     outbound pre-flight check in handle_connect_peer and both promotion
+     gates, p2p_protoc/connection_lifecycle.rs, through
+     refuses_connection_at_cap()) so the exception is live on the real
+     CONNECT path, not just should_accept. See connection_manager.rs.
      MINIMUM-DEGREE FLOOR: the whole lattice feature (this exception, the
      per-side acceptance clause, the route-to-self discovery probe, and the
      topology.rs retention exemption) is GATED OFF when this peer's CONFIGURED
@@ -493,7 +495,7 @@ SummaryRequest / ChangeInterests):
     10 §1c) — with register-after-state a genuine phantom is unrepresentable, so
     an immediate drop would only churn (an eviction teardown re-registers →
     register/drop cycling). BUT the exemption is time-bounded (see "Cleanup
-    Exemptions Must Be Time-Bounded" below): a phantom whose downstream keeps
+    Exemptions Must Be Bounded" below): a phantom whose downstream keeps
     RENEWING never hits the Fix-6 downstream-expiry prune, so once it is older
     than PHANTOM_ABSOLUTE_MAX_AGE (4 × SUBSCRIPTION_LEASE_DURATION ≈ 32 min) the
     sweep emits PhantomRepair::Drop (drop_phantom_downstream + interest decrement
@@ -513,13 +515,21 @@ SummaryRequest / ChangeInterests):
     repair-or-drop.
 ```
 
-### Cleanup Exemptions Must Be Time-Bounded
+### Cleanup Exemptions Must Be Bounded
 
 ```
 Any condition that exempts an entry from garbage collection
-(is_transient, has_pending, etc.) MUST:
-  1. Expire via TTL, OR
-  2. Be overridden by an absolute age threshold
+(is_transient, has_pending, etc.) MUST end by one of:
+  1. A TTL, or an absolute age threshold that overrides it, OR
+  2. A lifecycle event that always happens and that the entry cannot
+     trigger or postpone itself, such as the owning connection closing.
+     Check that every way the owner can end (clean close, error,
+     dropped task) triggers it.
+
+A condition the entry can renew for itself does not bound it.
+A connection held open indefinitely is not yet bounded (#5922); an
+entry bounded only by connection close inherits that gap, and should
+say so where it is defined.
 
 Unbounded exemptions create permanent GC blind spots.
 
@@ -535,7 +545,7 @@ CORRECT:
 
 **Audit targets:**
 - All `prune_connection` / `drop_connection` call sites — verify all related maps are cleaned up
-- All `retain()` / sweep loops — verify exemption conditions have TTL or absolute age bounds
+- All `retain()` / sweep loops: verify exemption conditions are bounded (TTL, absolute age, or a lifecycle event)
 - `ConnectionManager` fields — verify each map has a documented cleanup owner
 
 ### Cross-DashMap Lock Discipline (`significant_drop_tightening` exception)

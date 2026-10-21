@@ -15,6 +15,7 @@ impl P2pConnManager {
         &mut self,
         peer_addr: SocketAddr,
         handshake_cmd_sender: &HandshakeCommandSender,
+        reason: crate::tracing::DisconnectReason,
     ) -> bool {
         let Some(entry) = self.connections.get(&peer_addr) else {
             return false;
@@ -43,7 +44,7 @@ impl P2pConnManager {
         // redundant teardown — we remove the connection from ctx.connections /
         // addr_by_pub_key and prune the ring below regardless. A missed
         // DropConnection leaves at most one stale per-SocketAddr
-        // ExpectedInboundTracker entry (no TTL sweep, but overwritten on the
+        // InboundMatcher entry (no TTL sweep, but overwritten on the
         // next register() and consumed on a matching inbound — bounded, benign).
         if !handshake_cmd_sender.try_send(HandshakeCommand::DropConnection { peer: peer.clone() }) {
             tracing::warn!(
@@ -58,7 +59,10 @@ impl P2pConnManager {
             .bridge
             .op_manager
             .ring
-            .prune_connection(PeerId::new(peer.pub_key().clone(), peer_addr))
+            .prune_connection(
+                PeerId::new(peer.pub_key().clone(), peer_addr),
+                reason.clone(),
+            )
             .await;
 
         // Handle orphaned transactions immediately (retry via alternate routes).
@@ -85,7 +89,7 @@ impl P2pConnManager {
                 Duration::from_secs(1),
                 conn.sender
                     .send(Right(ConnEvent::NodeAction(NodeEvent::DropConnection(
-                        peer_addr,
+                        peer_addr, reason,
                     )))),
             )
             .await
@@ -156,7 +160,10 @@ impl P2pConnManager {
             .bridge
             .op_manager
             .ring
-            .prune_connection(PeerId::new(peer.pub_key().clone(), peer_addr))
+            .prune_connection(
+                PeerId::new(peer.pub_key().clone(), peer_addr),
+                crate::tracing::DisconnectReason::Explicit("unpromoted_transport".into()),
+            )
             .await;
 
         // Handle orphaned transactions
@@ -184,6 +191,7 @@ impl P2pConnManager {
                 conn.sender
                     .send(Right(ConnEvent::NodeAction(NodeEvent::DropConnection(
                         peer_addr,
+                        crate::tracing::DisconnectReason::Explicit("unpromoted_transport".into()),
                     )))),
             )
             .await
@@ -196,6 +204,9 @@ impl P2pConnManager {
         }
     }
 
+    // `origin` is telemetry carried alongside the dial; bundling it with the
+    // other arguments would only move them into a one-use struct.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn handle_connect_peer(
         &mut self,
         peer: PeerKeyLocation,
@@ -204,6 +215,7 @@ impl P2pConnManager {
         handshake_commands: &HandshakeCommandSender,
         state: &mut EventListenerState,
         transient: bool,
+        origin: crate::transport::NatAttemptOrigin,
     ) -> anyhow::Result<()> {
         // Periodic cleanup of expired backoff entries (every 60 seconds)
         const BACKOFF_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
@@ -320,9 +332,7 @@ impl P2pConnManager {
                 // farther non-lattice link next tick. See
                 // connection_manager.rs::{admits_lattice_edge_over_cap, LATTICE_OVERMAX_SLACK}.
                 let current = connection_manager.connection_count();
-                if current >= connection_manager.max_connections
-                    && !connection_manager.admits_lattice_edge_over_cap(loc)
-                {
+                if connection_manager.refuses_connection_at_cap(loc) {
                     tracing::warn!(
                         tx = %tx,
                         %peer,
@@ -506,10 +516,17 @@ impl P2pConnManager {
         // the connection was already accepted at the protocol level (the CONNECT terminus handler in connect.rs)
         // and re-rolling the probabilistic Kleinberg filter would discard connections
         // after costly NAT traversal for no capacity reason (#3545).
+        // The cap has the SAME nearest-neighbor lattice exemption
+        // (`admits_lattice_edge_over_cap`) as should_accept, add_connection and
+        // both promotion gates; this check and the promotion gates share
+        // `refuses_connection_at_cap`. Without it a peer at max refused its own
+        // lattice probe's acceptor here, before NAT traversal, so tightening at
+        // capacity never succeeded from our side (#5827).
         if !transient && !peer_addr.ip().is_unspecified() {
             let connection_manager = &self.bridge.op_manager.ring.connection_manager;
             let current = connection_manager.connection_count();
-            if current >= connection_manager.max_connections {
+            let loc = Location::from_address(&peer_addr);
+            if connection_manager.refuses_connection_at_cap(loc) {
                 tracing::info!(
                     tx = %tx,
                     remote = %peer_addr,
@@ -589,10 +606,12 @@ impl P2pConnManager {
         // parking. The connect op can retry on a later attempt; this failure is
         // LOCAL channel contention, not a remote connection failure, so we do
         // NOT record peer backoff.
+        let origin = dial_origin(origin, transient, peer_addr, &self.gateways);
         if !handshake_commands.try_send(HandshakeCommand::Connect {
             peer: peer.clone(),
             transaction: tx,
             transient,
+            origin,
         }) {
             tracing::warn!(
                 tx = %tx,
@@ -982,7 +1001,12 @@ impl P2pConnManager {
                     .bridge
                     .op_manager
                     .ring
-                    .prune_connection(PeerId::new(old_peer.pub_key().clone(), peer_addr))
+                    .prune_connection(
+                        PeerId::new(old_peer.pub_key().clone(), peer_addr),
+                        crate::tracing::DisconnectReason::Explicit(
+                            "replaced_by_new_connection".into(),
+                        ),
+                    )
                     .await;
                 self.bridge
                     .handle_orphaned_transactions(prune_result.orphaned_transactions, peer_addr)
@@ -1001,7 +1025,7 @@ impl P2pConnManager {
                 // connection is redundant cleanup — we've already pruned the old
                 // peer from the ring above and are about to install the new
                 // connection entry. A missed DropConnection leaves at most one
-                // stale per-SocketAddr ExpectedInboundTracker entry (no TTL sweep,
+                // stale per-SocketAddr InboundMatcher entry (no TTL sweep,
                 // but overwritten on the next register() and consumed on a
                 // matching inbound — bounded, benign).
                 if !handshake_commands.try_send(HandshakeCommand::DropConnection {
@@ -1096,7 +1120,7 @@ impl P2pConnManager {
         // between stream fragments and metadata messages (RequestStreaming/ResponseStreaming).
         let mut connection = connection;
         connection
-            .set_orphan_stream_registry(self.bridge.op_manager.orphan_stream_registry().clone());
+            .set_inbound_stream_registry(self.bridge.op_manager.orphan_stream_registry().clone());
 
         // Use tokio::spawn directly instead of GlobalExecutor::spawn.
         // GlobalExecutor::spawn uses Handle::try_current().spawn() which doesn't
@@ -1215,9 +1239,7 @@ impl P2pConnManager {
                 // farther non-lattice link next tick. See
                 // connection_manager.rs::{admits_lattice_edge_over_cap, LATTICE_OVERMAX_SLACK}.
                 let current = connection_manager.connection_count();
-                if current >= connection_manager.max_connections
-                    && !connection_manager.admits_lattice_edge_over_cap(loc)
-                {
+                if connection_manager.refuses_connection_at_cap(loc) {
                     tracing::warn!(
                         %peer_addr,
                         current_connections = current,
@@ -1228,8 +1250,12 @@ impl P2pConnManager {
                     // Drop the connection immediately instead of letting it linger
                     // as a zombie for up to 5 minutes confusing the dashboard.
                     crate::node::network_status::record_peer_disconnected(peer_addr);
-                    self.drop_connection_by_addr(peer_addr, handshake_commands)
-                        .await;
+                    self.drop_connection_by_addr(
+                        peer_addr,
+                        handshake_commands,
+                        crate::tracing::DisconnectReason::ConnectionLimitReached,
+                    )
+                    .await;
                     return Ok(());
                 }
                 tracing::info!(%peer_addr, %loc, "handle_successful_connection: promoting connection into ring");
@@ -1477,11 +1503,13 @@ impl P2pConnManager {
                 remote_addr,
                 error,
                 connection_id,
+                reason,
             }) => {
                 tracing::debug!(
                     remote = %remote_addr,
                     ?error,
                     connection_id,
+                    %reason,
                     "peer_connection_listener reported transport closure"
                 );
                 // Ignore stale TransportClosed from replaced connections: the old
@@ -1517,7 +1545,7 @@ impl P2pConnManager {
                         .bridge
                         .op_manager
                         .ring
-                        .prune_connection(PeerId::new(peer.pub_key().clone(), remote_addr))
+                        .prune_connection(PeerId::new(peer.pub_key().clone(), remote_addr), reason)
                         .await;
 
                     // Handle orphaned transactions immediately (retry via alternate routes)
@@ -1549,7 +1577,7 @@ impl P2pConnManager {
                     // The DropConnection is redundant teardown — the connection is
                     // already removed from ctx.connections and pruned from the ring
                     // above. A missed DropConnection leaves at most one stale
-                    // per-SocketAddr ExpectedInboundTracker entry (no TTL sweep, but
+                    // per-SocketAddr InboundMatcher entry (no TTL sweep, but
                     // overwritten on the next register() and consumed on a matching
                     // inbound — bounded, benign).
                     if !handshake_commands
@@ -1572,6 +1600,123 @@ impl P2pConnManager {
                 tracing::error!("All peer connection event channels closed");
                 Ok(EventResult::Continue)
             }
+        }
+    }
+}
+
+/// The origin a dial is reported under: `Gateway` for any dial to a
+/// configured gateway (or one the caller marked as a gateway dial), whichever
+/// path started it, otherwise the caller's `origin`. A CONNECT joiner whose
+/// acceptor is a gateway, for example, is still a gateway dial.
+fn dial_origin(
+    origin: crate::transport::NatAttemptOrigin,
+    is_gw: bool,
+    peer_addr: SocketAddr,
+    gateways: &[PeerKeyLocation],
+) -> crate::transport::NatAttemptOrigin {
+    if is_gw
+        || gateways
+            .iter()
+            .any(|gw| gw.socket_addr() == Some(peer_addr))
+    {
+        crate::transport::NatAttemptOrigin::Gateway
+    } else {
+        origin
+    }
+}
+
+#[cfg(test)]
+mod dial_origin_tests {
+    use super::*;
+    use crate::transport::NatAttemptOrigin;
+
+    fn gateway() -> PeerKeyLocation {
+        PeerKeyLocation::new(
+            crate::transport::TransportKeypair::new().public().clone(),
+            "192.0.2.1:31337".parse().unwrap(),
+        )
+    }
+
+    /// A dial to a configured gateway is `Gateway` whatever path started it.
+    #[test]
+    fn a_configured_gateway_is_always_a_gateway_dial() {
+        let gw = gateway();
+        let addr = gw.socket_addr().unwrap();
+        for origin in NatAttemptOrigin::ALL {
+            assert_eq!(
+                dial_origin(origin, false, addr, std::slice::from_ref(&gw)),
+                NatAttemptOrigin::Gateway,
+                "{origin:?}"
+            );
+        }
+    }
+
+    /// A dial the caller marked as a gateway dial is `Gateway` even before
+    /// the gateway list knows the address.
+    #[test]
+    fn a_marked_gateway_dial_is_a_gateway_dial() {
+        let addr: SocketAddr = "198.51.100.4:9".parse().unwrap();
+        assert_eq!(
+            dial_origin(NatAttemptOrigin::RingPeerNoTransport, true, addr, &[]),
+            NatAttemptOrigin::Gateway
+        );
+    }
+
+    /// Source pin: `handle_connect_peer` applies `dial_origin` to the
+    /// origin it hands to the handshake driver (the event loop has no
+    /// harness here).
+    #[test]
+    fn handle_connect_peer_applies_dial_origin() {
+        const SOURCE: &str = include_str!("connection_lifecycle.rs");
+        let tests_at = SOURCE
+            .find("\n#[cfg(test)]\nmod dial_origin_tests")
+            .expect("test module");
+        let start = SOURCE
+            .find("pub(super) async fn handle_connect_peer(")
+            .expect("handle_connect_peer renamed");
+        assert!(start < tests_at, "the anchor must be production code");
+        let open = start
+            + SOURCE[start..]
+                .find(") -> anyhow::Result<()> {")
+                .expect("body")
+            + 24;
+        let (mut depth, mut end) = (0i32, open);
+        for (i, b) in SOURCE.bytes().enumerate().skip(open) {
+            match b {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(end > open && end < tests_at, "unbalanced body slice");
+        let code: String = SOURCE[open..end].split_whitespace().collect();
+        let applied = code
+            .find("letorigin=dial_origin(origin,transient,peer_addr,&self.gateways);")
+            .expect("handle_connect_peer must apply dial_origin");
+        let sent = code
+            .find("HandshakeCommand::Connect{peer:peer.clone(),transaction:tx,transient,origin,}")
+            .expect("the handshake command carries the origin");
+        assert!(applied < sent, "applied before it is sent");
+    }
+
+    /// Any other dial keeps its origin, including one to another port of a
+    /// gateway's IP.
+    #[test]
+    fn a_non_gateway_dial_keeps_its_origin() {
+        let gw = gateway();
+        let other_port: SocketAddr = "192.0.2.1:31338".parse().unwrap();
+        for origin in NatAttemptOrigin::ALL {
+            assert_eq!(
+                dial_origin(origin, false, other_port, std::slice::from_ref(&gw)),
+                origin,
+                "{origin:?}"
+            );
         }
     }
 }

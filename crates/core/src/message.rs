@@ -853,13 +853,22 @@ pub trait InnerMessage: Into<NetMessage> {
 }
 
 type RemainingChecks = Option<usize>;
-type ConnectResult = Result<(SocketAddr, RemainingChecks), ()>;
+pub(crate) type ConnectResult = Result<(SocketAddr, RemainingChecks), ()>;
 
 /// Internal node events emitted to the event loop.
 #[derive(Debug, Clone)]
 pub(crate) enum NodeEvent {
-    /// Drop the given peer connection by socket address.
-    DropConnection(SocketAddr),
+    /// Drop the given peer connection by socket address. The reason is
+    /// reported on the `disconnect` telemetry event.
+    DropConnection(SocketAddr, crate::tracing::DisconnectReason),
+    /// Drop a gateway link that bootstrapping CONNECTs found dead, unless
+    /// the gateway is a ring connection by the time the event loop handles
+    /// this. `done` is signalled either way, so the sender can hold its next
+    /// CONNECT until the drop has happened (#5858).
+    DropStaleGatewayLink {
+        addr: SocketAddr,
+        done: tokio::sync::mpsc::Sender<()>,
+    },
     /// Drop all connections (ring + transient). Used after suspend/resume
     /// to force fresh transport reconnection to gateways.
     DropAllConnections,
@@ -869,6 +878,9 @@ pub(crate) enum NodeEvent {
         tx: Transaction,
         callback: tokio::sync::mpsc::Sender<ConnectResult>,
         is_gw: bool,
+        /// Why this dial is made (telemetry only; a configured gateway is
+        /// tagged `Gateway` whatever is passed here).
+        origin: crate::transport::NatAttemptOrigin,
     },
     Disconnect {
         cause: Option<Cow<'static, str>>,
@@ -1025,8 +1037,11 @@ pub(crate) enum QueryResult {
 impl Display for NodeEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            NodeEvent::DropConnection(peer) => {
-                write!(f, "DropConnection (from {peer})")
+            NodeEvent::DropConnection(peer, reason) => {
+                write!(f, "DropConnection (from {peer}, {reason})")
+            }
+            NodeEvent::DropStaleGatewayLink { addr, .. } => {
+                write!(f, "DropStaleGatewayLink (from {addr})")
             }
             NodeEvent::DropAllConnections => {
                 write!(f, "DropAllConnections")

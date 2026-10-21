@@ -30,9 +30,10 @@ use crate::operations::connect::ConnectMsg;
 use crate::ring::PeerKey;
 use crate::ring::{Distance, Location};
 use crate::transport::{
-    BroadcastDeliveryOutcome, CongestionControlConfig, ExpectedInboundTracker, PeerConnectionApi,
-    Socket, TransportError, TransportKeypair, TransportPublicKey, UdpTransportSocket,
-    create_connection_handler, global_bandwidth::GlobalBandwidthManager, peer_connection::StreamId,
+    CongestionControlConfig, InboundExpectations, ListenerExit, OutboundConnector,
+    PeerConnectionApi, Socket, StreamId, StreamSendOutcome, TransportError, TransportHandle,
+    TransportKeypair, TransportPublicKey, UdpTransportConfig, UdpTransportSocket,
+    global_bandwidth::GlobalBandwidthManager, open_udp_transport,
 };
 use crate::util::time_source::{DynTimeSource, InstantTimeSrc};
 use crate::{
@@ -150,9 +151,9 @@ pub(crate) enum P2pBridgeEvent {
         metadata: Option<bytes::Bytes>,
         /// Optional completion signal for broadcast queue concurrency control.
         /// Signaled when the actual stream transfer finishes (not just enqueue),
-        /// carrying a [`BroadcastDeliveryOutcome`] so the queue distinguishes a
+        /// carrying a [`StreamSendOutcome`] so the queue distinguishes a
         /// real delivery from a drop (#4235).
-        completion_tx: Option<tokio::sync::oneshot::Sender<BroadcastDeliveryOutcome>>,
+        completion_tx: Option<tokio::sync::oneshot::Sender<StreamSendOutcome>>,
         /// Optional per-fragment progress handle for the streaming-PUT retry
         /// loop (#4001). Threaded through to `send_stream` so the originator's
         /// retry loop sees liveness ticks. `None` for every non-originator path.
@@ -162,7 +163,7 @@ pub(crate) enum P2pBridgeEvent {
     PipeStream {
         target_addr: SocketAddr,
         outbound_stream_id: StreamId,
-        inbound_handle: crate::transport::peer_connection::streaming::StreamHandle,
+        inbound_handle: crate::transport::IncomingStream,
         metadata: Option<bytes::Bytes>,
     },
 }
@@ -281,7 +282,7 @@ impl P2pBridge {
         stream_id: StreamId,
         data: bytes::Bytes,
         metadata: Option<bytes::Bytes>,
-        completion_tx: Option<tokio::sync::oneshot::Sender<BroadcastDeliveryOutcome>>,
+        completion_tx: Option<tokio::sync::oneshot::Sender<StreamSendOutcome>>,
         progress: Option<crate::operations::stream_progress::StreamProgressHandle>,
     ) -> super::ConnResult<()> {
         // channel-safety: ok — sole caller is the broadcast-queue task
@@ -386,9 +387,13 @@ impl P2pBridge {
 impl NetworkBridge for P2pBridge {
     async fn drop_connection(&mut self, peer_addr: SocketAddr) -> super::ConnResult<()> {
         if self.accepted_peers.remove(&peer_addr).is_some() {
+            // channel-safety: ok — pre-existing send (only the reason argument is
+            // new); `P2pBridge::drop_connection` is called only from test
+            // utilities, never from inside the network event loop.
             self.ev_listener_tx
                 .send(P2pBridgeEvent::NodeAction(NodeEvent::DropConnection(
                     peer_addr,
+                    crate::tracing::DisconnectReason::Pruned,
                 )))
                 .await
                 .map_err(|_| ConnectionError::SendNotCompleted(peer_addr))?;
@@ -502,7 +507,7 @@ impl NetworkBridge for P2pBridge {
         &self,
         target_addr: SocketAddr,
         outbound_stream_id: StreamId,
-        inbound_handle: crate::transport::peer_connection::streaming::StreamHandle,
+        inbound_handle: crate::transport::IncomingStream,
         metadata: Option<bytes::Bytes>,
     ) -> super::ConnResult<()> {
         self.ev_listener_tx
@@ -1337,6 +1342,40 @@ impl P2pConnManager {
         notification_channel: EventLoopNotificationsReceiver,
         node_controller: Receiver<NodeEvent>,
     ) -> anyhow::Result<Infallible> {
+        let transport = open_udp_transport::<S>(
+            self.key_pair.clone(),
+            self.listening_ip,
+            self.listening_port,
+            self.is_gateway,
+            UdpTransportConfig {
+                bandwidth_limit: self.bandwidth_limit,
+                global_bandwidth: self.global_bandwidth.clone(),
+                ledbat_min_ssthresh: self.ledbat_min_ssthresh,
+                congestion_config: Some(self.congestion_config.clone()),
+                ack_version_floor_override: self.ack_version_floor_override,
+            },
+        )
+        .await?;
+        self.run_event_listener_with_transport(
+            transport,
+            op_manager,
+            client_wait_for_transaction,
+            notification_channel,
+            node_controller,
+        )
+        .await
+    }
+
+    /// Runs the event loop over an open transport. Not generic over the socket
+    /// type: the transport is reached only through [`TransportHandle`].
+    async fn run_event_listener_with_transport(
+        self,
+        transport: TransportHandle,
+        op_manager: Arc<OpManager>,
+        client_wait_for_transaction: ContractHandlerChannel<WaitingResolution>,
+        notification_channel: EventLoopNotificationsReceiver,
+        node_controller: Receiver<NodeEvent>,
+    ) -> anyhow::Result<Infallible> {
         // Destructure self to avoid partial move issues
         let P2pConnManager {
             gateways,
@@ -1355,7 +1394,7 @@ impl P2pConnManager {
             this_location,
             check_version,
             bandwidth_limit,
-            global_bandwidth,
+            global_bandwidth: _,
             ledbat_min_ssthresh,
             congestion_config,
             ack_version_floor_override,
@@ -1366,19 +1405,12 @@ impl P2pConnManager {
             broadcast_queue,
         } = self;
 
-        let (outbound_conn_handler, inbound_conn_handler, mut listen_task_handle) =
-            create_connection_handler::<S>(
-                key_pair.clone(),
-                listening_ip,
-                listening_port,
-                is_gateway,
-                bandwidth_limit,
-                global_bandwidth,
-                ledbat_min_ssthresh,
-                Some(congestion_config.clone()),
-                ack_version_floor_override,
-            )
-            .await?;
+        let TransportHandle {
+            connector,
+            acceptor,
+            expected_inbound,
+            listener: mut listener_liveness,
+        } = transport;
 
         tracing::info!(
             listening_port,
@@ -1389,7 +1421,6 @@ impl P2pConnManager {
             "Network listener opened - ready to receive connections"
         );
 
-        let expected_inbound = outbound_conn_handler.expected_inbound_tracker();
         let mut state = EventListenerState::new(expected_inbound);
 
         let (conn_event_tx, conn_event_rx) = mpsc::channel(1024);
@@ -1402,9 +1433,16 @@ impl P2pConnManager {
             None
         };
 
+        // Hold a connector for as long as the event loop runs, as the event loop
+        // held the outbound handler before the transport handle existed. The
+        // UDP listener exits once every connector (every queue sender) is
+        // gone, so without this a dead handshake driver would take the
+        // listener down with it and restart the node, where before it only
+        // closed the handshake stream.
+        let _outbound_keepalive: Arc<dyn OutboundConnector> = Arc::clone(&connector);
         let (handshake_handler, handshake_cmd_sender) = HandshakeHandler::new(
-            inbound_conn_handler,
-            outbound_conn_handler.clone(),
+            acceptor,
+            connector,
             bridge.op_manager.ring.connection_manager.clone(),
             bridge.op_manager.ring.router.clone(),
             this_location,
@@ -1448,11 +1486,11 @@ impl P2pConnManager {
             this_location,
             check_version,
             bandwidth_limit,
-            global_bandwidth: None, // Already used for connection handler, not needed in ctx
+            global_bandwidth: None, // Already used to open the transport, not needed in ctx
             ledbat_min_ssthresh,
-            congestion_config, // Already used for connection handler, kept for struct completeness
-            // Already consumed by create_connection_handler above; kept for
-            // struct completeness, same as the two fields around it.
+            congestion_config, // Already used to open the transport, kept for struct completeness
+            // Already used by open_udp_transport in run_event_listener_with_socket;
+            // kept for struct completeness, same as the two fields around it.
             ack_version_floor_override,
             blocked_addresses,
             broadcast_retries,
@@ -1486,29 +1524,11 @@ impl P2pConnManager {
             let result = tokio::select! {
                 biased;
 
-                listen_result = &mut listen_task_handle => {
+                exit = &mut listener_liveness => {
                     // The UDP listener task has exited — this is fatal.
                     // Without the listener, no UDP packets are read from the socket,
                     // connections will time out, and the node becomes unresponsive.
-                    match listen_result {
-                        Ok(e) => {
-                            tracing::error!(
-                                error = %e,
-                                "CRITICAL: UDP listen task exited with transport error"
-                            );
-                        }
-                        Err(join_err) => {
-                            let cause = if join_err.is_panic() { "panicked" } else { "cancelled" };
-                            tracing::error!(
-                                cause,
-                                "CRITICAL: UDP listen task failed: {join_err}"
-                            );
-                        }
-                    }
-                    return Err(anyhow!(
-                        "UDP listen task exited unexpectedly — \
-                         transport layer is dead, node must restart"
-                    ));
+                    return Err(listener_exit_error(&exit));
                 },
 
                 // Also wakes for a zombie sweep backlog deadline, so a backlog
@@ -1876,6 +1896,7 @@ impl P2pConnManager {
                                             tx,
                                             callback,
                                             is_gw,
+                                            origin: unconnected_dial_origin(is_gw),
                                         }),
                                     ) {
                                         // `err` owns the ConnectPeer event (and thus the
@@ -1895,6 +1916,28 @@ impl P2pConnManager {
                                              Sustained occurrences indicate fan-out / migration load \
                                              overwhelming the event loop."
                                         );
+                                        // A joiner's CONNECT request has no op
+                                        // retry: end its driver now, as the
+                                        // resend waiter does, rather than leave
+                                        // it holding a bootstrap round for its
+                                        // TTL (#5858). Handled inline: this IS
+                                        // the event loop, and the channel that
+                                        // would carry the notice is the full one.
+                                        if unsent_message_notice(
+                                            &msg,
+                                            tx,
+                                            target_addr,
+                                            &ctx.bridge.op_manager.ring.connection_manager.pub_key,
+                                        )
+                                        .is_some()
+                                        {
+                                            orphan_transaction(
+                                                &mut state,
+                                                &ctx.bridge.op_manager.ring.live_tx_tracker,
+                                                tx,
+                                                target_addr,
+                                            );
+                                        }
                                         continue;
                                     }
 
@@ -1907,8 +1950,18 @@ impl P2pConnManager {
 
                                     // Spawn a task to wait for connection and then send the message
                                     let target_peer_for_resend = target_peer.clone();
+                                    let unsent_notice = unsent_message_notice(
+                                        &msg_clone,
+                                        tx,
+                                        target_addr,
+                                        &ctx.bridge.op_manager.ring.connection_manager.pub_key,
+                                    );
                                     GlobalExecutor::spawn(async move {
-                                        match timeout(Duration::from_secs(20), result.recv()).await
+                                        let resent = match timeout(
+                                            Duration::from_secs(20),
+                                            result.recv(),
+                                        )
+                                        .await
                                         {
                                             Ok(Some(Ok((connected_addr, _)))) => {
                                                 tracing::debug!(
@@ -1939,6 +1992,7 @@ impl P2pConnManager {
                                                         "Failed to reschedule message after connection established"
                                                     );
                                                 }
+                                                true
                                             }
                                             Ok(Some(Err(e))) => {
                                                 tracing::debug!(
@@ -1948,6 +2002,7 @@ impl P2pConnManager {
                                                     phase = "error",
                                                     "Connection attempt failed"
                                                 );
+                                                false
                                             }
                                             Ok(None) => {
                                                 tracing::error!(
@@ -1956,6 +2011,7 @@ impl P2pConnManager {
                                                     phase = "error",
                                                     "Response channel closed before connection result received"
                                                 );
+                                                false
                                             }
                                             Err(_) => {
                                                 tracing::error!(
@@ -1963,6 +2019,47 @@ impl P2pConnManager {
                                                     peer_addr = %target_addr,
                                                     phase = "timeout",
                                                     "Timeout waiting for connection establishment"
+                                                );
+                                                false
+                                            }
+                                        };
+                                        // A CONNECT request that never went out
+                                        // has nothing in flight: end its driver
+                                        // now, as for a peer pruned mid-flight,
+                                        // instead of leaving it to wait out its
+                                        // TTL (#5858). Other ops keep their own
+                                        // retry handling.
+                                        // This is the only notice, and a lost one
+                                        // holds the join's pending slot and
+                                        // bootstrap-round guard until the TTL, so
+                                        // wait out a transient backlog rather than
+                                        // drop it. Bounded (channel-safety rule
+                                        // #6): this is the spawned resend waiter,
+                                        // not the event loop.
+                                        const UNSENT_NOTICE_SEND_TIMEOUT: Duration =
+                                            Duration::from_secs(5);
+                                        if let (false, Some(notice)) = (resent, unsent_notice) {
+                                            if let Err(e) = bridge_sender
+                                                .send_timeout(
+                                                    P2pBridgeEvent::NodeAction(notice),
+                                                    UNSENT_NOTICE_SEND_TIMEOUT,
+                                                )
+                                                .await
+                                            {
+                                                let reason = match e {
+                                                    mpsc::error::SendTimeoutError::Timeout(_) => {
+                                                        "timeout"
+                                                    }
+                                                    mpsc::error::SendTimeoutError::Closed(_) => {
+                                                        "closed"
+                                                    }
+                                                };
+                                                tracing::warn!(
+                                                    tx = %tx,
+                                                    peer_addr = %target_addr,
+                                                    reason,
+                                                    "Unsent CONNECT notice not delivered; \
+                                                     the driver waits out its TTL"
                                                 );
                                             }
                                         }
@@ -1974,6 +2071,7 @@ impl P2pConnManager {
                             remote_addr,
                             error,
                             connection_id,
+                            reason: _,
                         } => {
                             tracing::debug!(
                                 peer_addr = %remote_addr,
@@ -2030,8 +2128,7 @@ impl P2pConnManager {
                                              cannot route stream fragment"
                                         );
                                         if let Some(tx) = completion_tx {
-                                            let _ignored =
-                                                tx.send(BroadcastDeliveryOutcome::Dropped);
+                                            let _ignored = tx.send(StreamSendOutcome::Dropped);
                                         }
                                     }
                                     Err(_timeout) => {
@@ -2044,8 +2141,7 @@ impl P2pConnManager {
                                              to keep event loop responsive"
                                         );
                                         if let Some(tx) = completion_tx {
-                                            let _ignored =
-                                                tx.send(BroadcastDeliveryOutcome::Dropped);
+                                            let _ignored = tx.send(StreamSendOutcome::Dropped);
                                         }
                                     }
                                 }
@@ -2060,7 +2156,7 @@ impl P2pConnManager {
                                 // is released immediately. No connection means the
                                 // fragment was dropped, not delivered (#4235).
                                 if let Some(tx) = completion_tx {
-                                    let _ignored = tx.send(BroadcastDeliveryOutcome::Dropped);
+                                    let _ignored = tx.send(StreamSendOutcome::Dropped);
                                 }
                             }
                         }
@@ -2176,10 +2272,12 @@ impl P2pConnManager {
                                             .bridge
                                             .op_manager
                                             .ring
-                                            .prune_connection(PeerId::new(
-                                                peer.pub_key().clone(),
-                                                peer_addr,
-                                            ))
+                                            .prune_connection(
+                                                PeerId::new(peer.pub_key().clone(), peer_addr),
+                                                crate::tracing::DisconnectReason::Explicit(
+                                                    "shutdown".into(),
+                                                ),
+                                            )
                                             .await;
 
                                         // Note: In the simplified architecture (2026-01), subscriptions are lease-based
@@ -2221,7 +2319,7 @@ impl P2pConnManager {
                                         // cleanup: the connection has already been removed from
                                         // ctx.connections / addr_by_pub_key and pruned from the
                                         // ring above. The only residue is the handshake driver's
-                                        // ExpectedInboundTracker entry (if any). That tracker is
+                                        // InboundMatcher entry (if any). That tracker is
                                         // a per-SocketAddr HashMap with no TTL sweep, but the
                                         // entry is benign and bounded: it is overwritten on the
                                         // next register() for the same addr and consumed when a
@@ -2288,15 +2386,57 @@ impl P2pConnManager {
                             }
                         }
                         ConnEvent::NodeAction(action) => match action {
-                            NodeEvent::DropConnection(peer_addr) => {
+                            NodeEvent::DropConnection(peer_addr, reason) => {
                                 if !ctx
-                                    .drop_connection_by_addr(peer_addr, &handshake_cmd_sender)
+                                    .drop_connection_by_addr(
+                                        peer_addr,
+                                        &handshake_cmd_sender,
+                                        reason,
+                                    )
                                     .await
                                 {
                                     tracing::debug!(
                                         peer_addr = %peer_addr,
                                         phase = "disconnect",
                                         "Drop connection requested for unknown address - ignoring"
+                                    );
+                                }
+                            }
+                            NodeEvent::DropStaleGatewayLink { addr, done } => {
+                                // Checked here, not only by the sender: the
+                                // gateway may have become a ring connection
+                                // while this event was queued (#5858).
+                                if ctx
+                                    .bridge
+                                    .op_manager
+                                    .ring
+                                    .connection_manager
+                                    .is_in_ring(addr)
+                                {
+                                    tracing::debug!(
+                                        peer_addr = %addr,
+                                        "Stale gateway link is now a ring connection - keeping it"
+                                    );
+                                } else if !ctx
+                                    .drop_connection_by_addr(
+                                        addr,
+                                        &handshake_cmd_sender,
+                                        crate::tracing::DisconnectReason::Explicit(
+                                            "stale_gateway_link".into(),
+                                        ),
+                                    )
+                                    .await
+                                {
+                                    tracing::debug!(
+                                        peer_addr = %addr,
+                                        "Stale gateway link already gone - ignoring"
+                                    );
+                                }
+                                // The sender waits on this with a timeout.
+                                if done.try_send(()).is_err() {
+                                    tracing::debug!(
+                                        peer_addr = %addr,
+                                        "Stale gateway link handled after its sender stopped waiting"
                                     );
                                 }
                             }
@@ -2314,8 +2454,14 @@ impl P2pConnManager {
                                 // during suspend/resume recovery (rare), and during resume
                                 // there are few inbound connections to fill the events channel.
                                 for peer_addr in all_addrs {
-                                    ctx.drop_connection_by_addr(peer_addr, &handshake_cmd_sender)
-                                        .await;
+                                    ctx.drop_connection_by_addr(
+                                        peer_addr,
+                                        &handshake_cmd_sender,
+                                        crate::tracing::DisconnectReason::Explicit(
+                                            "suspend_resume".into(),
+                                        ),
+                                    )
+                                    .await;
                                 }
                             }
                             NodeEvent::ConnectPeer {
@@ -2323,6 +2469,7 @@ impl P2pConnManager {
                                 tx,
                                 callback,
                                 is_gw: transient,
+                                origin,
                             } => {
                                 tracing::debug!(
                                     tx = %tx,
@@ -2339,6 +2486,7 @@ impl P2pConnManager {
                                     &handshake_cmd_sender,
                                     &mut state,
                                     transient,
+                                    origin,
                                 )
                                 .await?;
                             }
@@ -2726,26 +2874,12 @@ impl P2pConnManager {
                                     .remove_finished_transaction(tx);
                             }
                             NodeEvent::TransactionOrphaned { tx, peer } => {
-                                // The awaited peer was pruned mid-flight (#4313).
-                                // Deliver the cause THROUGH the waiter channel
-                                // before the sender drops, so the parked driver's
-                                // recv() yields PeerDisconnected before None —
-                                // race-free, no side registry. Then clean up like
-                                // TransactionCompleted.
-                                state.tx_to_client.remove(&tx);
-                                if let Some(sender) = state.pending_op_results.remove(&tx) {
-                                    // Best-effort: a full channel means a real
-                                    // reply is already queued, a closed one means
-                                    // the driver already exited — both benign.
-                                    #[allow(clippy::let_underscore_must_use)]
-                                    let _ = sender.try_send(WaiterReply::PeerDisconnected { peer });
-                                    crate::config::GlobalTestMetrics::record_pending_op_remove();
-                                }
-                                ctx.bridge
-                                    .op_manager
-                                    .ring
-                                    .live_tx_tracker
-                                    .remove_finished_transaction(tx);
+                                orphan_transaction(
+                                    &mut state,
+                                    &ctx.bridge.op_manager.ring.live_tx_tracker,
+                                    tx,
+                                    peer,
+                                );
                             }
                             NodeEvent::LocalSubscribeComplete {
                                 tx,
@@ -2928,6 +3062,70 @@ impl ConnectResultSender for mpsc::Sender<Result<(SocketAddr, Option<usize>), ()
     }
 }
 
+/// End `tx`'s driver because the peer it waits on is gone (#4313) or its
+/// request never left (#5858): deliver the cause THROUGH the waiter channel
+/// before the sender drops, so the parked driver's recv() yields
+/// PeerDisconnected before None (race-free, no side registry), then clean up
+/// like TransactionCompleted. Shared by every orphaning site so they cannot
+/// drift apart.
+fn orphan_transaction(
+    state: &mut EventListenerState,
+    live_tx_tracker: &crate::ring::LiveTransactionTracker,
+    tx: Transaction,
+    peer: SocketAddr,
+) {
+    state.tx_to_client.remove(&tx);
+    if let Some(sender) = state.pending_op_results.remove(&tx) {
+        // Best-effort: a full channel means a real reply is already queued, a
+        // closed one means the driver already exited — both benign.
+        #[allow(clippy::let_underscore_must_use)]
+        let _ = sender.try_send(WaiterReply::PeerDisconnected { peer });
+        crate::config::GlobalTestMetrics::record_pending_op_remove();
+    }
+    live_tx_tracker.remove_finished_transaction(tx);
+}
+
+/// The origin of the event loop's dial for a message to a peer it has no
+/// transport to. The target is a configured gateway or a peer the ring still
+/// lists (`peek_target_peer` always returns `None` since #4110, so nothing
+/// else reaches the dial), so a non-gateway target is a ring peer whose
+/// transport was lost. The message may be from any op: a relayed request, a
+/// reply, or our own CONNECT request routed through that peer (for example
+/// by `acquire_new`). Cached-peer joins never reach this dial (#5954).
+fn unconnected_dial_origin(is_gw: bool) -> crate::transport::NatAttemptOrigin {
+    if is_gw {
+        crate::transport::NatAttemptOrigin::Gateway
+    } else {
+        crate::transport::NatAttemptOrigin::RingPeerNoTransport
+    }
+}
+
+/// What to tell the event loop when `msg`, waiting for a connection to
+/// `target_addr`, was dropped because the connection failed. Only this
+/// node's own CONNECT request as a joiner (`own`) is reported (#5858): its
+/// transaction has nothing in flight, so ending its driver at once (as for a
+/// peer pruned mid-flight) frees the bootstrap round instead of holding it
+/// for the transaction TTL. A relayed request and every other message keep
+/// their ops' own retry handling.
+fn unsent_message_notice(
+    msg: &NetMessage,
+    tx: Transaction,
+    target_addr: SocketAddr,
+    own: &TransportPublicKey,
+) -> Option<NodeEvent> {
+    let NetMessage::V1(NetMessageV1::Connect(crate::operations::connect::ConnectMsg::Request {
+        payload,
+        ..
+    })) = msg
+    else {
+        return None;
+    };
+    (payload.joiner.pub_key() == own).then_some(NodeEvent::TransactionOrphaned {
+        tx,
+        peer: target_addr,
+    })
+}
+
 /// Fail every callback awaiting a connection to `peer_addr` after a connect
 /// attempt was abandoned (e.g. its `HandshakeCommand::Connect` enqueue was
 /// dropped on a full/closed handshake command channel, #4145).
@@ -2991,7 +3189,7 @@ async fn fail_awaiting_connection(
 }
 
 struct EventListenerState {
-    expected_inbound: ExpectedInboundTracker,
+    expected_inbound: Arc<dyn InboundExpectations>,
     pending_from_executor: HashSet<Transaction>,
     /// Maps transactions to the set of clients waiting for their results.
     /// Cleaned up via `TransactionTimedOut` and `TransactionCompleted` handlers.
@@ -3010,7 +3208,7 @@ struct EventListenerState {
 }
 
 impl EventListenerState {
-    fn new(expected_inbound: ExpectedInboundTracker) -> Self {
+    fn new(expected_inbound: Arc<dyn InboundExpectations>) -> Self {
         Self {
             expected_inbound,
             pending_from_executor: HashSet::new(),
@@ -3068,6 +3266,8 @@ pub(super) enum ConnEvent {
         /// ID of the connection entry that spawned the listener reporting this closure.
         /// Used to ignore stale events from replaced connections.
         connection_id: u64,
+        /// Why the connection ended, for the `disconnect` telemetry event.
+        reason: crate::tracing::DisconnectReason,
     },
     /// Send raw stream data to a peer via the transport's stream mechanism.
     /// Used by operations-level streaming to send large payloads as stream fragments.
@@ -3077,8 +3277,8 @@ pub(super) enum ConnEvent {
         data: bytes::Bytes,
         metadata: Option<bytes::Bytes>,
         /// Optional completion signal for broadcast queue concurrency control,
-        /// carrying a [`BroadcastDeliveryOutcome`] (#4235).
-        completion_tx: Option<tokio::sync::oneshot::Sender<BroadcastDeliveryOutcome>>,
+        /// carrying a [`StreamSendOutcome`] (#4235).
+        completion_tx: Option<tokio::sync::oneshot::Sender<StreamSendOutcome>>,
         /// Optional per-fragment progress handle for the streaming-PUT retry
         /// loop (#4001). `None` for every non-originator path.
         progress: Option<crate::operations::stream_progress::StreamProgressHandle>,
@@ -3088,7 +3288,7 @@ pub(super) enum ConnEvent {
     PipeStream {
         target_addr: SocketAddr,
         outbound_stream_id: StreamId,
-        inbound_handle: crate::transport::peer_connection::streaming::StreamHandle,
+        inbound_handle: crate::transport::IncomingStream,
         metadata: Option<bytes::Bytes>,
     },
 }
@@ -3151,11 +3351,21 @@ async fn handle_peer_channel_message(
             // nothing on this hot path.
             let class =
                 crate::node::network_bridge::outbound_message_mix::OutboundClass::classify(&msg);
-            match conn.send_message(msg).await {
+            // The transport moves bytes; serializing the message is this
+            // layer's job. A serialization failure is reported exactly as a
+            // failed send.
+            let sent = match bincode::serialize(&msg) {
+                Ok(data) => {
+                    let serialized_len = data.len();
+                    conn.send_bytes(data).await.map(|()| serialized_len)
+                }
+                Err(error) => Err(serialization_failure(error)),
+            };
+            match sent {
                 Ok(serialized_len) => {
                     // #4956: attribute the bytes to the message kind that
-                    // produced them. `send_message` returns the length it
-                    // already computed, so nothing is serialized twice.
+                    // produced them. The length is the one just serialized,
+                    // so nothing is serialized twice.
                     // Recorded only on a successful hand-off to the transport,
                     // matching the payload mix's real-delivery accounting rule
                     // so a failed send never inflates the census.
@@ -3164,7 +3374,7 @@ async fn handle_peer_channel_message(
                 Err(error) => {
                     tracing::error!(
                         to = %conn.remote_addr(),
-                        ?error,
+                        error = %error,
                         "[CONN_LIFECYCLE] Failed to send message to peer"
                     );
                     return Err(error);
@@ -3178,7 +3388,7 @@ async fn handle_peer_channel_message(
         Right(action) => {
             tracing::debug!(to=%conn.remote_addr(), "Received action from channel");
             match action {
-                ConnEvent::NodeAction(NodeEvent::DropConnection(peer)) => {
+                ConnEvent::NodeAction(NodeEvent::DropConnection(peer, _)) => {
                     tracing::info!(
                         to = %conn.remote_addr(),
                         peer = %peer,
@@ -3209,6 +3419,8 @@ async fn handle_peer_channel_message(
                         has_metadata = metadata.is_some(),
                         "[CONN_LIFECYCLE] Sending operations stream data to peer"
                     );
+                    let progress = progress
+                        .map(|p| Arc::new(p) as Arc<dyn crate::transport::StreamProgressObserver>);
                     if let Err(error) = conn
                         .send_stream_data(stream_id, data, metadata, completion_tx, progress)
                         .await
@@ -3269,12 +3481,14 @@ async fn notify_transport_closed(
     remote_addr: SocketAddr,
     error: TransportError,
     connection_id: u64,
+    reason: crate::tracing::DisconnectReason,
 ) {
     if sender
         .send(ConnEvent::TransportClosed {
             remote_addr,
             error,
             connection_id,
+            reason,
         })
         .await
         .is_err()
@@ -3371,7 +3585,7 @@ async fn peer_connection_listener(
                     if let Err(error) =
                         handle_peer_channel_message(&mut conn, msg, &outbound_mix).await
                     {
-                        if error.is_transient_send_failure() {
+                        if !error.closes_connection() {
                             tracing::warn!(
                                 to = %remote_addr,
                                 ?error,
@@ -3380,7 +3594,7 @@ async fn peer_connection_listener(
                         } else {
                             tracing::debug!(
                                 to = %remote_addr,
-                                ?error,
+                                error = %error,
                                 "[CONN_LIFECYCLE] Connection closed after channel command"
                             );
                             // Drain any messages that arrived after our try_recv() but before
@@ -3397,6 +3611,9 @@ async fn peer_connection_listener(
                                 remote_addr,
                                 error,
                                 connection_id,
+                                crate::tracing::DisconnectReason::NetworkError(
+                                    "outbound_command_failed".into(),
+                                ),
                             )
                             .await;
                             return;
@@ -3418,6 +3635,9 @@ async fn peer_connection_listener(
                         remote_addr,
                         TransportError::ConnectionClosed(remote_addr),
                         connection_id,
+                        crate::tracing::DisconnectReason::Explicit(
+                            "listener_channel_closed".into(),
+                        ),
                     )
                     .await;
                     return;
@@ -3432,7 +3652,7 @@ async fn peer_connection_listener(
                 match msg {
                     Some(msg) => {
                         if let Err(error) = handle_peer_channel_message(&mut conn, msg, &outbound_mix).await {
-                            if error.is_transient_send_failure() {
+                            if !error.closes_connection() {
                                 tracing::warn!(
                                     to = %remote_addr,
                                     ?error,
@@ -3441,12 +3661,19 @@ async fn peer_connection_listener(
                             } else {
                                 tracing::debug!(
                                     to = %remote_addr,
-                                    ?error,
+                                    error = %error,
                                     "[CONN_LIFECYCLE] Connection closed after channel command"
                                 );
                                 // Drain any messages that arrived while we were processing this one
                                 drain_pending_before_shutdown(&mut rx, &mut conn, remote_addr, &outbound_mix).await;
-                                notify_transport_closed(&conn_events, remote_addr, error, connection_id).await;
+                                notify_transport_closed(
+                                    &conn_events,
+                                    remote_addr,
+                                    error,
+                                    connection_id,
+                                    crate::tracing::DisconnectReason::NetworkError("outbound_command_failed".into()),
+                                )
+                                .await;
                                 return;
                             }
                         }
@@ -3462,6 +3689,9 @@ async fn peer_connection_listener(
                             remote_addr,
                             TransportError::ConnectionClosed(remote_addr),
                             connection_id,
+                            crate::tracing::DisconnectReason::Explicit(
+                                "listener_channel_closed".into(),
+                            ),
                         )
                         .await;
                         return;
@@ -3513,11 +3743,18 @@ async fn peer_connection_listener(
                             let transport_error = TransportError::Other(anyhow!(
                                 "Failed to deserialize inbound message from {remote_addr}: {error:?}"
                             ));
-                            notify_transport_closed(&conn_events, remote_addr, transport_error, connection_id).await;
+                            notify_transport_closed(
+                                &conn_events,
+                                remote_addr,
+                                transport_error,
+                                connection_id,
+                                crate::tracing::DisconnectReason::NetworkError("undecodable_message".into()),
+                            )
+                            .await;
                             return;
                         }
                     },
-                    Err(error) if error.is_transient_send_failure() => {
+                    Err(error) if !error.closes_connection() => {
                         // Transient send failure from internal sends (ACKs, etc.) that
                         // bubbled up through recv(). Don't kill the connection — the idle
                         // timeout is the sole authority on liveness.
@@ -3536,14 +3773,74 @@ async fn peer_connection_listener(
                         // CRITICAL: Drain pending outbound messages before exiting.
                         // Messages may have been queued to the channel while we were
                         // waiting in select!, and they would be lost without this drain.
+                        // Label the disconnect (see disconnect_reason_for_close).
+                        let reason = disconnect_reason_for_close(conn.close_reason());
                         drain_pending_before_shutdown(&mut rx, &mut conn, remote_addr, &outbound_mix).await;
-                        notify_transport_closed(&conn_events, remote_addr, error, connection_id).await;
+                        notify_transport_closed(&conn_events, remote_addr, error, connection_id, reason).await;
                         return;
                     }
                 }
             },
         }
     }
+}
+
+/// The telemetry label for a connection that `recv` ended: the idle timeout
+/// is the only liveness check, so it is the "timeout" case; every other recv
+/// error is a transport closure.
+fn disconnect_reason_for_close(
+    reason: Option<crate::transport::CloseReason>,
+) -> crate::tracing::DisconnectReason {
+    use crate::transport::CloseReason;
+    match reason {
+        Some(CloseReason::IdleTimeout) => crate::tracing::DisconnectReason::Timeout,
+        Some(CloseReason::InboundStreamRefusals) => {
+            crate::tracing::DisconnectReason::Explicit("inbound_stream_refusals".into())
+        }
+        None => crate::tracing::DisconnectReason::NetworkError("transport_closed".into()),
+    }
+}
+
+/// Log a stopped transport listener and return the error that ends the event
+/// loop. The log lines are the ones the node wrote when it read the listener
+/// task's `JoinHandle` itself: a returned error is logged with `error`, a
+/// panic or cancellation with `cause` and the join error's text.
+fn listener_exit_error(exit: &ListenerExit) -> anyhow::Error {
+    match exit {
+        ListenerExit::Error(e) => {
+            tracing::error!(
+                error = %e,
+                "CRITICAL: UDP listen task exited with transport error"
+            );
+        }
+        ListenerExit::Panicked(join_err) => {
+            tracing::error!(
+                cause = "panicked",
+                "CRITICAL: UDP listen task failed: {join_err}"
+            );
+        }
+        ListenerExit::Cancelled(join_err) => {
+            tracing::error!(
+                cause = "cancelled",
+                "CRITICAL: UDP listen task failed: {join_err}"
+            );
+        }
+    }
+    anyhow!(
+        "UDP listen task exited unexpectedly — \
+         transport layer is dead, node must restart"
+    )
+}
+
+/// The send error for a message this node could not serialize. It is the
+/// node's failure, not the transport's, so it is reported as
+/// `TransportError::Other`, with the same text and the same classification
+/// (it closes the connection) as the transport's own serialization error.
+/// The send path logs errors with Display (`%error`), so the `anyhow`
+/// wrapper's Debug form, and any backtrace it captured under
+/// `RUST_BACKTRACE`, never reaches the log.
+fn serialization_failure(error: bincode::Error) -> TransportError {
+    TransportError::Other(anyhow::Error::from(error))
 }
 
 #[inline(always)]
@@ -3611,6 +3908,372 @@ pub(crate) mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::mpsc;
     use tokio::time::{Duration, Instant, sleep, timeout};
+
+    /// Each way the transport listener can stop is logged as the event loop
+    /// logged it when it read the listener task's `JoinHandle` itself, and ends
+    /// the loop with the same error.
+    #[test]
+    fn listener_exit_is_logged_as_before_and_ends_the_loop() {
+        use crate::transport::{ListenerExit, TransportError};
+        let (logs, _guard) = crate::util::test_log_capture::install();
+        let returned = TransportError::ChannelClosed.to_string();
+        let cases = [
+            (
+                ListenerExit::Error(TransportError::ChannelClosed),
+                vec![
+                    "CRITICAL: UDP listen task exited with transport error".to_string(),
+                    format!("error={returned}"),
+                ],
+            ),
+            (
+                ListenerExit::Panicked("task 7 panicked".into()),
+                vec![
+                    "CRITICAL: UDP listen task failed: task 7 panicked".to_string(),
+                    "cause=\"panicked\"".to_string(),
+                ],
+            ),
+            (
+                ListenerExit::Cancelled("task 8 was cancelled".into()),
+                vec![
+                    "CRITICAL: UDP listen task failed: task 8 was cancelled".to_string(),
+                    "cause=\"cancelled\"".to_string(),
+                ],
+            ),
+        ];
+        for (exit, expected) in cases {
+            logs.lock().unwrap().clear();
+            let err = super::listener_exit_error(&exit);
+            assert_eq!(
+                err.to_string(),
+                "UDP listen task exited unexpectedly — transport layer is dead, node must restart"
+            );
+            let captured = logs.lock().unwrap().clone();
+            let line = captured
+                .iter()
+                .find(|l| l.starts_with("ERROR") && l.contains("CRITICAL: UDP listen task"))
+                .unwrap_or_else(|| panic!("{exit:?} was not logged: {captured:?}"));
+            for part in expected {
+                assert!(
+                    line.contains(&part),
+                    "{exit:?}: {part:?} missing from {line:?}"
+                );
+            }
+        }
+    }
+
+    /// A message the node cannot serialize fails its send as an `Other`
+    /// error with exactly the text and classification the transport's own
+    /// serialization error had.
+    #[test]
+    fn a_node_serialization_failure_reads_as_before() {
+        let error = || bincode::deserialize::<u64>(&[]).unwrap_err();
+        let node = super::serialization_failure(error());
+        let transport = super::TransportError::from(error());
+        assert!(matches!(node, super::TransportError::Other(_)), "{node:?}");
+        assert_eq!(node.to_string(), transport.to_string());
+        assert_eq!(node.scope(), transport.scope());
+        assert!(node.closes_connection());
+    }
+
+    /// A connection that records the bytes it is asked to send, and fails
+    /// every send when `fail` is set.
+    struct RecordingConnection {
+        sent: Arc<parking_lot::Mutex<Vec<Vec<u8>>>>,
+        fail: bool,
+    }
+
+    impl super::PeerConnectionApi for RecordingConnection {
+        fn remote_addr(&self) -> std::net::SocketAddr {
+            "192.0.2.1:4000".parse().unwrap()
+        }
+
+        fn remote_version(&self) -> Option<(u8, u8, u16)> {
+            None
+        }
+
+        fn send_bytes(
+            &mut self,
+            data: Vec<u8>,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), super::TransportError>> + Send + '_>,
+        > {
+            self.sent.lock().push(data);
+            let result = if self.fail {
+                Err(super::TransportError::ConnectionClosed(self.remote_addr()))
+            } else {
+                Ok(())
+            };
+            Box::pin(async move { result })
+        }
+
+        fn recv(
+            &mut self,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<Vec<u8>, super::TransportError>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(std::future::pending())
+        }
+
+        fn set_inbound_stream_registry(
+            &mut self,
+            _registry: Arc<dyn crate::transport::InboundStreamRegistry>,
+        ) {
+        }
+
+        fn send_stream_data(
+            &mut self,
+            _stream_id: crate::transport::StreamId,
+            _data: bytes::Bytes,
+            _metadata: Option<bytes::Bytes>,
+            _completion_tx: Option<
+                tokio::sync::oneshot::Sender<crate::transport::StreamSendOutcome>,
+            >,
+            _progress: Option<Arc<dyn crate::transport::StreamProgressObserver>>,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), super::TransportError>> + Send + '_>,
+        > {
+            unreachable!("not used by these tests")
+        }
+
+        fn pipe_stream_data(
+            &mut self,
+            _outbound_stream_id: crate::transport::StreamId,
+            _inbound_handle: crate::transport::IncomingStream,
+            _metadata: Option<bytes::Bytes>,
+            _progress: Option<Arc<dyn crate::transport::StreamProgressObserver>>,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), super::TransportError>> + Send + '_>,
+        > {
+            unreachable!("not used by these tests")
+        }
+    }
+
+    /// Every combination of the UDP connection's two close flags reaches the
+    /// same `DisconnectReason` through `close_reason()` as the node computed
+    /// when it read the flags itself. The expected column is that old
+    /// if-chain, written out inline.
+    #[test]
+    fn close_reason_preserves_the_disconnect_reason_for_every_flag_combination() {
+        use crate::tracing::DisconnectReason;
+        use crate::transport::peer_connection::close_reason_from_flags;
+        for idle in [false, true] {
+            for refusals in [false, true] {
+                let old = if idle {
+                    DisconnectReason::Timeout
+                } else if refusals {
+                    DisconnectReason::Explicit("inbound_stream_refusals".into())
+                } else {
+                    DisconnectReason::NetworkError("transport_closed".into())
+                };
+                let new =
+                    super::disconnect_reason_for_close(close_reason_from_flags(idle, refusals));
+                assert_eq!(new, old, "idle={idle} refusals={refusals}");
+            }
+        }
+    }
+
+    fn hosting_announce() -> crate::message::NetMessage {
+        use crate::message::{NeighborHostingMessage, NetMessage, NetMessageV1};
+        NetMessage::V1(NetMessageV1::NeighborHosting {
+            message: NeighborHostingMessage::HostingAnnounce {
+                added: vec![freenet_stdlib::prelude::ContractInstanceId::new([1u8; 32])],
+                removed: vec![],
+                is_response: false,
+            },
+        })
+    }
+
+    /// The bridge serializes a message itself and hands the transport exactly
+    /// `bincode::serialize(&msg)`, once (the transport no longer serializes),
+    /// and attributes that many bytes to the outbound message mix.
+    #[tokio::test]
+    async fn bridge_sends_the_serialized_message_and_records_its_length() {
+        let sent = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let mut conn: Box<dyn super::PeerConnectionApi> = Box::new(RecordingConnection {
+            sent: sent.clone(),
+            fail: false,
+        });
+        let mix = crate::node::network_bridge::outbound_message_mix::OutboundMix::new();
+        let msg = hosting_announce();
+        let expected = bincode::serialize(&msg).unwrap();
+
+        super::handle_peer_channel_message(&mut conn, either::Left(msg), &mix)
+            .await
+            .expect("send succeeds");
+
+        assert_eq!(*sent.lock(), vec![expected.clone()]);
+        let rollup = mix.rollup_body_for_test();
+        assert_eq!(rollup["total_msgs"], 1);
+        assert_eq!(rollup["total_bytes"], expected.len() as u64);
+    }
+
+    /// A send the transport refuses is returned as an error and records
+    /// nothing in the outbound message mix.
+    #[tokio::test]
+    async fn bridge_records_nothing_for_a_failed_send() {
+        let sent = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let mut conn: Box<dyn super::PeerConnectionApi> = Box::new(RecordingConnection {
+            sent: sent.clone(),
+            fail: true,
+        });
+        let mix = crate::node::network_bridge::outbound_message_mix::OutboundMix::new();
+
+        let result =
+            super::handle_peer_channel_message(&mut conn, either::Left(hosting_announce()), &mix)
+                .await;
+
+        assert!(result.is_err(), "the transport's error is returned");
+        assert_eq!(sent.lock().len(), 1, "premise: the send was attempted");
+        let rollup = mix.rollup_body_for_test();
+        assert_eq!(rollup["total_msgs"], 0);
+        assert_eq!(rollup["total_bytes"], 0);
+    }
+
+    /// Only this node's own CONNECT request as a joiner is ended at once
+    /// when its target could not be connected (#5858); a relayed request and
+    /// every other message keep their ops' own retry handling.
+    #[test]
+    fn only_an_unsent_connect_request_is_ended_at_once() {
+        use crate::message::{NetMessage, NetMessageV1, NodeEvent, Transaction};
+        use crate::operations::connect::{ConnectMsg, prepare_join_request};
+        use crate::ring::{Location, PeerKeyLocation};
+        use crate::transport::TransportKeypair;
+
+        let peer = |port: u16| {
+            PeerKeyLocation::new(
+                TransportKeypair::new().public().clone(),
+                std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+            )
+        };
+        let (me, other) = (peer(1), peer(4));
+        let gateway = std::net::SocketAddr::from(([127, 0, 0, 1], 2));
+        let tx = Transaction::new::<ConnectMsg>();
+        let own_request = prepare_join_request(tx, &me, &peer(2), Location::new(0.5), 10, &[]);
+        let notice = |msg: ConnectMsg| {
+            super::unsent_message_notice(
+                &NetMessage::V1(NetMessageV1::Connect(msg)),
+                tx,
+                gateway,
+                me.pub_key(),
+            )
+        };
+        match notice(own_request) {
+            Some(NodeEvent::TransactionOrphaned { tx: t, peer }) => {
+                assert_eq!((t, peer), (tx, gateway));
+            }
+            other => panic!("an unsent CONNECT request must end its driver, got {other:?}"),
+        }
+        let relayed = prepare_join_request(tx, &other, &peer(2), Location::new(0.5), 10, &[]);
+        assert!(
+            notice(relayed).is_none(),
+            "a relayed request is not ours to end"
+        );
+        let observed = ConnectMsg::ObservedAddress {
+            id: tx,
+            address: std::net::SocketAddr::from(([127, 0, 0, 1], 3)),
+        };
+        assert!(notice(observed).is_none());
+    }
+
+    /// Both places that drop a message waiting for a connection report an
+    /// unsent CONNECT (#5858): the resend waiter, only when it did not resend
+    /// it, and the full/closed ConnectPeer dispatch (re-review N3), inline
+    /// since that channel is the full one. Source pin: both run inside the
+    /// event loop, which has no harness here.
+    #[test]
+    fn the_resend_waiter_reports_only_a_message_it_did_not_send() {
+        let code = event_loop_code();
+        let own = "&ctx.bridge.op_manager.ring.connection_manager.pub_key,";
+        let notice = code
+            .find(&format!(
+                "letunsent_notice=unsent_message_notice(&msg_clone,tx,target_addr,{own});"
+            ))
+            .expect("the waiter must work out the notice before msg_clone is moved");
+        let sent = code[notice..]
+            .find("iflet(false,Some(notice))=(resent,unsent_notice){ifletErr(e)=bridge_sender.send_timeout(P2pBridgeEvent::NodeAction(notice),UNSENT_NOTICE_SEND_TIMEOUT,).await")
+            .expect("the notice must go out only when the message was not resent");
+        let resent_ok = code[notice..]
+            .find("\"Failedtoreschedulemessageafterconnectionestablished\");}true}")
+            .expect("a resent message must count as sent");
+        assert!(resent_ok < sent);
+        let dropped = code
+            .find("overwhelmingtheeventloop.\");")
+            .expect("the ConnectPeer full/closed branch");
+        let inline = code[dropped..]
+            .find(&format!(
+                "ifunsent_message_notice(&msg,tx,target_addr,{own}).is_some(){{orphan_transaction(&mutstate,&ctx.bridge.op_manager.ring.live_tx_tracker,tx,target_addr,);}}"
+            ))
+            .expect("the full/closed branch must end an unsent CONNECT's driver");
+        let cont = code[dropped..].find("continue;").expect("the branch ends");
+        assert!(inline < cont, "before the branch moves on");
+    }
+
+    /// The event-loop function `run_event_listener_with_transport`, with all
+    /// whitespace removed. Scoped to that function: a whole-file scrape could
+    /// match a literal anywhere, including in these tests.
+    fn event_loop_code() -> String {
+        const SOURCE: &str = include_str!("p2p_protoc.rs");
+        let signature = "async fn run_event_listener_with_transport(";
+        let start = SOURCE.find(signature).expect("event-loop function renamed");
+        let tests_at = SOURCE
+            .find("\n#[cfg(test)]\npub(crate) mod tests")
+            .expect("tests");
+        assert!(start < tests_at, "the anchor must be production code");
+        let open = start + SOURCE[start..].find('{').expect("function body");
+        let bytes = SOURCE.as_bytes();
+        let (mut depth, mut end) = (0i32, open);
+        for (i, b) in bytes.iter().enumerate().skip(open) {
+            match b {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(end > open && end < tests_at, "unbalanced body slice");
+        SOURCE[open..end].split_whitespace().collect()
+    }
+
+    /// The event loop's dial for a message with no transport is `Gateway`
+    /// for a gateway and `RingPeerNoTransport` otherwise.
+    #[test]
+    fn an_unconnected_dial_is_tagged_by_its_target() {
+        use crate::transport::NatAttemptOrigin;
+        assert_eq!(
+            super::unconnected_dial_origin(true),
+            NatAttemptOrigin::Gateway
+        );
+        assert_eq!(
+            super::unconnected_dial_origin(false),
+            NatAttemptOrigin::RingPeerNoTransport
+        );
+    }
+
+    /// Source pin: the event loop's dial for a message with no connection
+    /// is tagged by `unconnected_dial_origin` (the event loop has no harness
+    /// here). The call must be the `origin:` field of that `ConnectPeer`.
+    #[test]
+    fn the_unconnected_dial_uses_unconnected_dial_origin() {
+        let code = event_loop_code();
+        let dispatch = code
+            .find("P2pBridgeEvent::NodeAction(NodeEvent::ConnectPeer{peer:target_peer.clone(),tx,callback,is_gw,")
+            .expect("the unconnected-dial ConnectPeer");
+        assert!(
+            code[dispatch..].starts_with(
+                "P2pBridgeEvent::NodeAction(NodeEvent::ConnectPeer{peer:target_peer.clone(),tx,callback,is_gw,origin:unconnected_dial_origin(is_gw),}),"
+            ),
+            "the dial's origin must come from unconnected_dial_origin"
+        );
+    }
 
     /// A fake [`super::ContractPresenceOracle`] for testing
     /// [`super::collect_contract_states`] without standing up a real `Ring`.
@@ -4292,7 +4955,8 @@ pub(crate) mod tests {
 
         let removes_before = GlobalTestMetrics::pending_op_removes();
 
-        let mut state = super::EventListenerState::new(ExpectedInboundTracker::empty_for_test());
+        let mut state =
+            super::EventListenerState::new(Arc::new(ExpectedInboundTracker::empty_for_test()));
         for _ in 0..3 {
             let (callback, _rx) = mpsc::channel(1);
             state
@@ -4339,9 +5003,9 @@ pub(crate) mod tests {
         use crate::transport::ExpectedInboundTracker;
 
         let removes_before = GlobalTestMetrics::pending_op_removes();
-        drop(super::EventListenerState::new(
+        drop(super::EventListenerState::new(Arc::new(
             ExpectedInboundTracker::empty_for_test(),
-        ));
+        )));
         assert_eq!(GlobalTestMetrics::pending_op_removes(), removes_before);
     }
 
@@ -4650,13 +5314,12 @@ pub(crate) mod tests {
     /// a 120 s production stall.
     #[tokio::test]
     async fn stream_send_pattern_fires_completion_tx_on_timeout() {
-        use crate::transport::BroadcastDeliveryOutcome;
+        use crate::transport::StreamSendOutcome;
         const SEND_TIMEOUT: Duration = Duration::from_millis(100);
         let (tx, _rx) = mpsc::channel::<u32>(1);
         tx.try_send(0).expect("first send must succeed");
 
-        let (completion_tx, completion_rx) =
-            tokio::sync::oneshot::channel::<BroadcastDeliveryOutcome>();
+        let (completion_tx, completion_rx) = tokio::sync::oneshot::channel::<StreamSendOutcome>();
 
         // Mirror the StreamSend dispatch pattern:
         //   reserve() → permit OR closed OR timeout
@@ -4671,16 +5334,16 @@ pub(crate) mod tests {
                 panic!("reserve unexpectedly succeeded on saturated channel");
             }
             Ok(Err(_closed)) => {
-                let _ignored = completion_tx.send(BroadcastDeliveryOutcome::Dropped);
+                let _ignored = completion_tx.send(StreamSendOutcome::Dropped);
             }
             Err(_timeout) => {
-                let _ignored = completion_tx.send(BroadcastDeliveryOutcome::Dropped);
+                let _ignored = completion_tx.send(StreamSendOutcome::Dropped);
             }
         }
 
         let signal = timeout(Duration::from_millis(50), completion_rx).await;
         assert!(
-            matches!(signal, Ok(Ok(BroadcastDeliveryOutcome::Dropped))),
+            matches!(signal, Ok(Ok(StreamSendOutcome::Dropped))),
             "completion_tx must be fired on the dispatch timeout path so the \
              broadcast queue releases its permit immediately (not after \
              120s STREAM_COMPLETION_TIMEOUT). Got {signal:?}"
@@ -4744,20 +5407,18 @@ pub(crate) mod tests {
         // would otherwise silently reintroduce the 120 s
         // STREAM_COMPLETION_TIMEOUT stall.
         //
-        // Post-#4235 the signal carries a `BroadcastDeliveryOutcome` instead
+        // Post-#4235 the signal carries a `StreamSendOutcome` instead
         // of `()`, and every drop arm reports `Dropped` so the broadcast queue
         // releases the permit WITHOUT treating the drop as a delivery. Counting
         // `Dropped` fires here pins both invariants at once: a regression that
         // dropped an arm OR that mislabeled a drop arm as `Delivered` (the
         // exact conflation #4235 fixed) trips this assertion. Tested
         // behaviourally by `stream_send_pattern_fires_completion_tx_on_timeout`.
-        let fire_count = body
-            .matches("tx.send(BroadcastDeliveryOutcome::Dropped)")
-            .count();
+        let fire_count = body.matches("tx.send(StreamSendOutcome::Dropped)").count();
         assert_eq!(
             fire_count, 3,
             "StreamSend dispatch must signal completion_tx with \
-             BroadcastDeliveryOutcome::Dropped in all three non-success arms \
+             StreamSendOutcome::Dropped in all three non-success arms \
              (closed / timeout / no-connection) — found {fire_count} such \
              occurrences, expected exactly 3. If you REMOVED one, a refactor \
              reintroduced the 120 s STREAM_COMPLETION_TIMEOUT stall (#4145). \
@@ -4905,7 +5566,18 @@ pub(crate) mod tests {
             .find("\n                            }\n")
             .map(|p| arm_start + p)
             .expect("TransactionOrphaned arm closer not found");
-        let body = &SOURCE[arm_start..arm_end];
+        assert!(
+            SOURCE[arm_start..arm_end].contains("orphan_transaction("),
+            "the TransactionOrphaned arm must go through orphan_transaction"
+        );
+        let fn_start = SOURCE
+            .find("\nfn orphan_transaction(")
+            .expect("orphan_transaction renamed or removed");
+        let fn_end = fn_start
+            + SOURCE[fn_start..]
+                .find("\n}\n")
+                .expect("end of orphan_transaction");
+        let body = &SOURCE[fn_start..fn_end];
 
         let send_pos = body
             .find("WaiterReply::PeerDisconnected")
@@ -5913,7 +6585,7 @@ pub(crate) mod tests {
     /// Source pin: the `ctx` rebuild at event-loop entry must CARRY the start
     /// instant across, never re-read it from the clock.
     ///
-    /// `run_event_listener_with_socket` destructures `self` and rebuilds a
+    /// `run_event_listener_with_transport` destructures `self` and rebuilds a
     /// `P2pConnManager` for the loop. Writing `started_at: uptime_clock.now()`
     /// there instead of the `started_at` shorthand would restart the
     /// measurement at event-loop entry, silently under-reporting uptime by the
@@ -5925,15 +6597,20 @@ pub(crate) mod tests {
     /// is the check that makes the documentation load-bearing.
     #[test]
     fn event_loop_ctx_carries_start_instant_rather_than_re_reading_it() {
-        let src = production_src();
+        let body = event_loop_body();
         const ANCHOR: &str = "let mut ctx = P2pConnManager {";
-        let start = src
-            .find(ANCHOR)
-            .expect("run_event_listener_with_socket must rebuild `let mut ctx = P2pConnManager {`");
-        let rest = &src[start + ANCHOR.len()..];
+        let start = body.find(ANCHOR).expect(
+            "run_event_listener_with_transport must rebuild `let mut ctx = P2pConnManager {`",
+        );
+        assert_eq!(
+            body.matches(ANCHOR).count(),
+            1,
+            "exactly one ctx rebuild in the event-loop body"
+        );
+        let rest = &body[start + ANCHOR.len()..];
         let end = rest
             .find("\n        };")
-            .expect("the ctx rebuild literal must be closed by `};`");
+            .expect("the ctx rebuild literal must be closed by `};` inside the event loop");
         let ctx_literal = &rest[..end];
 
         assert!(
@@ -5947,6 +6624,62 @@ pub(crate) mod tests {
              the clock here restarts the uptime measurement at event-loop \
              entry. Found:\n{ctx_literal}"
         );
+    }
+
+    /// Source pin: the event loop holds a connector for its whole lifetime,
+    /// declared before the handshake driver takes its own. The UDP listener
+    /// exits when every connector is gone (see the transport test
+    /// `listener_outlives_a_dropped_connector_while_a_clone_remains`), so
+    /// without this a dead handshake driver would restart the node.
+    #[test]
+    fn event_loop_keeps_a_connector_alive() {
+        let body = event_loop_body();
+        const KEEPALIVE: &str =
+            "let _outbound_keepalive: Arc<dyn OutboundConnector> = Arc::clone(&connector);";
+        let at = body
+            .match_indices(KEEPALIVE)
+            .find(|(i, _)| {
+                let line_start = body[..*i].rfind('\n').map_or(0, |n| n + 1);
+                body[line_start..*i].trim().is_empty()
+            })
+            .map(|(i, _)| i)
+            .expect("the event loop must bind a connector clone at statement position");
+        let driver = body
+            .find("HandshakeHandler::new(")
+            .expect("the event loop starts the handshake driver");
+        assert!(
+            at < driver,
+            "the clone must be taken before the driver gets the connector"
+        );
+    }
+
+    /// The body of `run_event_listener_with_transport`, from its opening brace
+    /// to the matching closing one. Panics if the signature is missing, sits
+    /// in the test module, or the braces do not balance before it.
+    fn event_loop_body() -> String {
+        let full = include_str!("p2p_protoc.rs");
+        let tests_at = full
+            .find("\npub(crate) mod tests {")
+            .expect("p2p_protoc.rs must have a `pub(crate) mod tests {` block");
+        let signature = "\n    async fn run_event_listener_with_transport(";
+        let start = full.find(signature).expect("event-loop function renamed");
+        assert!(start < tests_at, "the anchor must be production code");
+        let open = start + full[start..].find('{').expect("function body");
+        let mut depth = 0i32;
+        for (i, b) in full.bytes().enumerate().skip(open) {
+            match b {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        assert!(i < tests_at, "unbalanced body slice");
+                        return full[open..=i].to_string();
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unbalanced body slice");
     }
 
     /// Production source ONLY (everything before the `mod tests` block).
@@ -6222,7 +6955,8 @@ pub(crate) mod tests {
         use crate::transport::ExpectedInboundTracker;
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-        let mut state = super::EventListenerState::new(ExpectedInboundTracker::empty_for_test());
+        let mut state =
+            super::EventListenerState::new(Arc::new(ExpectedInboundTracker::empty_for_test()));
         let peer_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 45678);
         let tx = Transaction::new::<crate::operations::connect::ConnectMsg>();
 
@@ -6391,7 +7125,8 @@ pub(crate) mod tests {
         use crate::transport::ExpectedInboundTracker;
         use tokio::sync::mpsc::error::TryRecvError;
 
-        let mut state = super::EventListenerState::new(ExpectedInboundTracker::empty_for_test());
+        let mut state =
+            super::EventListenerState::new(Arc::new(ExpectedInboundTracker::empty_for_test()));
         let tx = crate::dev_tool::Transaction::new::<crate::operations::put::PutMsg>();
 
         // Step 1: the originator's live waiter (send_and_await's callback).
@@ -6458,7 +7193,8 @@ pub(crate) mod tests {
     async fn install_pending_op_callback_drops_a_refused_newcomer() {
         use crate::transport::ExpectedInboundTracker;
 
-        let mut state = super::EventListenerState::new(ExpectedInboundTracker::empty_for_test());
+        let mut state =
+            super::EventListenerState::new(Arc::new(ExpectedInboundTracker::empty_for_test()));
         let tx = crate::dev_tool::Transaction::new::<crate::operations::put::PutMsg>();
 
         // A live incumbent holds the slot.
@@ -6503,7 +7239,8 @@ pub(crate) mod tests {
     async fn install_pending_op_callback_skips_a_closed_incoming_callback() {
         use crate::transport::ExpectedInboundTracker;
 
-        let mut state = super::EventListenerState::new(ExpectedInboundTracker::empty_for_test());
+        let mut state =
+            super::EventListenerState::new(Arc::new(ExpectedInboundTracker::empty_for_test()));
         let tx = crate::dev_tool::Transaction::new::<crate::operations::put::PutMsg>();
 
         let (sender, receiver) = mpsc::channel::<crate::node::WaiterReply>(1);
@@ -6536,7 +7273,8 @@ pub(crate) mod tests {
     async fn install_pending_op_callback_replaces_a_closed_incumbent() {
         use crate::transport::ExpectedInboundTracker;
 
-        let mut state = super::EventListenerState::new(ExpectedInboundTracker::empty_for_test());
+        let mut state =
+            super::EventListenerState::new(Arc::new(ExpectedInboundTracker::empty_for_test()));
         let tx = crate::dev_tool::Transaction::new::<crate::operations::put::PutMsg>();
 
         // A stale incumbent whose receiver is already gone.
@@ -6590,7 +7328,8 @@ pub(crate) mod tests {
     async fn install_pending_op_callback_inserts_when_the_slot_is_empty() {
         use crate::transport::ExpectedInboundTracker;
 
-        let mut state = super::EventListenerState::new(ExpectedInboundTracker::empty_for_test());
+        let mut state =
+            super::EventListenerState::new(Arc::new(ExpectedInboundTracker::empty_for_test()));
         let tx = crate::dev_tool::Transaction::new::<crate::operations::put::PutMsg>();
 
         let (sender, _rx) = mpsc::channel::<crate::node::WaiterReply>(1);

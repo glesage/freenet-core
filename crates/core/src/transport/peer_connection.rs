@@ -1,4 +1,3 @@
-use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -18,11 +17,12 @@ use crate::transport::sent_packet_tracker::MESSAGE_CONFIRMATION_TIMEOUT;
 use aes_gcm::Aes128Gcm;
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{Instrument, span};
 
+mod inbound_budget;
 mod inbound_stream;
 mod outbound_stream;
 pub(crate) mod piped_stream;
@@ -51,7 +51,6 @@ use super::{
     symmetric_message::{self, SymmetricMessage, SymmetricMessagePayload},
     token_bucket::TokenBucket,
 };
-use crate::operations::orphan_streams::OrphanStreamRegistry;
 use crate::util::time_source::InstantTimeSrc;
 
 type Result<T = (), E = TransportError> = std::result::Result<T, E>;
@@ -118,7 +117,7 @@ pub(crate) struct RemoteConnection<S = super::UdpSocket, T: TimeSource = RealTim
     /// version and the joiner never parses an intro packet from it.
     pub(super) remote_protoc_version: Option<(u8, u8, u16)>,
     pub(super) transport_secret_key: TransportSecretKey,
-    /// Congestion controller (BBR by default) - adapts to network conditions
+    /// Congestion controller (FixedRate by default; BBR and LEDBAT++ are selectable)
     pub(super) congestion_controller: Arc<CongestionController<T>>,
     /// Token bucket rate limiter - smooths packet pacing based on congestion controller rate
     pub(super) token_bucket: Arc<TokenBucket<T>>,
@@ -151,78 +150,41 @@ impl<S, T: TimeSource> Drop for RemoteConnection<S, T> {
     }
 }
 
-/// Unique identifier for a streaming transfer.
-///
-/// Used to correlate streaming metadata messages with their data streams.
-/// StreamIds are unique within a node's lifetime and are generated atomically.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[repr(transparent)]
-#[serde(transparent)]
-pub struct StreamId(u32);
-
-const STREAM_ID_BLOCK: u32 = 100_000;
-
-thread_local! {
-    static STREAM_ID_COUNTER: Cell<u32> = {
-        let idx = crate::config::GlobalRng::thread_index();
-        Cell::new((idx as u32) * STREAM_ID_BLOCK)
-    };
-}
-
-impl StreamId {
-    /// Marker bit that distinguishes operations-level streams from transport-level streams.
-    /// When set, the receiver skips the legacy `InboundStream` reassembly path and only
-    /// routes fragments through the orphan registry / streaming handles.
-    const OPS_STREAM_BIT: u32 = 0x8000_0000;
-
-    pub fn next() -> Self {
-        Self(STREAM_ID_COUNTER.with(|c| {
-            let v = c.get();
-            c.set(v + 1);
-            v
-        }))
-    }
-
-    /// Generate a new StreamId for operations-level streaming.
-    /// The high bit is set so the receiver can distinguish these from transport-level streams
-    /// and skip the legacy `InboundStream` decode path (which would fail because the bytes
-    /// are a streaming payload, not a `NetMessage`).
-    pub fn next_operations() -> Self {
-        let id = STREAM_ID_COUNTER.with(|c| {
-            let v = c.get();
-            c.set(v + 1);
-            v
-        });
-        Self(id | Self::OPS_STREAM_BIT)
-    }
-
-    /// Returns true if this stream was created for operations-level streaming.
-    pub fn is_operations_stream(&self) -> bool {
-        self.0 & Self::OPS_STREAM_BIT != 0
-    }
-
-    /// Reset the stream ID counter to initial state for this thread.
-    /// Thread-local, so safe for parallel test execution.
-    pub fn reset_counter() {
-        let idx = crate::config::GlobalRng::thread_index();
-        STREAM_ID_COUNTER.with(|c| c.set((idx as u32) * STREAM_ID_BLOCK));
-    }
-}
-
-impl std::fmt::Display for StreamId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
-    }
-}
-
-#[cfg(test)]
-impl<'a> arbitrary::Arbitrary<'a> for StreamId {
-    fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
-        Ok(Self(u.arbitrary()?))
-    }
-}
+pub use super::boundary::StreamId;
 
 type InboundStreamResult = Result<(StreamId, SerializedMessage), StreamId>;
+
+/// Test-only per-connection tallies of telemetry events (see
+/// `PeerConnection::telemetry_test_counts`).
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct TelemetryTestCounts {
+    transfers_acked: u32,
+    abandoned: u32,
+    retransmissions: u32,
+    keepalive_rtt_samples: u32,
+    standalone_ack_flushes: u32,
+    outbound_streams_failed: u32,
+}
+
+/// See [`PeerConnection::congestion_probe`].
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CongestionProbe {
+    pub flightsize: usize,
+    pub cwnd: usize,
+    /// Smallest RTT sample the sent-packet tracker has taken (every sample
+    /// the controllers see passes through it); `None` before the first one.
+    pub min_rtt_sample: Option<Duration>,
+    /// Largest RTT sample the tracker has taken (zero before the first).
+    pub max_rtt_sample: Duration,
+    pub srtt: Option<Duration>,
+    pub rto_expiries: u64,
+    /// Packets given up on after `MAX_PACKET_RETRANSMITS`.
+    pub abandoned_packets: u32,
+    /// Outbound streams whose send task failed (e.g. the cwnd-wait timeout).
+    pub outbound_streams_failed: u32,
+}
 
 /// The `PeerConnection` struct is responsible for managing the connection with a remote peer.
 /// It provides methods for sending and receiving messages to and from the remote peer.
@@ -249,7 +211,11 @@ pub struct PeerConnection<S = super::UdpSocket, T: TimeSource = RealTime> {
     remote_conn: RemoteConnection<S, T>,
     received_tracker: ReceivedPacketTracker<InstantTimeSrc>,
     inbound_streams: HashMap<StreamId, mpsc::Sender<(u32, bytes::Bytes)>>,
-    inbound_stream_futures: FuturesUnordered<JoinHandle<InboundStreamResult>>,
+    /// Legacy reassembly tasks. Each returns its accounting token with its
+    /// result, so the stream's charge is held until `recv()` has taken the
+    /// output (see `inbound_budget::Liveness::Task`).
+    inbound_stream_futures:
+        FuturesUnordered<JoinHandle<(InboundStreamResult, Arc<inbound_budget::LegacyStreamToken>)>>,
     outbound_stream_futures: FuturesUnordered<JoinHandle<OutboundStreamResult>>,
     failure_count: usize,
     /// First failure time as nanoseconds since time_source epoch
@@ -295,6 +261,15 @@ pub struct PeerConnection<S = super::UdpSocket, T: TimeSource = RealTime> {
     receipts_flush_due: bool,
     /// Number of timeout-check ticks handled (observability for tests).
     timeout_checks_run: u64,
+    /// Set when `recv` ends the connection because nothing was received for
+    /// the idle timeout, so the node can report the disconnect as a timeout
+    /// rather than a generic transport closure (telemetry only).
+    closed_by_idle_timeout: bool,
+    /// Test-only per-connection tallies of the telemetry events this
+    /// connection recorded, so tests need not read process-wide counters
+    /// that concurrent tests also move.
+    #[cfg(test)]
+    telemetry_test_counts: TelemetryTestCounts,
     /// Tracks pending ping probes awaiting pong responses.
     /// Maps ping sequence number -> send timestamp (nanoseconds since time_source epoch).
     /// Used for bidirectional liveness detection.
@@ -317,11 +292,11 @@ pub struct PeerConnection<S = super::UdpSocket, T: TimeSource = RealTime> {
     streaming_handles: HashMap<StreamId, (streaming::StreamHandle, u64)>,
     /// Time source for deterministic simulation support
     time_source: T,
-    /// Optional orphan stream registry for handling race conditions between
-    /// stream fragments and metadata messages (RequestStreaming/ResponseStreaming).
+    /// Registry that receives inbound operations streams, handling the race
+    /// between stream fragments and metadata messages
+    /// (RequestStreaming/ResponseStreaming).
     /// Set by the node layer after connection establishment.
-    orphan_stream_registry:
-        Option<std::sync::Arc<crate::operations::orphan_streams::OrphanStreamRegistry>>,
+    inbound_stream_registry: Option<std::sync::Arc<dyn super::InboundStreamRegistry>>,
     /// LRU cache of recently dispatched metadata hashes (capacity 1000), used to dedup
     /// embedded-metadata-in-fragment-#1 against the separate ShortMessage.
     ///
@@ -330,6 +305,26 @@ pub struct PeerConnection<S = super::UdpSocket, T: TimeSource = RealTime> {
     /// the affected stream -- acceptable given the small working set and
     /// negligible collision probability. See issue #3317.
     dispatched_msg_hashes: lru::LruCache<u64, ()>,
+    /// Refused stream ids, so a refused stream's later fragments are dropped
+    /// rather than admitted part-way through (see
+    /// `inbound_budget::RefusedStreams`).
+    rejected_inbound_streams: inbound_budget::RefusedStreams,
+    /// `recv` ended this connection because a refused stream could not be
+    /// remembered (see `inbound_budget::RefusedStreams`).
+    closed_by_stream_refusals: bool,
+    /// Rate limiter for the refused-stream warning.
+    refusal_log: RefusalLog,
+    /// Recently completed (and released) inbound streams, so a late
+    /// retransmission does not start one again.
+    completed_inbound_streams: lru::LruCache<StreamId, ()>,
+    /// Tokens of the legacy streams in `inbound_streams`, to cancel them.
+    legacy_tokens: HashMap<StreamId, Arc<inbound_budget::LegacyStreamToken>>,
+    /// This connection's inbound stream outcomes, indexed by
+    /// `InboundStreamOutcome` (also counted node-wide in `TRANSPORT_METRICS`).
+    inbound_outcomes: [u64; super::metrics::InboundStreamOutcome::COUNT],
+    /// Charges for every inbound stream holding reassembly state on this
+    /// connection, released when that state is gone.
+    inbound_budget: inbound_budget::InboundStreamBudget,
 }
 
 impl<S, T: TimeSource> std::fmt::Debug for PeerConnection<S, T> {
@@ -342,6 +337,26 @@ impl<S, T: TimeSource> std::fmt::Debug for PeerConnection<S, T> {
 
 impl<S, T: TimeSource> Drop for PeerConnection<S, T> {
     fn drop(&mut self) {
+        // Report refusals the warning rate limit was still holding back.
+        if self.refusal_log.suppressed > 0 {
+            tracing::warn!(
+                peer_addr = %self.remote_conn.remote_addr,
+                refusals_since_last_warning = self.refusal_log.suppressed,
+                "Refused further inbound streams before the connection closed"
+            );
+        }
+        // Unclaimed buffers this connection charged (complete ones it already
+        // retired, too) would otherwise wait out the orphan timeout with
+        // nothing accounting for them.
+        if let Some(registry) = &self.inbound_stream_registry {
+            registry.cancel_unclaimed_streams(
+                self.remote_conn.remote_addr,
+                &mut self
+                    .inbound_budget
+                    .live_buffer_streams()
+                    .map(|(id, buffer)| (id, super::StreamIdentity::from_udp_buffer(buffer))),
+            );
+        }
         // Cancel all active streaming handles so that any operation blocked on
         // stream_handle.assemble().await will receive StreamError::Cancelled
         // instead of waiting forever for fragments that will never arrive.
@@ -652,6 +667,52 @@ const DEDUP_CACHE_CAPACITY: NonZeroUsize = match NonZeroUsize::new(1000) {
     Some(v) => v,
     None => panic!("DEDUP_CACHE_CAPACITY must be non-zero"),
 };
+
+/// How many completed inbound stream ids to remember, so late
+/// retransmissions of them are not taken for new streams. As many as a
+/// connection may have open at once.
+const COMPLETED_STREAM_MEMORY: NonZeroUsize =
+    match NonZeroUsize::new(streaming::MAX_INBOUND_STREAMS_PER_CONNECTION) {
+        Some(v) => v,
+        None => panic!("COMPLETED_STREAM_MEMORY must be non-zero"),
+    };
+
+/// Least time between two `warn` lines about refused inbound streams on one
+/// connection; refusals in between are counted and reported with the next.
+const REFUSAL_WARN_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Why a fragment of a new inbound stream was not admitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InboundStreamRejection {
+    /// The declared total length is invalid on its own.
+    Length(streaming::StreamLengthRejection),
+    /// The connection's stream or byte allowance is used up.
+    Budget(inbound_budget::BudgetRejection),
+    /// An earlier fragment of this stream was refused.
+    PreviouslyRefused,
+    /// The stream already completed and its state was released.
+    AlreadyCompleted,
+}
+
+/// Rate limiter for the refusal log line.
+#[derive(Default)]
+struct RefusalLog {
+    last_warn_nanos: Option<u64>,
+    suppressed: u64,
+}
+
+/// Longest an inbound stream of `total_bytes` may hold reassembly state
+/// ([`streaming::max_inbound_stream_age`]). Under the simulation idle-timeout
+/// accommodation it is at least the (long) simulation idle threshold, for the
+/// same reason that threshold exists.
+fn inbound_stream_age_limit(total_bytes: u64) -> Duration {
+    let limit = streaming::max_inbound_stream_age(total_bytes);
+    if crate::config::SimulationIdleTimeout::is_enabled() {
+        limit.max(STREAMING_HANDLE_IDLE_TIMEOUT_SIM)
+    } else {
+        limit
+    }
+}
 
 /// Production idle threshold for sweeping `streaming_handles` entries.
 ///
@@ -967,6 +1028,9 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             ack_remote_noops,
             recv_timers,
             timeout_checks_run: 0,
+            closed_by_idle_timeout: false,
+            #[cfg(test)]
+            telemetry_test_counts: TelemetryTestCounts::default(),
             receipts_flush_due: false,
             answered_connection_ack: false,
             stalled_fragment: None,
@@ -987,8 +1051,18 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             streaming_registry: Arc::new(streaming::StreamRegistry::new()),
             streaming_handles: HashMap::new(),
             time_source,
-            orphan_stream_registry: None,
+            inbound_stream_registry: None,
             dispatched_msg_hashes: lru::LruCache::new(DEDUP_CACHE_CAPACITY),
+            rejected_inbound_streams: inbound_budget::RefusedStreams::default(),
+            closed_by_stream_refusals: false,
+            refusal_log: RefusalLog::default(),
+            completed_inbound_streams: lru::LruCache::new(COMPLETED_STREAM_MEMORY),
+            legacy_tokens: HashMap::new(),
+            inbound_outcomes: [0; super::metrics::InboundStreamOutcome::COUNT],
+            inbound_budget: inbound_budget::InboundStreamBudget::new(
+                streaming::MAX_INBOUND_STREAMS_PER_CONNECTION,
+                streaming::MAX_INBOUND_STREAM_BYTES_PER_CONNECTION,
+            ),
         }
     }
 
@@ -1009,16 +1083,17 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             .is_some()
     }
 
-    /// Sets the orphan stream registry for handling race conditions between
-    /// stream fragments and metadata messages.
+    /// Sets the registry that receives this connection's inbound operations
+    /// streams, handling the race between stream fragments and metadata
+    /// messages.
     ///
     /// This should be called by the node layer after connection establishment,
     /// before any messages are processed.
-    pub fn set_orphan_stream_registry(
+    pub(crate) fn set_inbound_stream_registry(
         &mut self,
-        registry: std::sync::Arc<crate::operations::orphan_streams::OrphanStreamRegistry>,
+        registry: std::sync::Arc<dyn super::InboundStreamRegistry>,
     ) {
-        self.orphan_stream_registry = Some(registry);
+        self.inbound_stream_registry = Some(registry);
     }
 
     /// Sweep `streaming_handles` of entries that have not seen activity for
@@ -1031,6 +1106,13 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
     ///
     /// Called from the existing `timeout_check` tick (5 s cadence) in `recv()`.
     /// See issue #4079 for the leak scenarios this closes.
+    /// The periodic stream sweeps. Inbound streams first: that sweep evicts
+    /// (and counts) a stream while its state is still alive to be seen.
+    fn sweep_streams(&mut self) {
+        self.sweep_inbound_streams();
+        self.sweep_idle_streaming_handles();
+    }
+
     fn sweep_idle_streaming_handles(&mut self) {
         let now_nanos = self.time_source.now_nanos();
         sweep_streaming_handles_inner(
@@ -1042,14 +1124,8 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
         );
     }
 
-    /// Serialize `data` and hand it to the transport.
-    ///
-    /// Returns the SERIALIZED byte length, so callers that already know the
-    /// message kind can attribute outbound bytes without a second
-    /// serialization pass just to measure it (see
-    /// [`outbound_message_mix`][omm]).
-    ///
-    /// [omm]: crate::node::network_bridge::outbound_message_mix
+    /// Serialize `data` and hand it to the transport (see `send_serialized`).
+    /// Returns the SERIALIZED byte length.
     pub async fn send<D>(&mut self, data: D) -> Result<usize>
     where
         D: Serialize + Send + std::fmt::Debug,
@@ -1058,23 +1134,28 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
         // that spawn_blocking overhead isn't worth it. Using spawn_blocking here caused chronic
         // blocking pool thread churn under load (see issue #2310).
         let data = bincode::serialize(&data)?;
+        let len = data.len();
+        self.send_serialized(data).await?;
+        Ok(len)
+    }
+
+    /// Hand an already-serialized message to the transport: as one short
+    /// message when it fits in a packet, otherwise as a stream.
+    pub(crate) async fn send_serialized(&mut self, data: SerializedMessage) -> Result<()> {
         if data.len() + SymmetricMessage::short_message_overhead() > MAX_DATA_SIZE {
             tracing::trace!(
                 peer_addr = %self.remote_conn.remote_addr,
                 total_size_bytes = data.len(),
                 "Sending as stream"
             );
-            let len = data.len();
             self.outbound_stream(data).await;
-            Ok(len)
+            Ok(())
         } else {
             tracing::trace!(
                 peer_addr = %self.remote_conn.remote_addr,
                 "Sending as short message"
             );
-            let len = data.len();
-            self.outbound_short_message(data).await?;
-            Ok(len)
+            self.outbound_short_message(data).await
         }
     }
 
@@ -1344,6 +1425,15 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                                 let rtt_us = rtt_nanos / 1_000;
                                 if rtt_us > 0 {
                                     super::TRANSPORT_METRICS.record_rtt_sample(rtt_us);
+                                    #[cfg(test)]
+                                    {
+                                        self.telemetry_test_counts.keepalive_rtt_samples += 1;
+                                    }
+                                    // Per-connection RTT for the snapshot's
+                                    // cross-connection distribution.
+                                    self.remote_conn
+                                        .rolling_rtt_stats
+                                        .record_keepalive(Duration::from_nanos(rtt_nanos));
                                 }
                             }
                         }
@@ -1375,11 +1465,37 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                         false
                     };
 
-                    // Process ACKs and update BBR congestion controller
-                    let (ack_info, _loss_rate) = self.remote_conn
-                        .sent_tracker
-                        .lock()
-                        .report_received_receipts(&confirm_receipt);
+                    // Process ACKs and update BBR congestion controller.
+                    // The SRTT read and the final-ACK drain happen under the
+                    // same lock acquisition: telemetry only, no extra lock.
+                    let (ack_info, srtt, completed_stream_acks) = if confirm_receipt.is_empty() {
+                        (Vec::new(), None, Vec::new())
+                    } else {
+                        let mut tracker = self.remote_conn.sent_tracker.lock();
+                        let (ack_info, _loss_rate) =
+                            tracker.report_received_receipts(&confirm_receipt);
+                        // Publish only when this batch gave the tracker a new
+                        // sample: a retransmit-only or duplicate batch (Karn's
+                        // rule: no sample) would otherwise republish a stale
+                        // SRTT as the freshest value, outranking a newer
+                        // keep-alive SRTT exactly during loss.
+                        let fresh_srtt = ack_info
+                            .iter()
+                            .any(|(rtt, _, _)| rtt.is_some())
+                            .then(|| tracker.smoothed_rtt())
+                            .flatten();
+                        (ack_info, fresh_srtt, tracker.take_completed_stream_acks())
+                    };
+                    if let Some(srtt) = srtt {
+                        self.remote_conn.rolling_rtt_stats.publish_srtt(srtt);
+                    }
+                    for elapsed_nanos in completed_stream_acks {
+                        super::TRANSPORT_METRICS.record_transfer_acked(elapsed_nanos / 1_000_000);
+                        #[cfg(test)]
+                        {
+                            self.telemetry_test_counts.transfers_acked += 1;
+                        }
+                    }
 
                     // Feed ACK info to congestion controller for window adjustment
                     // All ACKs decrement flightsize, but only non-retransmitted packets
@@ -1497,18 +1613,29 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                         );
                         continue
                     };
-                    let Ok((stream_id, msg)) = res.map_err(|e| TransportError::Other(e.into()))? else {
-                        tracing::error!(
-                            peer_addr = %self.remote_conn.remote_addr,
-                            "Unexpected error from ongoing_inbound_streams"
-                        );
-                        // TODO: may leave orphan stream recvs hanging around in this case
-                        continue;
+                    let (res, token) = res.map_err(|e| TransportError::Other(e.into()))?;
+                    // The output has been taken; release the stream's charge.
+                    drop(token);
+                    let (stream_id, msg) = match res {
+                        Ok(done) => done,
+                        Err(stream_id) => {
+                            // The task ended without a message: its sender was
+                            // dropped (eviction). Its state is gone with it.
+                            self.inbound_streams.remove(&stream_id);
+                            self.legacy_tokens.remove(&stream_id);
+                            self.inbound_budget.release_if_gone(stream_id);
+                            tracing::debug!(
+                                peer_addr = %self.remote_conn.remote_addr,
+                                stream_id = %stream_id,
+                                "Inbound stream ended before completing"
+                            );
+                            continue;
+                        }
                     };
                     self.inbound_streams.remove(&stream_id);
-                    // Also clean up streaming handle and registry
-                    self.streaming_handles.remove(&stream_id);
-                    self.streaming_registry.remove(stream_id);
+                    self.legacy_tokens.remove(&stream_id);
+                    self.inbound_budget.release_if_gone(stream_id);
+                    self.completed_inbound_streams.put(stream_id, ());
                     // Record inbound bytes for dashboard metrics
                     let bytes_received = msg.len() as u64;
                     super::TRANSPORT_METRICS.record_inbound_completed(bytes_received);
@@ -1581,16 +1708,30 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                         //    the counter does not). This concentrates at
                         //    teardown, and `record_transfer_completed` above has
                         //    the same gap.
-                        Err(e) if e.is_transient_send_failure() => {
+                        Err(e) if e.is_transient() => {
                             super::TRANSPORT_METRICS.record_transfer_failed();
+                            #[cfg(test)]
+                            {
+                                self.telemetry_test_counts.outbound_streams_failed += 1;
+                            }
                             tracing::warn!(
                                 peer_addr = %self.remote_conn.remote_addr,
                                 error = %e,
                                 "Outbound stream send failed, operation layer will timeout and retry"
                             );
                         }
+                        // Stream-scoped and permanent: the message was never
+                        // started (the sender already logged why). The
+                        // connection is unaffected.
+                        Err(TransportError::OutboundStreamInvalidLength(..)) => {
+                            super::TRANSPORT_METRICS.record_transfer_failed();
+                        }
                         Err(e) => {
                             super::TRANSPORT_METRICS.record_transfer_failed();
+                            #[cfg(test)]
+                            {
+                                self.telemetry_test_counts.outbound_streams_failed += 1;
+                            }
                             return Err(e);
                         }
                     }
@@ -1627,6 +1768,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                             );
                         }
 
+                        self.closed_by_idle_timeout = true;
                         return Err(TransportError::ConnectionClosed(self.remote_addr()));
                     }
 
@@ -1677,7 +1819,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                     // life of the connection. Reactive eviction at the
                     // fragment-arrival sites cannot fire when no more
                     // fragments are coming.
-                    self.sweep_idle_streaming_handles();
+                    self.sweep_streams();
                 },
                 // Fires once the armed resend deadline passes (and disarms; the
                 // top-of-loop guard re-arms it). Not consumed when another branch
@@ -1723,6 +1865,11 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                                 self.remote_conn
                                     .congestion_controller
                                     .release_flightsize(payload_len);
+                                super::TRANSPORT_METRICS.record_packet_abandoned();
+                                #[cfg(test)]
+                                {
+                                    self.telemetry_test_counts.abandoned += 1;
+                                }
                                 tracing::debug!(
                                     peer_addr = %self.remote_conn.remote_addr,
                                     packet_id,
@@ -1742,6 +1889,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                                 // immediately re-sent and re-registered below — so flight size
                                 // is unchanged; on_timeout only applies the cwnd loss response.
                                 self.remote_conn.congestion_controller.on_timeout();
+                                super::TRANSPORT_METRICS.record_rto_expiry();
                                 (idx, packet)
                             }
                             ResendAction::TlpProbe(idx, packet) => {
@@ -1753,6 +1901,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                                     packet_id = idx,
                                     "Sending TLP probe"
                                 );
+                                super::TRANSPORT_METRICS.record_tlp_probe();
                                 (idx, packet)
                             }
                         };
@@ -1765,6 +1914,11 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                             .await
                         {
                             Ok(_) => {
+                                super::TRANSPORT_METRICS.record_retransmission_sent();
+                                #[cfg(test)]
+                                {
+                                    self.telemetry_test_counts.retransmissions += 1;
+                                }
                                 // Refresh the packet's send timestamp to the actual
                                 // post-send instant. Since #4345 get_resend KEEPS the
                                 // packet in the tracker across a resend, so this is an
@@ -1918,6 +2072,23 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
         self.remote_conn.remote_protoc_version
     }
 
+    /// Test-only snapshot of the sender-side state the WAN bench asserts on.
+    #[cfg(test)]
+    pub(crate) fn congestion_probe(&self) -> CongestionProbe {
+        use super::congestion_control::CongestionControl;
+        let tracker = self.remote_conn.sent_tracker.lock();
+        CongestionProbe {
+            flightsize: self.remote_conn.congestion_controller.flightsize(),
+            cwnd: self.remote_conn.congestion_controller.current_cwnd(),
+            min_rtt_sample: tracker.smoothed_rtt().map(|_| tracker.min_rtt()),
+            max_rtt_sample: tracker.max_rtt_sample(),
+            srtt: tracker.smoothed_rtt(),
+            rto_expiries: tracker.rto_expiries(),
+            abandoned_packets: self.telemetry_test_counts.abandoned,
+            outbound_streams_failed: self.telemetry_test_counts.outbound_streams_failed,
+        }
+    }
+
     /// Returns a handle for accessing an inbound stream incrementally.
     ///
     /// This provides a `futures::Stream` interface for consuming fragments
@@ -1976,6 +2147,365 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
     /// - Get handles for incremental stream consumption
     pub fn streaming_registry(&self) -> Arc<streaming::StreamRegistry> {
         Arc::clone(&self.streaming_registry)
+    }
+
+    /// Decide whether a new inbound stream declaring `total_length_bytes` may
+    /// get reassembly state on this connection. Runs before anything is
+    /// created for it.
+    fn admit_inbound_stream(
+        &mut self,
+        stream_id: StreamId,
+        total_length_bytes: u64,
+    ) -> std::result::Result<(), InboundStreamRejection> {
+        // A stream refused once stays refused: admitting it later (say, once
+        // the allowance frees up) would only create state for a stream whose
+        // earlier fragments were already dropped.
+        let now_nanos = self.time_source.now_nanos();
+        if self.rejected_inbound_streams.contains(stream_id, now_nanos) {
+            return Err(InboundStreamRejection::PreviouslyRefused);
+        }
+        // A late retransmission of a stream that already completed and was
+        // released must not start it again.
+        if self.completed_inbound_streams.contains(&stream_id) {
+            return Err(InboundStreamRejection::AlreadyCompleted);
+        }
+        streaming::check_declared_stream_length(total_length_bytes)
+            .map_err(InboundStreamRejection::Length)?;
+        self.inbound_budget
+            .check(total_length_bytes)
+            .map_err(InboundStreamRejection::Budget)
+    }
+
+    /// What `process_inbound` returns for a dropped stream fragment: nothing,
+    /// unless a refusal could not be remembered, which ends the connection.
+    fn inbound_refusal_result(&self) -> Result<Option<Vec<u8>>> {
+        if self.closed_by_stream_refusals {
+            Err(TransportError::ConnectionClosed(
+                self.remote_conn.remote_addr,
+            ))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Count an inbound stream outcome, process-wide and on this connection.
+    fn record_inbound_outcome(&mut self, outcome: super::metrics::InboundStreamOutcome) {
+        super::TRANSPORT_METRICS.record_inbound_stream_outcome(outcome);
+        self.inbound_outcomes[outcome as usize] += 1;
+    }
+
+    /// Remember a refused stream and log the refusal, at most one `warn` per
+    /// [`REFUSAL_WARN_INTERVAL`] per connection. If the refusal cannot be
+    /// remembered, sets `closed_by_stream_refusals`: the caller must then end
+    /// the connection, since the stream's later fragments could not be kept
+    /// out.
+    fn note_refused_stream(
+        &mut self,
+        stream_id: StreamId,
+        total_length_bytes: u64,
+        rejection: InboundStreamRejection,
+        now_nanos: u64,
+    ) {
+        use super::metrics::InboundStreamOutcome as O;
+        use inbound_budget::BudgetRejection as B;
+        // A refused stream is remembered for as long as a stream of its
+        // length could be arriving: an admitted one would be evicted by then.
+        let expiry = now_nanos.saturating_add(
+            u64::try_from(
+                inbound_stream_age_limit(total_length_bytes.min(streaming::MAX_STREAM_TOTAL_BYTES))
+                    .as_nanos(),
+            )
+            .unwrap_or(u64::MAX),
+        );
+        let outcome = match rejection {
+            InboundStreamRejection::Length(_) => O::RefusedInvalidLength,
+            InboundStreamRejection::Budget(B::Bytes { .. }) => O::RefusedConnectionBytes,
+            InboundStreamRejection::Budget(B::Streams { .. }) => O::RefusedConnectionStreams,
+            // A later fragment of a stream already counted when first
+            // refused, or a retransmission of a completed one: dropped
+            // quietly, and not counted again.
+            InboundStreamRejection::PreviouslyRefused
+            | InboundStreamRejection::AlreadyCompleted => {
+                tracing::debug!(
+                    peer_addr = %self.remote_conn.remote_addr,
+                    stream_id = %stream_id,
+                    ?rejection,
+                    "Dropping fragment"
+                );
+                return;
+            }
+        };
+        if !self
+            .rejected_inbound_streams
+            .remember(stream_id, expiry, now_nanos)
+        {
+            self.closed_by_stream_refusals = true;
+            self.record_inbound_outcome(O::ClosedTooManyRefusals);
+            tracing::warn!(
+                peer_addr = %self.remote_conn.remote_addr,
+                "Closing connection: too many refused inbound streams outstanding"
+            );
+            return;
+        }
+        self.record_inbound_outcome(outcome);
+        let interval_nanos = REFUSAL_WARN_INTERVAL.as_nanos() as u64;
+        let due = self
+            .refusal_log
+            .last_warn_nanos
+            .is_none_or(|last| now_nanos.saturating_sub(last) >= interval_nanos);
+        if due {
+            tracing::warn!(
+                peer_addr = %self.remote_conn.remote_addr,
+                stream_id = %stream_id,
+                total_length_bytes,
+                ?rejection,
+                open_streams = self.inbound_budget.stream_count(),
+                charged_bytes = self.inbound_budget.charged_bytes(),
+                refusals_since_last_warning = self.refusal_log.suppressed,
+                "Refusing inbound stream"
+            );
+            self.refusal_log.last_warn_nanos = Some(now_nanos);
+            self.refusal_log.suppressed = 0;
+        } else {
+            self.refusal_log.suppressed += 1;
+            tracing::debug!(
+                peer_addr = %self.remote_conn.remote_addr,
+                stream_id = %stream_id,
+                ?rejection,
+                "Refusing inbound stream"
+            );
+        }
+    }
+
+    /// Handle a fragment of an operations-level stream (its bytes are a
+    /// streaming payload claimed through the orphan registry, not a
+    /// `NetMessage`). Returns whether the fragment belongs to an admitted
+    /// stream (false if it was refused or its stream's state was released).
+    /// An incomplete admitted stream stays in `streaming_handles`; a complete
+    /// one is retired from it (see `retire_handle_if_complete`).
+    fn process_operations_fragment(
+        &mut self,
+        stream_id: StreamId,
+        total_length_bytes: u64,
+        fragment_number: u32,
+        payload: bytes::Bytes,
+        now_nanos: u64,
+    ) -> bool {
+        if let Some((streaming_handle, last_activity_nanos)) =
+            self.streaming_handles.get_mut(&stream_id)
+        {
+            let push_result = streaming_handle.push_fragment(fragment_number, payload);
+            // Refresh `last_activity_nanos` ONLY on real forward
+            // progress (`Ok(true)` = new fragment inserted).
+            // Duplicates (`Ok(false)`) and invalid fragments
+            // (`Err(InvalidFragment)`) MUST NOT extend the sweep
+            // deadline; otherwise a peer can keep a dead stream alive
+            // indefinitely by replaying the same fragment every <30s,
+            // defeating the bound issue #4079 enforces. This honors
+            // "Cleanup exemptions MUST be time-bounded" — the
+            // exemption must not be refreshable by no-progress traffic.
+            if matches!(push_result, Ok(true)) {
+                *last_activity_nanos = now_nanos;
+                self.inbound_budget.note_progress(stream_id, now_nanos);
+            }
+            return match push_result {
+                Ok(inserted) => {
+                    if inserted {
+                        self.retire_handle_if_complete(stream_id);
+                    }
+                    true
+                }
+                Err(streaming::StreamError::Cancelled) => {
+                    // Stream was cancelled (e.g., transaction timeout). Remove handle
+                    // to stop processing further fragments for this stream.
+                    self.streaming_handles.remove(&stream_id);
+                    self.streaming_registry.remove(stream_id);
+                    self.inbound_budget.release_if_gone(stream_id);
+                    tracing::debug!(
+                        peer_addr = %self.remote_conn.remote_addr,
+                        stream_id = %stream_id,
+                        fragment_number,
+                        "Stream cancelled, removed from handles and registry"
+                    );
+                    false
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        peer_addr = %self.remote_conn.remote_addr,
+                        stream_id = %stream_id,
+                        fragment_number,
+                        error = %e,
+                        "Failed to push fragment to streaming handle"
+                    );
+                    true
+                }
+            };
+        }
+
+        if self.inbound_budget.contains(stream_id) {
+            // Its handle was released (cancelled, swept or evicted) while a
+            // consumer still holds the buffer; do not start it again.
+            tracing::debug!(
+                peer_addr = %self.remote_conn.remote_addr,
+                stream_id = %stream_id,
+                fragment_number,
+                "Dropping fragment of a released inbound stream"
+            );
+            return false;
+        }
+        if let Err(rejection) = self.admit_inbound_stream(stream_id, total_length_bytes) {
+            // The caller checks `closed_by_stream_refusals`.
+            self.note_refused_stream(stream_id, total_length_bytes, rejection, now_nanos);
+            return false;
+        }
+
+        // New stream - register with streaming registry
+        let streaming_handle = self
+            .streaming_registry
+            .register(stream_id, total_length_bytes);
+        self.inbound_budget.charge(
+            stream_id,
+            total_length_bytes,
+            now_nanos,
+            inbound_stream_age_limit(total_length_bytes),
+            inbound_budget::Liveness::Buffer(streaming_handle.buffer_weak()),
+        );
+        match streaming_handle.push_fragment(fragment_number, payload) {
+            Err(streaming::StreamError::Cancelled) => {
+                // Stream was already cancelled, don't register it
+                tracing::debug!(
+                    peer_addr = %self.remote_conn.remote_addr,
+                    stream_id = %stream_id,
+                    fragment_number,
+                    "New stream already cancelled, not registering"
+                );
+                self.streaming_registry.remove(stream_id);
+                drop(streaming_handle);
+                self.inbound_budget.release_if_gone(stream_id);
+                return false;
+            }
+            Err(e) => {
+                // Still register the handle for non-cancellation errors
+                tracing::warn!(
+                    peer_addr = %self.remote_conn.remote_addr,
+                    stream_id = %stream_id,
+                    fragment_number,
+                    error = %e,
+                    "Failed to push first fragment to streaming handle"
+                );
+            }
+            Ok(_) => {}
+        }
+        // Phase 4: Register with orphan stream registry for race condition handling.
+        // This allows operations layer to claim the stream when metadata arrives,
+        // even if the stream fragments arrived first.
+        if let Some(registry) = &self.inbound_stream_registry {
+            registry.register_inbound_stream(
+                self.remote_conn.remote_addr,
+                stream_id,
+                super::IncomingStream::from(streaming_handle.clone()),
+            );
+            tracing::trace!(
+                peer_addr = %self.remote_conn.remote_addr,
+                stream_id = %stream_id,
+                "Registered stream as orphan for operations layer"
+            );
+        } else {
+            // CRITICAL: Operations-level streams require orphan registry for claim_or_wait().
+            // If registry is None, the stream won't be registered and the operations
+            // layer will timeout waiting for it. This indicates a bug in connection setup.
+            tracing::error!(
+                peer_addr = %self.remote_conn.remote_addr,
+                stream_id = %stream_id,
+                "Operations stream fragment arrived but inbound_stream_registry is None! \
+                 This will cause claim_or_wait() to timeout. Check connection setup."
+            );
+        }
+        self.streaming_handles
+            .insert(stream_id, (streaming_handle, now_nanos));
+        self.retire_handle_if_complete(stream_id);
+        true
+    }
+
+    /// Once an operations stream has received all its bytes, nothing more is
+    /// pushed into it: drop the connection's own references (handle map and
+    /// registry row) so that only its consumers hold the buffer, and its
+    /// charge is released when they let go.
+    fn retire_handle_if_complete(&mut self, stream_id: StreamId) {
+        let complete = self
+            .streaming_handles
+            .get(&stream_id)
+            .is_some_and(|(handle, _)| handle.is_complete());
+        if complete {
+            self.streaming_handles.remove(&stream_id);
+            self.streaming_registry.remove(stream_id);
+            self.inbound_budget.release_if_gone(stream_id);
+            self.completed_inbound_streams.put(stream_id, ());
+        }
+    }
+
+    /// Evict inbound streams that have been idle too long or have reached
+    /// their maximum age, on either reassembly path, then release the charges
+    /// of streams whose state is gone. Runs on the `timeout_check` tick.
+    fn sweep_inbound_streams(&mut self) {
+        let now_nanos = self.time_source.now_nanos();
+        let expired = self
+            .inbound_budget
+            .take_expired(now_nanos, streaming_handle_idle_timeout());
+        let mut evicted = Vec::with_capacity(expired.len());
+        for (stream_id, reason) in &expired {
+            if let Some((handle, _)) = self.streaming_handles.remove(stream_id) {
+                handle.cancel();
+            }
+            if let Some(handle) = self.streaming_registry.remove(*stream_id) {
+                handle.cancel();
+            }
+            // Dropping the sender alone would let the `recv_stream` task drain
+            // fragments already queued, and still assemble and deliver the
+            // message; cancelling makes it end at its next fragment.
+            self.inbound_streams.remove(stream_id);
+            if let Some(token) = self.legacy_tokens.remove(stream_id) {
+                if !token.cancel() {
+                    // It completed first and will be delivered: not evicted.
+                    continue;
+                }
+            }
+            use super::metrics::InboundStreamOutcome as O;
+            self.record_inbound_outcome(match reason {
+                inbound_budget::EvictionReason::Idle => O::EvictedIdle,
+                inbound_budget::EvictionReason::Age => O::EvictedAge,
+            });
+            evicted.push(*reason);
+        }
+        if !evicted.is_empty() {
+            tracing::info!(
+                peer_addr = %self.remote_conn.remote_addr,
+                evicted = evicted.len(),
+                reasons = ?evicted,
+                "Evicted stale inbound streams"
+            );
+        }
+        self.inbound_budget.release_gone();
+        self.flush_refusal_log(now_nanos);
+    }
+
+    /// Report refusals still suppressed by the warning rate limit once the
+    /// interval has passed, even if no further refusal arrives to carry them.
+    fn flush_refusal_log(&mut self, now_nanos: u64) {
+        let interval_nanos = REFUSAL_WARN_INTERVAL.as_nanos() as u64;
+        let due = self
+            .refusal_log
+            .last_warn_nanos
+            .is_some_and(|last| now_nanos.saturating_sub(last) >= interval_nanos);
+        if due && self.refusal_log.suppressed > 0 {
+            tracing::warn!(
+                peer_addr = %self.remote_conn.remote_addr,
+                refusals_since_last_warning = self.refusal_log.suppressed,
+                "Refused further inbound streams"
+            );
+            self.refusal_log.last_warn_nanos = Some(now_nanos);
+            self.refusal_log.suppressed = 0;
+        }
     }
 
     async fn process_inbound(
@@ -2042,130 +2572,19 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                 metadata_bytes,
             } => {
                 let now_nanos = self.time_source.now_nanos();
-                // Push to streaming handle for incremental access (Phase 1 streaming)
-                if let Some((streaming_handle, last_activity_nanos)) =
-                    self.streaming_handles.get_mut(&stream_id)
-                {
-                    // Existing streaming handle - push fragment.
-                    let push_result =
-                        streaming_handle.push_fragment(fragment_number, payload.clone());
-                    // Refresh `last_activity_nanos` ONLY on real forward
-                    // progress (`Ok(true)` = new fragment inserted).
-                    // Duplicates (`Ok(false)`) and invalid fragments
-                    // (`Err(InvalidFragment)`) MUST NOT extend the sweep
-                    // deadline; otherwise a peer can keep a dead stream alive
-                    // indefinitely by replaying the same fragment every <30s,
-                    // defeating the bound issue #4079 enforces. This honors
-                    // "Cleanup exemptions MUST be time-bounded" — the
-                    // exemption must not be refreshable by no-progress traffic.
-                    if matches!(push_result, Ok(true)) {
-                        *last_activity_nanos = now_nanos;
+                if stream_id.is_caller_named() {
+                    let accepted = self.process_operations_fragment(
+                        stream_id,
+                        total_length_bytes,
+                        fragment_number,
+                        payload,
+                        now_nanos,
+                    );
+                    // A refused or dropped fragment carries no metadata worth
+                    // dispatching: its stream holds no state to claim.
+                    if !accepted {
+                        return self.inbound_refusal_result();
                     }
-                    if let Err(e) = push_result {
-                        if matches!(e, streaming::StreamError::Cancelled) {
-                            // Stream was cancelled (e.g., transaction timeout). Remove handle
-                            // to stop processing further fragments for this stream.
-                            self.streaming_handles.remove(&stream_id);
-                            self.streaming_registry.remove(stream_id);
-                            tracing::debug!(
-                                peer_addr = %self.remote_conn.remote_addr,
-                                stream_id = %stream_id,
-                                fragment_number,
-                                "Stream cancelled, removed from handles and registry"
-                            );
-                        } else {
-                            tracing::warn!(
-                                peer_addr = %self.remote_conn.remote_addr,
-                                stream_id = %stream_id,
-                                fragment_number,
-                                error = %e,
-                                "Failed to push fragment to streaming handle"
-                            );
-                        }
-                    }
-                } else {
-                    // New stream - register with streaming registry
-                    let streaming_handle = self
-                        .streaming_registry
-                        .register(stream_id, total_length_bytes);
-                    if let Err(e) = streaming_handle.push_fragment(fragment_number, payload.clone())
-                    {
-                        if matches!(e, streaming::StreamError::Cancelled) {
-                            // Stream was already cancelled, don't register it
-                            tracing::debug!(
-                                peer_addr = %self.remote_conn.remote_addr,
-                                stream_id = %stream_id,
-                                fragment_number,
-                                "New stream already cancelled, not registering"
-                            );
-                            // Skip orphan registration and handle insertion
-                        } else {
-                            tracing::warn!(
-                                peer_addr = %self.remote_conn.remote_addr,
-                                stream_id = %stream_id,
-                                fragment_number,
-                                error = %e,
-                                "Failed to push first fragment to streaming handle"
-                            );
-                            // Still register the handle for non-cancellation errors
-                            if let Some(orphan_registry) = &self.orphan_stream_registry {
-                                orphan_registry.register_orphan(
-                                    self.remote_conn.remote_addr,
-                                    stream_id,
-                                    streaming_handle.clone(),
-                                );
-                                tracing::trace!(
-                                    peer_addr = %self.remote_conn.remote_addr,
-                                    stream_id = %stream_id,
-                                    "Registered stream as orphan for operations layer"
-                                );
-                            } else if stream_id.is_operations_stream() {
-                                tracing::error!(
-                                    peer_addr = %self.remote_conn.remote_addr,
-                                    stream_id = %stream_id,
-                                    "Operations stream fragment arrived but orphan_stream_registry is None! \
-                                     This will cause claim_or_wait() to timeout. Check connection setup."
-                                );
-                            }
-                            self.streaming_handles
-                                .insert(stream_id, (streaming_handle, now_nanos));
-                        }
-                    } else {
-                        // Phase 4: Register with orphan stream registry for race condition handling.
-                        // This allows operations layer to claim the stream when metadata arrives,
-                        // even if the stream fragments arrived first.
-                        if let Some(orphan_registry) = &self.orphan_stream_registry {
-                            orphan_registry.register_orphan(
-                                self.remote_conn.remote_addr,
-                                stream_id,
-                                streaming_handle.clone(),
-                            );
-                            tracing::trace!(
-                                peer_addr = %self.remote_conn.remote_addr,
-                                stream_id = %stream_id,
-                                "Registered stream as orphan for operations layer"
-                            );
-                        } else if stream_id.is_operations_stream() {
-                            // CRITICAL: Operations-level streams require orphan registry for claim_or_wait().
-                            // If registry is None, the stream won't be registered and the operations
-                            // layer will timeout waiting for it. This indicates a bug in connection setup.
-                            tracing::error!(
-                                peer_addr = %self.remote_conn.remote_addr,
-                                stream_id = %stream_id,
-                                "Operations stream fragment arrived but orphan_stream_registry is None! \
-                                 This will cause claim_or_wait() to timeout. Check connection setup."
-                            );
-                        }
-
-                        self.streaming_handles
-                            .insert(stream_id, (streaming_handle, now_nanos));
-                    }
-                }
-
-                // Operations-level streams skip the legacy InboundStream path.
-                // Their bytes are a streaming payload (e.g. GetStreamingPayload), not a
-                // NetMessage, so decode_msg() would fail and close the connection.
-                if stream_id.is_operations_stream() {
                     // If fragment #1 carries embedded metadata bytes (fix #2757),
                     // dispatch them as if they were a ShortMessage so the operations
                     // layer processes the metadata even if the separate metadata
@@ -2188,19 +2607,16 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                             return Ok(Some(bytes));
                         }
                     }
-                    tracing::trace!(
-                        peer_addr = %self.remote_conn.remote_addr,
-                        stream_id = %stream_id,
-                        fragment_number,
-                        "Operations stream fragment - skipping legacy InboundStream path"
-                    );
                     return Ok(None);
                 }
 
-                // Legacy path: push to mpsc channel for existing recv() behavior.
+                // Legacy path: a transport-level stream carrying one
+                // serialized `NetMessage`, reassembled by a `recv_stream` task.
+                // These streams are never claimed through the orphan registry
+                // (only operations streams are), so they take this path alone.
                 //
-                // This is one of the rare in-tree exceptions to the
-                // `.send().await`-in-recv-loop ban from
+                // Pushing into the task's channel is one of the rare in-tree
+                // exceptions to the `.send().await`-in-recv-loop ban from
                 // `.claude/rules/channel-safety.md`. The receiver here is
                 // the freenet-spawned `recv_stream` reassembly task in
                 // `inbound_stream_futures` — it is NOT an external client
@@ -2236,6 +2652,9 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                         self.stalled_fragment.is_none(),
                         "a parked fragment must be delivered before the next one"
                     );
+                    // Not progress by itself: the fragment may be a replay.
+                    // The sweep counts progress from the bytes the task
+                    // reports holding (see `InboundStreamBudget::take_expired`).
                     self.stalled_fragment = Some((stream_id, fragment_number, payload));
                     self.deliver_stalled_fragment().await?;
                     tracing::trace!(
@@ -2244,33 +2663,61 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                         fragment_number,
                         "Fragment pushed to existing stream"
                     );
-                } else {
-                    let (sender, receiver) = mpsc::channel(64);
+                    return Ok(None);
+                }
+                if self.inbound_budget.contains(stream_id) {
+                    // Its reassembly state was evicted and is still winding
+                    // down; do not start it again.
+                    tracing::debug!(
+                        peer_addr = %self.remote_conn.remote_addr,
+                        stream_id = %stream_id,
+                        fragment_number,
+                        "Dropping fragment of an evicted inbound stream"
+                    );
+                    return Ok(None);
+                }
+                if let Err(rejection) = self.admit_inbound_stream(stream_id, total_length_bytes) {
+                    self.note_refused_stream(stream_id, total_length_bytes, rejection, now_nanos);
+                    return self.inbound_refusal_result();
+                }
+                tracing::trace!(
+                    peer_addr = %self.remote_conn.remote_addr,
+                    stream_id = %stream_id,
+                    fragment_number,
+                    "New stream"
+                );
+                // The token carries the bytes received and the stream's
+                // state. The task holds it while it (and the `InboundStream` it
+                // owns) runs, and returns it with its output, so the charge is
+                // held until `recv()` has taken that output.
+                let token = inbound_budget::LegacyStreamToken::new();
+                let mut stream = inbound_stream::InboundStream::new(total_length_bytes)
+                    .with_token(Arc::clone(&token));
+                if let Some(msg) = stream.push_fragment(fragment_number, payload) {
                     tracing::trace!(
                         peer_addr = %self.remote_conn.remote_addr,
                         stream_id = %stream_id,
                         fragment_number,
-                        "New stream"
+                        "Stream finished"
                     );
-                    self.inbound_streams.insert(stream_id, sender);
-                    let mut stream = inbound_stream::InboundStream::new(total_length_bytes);
-                    if let Some(msg) = stream.push_fragment(fragment_number, payload) {
-                        self.inbound_streams.remove(&stream_id);
-                        // Also remove from streaming handles and registry when complete
-                        self.streaming_handles.remove(&stream_id);
-                        self.streaming_registry.remove(stream_id);
-                        tracing::trace!(
-                            peer_addr = %self.remote_conn.remote_addr,
-                            stream_id = %stream_id,
-                            fragment_number,
-                            "Stream finished"
-                        );
-                        return Ok(Some(msg));
-                    }
-                    self.inbound_stream_futures.push(GlobalExecutor::spawn(
-                        inbound_stream::recv_stream(stream_id, receiver, stream),
-                    ));
+                    self.completed_inbound_streams.put(stream_id, ());
+                    return Ok(Some(msg));
                 }
+                self.inbound_budget.charge(
+                    stream_id,
+                    total_length_bytes,
+                    now_nanos,
+                    inbound_stream_age_limit(total_length_bytes),
+                    inbound_budget::Liveness::Task(Arc::downgrade(&token)),
+                );
+                let (sender, receiver) = mpsc::channel(64);
+                self.inbound_streams.insert(stream_id, sender);
+                self.legacy_tokens.insert(stream_id, Arc::clone(&token));
+                self.inbound_stream_futures
+                    .push(GlobalExecutor::spawn(async move {
+                        let result = inbound_stream::recv_stream(stream_id, receiver, stream).await;
+                        (result, token)
+                    }));
                 Ok(None)
             }
             NoOp => Ok(None),
@@ -2310,7 +2757,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
         }
         match self.noop(receipts).await {
             Ok(()) => Ok(()),
-            Err(e) if e.is_transient_send_failure() => {
+            Err(e) if e.is_transient() => {
                 tracing::warn!(
                     peer_addr = %self.remote_conn.remote_addr,
                     "ACK noop send failed; the remote's retransmission will be re-acked"
@@ -2366,14 +2813,19 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             )
             .await;
         }
-        send_untracked_receipts(
+        let result = send_untracked_receipts(
             self.remote_conn.remote_addr,
             &self.remote_conn.socket,
             &self.remote_conn.outbound_symmetric_key,
             &receipts,
             &self.remote_conn.last_packet_id,
         )
-        .await
+        .await;
+        #[cfg(test)]
+        if result.is_ok() {
+            self.telemetry_test_counts.standalone_ack_flushes += 1;
+        }
+        result
     }
 
     /// Send a Pong response to a received Ping.
@@ -2457,7 +2909,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
     }
 
     async fn outbound_stream(&mut self, data: SerializedMessage) {
-        let stream_id = StreamId::next();
+        let stream_id = StreamId::next_transport_internal();
         self.outbound_stream_with_id(stream_id, data.into(), None, None, None)
             .await;
     }
@@ -2467,7 +2919,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
     /// in the metadata message and must match the data stream.
     ///
     /// If `completion_tx` is provided, it will be signaled when the stream
-    /// transfer completes, carrying a [`BroadcastDeliveryOutcome`] that
+    /// transfer completes, carrying a [`StreamSendOutcome`] that
     /// distinguishes delivery from a drop (#4235). Used by the broadcast queue
     /// to hold a semaphore permit until the actual transfer finishes.
     async fn outbound_stream_with_id(
@@ -2475,8 +2927,8 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
         stream_id: StreamId,
         data: bytes::Bytes,
         metadata: Option<bytes::Bytes>,
-        completion_tx: Option<tokio::sync::oneshot::Sender<super::BroadcastDeliveryOutcome>>,
-        progress: Option<crate::operations::stream_progress::StreamProgressHandle>,
+        completion_tx: Option<tokio::sync::oneshot::Sender<super::StreamSendOutcome>>,
+        progress: Option<std::sync::Arc<dyn super::StreamProgressObserver>>,
     ) {
         let task = GlobalExecutor::spawn(
             outbound_stream::send_stream(
@@ -2507,9 +2959,9 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
     async fn pipe_stream_to_remote(
         &mut self,
         outbound_stream_id: StreamId,
-        inbound_handle: streaming::StreamHandle,
+        inbound_handle: super::IncomingStream,
         metadata: Option<bytes::Bytes>,
-        progress: Option<crate::operations::stream_progress::StreamProgressHandle>,
+        progress: Option<std::sync::Arc<dyn super::StreamProgressObserver>>,
     ) {
         let task = GlobalExecutor::spawn(
             outbound_stream::pipe_stream(
@@ -2770,7 +3222,7 @@ async fn packet_sending<S: super::Socket, T: crate::simulation::TimeSource>(
                         error = %e,
                         "Failed to send packet (transient)"
                     );
-                    Err(TransportError::SendFailed(remote_addr, e.kind()))
+                    Err(TransportError::send_failed(remote_addr, e.kind()))
                 }
             }
         }
@@ -2801,7 +3253,7 @@ async fn packet_sending<S: super::Socket, T: crate::simulation::TimeSource>(
             socket
                 .send_to(&packet, remote_addr)
                 .await
-                .map_err(|e| TransportError::SendFailed(remote_addr, e.kind()))?;
+                .map_err(|e| TransportError::send_failed(remote_addr, e.kind()))?;
             super::shadow_demand::record_outbound(outbound_class, packet.len());
             report_sent_tagged(
                 &mut sent_tracker.lock(),
@@ -2845,14 +3297,31 @@ async fn send_untracked_receipts<S: super::Socket>(
         socket
             .send_to(&packet, remote_addr)
             .await
-            .map_err(|e| TransportError::SendFailed(remote_addr, e.kind()))?;
+            .map_err(|e| TransportError::send_failed(remote_addr, e.kind()))?;
         // Phase 1.6 (#4074): ack-only NoOps are must-flow.
         super::shadow_demand::record_outbound(
             super::shadow_demand::OutboundClass::MustFlow,
             packet.len(),
         );
+        super::TRANSPORT_METRICS.record_standalone_ack(packet.len() as u64);
     }
     Ok(())
+}
+
+/// The [`CloseReason`](super::CloseReason) a connection reports from its two
+/// close flags. If both are set, the idle timeout wins, as it did when the
+/// node read the flags itself.
+pub(crate) fn close_reason_from_flags(
+    closed_by_idle_timeout: bool,
+    closed_by_stream_refusals: bool,
+) -> Option<super::CloseReason> {
+    if closed_by_idle_timeout {
+        Some(super::CloseReason::IdleTimeout)
+    } else if closed_by_stream_refusals {
+        Some(super::CloseReason::InboundStreamRefusals)
+    } else {
+        None
+    }
 }
 
 // =============================================================================
@@ -2868,13 +3337,17 @@ impl<S: super::Socket> super::PeerConnectionApi for PeerConnection<S> {
         PeerConnection::remote_version(self)
     }
 
-    fn send_message(
+    fn close_reason(&self) -> Option<super::CloseReason> {
+        close_reason_from_flags(self.closed_by_idle_timeout, self.closed_by_stream_refusals)
+    }
+
+    fn send_bytes(
         &mut self,
-        msg: crate::message::NetMessage,
+        data: Vec<u8>,
     ) -> std::pin::Pin<
-        Box<dyn futures::Future<Output = Result<usize, super::TransportError>> + Send + '_>,
+        Box<dyn futures::Future<Output = Result<(), super::TransportError>> + Send + '_>,
     > {
-        Box::pin(async move { self.send(msg).await })
+        Box::pin(async move { self.send_serialized(data).await })
     }
 
     fn recv(
@@ -2885,8 +3358,11 @@ impl<S: super::Socket> super::PeerConnectionApi for PeerConnection<S> {
         Box::pin(async move { PeerConnection::recv(self).await })
     }
 
-    fn set_orphan_stream_registry(&mut self, registry: std::sync::Arc<OrphanStreamRegistry>) {
-        PeerConnection::set_orphan_stream_registry(self, registry);
+    fn set_inbound_stream_registry(
+        &mut self,
+        registry: std::sync::Arc<dyn super::InboundStreamRegistry>,
+    ) {
+        PeerConnection::set_inbound_stream_registry(self, registry);
     }
 
     fn send_stream_data(
@@ -2894,8 +3370,8 @@ impl<S: super::Socket> super::PeerConnectionApi for PeerConnection<S> {
         stream_id: StreamId,
         data: bytes::Bytes,
         metadata: Option<bytes::Bytes>,
-        completion_tx: Option<tokio::sync::oneshot::Sender<super::BroadcastDeliveryOutcome>>,
-        progress: Option<crate::operations::stream_progress::StreamProgressHandle>,
+        completion_tx: Option<tokio::sync::oneshot::Sender<super::StreamSendOutcome>>,
+        progress: Option<std::sync::Arc<dyn super::StreamProgressObserver>>,
     ) -> std::pin::Pin<
         Box<dyn futures::Future<Output = Result<(), super::TransportError>> + Send + '_>,
     > {
@@ -2909,9 +3385,9 @@ impl<S: super::Socket> super::PeerConnectionApi for PeerConnection<S> {
     fn pipe_stream_data(
         &mut self,
         outbound_stream_id: StreamId,
-        inbound_handle: streaming::StreamHandle,
+        inbound_handle: super::IncomingStream,
         metadata: Option<bytes::Bytes>,
-        progress: Option<crate::operations::stream_progress::StreamProgressHandle>,
+        progress: Option<std::sync::Arc<dyn super::StreamProgressObserver>>,
     ) -> std::pin::Pin<
         Box<dyn futures::Future<Output = Result<(), super::TransportError>> + Send + '_>,
     > {
@@ -3065,10 +3541,7 @@ mod tests {
             .await;
 
             let err = result.expect_err("should fail");
-            assert!(
-                err.is_transient_send_failure(),
-                "expected SendFailed, got: {err:?}"
-            );
+            assert!(err.is_transient(), "expected SendFailed, got: {err:?}");
             assert!(
                 !matches!(err, TransportError::ConnectionClosed(_)),
                 "should NOT be ConnectionClosed"
@@ -3093,7 +3566,7 @@ mod tests {
     /// behind that blocks the next send on the same socket+key. It does NOT
     /// exercise connection teardown: the decision to keep or drop the
     /// connection lives in the callers that consume this error
-    /// (`is_transient_send_failure` dispatch sites), which this free function
+    /// (`is_transient` dispatch sites), which this free function
     /// does not drive. That residual caller-level gap is the #3321 follow-up.
     #[test]
     fn transient_send_failure_then_recovery_succeeds() {
@@ -3133,7 +3606,7 @@ mod tests {
             .await
             .expect_err("send during blip should fail");
             assert!(
-                err.is_transient_send_failure(),
+                err.is_transient(),
                 "blip must surface as a transient failure callers can swallow, got: {err:?}"
             );
             assert!(
@@ -3170,9 +3643,9 @@ mod tests {
     /// All transient send error kinds observed in production (the ENETUNREACH
     /// family and friends) must classify as transient so the p2p error
     /// handlers swallow them instead of closing the connection.  This locks
-    /// the `is_transient_send_failure` contract the #3321 fix relies on.
+    /// the `is_transient` contract the #3321 fix relies on.
     ///
-    /// Classification is deliberately kind-agnostic: `is_transient_send_failure`
+    /// Classification is deliberately kind-agnostic: `is_transient`
     /// matches `SendFailed(..)` on the *variant*, not the inner `ErrorKind`, so
     /// every send error is connection-local regardless of errno. The loop below
     /// therefore pins "every `SendFailed` is transient"; the explicit negative
@@ -3190,9 +3663,9 @@ mod tests {
             ErrorKind::WouldBlock,
             ErrorKind::TimedOut,
         ] {
-            let err = TransportError::SendFailed(remote_addr, kind);
+            let err = TransportError::send_failed(remote_addr, kind);
             assert!(
-                err.is_transient_send_failure(),
+                err.is_transient(),
                 "SendFailed({kind:?}) must be transient so the connection survives — issue #3321"
             );
         }
@@ -3202,11 +3675,11 @@ mod tests {
         // closures. `ConnectionClosed` and `ChannelClosed` are the canonical
         // non-transient variants.
         assert!(
-            !TransportError::ConnectionClosed(remote_addr).is_transient_send_failure(),
+            !TransportError::ConnectionClosed(remote_addr).is_transient(),
             "ConnectionClosed must NOT be swallowed as a transient send failure — issue #3321"
         );
         assert!(
-            !TransportError::ChannelClosed.is_transient_send_failure(),
+            !TransportError::ChannelClosed.is_transient(),
             "ChannelClosed must NOT be swallowed as a transient send failure — issue #3321"
         );
     }
@@ -3230,7 +3703,7 @@ mod tests {
             let ok_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let (tx, _rx) = mpsc::channel(16);
             let socket = Arc::new(FailableTestSocket::new(tx, ok_flag));
-            let stream_id = StreamId::next();
+            let stream_id = StreamId::next_transport_internal();
             let packet_size = 128;
 
             packet_sending(
@@ -3322,7 +3795,7 @@ mod tests {
             );
 
             // ---- success: StreamFragment advances `bulk` ----
-            let frag_stream_id = StreamId::next();
+            let frag_stream_id = StreamId::next_transport_internal();
             packet_sending(
                 remote_addr,
                 &socket,
@@ -3462,7 +3935,7 @@ mod tests {
             time_source.clone(),
         ));
 
-        let stream_id = StreamId::next();
+        let stream_id = StreamId::next_transport_internal();
         // Send a long message using the outbound stream
         let outbound = GlobalExecutor::spawn(send_stream(
             stream_id,
@@ -3540,7 +4013,7 @@ mod tests {
     // SCOPE: `InboundStream` carries large NetMessage sends. It is NOT the
     // reassembler a contract state travels through - operations-level streams
     // bypass it entirely (see `process_inbound`'s
-    // `if stream_id.is_operations_stream() { return Ok(None) }`) in favour of
+    // `if stream_id.is_caller_named() { return Ok(None) }`) in favour of
     // `LockFreeStreamBuffer`. The equivalent coverage for that buffer is the
     // `streaming_buffer_*` block further down; neither block's result carries
     // over to the other.
@@ -3615,7 +4088,7 @@ mod tests {
             time_source.clone(),
         ));
 
-        let stream_id = StreamId::next();
+        let stream_id = StreamId::next_transport_internal();
         let outbound = GlobalExecutor::spawn(send_stream(
             stream_id,
             Arc::new(AtomicU32::new(0)),
@@ -3709,9 +4182,13 @@ mod tests {
             tx.send(fragment).await.expect("receiver is alive");
         }
         drop(tx);
-        recv_stream(StreamId::next(), rx, InboundStream::new(total_length_bytes))
-            .await
-            .map(|(_, msg)| msg)
+        recv_stream(
+            StreamId::next_transport_internal(),
+            rx,
+            InboundStream::new(total_length_bytes),
+        )
+        .await
+        .map(|(_, msg)| msg)
     }
 
     /// Strict reverse arrival: fragment #1, the one that may carry metadata and
@@ -3900,7 +4377,7 @@ mod tests {
     //
     // `assert_multi_fragment_roundtrip` above exercises `InboundStream`, which
     // is NOT the reassembler a contract state travels through. Operations-level
-    // streams (`StreamId::next_operations()` - every GET/PUT/broadcast payload)
+    // streams (`StreamId::next()` - every GET/PUT/broadcast payload)
     // return from `PeerConnection::process_inbound` BEFORE the legacy
     // `InboundStream` path is reached, and are reassembled instead by
     // `LockFreeStreamBuffer` behind `streaming::StreamHandle`, which
@@ -3925,7 +4402,7 @@ mod tests {
         total_length_bytes: u64,
         delivery: Vec<(u32, bytes::Bytes)>,
     ) -> std::result::Result<Vec<u8>, streaming::StreamError> {
-        let handle = streaming::StreamHandle::new(StreamId::next_operations(), total_length_bytes);
+        let handle = streaming::StreamHandle::new(StreamId::next(), total_length_bytes);
         for (number, fragment) in delivery {
             handle.push_fragment(number, fragment)?;
         }
@@ -3991,9 +4468,8 @@ mod tests {
     }
 
     /// With metadata embedded in fragment #1, the buffer's `+1` overflow slot
-    /// and its `min_complete_fragments` split are both load-bearing: the sender
-    /// emits one more fragment than `ceil(total / MAX_DATA_SIZE)`, and
-    /// `is_complete()` fires one fragment before assembly can succeed.
+    /// is load-bearing: the sender emits one more fragment than
+    /// `ceil(total / MAX_DATA_SIZE)`.
     #[tokio::test]
     async fn streaming_buffer_roundtrip_with_metadata_is_byte_identical() {
         let mut metadata = vec![0u8; ROUNDTRIP_METADATA_LEN];
@@ -4037,7 +4513,7 @@ mod tests {
         crate::config::GlobalRng::fill_bytes(&mut payload);
         let captured = capture_stream_fragments(&payload, None).await;
 
-        let handle = streaming::StreamHandle::new(StreamId::next_operations(), 24_832);
+        let handle = streaming::StreamHandle::new(StreamId::next(), 24_832);
         let mut consumer = handle.stream_with_reclaim();
         let mut received = Vec::with_capacity(payload.len());
 
@@ -4059,19 +4535,16 @@ mod tests {
     }
 
     /// `LockFreeStreamBuffer::take()` does not advance `consumed_frontier`, so
-    /// `insert()` still accepts a retransmission of a fragment a reclaiming
-    /// consumer has already read, and refills the emptied slot.
+    /// a retransmission of a fragment a reclaiming consumer has already read
+    /// finds its slot holding the `TAKEN` marker (empty to readers). The claim
+    /// fails on the marker, so it is treated as a duplicate and the reclaimed
+    /// slot is not refilled.
     ///
-    /// This test pins the CONSEQUENCE, which is the question that matters for
-    /// the #5256 corruption hunt: the refill is a bookkeeping defect (a slot
-    /// that was reclaimed becomes occupied again, and its memory is held until
-    /// the buffer drops), NOT a data defect. The consumer has already advanced
-    /// past that fragment and never re-reads it, and `assemble()` concatenates
-    /// slots strictly in order and stops at the first empty one, so it can
-    /// return `None` but cannot return mis-ordered or holed bytes.
-    ///
-    /// If a future change makes the refilled slot observable in the assembled
-    /// output, this test fails - which is the alarm worth having.
+    /// This test also pins the question that matters for the #5256 corruption
+    /// hunt: the consumer has already advanced past that fragment and never
+    /// re-reads it, and `assemble()` concatenates slots strictly in order and
+    /// stops at the first empty one, so it can return `None` but cannot return
+    /// mis-ordered or holed bytes.
     #[tokio::test]
     async fn streaming_buffer_replay_after_reclaim_does_not_corrupt_bytes() {
         let mut payload = vec![0u8; FULL_FRAGMENT_PAYLOAD * 4];
@@ -4079,27 +4552,23 @@ mod tests {
         let captured = capture_stream_fragments(&payload, None).await;
         assert_eq!(captured.fragments.len(), 4);
 
-        let handle =
-            streaming::StreamHandle::new(StreamId::next_operations(), payload.len() as u64);
+        let handle = streaming::StreamHandle::new(StreamId::next(), payload.len() as u64);
         for (number, fragment) in &captured.fragments {
             handle.push_fragment(*number, fragment.clone()).unwrap();
         }
 
-        // A reclaiming consumer takes fragment #1, emptying its slot.
+        // A reclaiming consumer takes fragment #1, leaving `TAKEN` in its slot.
         let mut consumer = handle.stream_with_reclaim();
         let first = consumer.next().await.unwrap().unwrap();
         assert_eq!(first, captured.fragments[0].1);
 
-        // A retransmission of that same fragment arrives afterwards. `take()`
-        // left `consumed_frontier` at 0, so `insert()` treats the emptied slot
-        // as vacant and accepts it.
-        let refilled = handle
-            .push_fragment(1, captured.fragments[0].1.clone())
-            .expect("replay after take is accepted, not rejected as consumed");
+        // A retransmission of that same fragment arrives afterwards. Readers
+        // see its slot as empty (`take()` left `consumed_frontier` at 0), but
+        // it holds `TAKEN`, so the replay is a duplicate and is not stored.
+        let replay = handle.push_fragment(1, captured.fragments[0].1.clone());
         assert!(
-            refilled,
-            "replay refills the slot a reclaiming consumer already emptied \
-             (see streaming_buffer.rs take(): it does not advance consumed_frontier)"
+            matches!(replay, Ok(false)),
+            "a replay below the frontier must not refill the slot: {replay:?}"
         );
 
         // The consumer never re-reads it: the remaining fragments come back in
@@ -5018,7 +5487,7 @@ mod tests {
     ///
     /// What the test asserts:
     ///   1. Each failed send returns `Err` classified as transient
-    ///      (`is_transient_send_failure()`, NOT `ConnectionClosed`), and the
+    ///      (`is_transient()`, NOT `ConnectionClosed`), and the
     ///      `&mut PeerConnection` is neither consumed nor poisoned — we keep
     ///      calling `send` on the same object across the whole burst.
     ///   2. After flipping the failure flag off, the very same connection sends
@@ -5113,7 +5582,7 @@ mod tests {
                 .await
                 .expect_err("send must fail while the socket is failing");
             assert!(
-                err.is_transient_send_failure(),
+                err.is_transient(),
                 "burst send #{attempt} must be a transient send failure so the \
                  connection survives (#3321/#3367), got: {err:?}"
             );
@@ -5273,11 +5742,11 @@ mod tests {
         // `OutboundStreamFailed` is what send_stream/pipe_stream's stream-scoped
         // error sites return (cwnd-wait timeout, pipe inactivity stall,
         // inbound-feed error) — the dominant outbound-stream failure by far. It
-        // is `is_transient_send_failure()`, so it takes the connection-survives
+        // is `is_transient()`, so it takes the connection-survives
         // arm.
         let err = TransportError::OutboundStreamFailed(remote_addr);
         assert!(
-            err.is_transient_send_failure(),
+            err.is_transient(),
             "test premise: OutboundStreamFailed must be classified transient, \
              otherwise this test is silently exercising the other arm"
         );
@@ -5313,8 +5782,8 @@ mod tests {
     /// counter must move before the error propagates.
     ///
     /// Reachability note: from an outbound stream this arm is only reachable
-    /// via `TransportError::Serialization` — the sole non-transient error
-    /// `packet_sending` can produce (a bincode failure from
+    /// via a serialization error (`UdpErrorKind::Serialization`) — the sole
+    /// non-transient error `packet_sending` can produce (a bincode failure from
     /// `try_serialize_msg_to_packet_data`); every other outbound-stream error
     /// is `OutboundStreamFailed` or `SendFailed`, both transient. That is
     /// exactly why instrumenting ONLY this arm would have left the counter
@@ -5325,7 +5794,7 @@ mod tests {
     /// yields `ConnectionClosed` (see the `inbound.ok_or_else(..)` site in
     /// `recv`), so asserting on that variant could pass for the wrong reason.
     /// The sentinel proves the error came from OUR stream task. What the arm
-    /// actually keys off is the `!is_transient_send_failure()` predicate, which
+    /// actually keys off is the `!is_transient()` predicate, which
     /// the test asserts directly.
     #[tokio::test]
     async fn recv_records_transfer_failed_on_terminal_stream_failure() {
@@ -5343,7 +5812,7 @@ mod tests {
             cause: SENTINEL.into(),
         };
         assert!(
-            !err.is_transient_send_failure(),
+            !err.is_transient(),
             "test premise: the injected error must NOT be classified transient, \
              otherwise this test is silently exercising the other arm"
         );
@@ -5483,18 +5952,16 @@ mod tests {
         conn.pending_pings.write().insert(pong_seq, send_nanos);
         time_source.advance_time(Duration::from_millis(50));
 
-        let samples_before = crate::transport::TRANSPORT_METRICS.rtt_sample_count();
-
         inbound_tx.send(pong_packet).await.expect("send pong");
         inbound_tx.send(short_packet).await.expect("send short");
 
         let _msg = conn.recv().await.expect("recv");
 
-        let samples_after = crate::transport::TRANSPORT_METRICS.rtt_sample_count();
-        assert!(
-            samples_after > samples_before,
-            "Pong for a pending ping must record at least one RTT sample \
-             (before={samples_before}, after={samples_after}). \
+        // Per-connection: concurrent tests also record into the process-wide
+        // TRANSPORT_METRICS, so a delta there could not fail.
+        assert_eq!(
+            conn.telemetry_test_counts.keepalive_rtt_samples, 1,
+            "Pong for a pending ping must record exactly one RTT sample. \
              The keep-alive RTT path (#4000) is not wired up."
         );
 
@@ -5541,8 +6008,8 @@ mod tests {
         let fresh_nanos = now_nanos.saturating_sub(Duration::from_secs(1).as_nanos() as u64);
 
         let registry = StreamRegistry::new();
-        let stale_id = StreamId::next();
-        let fresh_id = StreamId::next();
+        let stale_id = StreamId::next_transport_internal();
+        let fresh_id = StreamId::next_transport_internal();
         // `register` returns a fresh handle and also stores a clone inside
         // the registry — mirroring the production code path at
         // `process_inbound` line 1383.
@@ -5605,7 +6072,7 @@ mod tests {
     fn sweep_streaming_handles_inner_keeps_recent_entries() {
         use streaming::StreamRegistry;
         let registry = StreamRegistry::new();
-        let id = StreamId::next();
+        let id = StreamId::next_transport_internal();
         let handle = registry.register(id, 64 * 1024);
 
         let now_nanos = Duration::from_secs(3600).as_nanos() as u64;
@@ -5651,8 +6118,8 @@ mod tests {
     fn sweep_streaming_handles_inner_threshold_boundary_is_strict_greater_than() {
         use streaming::StreamRegistry;
         let registry = StreamRegistry::new();
-        let exact_id = StreamId::next();
-        let past_id = StreamId::next();
+        let exact_id = StreamId::next_transport_internal();
+        let past_id = StreamId::next_transport_internal();
         let exact_handle = registry.register(exact_id, 64 * 1024);
         let past_handle = registry.register(past_id, 64 * 1024);
 
@@ -5695,7 +6162,7 @@ mod tests {
     fn sweep_streaming_handles_inner_is_idempotent_on_repeat() {
         use streaming::StreamRegistry;
         let registry = StreamRegistry::new();
-        let id = StreamId::next();
+        let id = StreamId::next_transport_internal();
         let handle = registry.register(id, 64 * 1024);
         let now_nanos = STREAMING_HANDLE_IDLE_TIMEOUT_PROD.as_nanos() as u64 * 4;
 
@@ -5739,7 +6206,7 @@ mod tests {
     fn sweep_streaming_handles_inner_releases_buffer_arc() {
         use streaming::StreamRegistry;
         let registry = StreamRegistry::new();
-        let id = StreamId::next();
+        let id = StreamId::next_transport_internal();
         let handle = registry.register(id, 64 * 1024);
 
         // After register: registry holds 1 clone, our local `handle` holds 1.
@@ -5794,7 +6261,7 @@ mod tests {
         let mut expected_to_keep = Vec::new();
         let mut expected_to_drop = Vec::new();
         for i in 0..10u64 {
-            let id = StreamId::next();
+            let id = StreamId::next_transport_internal();
             let handle = registry.register(id, 64 * 1024);
             // i = 0..5 -> within window (kept); i = 5..10 -> outside (dropped).
             let last_activity_nanos = if i < 5 {
@@ -5909,7 +6376,7 @@ mod tests {
 
         // --- Part 1: behavioral pin on push_fragment's return values ---
         let registry = StreamRegistry::new();
-        let id = StreamId::next();
+        let id = StreamId::next_transport_internal();
         // 2 fragments + 1 overflow slot = 3 valid indices; index 99 is OOB.
         let handle = registry.register(id, (FRAGMENT_PAYLOAD_SIZE * 2) as u64);
 
