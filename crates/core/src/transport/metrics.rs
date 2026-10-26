@@ -70,6 +70,83 @@ macro_rules! labelled_counters {
 }
 
 labelled_counters! {
+    /// A decision about the peer identity (public key) the node records for
+    /// a connection, counted where the node makes it, to measure how often a
+    /// connection's peer identity is set or changed after establishment.
+    /// Exported per period as `conn_identity_<label>`, each key only when its
+    /// count is non-zero. Each `set_*`, `same_*` and `changed_*` kind is one
+    /// per decision on its path; `connect_request_known_addr`, `own_key`,
+    /// `duplicate_key` and `changed_ring_promotion` (which accompanies a
+    /// `changed_connect_peer` on the same ConnectPeer) are counted in
+    /// addition to the kind of the decision they qualify.
+    ///
+    /// An inbound connection that matched an expected-inbound registration
+    /// is recorded under the key the connect op dialled
+    /// (`expected_inbound_bound`), or, when the registration carried no key,
+    /// starts with none (`expected_inbound_unbound`). Any other inbound
+    /// connection starts with no key, so its first key is counted as
+    /// `set_connect_peer` or `set_connect_request`, whichever names the peer
+    /// first. A connection is recorded under this node's own key only when a
+    /// dial, a registration, a ConnectRequest or a ConnectPeer names that
+    /// key, so `own_key` is expected to stay at zero.
+    pub(crate) enum ConnIdentity {
+        /// An outbound connection was established and recorded under the key
+        /// it was dialled with.
+        SetDialed => "set_dialed",
+        /// An inbound connection matched an expected-inbound registration and
+        /// was recorded under the key the connect op dialled, which the
+        /// registration carried.
+        ExpectedInboundBound => "expected_inbound_bound",
+        /// An inbound connection matched an expected-inbound registration
+        /// that carried no key, so it starts with none, like an unexpected
+        /// one.
+        ExpectedInboundUnbound => "expected_inbound_unbound",
+        /// A ConnectRequest gave the joiner key of a connection that had none.
+        SetConnectRequest => "set_connect_request",
+        /// A ConnectRequest named the key the connection already had.
+        SameConnectRequest => "same_connect_request",
+        /// A ConnectRequest named a key other than the one the connection had,
+        /// and the connection's key was replaced with it.
+        ChangedConnectRequest => "changed_connect_request",
+        /// The ConnectRequest counted by one of the three kinds above gave the
+        /// joiner a known address equal to the connection's remote address,
+        /// rather than an unknown one.
+        ConnectRequestKnownAddr => "connect_request_known_addr",
+        /// A ConnectPeer for an existing connection gave the key of a
+        /// connection that had none.
+        SetConnectPeer => "set_connect_peer",
+        /// A ConnectPeer for an existing connection named the key it had.
+        SameConnectPeer => "same_connect_peer",
+        /// A ConnectPeer for an existing connection named a key other than the
+        /// one it had; the connection kept its key.
+        ChangedConnectPeer => "changed_connect_peer",
+        /// A ConnectPeer promoted an existing connection into the ring, and
+        /// the ring took it, under a key other than the one recorded for the
+        /// connection.
+        ChangedRingPromotion => "changed_ring_promotion",
+        /// A connection was recorded under this node's own key, on any path.
+        OwnKey => "own_key",
+        /// A key was recorded for a connection while the key-to-address map
+        /// held it for another open connection that still has that key (the
+        /// newer one replaces it in the map).
+        DuplicateKey => "duplicate_key",
+        /// Cleanup ran for a connection whose key is mapped to a different
+        /// connection. Counted on transport close, on an explicit drop, on
+        /// the unpromoted-connection sweep and when a new connection at the
+        /// same address replaces the entry; not on the cleanup when the event
+        /// loop shuts down.
+        TeardownKeyElsewhere => "teardown_key_elsewhere",
+        /// Cleanup, on the same paths, ran for a connection with no recorded
+        /// key, so no per-peer cleanup ran for it.
+        TeardownUnidentified => "teardown_unidentified",
+        /// Cleanup, on the same paths, ran for a connection whose key is not
+        /// mapped to any connection (for example, an earlier cleanup of
+        /// another connection with the same key removed the mapping).
+        TeardownKeyUnmapped => "teardown_key_unmapped",
+    }
+}
+
+labelled_counters! {
     /// Why an inbound stream was refused or evicted. Each has its own
     /// counter because each has a different remedy.
     pub(crate) enum InboundStreamOutcome {
@@ -141,6 +218,93 @@ labelled_counters! {
 }
 
 labelled_counters! {
+    /// How the demultiplexer classified an inbound datagram by its first
+    /// byte. Exactly one per datagram received; exported per period as
+    /// `demux_<label>`.
+    pub(crate) enum DemuxClass {
+        /// First byte is a type byte the UDP transport uses (`0x01` or
+        /// `0x02`). Passed on to the listener unchanged.
+        Legacy => "legacy",
+        /// First byte has the QUIC fixed bit or long-header bit set (mask
+        /// `0xC0`) and is not a UDP transport type byte. Dropped, or queued
+        /// for the QUIC ingress when one is enabled (see
+        /// [`QuicIngressOutcome`]).
+        Quic => "quic",
+        /// Anything else, including an empty datagram. Dropped.
+        Other => "other",
+    }
+}
+
+labelled_counters! {
+    /// What the demultiplexer did with a QUIC-class datagram
+    /// ([`DemuxClass::Quic`]). Exactly one per such datagram; exported per
+    /// period as `quic_ingress_<label>`. Every node counts `no_ingress` until
+    /// a QUIC endpoint is running (#5940).
+    pub(crate) enum QuicIngressOutcome {
+        /// Queued for the QUIC endpoint.
+        Forwarded => "forwarded",
+        /// Dropped: its source address is not in the ingress allow-set.
+        NotAllowed => "not_allowed",
+        /// Dropped: the ingress queue was full.
+        QueueFull => "queue_full",
+        /// Dropped: the datagrams already queued from this source address
+        /// filled its share of the queue (`demux::QUIC_INGRESS_PER_SOURCE_DATAGRAMS`),
+        /// so one source cannot take the whole queue from the others.
+        SourceFull => "source_full",
+        /// Dropped: no QUIC ingress is enabled, or its receiver is gone.
+        NoIngress => "no_ingress",
+    }
+}
+
+labelled_counters! {
+    /// The application error code this node closed a QUIC connection with
+    /// (`quic::error::close_code`, which also maps each to its wire value).
+    /// Exactly one per connection this node closed; exported per period as
+    /// `quic_close_sent_<label>`. Zero while QUIC carries no traffic.
+    pub(crate) enum QuicCloseCode {
+        /// The node dropped the peer (or the connection's handle).
+        NodeDroppedPeer => "node_dropped_peer",
+        /// Downgrade: the peer should fall back to UDP.
+        Downgrade => "downgrade",
+        /// The peer proved a key this node does not have on record for it.
+        IdentityMismatch => "identity_mismatch",
+    }
+}
+
+labelled_counters! {
+    /// What took most of a paced stream's gap between fragments, for a gap
+    /// that reached the egress cap's long-wait threshold or its deadline.
+    /// Exported per period as `egress_long_waits_<label>`,
+    /// `egress_streams_abandoned_<label>` and `egress_streams_refused_<label>`.
+    pub(crate) enum WaitCause {
+        /// Sleeping for the node-wide cap.
+        Cap => "cap",
+        /// Sleeping for the connection's own bucket.
+        Connection => "connection",
+        /// Anything else, such as waiting for the congestion window.
+        Other => "other",
+    }
+}
+
+labelled_counters! {
+    /// How a datagram the node sent was paced by the node-wide egress cap
+    /// (`transport::egress_cap`). Exactly one per datagram sent while a cap
+    /// is configured, recorded when it is charged after a successful send;
+    /// exported per period as `egress_<label>`. Nothing is recorded without
+    /// a cap.
+    pub(crate) enum EgressDecision {
+        /// A paced send (stream fragment) that did not have to wait.
+        Immediate => "immediate",
+        /// A paced send that waited for the bucket.
+        Waited => "waited",
+        /// A send that is never paced (handshake, short message, ACK,
+        /// receipt, keepalive, Pong, retransmission). Charged at once, into
+        /// debt if the bucket is empty.
+        Unpaced => "unpaced",
+    }
+}
+
+labelled_counters! {
     /// How long a CONNECT joiner held an acceptor in its dial queue between
     /// the acceptor's Response arriving and the dial being dispatched. The
     /// acceptor starts punching when it accepts and gives up after
@@ -170,10 +334,53 @@ impl DialQueueWait {
     }
 }
 
+/// The inbound concurrency levels counted per period, in ascending order
+/// (see [`TransportMetrics::record_inbound_concurrency`]). The top one is
+/// `quic::config::MAX_UNI_STREAMS`.
+pub(crate) const INBOUND_CONCURRENCY_THRESHOLDS: [u32; 6] = [8, 16, 32, 64, 128, 256];
+
+// The `inbound_concurrency_conns_ge_<T>` snapshot fields are read by
+// position in the list above; reordering it would mislabel them.
+const _: () = {
+    let t = INBOUND_CONCURRENCY_THRESHOLDS;
+    assert!(t[0] == 8 && t[1] == 16 && t[2] == 32 && t[3] == 64 && t[4] == 128 && t[5] == 256);
+};
+
+/// The inbound concurrency counts of one snapshot period. Guarded as a
+/// whole by `TransportMetrics::inbound_concurrency`, so a snapshot drains a
+/// consistent set (see [`TransportMetrics::record_inbound_concurrency`]).
+#[derive(Debug, Default, Clone, Copy)]
+struct InboundConcurrencyCounts {
+    /// Connections with at least one sample this period.
+    conns_sampled: u32,
+    /// Connections whose peak this period reached each
+    /// [`INBOUND_CONCURRENCY_THRESHOLDS`] entry, in that order.
+    conns_ge: [u32; INBOUND_CONCURRENCY_THRESHOLDS.len()],
+    /// Largest estimate on any connection this period.
+    max: u32,
+}
+
+/// One connection's highest inbound concurrency estimate in the current
+/// snapshot period. Owned by the connection's recv loop; see
+/// [`TransportMetrics::record_inbound_concurrency`].
+#[derive(Debug, Default)]
+pub(crate) struct InboundConcurrencyPeak {
+    /// The period (`TransportMetrics::inbound_concurrency_epoch`) `peak`
+    /// belongs to; 0 before the first sample, which no period has.
+    epoch: u64,
+    peak: u32,
+}
+
 /// Accumulates transport metrics for periodic reporting.
 ///
-/// All operations are lock-free using atomics. Metrics are accumulated
-/// until `take_snapshot()` is called, which resets the counters.
+/// Most counters are relaxed atomics, written without a lock. A few rare
+/// records take a small `parking_lot::Mutex`: the NAT detail state
+/// (observed addresses, failure samples) and the inbound concurrency
+/// counts, whose common case (no new peak) is a lock-free fast path and
+/// whose rare case (a connection's first sample of a period, or a new peak)
+/// locks so the snapshot drains a consistent set (see
+/// [`Self::record_inbound_concurrency`]). Metrics are accumulated until
+/// `take_snapshot()` is called, which resets the counters.
 ///
 /// # Thread Safety
 ///
@@ -309,6 +516,41 @@ pub struct TransportMetrics {
     inbound_queue_depth_hwm: AtomicU32,
     inbound_queue_drops: AtomicU64,
 
+    /// QUIC upgrade control messages received (#5940 e1, reset each
+    /// snapshot). Nothing sends them yet, so a non-zero value means a newer
+    /// peer is offering upgrades this node only decodes and ignores.
+    upgrade_control_received: AtomicU64,
+    /// Never-reset twin of `upgrade_control_received`.
+    cumulative_upgrade_control_received: AtomicU64,
+
+    /// Packets that would have completed a hole-punch handshake on the
+    /// side that answered the remote's intro, dropped because they were not
+    /// encrypted under that attempt's inbound session key; one count per
+    /// packet, not per attempt (reset each snapshot). The handshake stays
+    /// pending, so a later packet under that key still completes it.
+    handshake_unauthenticated_dropped: AtomicU64,
+
+    /// Connection identity decisions this period, by [`ConnIdentity`]
+    /// (reset each snapshot).
+    conn_identity: [AtomicU32; ConnIdentity::COUNT],
+
+    /// Times the QUIC endpoint went down while the node still held it (its
+    /// driver future returned), after which the node runs with QUIC off
+    /// (reset each snapshot). At most one per endpoint.
+    quic_endpoint_down: AtomicU64,
+    /// QUIC connections this node closed, by [`QuicCloseCode`] (reset each
+    /// snapshot).
+    quic_close_sent: [AtomicU64; QuicCloseCode::COUNT],
+
+    /// The current snapshot period, starting at 1 and advanced by each
+    /// `take_snapshot`. A connection's [`InboundConcurrencyPeak`] from an
+    /// earlier period is reset on its next sample. Written only while
+    /// `inbound_concurrency` is locked; read without the lock only by the
+    /// fast path of `record_inbound_concurrency`.
+    inbound_concurrency_epoch: AtomicU64,
+    /// This period's inbound concurrency counts (reset each snapshot).
+    inbound_concurrency: parking_lot::Mutex<InboundConcurrencyCounts>,
+
     /// Inbound streams refused or evicted this period, by reason (reset each
     /// snapshot). The never-reset twin is `cumulative_inbound_stream_outcomes`,
     /// which is what the OTel instrument observes.
@@ -331,6 +573,43 @@ pub struct TransportMetrics {
     /// CONNECT joiner acceptor dials by time spent queued, by
     /// [`DialQueueWait`] (reset each snapshot).
     dial_queue_wait: [AtomicU32; DialQueueWait::COUNT],
+
+    /// Inbound datagrams by [`DemuxClass`] (reset each snapshot). Counts
+    /// every datagram the socket wrapper receives, legacy ones included, so
+    /// the legacy share is visible.
+    demux_packets: [AtomicU64; DemuxClass::COUNT],
+
+    /// QUIC-class datagrams by [`QuicIngressOutcome`] (reset each snapshot).
+    quic_ingress: [AtomicU64; QuicIngressOutcome::COUNT],
+
+    /// Node-wide egress cap counters (reset each snapshot). Zero unless
+    /// `total-bandwidth-limit` is set.
+    egress: EgressCounters,
+}
+
+/// Period counters written by `transport::egress_cap`.
+#[derive(Debug, Default)]
+struct EgressCounters {
+    /// Datagrams sent, by [`EgressDecision`].
+    packets: [AtomicU64; EgressDecision::COUNT],
+    /// Bytes charged for those datagrams.
+    bytes: AtomicU64,
+    /// Bytes of datagrams that waited before they were sent.
+    bytes_waited: AtomicU64,
+    /// Sum and maximum of the waits, in microseconds.
+    wait_us_sum: AtomicU64,
+    wait_us_max: AtomicU64,
+    /// Paced gaps that reached `egress_cap::LONG_WAIT`, by [`WaitCause`].
+    long_waits: [AtomicU64; WaitCause::COUNT],
+    /// Streams failed at `egress_cap::PACED_WAIT_DEADLINE`, by [`WaitCause`].
+    streams_abandoned: [AtomicU64; WaitCause::COUNT],
+    /// Streams failed at once because a connection reservation would have
+    /// reached the deadline, by [`WaitCause`] (never `cap`).
+    streams_refused: [AtomicU64; WaitCause::COUNT],
+    /// Largest unpaced debt after a charge, in bytes.
+    debt_hwm_bytes: AtomicU64,
+    /// Unpaced bytes forgiven because the debt reached the debt limit.
+    debt_forgiven_bytes: AtomicU64,
 }
 
 /// Period counters for packet loss, retransmission and standalone-ACK
@@ -397,10 +676,37 @@ struct NatDetailCounters {
     #[cfg(test)]
     dial_queue_waits_by_remote:
         parking_lot::Mutex<std::collections::VecDeque<(SocketAddr, DialQueueWait)>>,
+    /// Test-only record of demultiplexed datagrams, kept only for the
+    /// remotes a test registered with `watch_demux`. Unwatched traffic costs
+    /// one lookup, so busy parallel tests cannot evict a watching test's
+    /// entries.
+    #[cfg(test)]
+    demux_watched: DashMap<SocketAddr, Vec<DemuxClass>>,
+    /// Test-only record of QUIC ingress outcomes, for the remotes a test
+    /// registered with `watch_quic_ingress`; same rules as `demux_watched`.
+    #[cfg(test)]
+    quic_ingress_watched: DashMap<SocketAddr, Vec<QuicIngressOutcome>>,
     /// Test-only log of dropped stray intros `(remote, kind)` (bounded).
     #[cfg(test)]
     stray_intros_by_remote:
         parking_lot::Mutex<std::collections::VecDeque<(SocketAddr, StrayIntro)>>,
+    /// Test-only log of the remotes whose handshake packets were dropped for
+    /// not being under the attempt's inbound key (bounded), one per packet.
+    #[cfg(test)]
+    handshake_unauthenticated_by_remote: parking_lot::Mutex<std::collections::VecDeque<SocketAddr>>,
+    /// Test-only record of connection identity decisions, kept only for the
+    /// remotes a test registered with `watch_conn_identity`; same rules as
+    /// `demux_watched`.
+    #[cfg(test)]
+    conn_identity_watched: DashMap<SocketAddr, Vec<ConnIdentity>>,
+    /// Test-only log of the local addresses of QUIC endpoints that went
+    /// down (bounded), one per `record_quic_endpoint_down`.
+    #[cfg(test)]
+    quic_endpoint_down_at: parking_lot::Mutex<std::collections::VecDeque<SocketAddr>>,
+    /// Test-only log of QUIC closes this node sent, with the remote
+    /// (bounded).
+    #[cfg(test)]
+    quic_close_sent_to: parking_lot::Mutex<std::collections::VecDeque<(SocketAddr, QuicCloseCode)>>,
     /// Test-only log of observed-address reporters (bounded).
     #[cfg(test)]
     observed_reporters: parking_lot::Mutex<std::collections::VecDeque<SocketAddr>>,
@@ -612,12 +918,23 @@ impl TransportMetrics {
             transfer_ack_time_max_ms: AtomicU64::new(0),
             inbound_queue_depth_hwm: AtomicU32::new(0),
             inbound_queue_drops: AtomicU64::new(0),
+            upgrade_control_received: AtomicU64::new(0),
+            cumulative_upgrade_control_received: AtomicU64::new(0),
+            handshake_unauthenticated_dropped: AtomicU64::new(0),
+            conn_identity: Default::default(),
+            quic_endpoint_down: AtomicU64::new(0),
+            quic_close_sent: Default::default(),
+            inbound_concurrency_epoch: AtomicU64::new(1),
+            inbound_concurrency: Default::default(),
             inbound_stream_outcomes: Default::default(),
             nat_attempts_by_origin: Default::default(),
             nat_established_by_origin: Default::default(),
             stray_intros: Default::default(),
             stray_intro_failures_evicted: AtomicU32::new(0),
             dial_queue_wait: Default::default(),
+            demux_packets: Default::default(),
+            quic_ingress: Default::default(),
+            egress: EgressCounters::default(),
         }
     }
 
@@ -763,6 +1080,56 @@ impl TransportMetrics {
             .collect()
     }
 
+    /// Test-only: start recording the demultiplexer class of every datagram
+    /// from `remote`. Call before the datagrams are sent. Starts an empty
+    /// record, discarding one left by an earlier watcher of the same address;
+    /// two tests watching one address at the same time still interfere, so
+    /// each test must use addresses no other test uses.
+    #[cfg(test)]
+    pub(crate) fn watch_demux(&self, remote: SocketAddr) {
+        self.nat_detail.demux_watched.insert(remote, Vec::new());
+    }
+
+    /// Test-only: start recording what the demultiplexer's QUIC ingress did
+    /// with each QUIC-class datagram from `remote`. Same rules as
+    /// [`Self::watch_demux`].
+    #[cfg(test)]
+    pub(crate) fn watch_quic_ingress(&self, remote: SocketAddr) {
+        self.nat_detail
+            .quic_ingress_watched
+            .insert(remote, Vec::new());
+    }
+
+    /// Test-only: the QUIC ingress outcomes recorded, in order, for
+    /// datagrams from a `remote` registered with `watch_quic_ingress`.
+    #[cfg(test)]
+    pub(crate) fn quic_ingress_from(&self, remote: SocketAddr) -> Vec<QuicIngressOutcome> {
+        self.nat_detail
+            .quic_ingress_watched
+            .get(&remote)
+            .map(|outcomes| outcomes.clone())
+            .unwrap_or_default()
+    }
+
+    /// Test-only: add `outcome` to `remote`'s record if it is watched.
+    #[cfg(test)]
+    pub(crate) fn note_quic_ingress_from(&self, remote: SocketAddr, outcome: QuicIngressOutcome) {
+        if let Some(mut watched) = self.nat_detail.quic_ingress_watched.get_mut(&remote) {
+            watched.push(outcome);
+        }
+    }
+
+    /// Test-only: the demultiplexer classes recorded, in order, for datagrams
+    /// from a `remote` registered with `watch_demux`.
+    #[cfg(test)]
+    pub(crate) fn demux_from(&self, remote: SocketAddr) -> Vec<DemuxClass> {
+        self.nat_detail
+            .demux_watched
+            .get(&remote)
+            .map(|classes| classes.clone())
+            .unwrap_or_default()
+    }
+
     /// Test-only: whether `reporter` has reported our external address.
     #[cfg(test)]
     pub(crate) fn observed_addr_reported_by(&self, reporter: SocketAddr) -> bool {
@@ -850,6 +1217,181 @@ impl TransportMetrics {
     /// channel was full.
     pub(crate) fn record_inbound_queue_drop(&self) {
         self.inbound_queue_drops.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A QUIC upgrade control message arrived on an established connection
+    /// and was ignored (#5940 e1). Counted once per distinct packet.
+    pub(crate) fn record_upgrade_control_received(&self) {
+        self.cumulative_upgrade_control_received
+            .fetch_add(1, Ordering::Relaxed);
+        self.upgrade_control_received
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A packet from `remote` that would have completed a hole-punch
+    /// handshake was dropped because it was not encrypted under the
+    /// attempt's inbound session key (`remote` is never exported).
+    pub(crate) fn record_handshake_unauthenticated_dropped(&self, remote: SocketAddr) {
+        #[cfg(test)]
+        push_test_log(&self.nat_detail.handshake_unauthenticated_by_remote, remote);
+        #[cfg(not(test))]
+        let _ = remote;
+        self.handshake_unauthenticated_dropped
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Test-only: how many handshake packets from `remote` were dropped for
+    /// not being under the attempt's inbound key.
+    #[cfg(test)]
+    pub(crate) fn handshake_unauthenticated_dropped_from(&self, remote: SocketAddr) -> usize {
+        self.nat_detail
+            .handshake_unauthenticated_by_remote
+            .lock()
+            .iter()
+            .filter(|addr| **addr == remote)
+            .count()
+    }
+
+    /// Record one connection's inbound concurrency estimate (see
+    /// `peer_connection::inbound_concurrency`). Per period, each connection
+    /// is counted once in `inbound_concurrency_conns_sampled` and once in
+    /// each `inbound_concurrency_conns_ge_<T>` its peak reaches, so those
+    /// are cumulative: a connection at 40 counts in `ge_8`, `ge_16` and
+    /// `ge_32`.
+    ///
+    /// Most samples take the fast path: the connection was already counted
+    /// this period and the estimate is not a new peak, which one relaxed
+    /// load of the period decides, with no lock and no write. Anything else
+    /// locks `inbound_concurrency`, re-reads the period under the lock and
+    /// updates the counts and the connection's state together; a snapshot
+    /// advances the period and drains the counts under the same lock. So a
+    /// snapshot never sees part of an update, and every row it reports
+    /// holds `ge_256 <= ... <= ge_8 <= conns_sampled`, with a non-zero
+    /// maximum only when a connection was sampled. The one effect of the
+    /// unlocked read: a sample that reads the period just before a
+    /// snapshot advances it may take the fast path and be skipped. It is
+    /// counted when the connection's next sample finds the new period. Until
+    /// then the new period lacks it, so the period understates the
+    /// connection only if that sample was its highest there, or its only
+    /// one.
+    pub(crate) fn record_inbound_concurrency(
+        &self,
+        conn: &mut InboundConcurrencyPeak,
+        estimate: u32,
+    ) {
+        if conn.epoch == self.inbound_concurrency_epoch.load(Ordering::Relaxed)
+            && estimate <= conn.peak
+        {
+            return;
+        }
+        let mut counts = self.inbound_concurrency.lock();
+        // The period only changes under this lock, so this read is current.
+        let epoch = self.inbound_concurrency_epoch.load(Ordering::Relaxed);
+        if conn.epoch != epoch {
+            conn.epoch = epoch;
+            conn.peak = 0;
+            counts.conns_sampled += 1;
+        }
+        if estimate <= conn.peak {
+            return;
+        }
+        for (count, &threshold) in counts
+            .conns_ge
+            .iter_mut()
+            .zip(&INBOUND_CONCURRENCY_THRESHOLDS)
+        {
+            if conn.peak < threshold && threshold <= estimate {
+                *count += 1;
+            }
+        }
+        conn.peak = estimate;
+        counts.max = counts.max.max(estimate);
+    }
+
+    /// Record a connection identity decision for the connection at `remote`
+    /// (`remote` is never exported).
+    pub(crate) fn record_conn_identity(&self, remote: SocketAddr, kind: ConnIdentity) {
+        #[cfg(test)]
+        if let Some(mut watched) = self.nat_detail.conn_identity_watched.get_mut(&remote) {
+            watched.push(kind);
+        }
+        #[cfg(not(test))]
+        let _ = remote;
+        self.conn_identity[kind as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Test-only: start recording the connection identity decisions for the
+    /// connection at `remote`. Call before driving them. Same rules as
+    /// [`Self::watch_demux`].
+    #[cfg(test)]
+    pub(crate) fn watch_conn_identity(&self, remote: SocketAddr) {
+        self.nat_detail
+            .conn_identity_watched
+            .insert(remote, Vec::new());
+    }
+
+    /// Test-only: the connection identity decisions recorded, in order, for
+    /// the connection at `remote` since `watch_conn_identity`.
+    #[cfg(test)]
+    pub(crate) fn conn_identity_from(&self, remote: SocketAddr) -> Vec<ConnIdentity> {
+        self.nat_detail
+            .conn_identity_watched
+            .get(&remote)
+            .map(|kinds| kinds.clone())
+            .unwrap_or_default()
+    }
+
+    /// The QUIC endpoint bound at `local` went down while the node held it
+    /// (`local` is never exported).
+    pub(crate) fn record_quic_endpoint_down(&self, local: SocketAddr) {
+        #[cfg(test)]
+        push_test_log(&self.nat_detail.quic_endpoint_down_at, local);
+        #[cfg(not(test))]
+        let _ = local;
+        self.quic_endpoint_down.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Test-only: how many times the QUIC endpoint bound at `local` went
+    /// down.
+    #[cfg(test)]
+    pub(crate) fn quic_endpoint_down_at(&self, local: SocketAddr) -> usize {
+        self.nat_detail
+            .quic_endpoint_down_at
+            .lock()
+            .iter()
+            .filter(|addr| **addr == local)
+            .count()
+    }
+
+    /// This node closed a QUIC connection to `remote` with `code`
+    /// (`remote` is never exported).
+    pub(crate) fn record_quic_close_sent(&self, code: QuicCloseCode, remote: SocketAddr) {
+        #[cfg(test)]
+        push_test_log(&self.nat_detail.quic_close_sent_to, (remote, code));
+        #[cfg(not(test))]
+        let _ = remote;
+        self.quic_close_sent[code as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Test-only: the codes this node closed QUIC connections to `remote`
+    /// with, in order.
+    #[cfg(test)]
+    pub(crate) fn quic_close_sent_to(&self, remote: SocketAddr) -> Vec<QuicCloseCode> {
+        self.nat_detail
+            .quic_close_sent_to
+            .lock()
+            .iter()
+            .filter(|(addr, _)| *addr == remote)
+            .map(|(_, code)| *code)
+            .collect()
+    }
+
+    /// QUIC upgrade control messages received since process start, never
+    /// reset (tests only).
+    #[cfg(test)]
+    pub(crate) fn cumulative_upgrade_control_received(&self) -> u64 {
+        self.cumulative_upgrade_control_received
+            .load(Ordering::Relaxed)
     }
 
     /// Per-peer wire bytes as read by the ring's per-connection bookkeeping
@@ -1017,6 +1559,66 @@ impl TransportMetrics {
         #[cfg(not(test))]
         let _ = remote;
         self.stray_intros[kind as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one inbound datagram from `remote` and how the demultiplexer
+    /// classified it (`remote` is never exported).
+    pub(crate) fn record_demux(&self, remote: SocketAddr, class: DemuxClass) {
+        #[cfg(test)]
+        if let Some(mut watched) = self.nat_detail.demux_watched.get_mut(&remote) {
+            watched.push(class);
+        }
+        #[cfg(not(test))]
+        let _ = remote;
+        self.demux_packets[class as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record what the demultiplexer did with one QUIC-class datagram.
+    pub(crate) fn record_quic_ingress(&self, outcome: QuicIngressOutcome) {
+        self.quic_ingress[outcome as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one datagram charged to the node-wide egress cap, how it was
+    /// paced, its size and how long it waited (microseconds).
+    pub(crate) fn record_egress(&self, decision: EgressDecision, bytes: u64, wait_us: u64) {
+        let e = &self.egress;
+        e.packets[decision as usize].fetch_add(1, Ordering::Relaxed);
+        e.bytes.fetch_add(bytes, Ordering::Relaxed);
+        if wait_us > 0 {
+            e.bytes_waited.fetch_add(bytes, Ordering::Relaxed);
+            e.wait_us_sum.fetch_add(wait_us, Ordering::Relaxed);
+            e.wait_us_max.fetch_max(wait_us, Ordering::Relaxed);
+        }
+    }
+
+    /// Record a paced gap that reached `egress_cap::LONG_WAIT`.
+    pub(crate) fn record_egress_long_wait(&self, cause: WaitCause) {
+        self.egress.long_waits[cause as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a stream failed at `egress_cap::PACED_WAIT_DEADLINE`.
+    pub(crate) fn record_egress_stream_abandoned(&self, cause: WaitCause) {
+        self.egress.streams_abandoned[cause as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a stream failed at once because its connection reservation
+    /// would have reached `egress_cap::PACED_WAIT_DEADLINE`.
+    pub(crate) fn record_egress_stream_refused(&self, cause: WaitCause) {
+        self.egress.streams_refused[cause as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record the egress cap's unpaced debt after a charge, in bytes.
+    pub(crate) fn record_egress_debt(&self, debt_bytes: u64) {
+        self.egress
+            .debt_hwm_bytes
+            .fetch_max(debt_bytes, Ordering::Relaxed);
+    }
+
+    /// Record egress debt forgiven because it exceeded the debt limit.
+    pub(crate) fn record_egress_forgiven(&self, bytes: u64) {
+        self.egress
+            .debt_forgiven_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
     }
 
     /// Record `n` recent traversal failures the listener forgot early
@@ -1329,6 +1931,27 @@ impl TransportMetrics {
         let established = &self.nat_established_by_origin;
         let stray = &self.stray_intros;
         let wait = &self.dial_queue_wait;
+        let demux = &self.demux_packets;
+        let quic = &self.quic_ingress;
+        let egress = &self.egress;
+        let identity = &self.conn_identity;
+        // On reset a new period starts: under the lock, so the drained
+        // counts are exactly the old period's (see
+        // `record_inbound_concurrency`). Each connection's next sample then
+        // resets its peak and is counted again.
+        let concurrency = {
+            let mut counts = self.inbound_concurrency.lock();
+            if reset {
+                self.inbound_concurrency_epoch
+                    .fetch_add(1, Ordering::Relaxed);
+                std::mem::take(&mut *counts)
+            } else {
+                *counts
+            }
+        };
+        // Indexed by position in INBOUND_CONCURRENCY_THRESHOLDS; the const
+        // assertion next to that list pins the order these fields assume.
+        let concurrency_ge = concurrency.conns_ge;
         SnapshotExtras {
             packets_sent: get64(&l.packets_sent),
             packets_retransmitted: get64(&l.packets_retransmitted),
@@ -1351,6 +1974,18 @@ impl TransportMetrics {
             max_transfer_ack_time_ms: (acked > 0).then_some(ack_max),
             inbound_queue_depth_hwm: get32(&self.inbound_queue_depth_hwm),
             inbound_queue_drops: get64(&self.inbound_queue_drops),
+            upgrade_control_received: get64(&self.upgrade_control_received),
+            handshake_unauthenticated_dropped: get64(&self.handshake_unauthenticated_dropped),
+            quic_endpoint_down: get64(&self.quic_endpoint_down),
+            quic_close_sent_node_dropped_peer: get64(
+                &self.quic_close_sent[QuicCloseCode::NodeDroppedPeer as usize],
+            ),
+            quic_close_sent_downgrade: get64(
+                &self.quic_close_sent[QuicCloseCode::Downgrade as usize],
+            ),
+            quic_close_sent_identity_mismatch: get64(
+                &self.quic_close_sent[QuicCloseCode::IdentityMismatch as usize],
+            ),
             nat_fail_samples: if reset {
                 std::mem::take(&mut *d.samples.lock())
             } else {
@@ -1403,6 +2038,86 @@ impl TransportMetrics {
             dial_queue_wait_lt_1s: get32(&wait[DialQueueWait::Lt1S as usize]),
             dial_queue_wait_lt_3s: get32(&wait[DialQueueWait::Lt3S as usize]),
             dial_queue_wait_ge_3s: get32(&wait[DialQueueWait::Ge3S as usize]),
+            demux_legacy: get64(&demux[DemuxClass::Legacy as usize]),
+            demux_quic: get64(&demux[DemuxClass::Quic as usize]),
+            demux_other: get64(&demux[DemuxClass::Other as usize]),
+            quic_ingress_forwarded: get64(&quic[QuicIngressOutcome::Forwarded as usize]),
+            quic_ingress_not_allowed: get64(&quic[QuicIngressOutcome::NotAllowed as usize]),
+            quic_ingress_queue_full: get64(&quic[QuicIngressOutcome::QueueFull as usize]),
+            quic_ingress_source_full: get64(&quic[QuicIngressOutcome::SourceFull as usize]),
+            quic_ingress_no_ingress: get64(&quic[QuicIngressOutcome::NoIngress as usize]),
+            egress_immediate: get64(&egress.packets[EgressDecision::Immediate as usize]),
+            egress_waited: get64(&egress.packets[EgressDecision::Waited as usize]),
+            egress_unpaced: get64(&egress.packets[EgressDecision::Unpaced as usize]),
+            egress_bytes: get64(&egress.bytes),
+            egress_bytes_waited: get64(&egress.bytes_waited),
+            egress_wait_us_sum: get64(&egress.wait_us_sum),
+            egress_wait_us_max: get64(&egress.wait_us_max),
+            egress_long_waits_cap: get64(&egress.long_waits[WaitCause::Cap as usize]),
+            egress_long_waits_connection: get64(&egress.long_waits[WaitCause::Connection as usize]),
+            egress_long_waits_other: get64(&egress.long_waits[WaitCause::Other as usize]),
+            egress_streams_abandoned_cap: get64(&egress.streams_abandoned[WaitCause::Cap as usize]),
+            egress_streams_abandoned_connection: get64(
+                &egress.streams_abandoned[WaitCause::Connection as usize],
+            ),
+            egress_streams_abandoned_other: get64(
+                &egress.streams_abandoned[WaitCause::Other as usize],
+            ),
+            egress_streams_refused_cap: get64(&egress.streams_refused[WaitCause::Cap as usize]),
+            egress_streams_refused_connection: get64(
+                &egress.streams_refused[WaitCause::Connection as usize],
+            ),
+            egress_streams_refused_other: get64(&egress.streams_refused[WaitCause::Other as usize]),
+            egress_debt_hwm_bytes: get64(&egress.debt_hwm_bytes),
+            egress_debt_forgiven_bytes: get64(&egress.debt_forgiven_bytes),
+            conn_identity_set_dialed: get32(&identity[ConnIdentity::SetDialed as usize]),
+            conn_identity_expected_inbound_bound: get32(
+                &identity[ConnIdentity::ExpectedInboundBound as usize],
+            ),
+            conn_identity_expected_inbound_unbound: get32(
+                &identity[ConnIdentity::ExpectedInboundUnbound as usize],
+            ),
+            conn_identity_set_connect_request: get32(
+                &identity[ConnIdentity::SetConnectRequest as usize],
+            ),
+            conn_identity_same_connect_request: get32(
+                &identity[ConnIdentity::SameConnectRequest as usize],
+            ),
+            conn_identity_changed_connect_request: get32(
+                &identity[ConnIdentity::ChangedConnectRequest as usize],
+            ),
+            conn_identity_connect_request_known_addr: get32(
+                &identity[ConnIdentity::ConnectRequestKnownAddr as usize],
+            ),
+            conn_identity_set_connect_peer: get32(&identity[ConnIdentity::SetConnectPeer as usize]),
+            conn_identity_same_connect_peer: get32(
+                &identity[ConnIdentity::SameConnectPeer as usize],
+            ),
+            conn_identity_changed_connect_peer: get32(
+                &identity[ConnIdentity::ChangedConnectPeer as usize],
+            ),
+            conn_identity_changed_ring_promotion: get32(
+                &identity[ConnIdentity::ChangedRingPromotion as usize],
+            ),
+            conn_identity_own_key: get32(&identity[ConnIdentity::OwnKey as usize]),
+            conn_identity_duplicate_key: get32(&identity[ConnIdentity::DuplicateKey as usize]),
+            conn_identity_teardown_key_elsewhere: get32(
+                &identity[ConnIdentity::TeardownKeyElsewhere as usize],
+            ),
+            conn_identity_teardown_unidentified: get32(
+                &identity[ConnIdentity::TeardownUnidentified as usize],
+            ),
+            conn_identity_teardown_key_unmapped: get32(
+                &identity[ConnIdentity::TeardownKeyUnmapped as usize],
+            ),
+            inbound_concurrency_conns_sampled: concurrency.conns_sampled,
+            inbound_concurrency_conns_ge_8: concurrency_ge[0],
+            inbound_concurrency_conns_ge_16: concurrency_ge[1],
+            inbound_concurrency_conns_ge_32: concurrency_ge[2],
+            inbound_concurrency_conns_ge_64: concurrency_ge[3],
+            inbound_concurrency_conns_ge_128: concurrency_ge[4],
+            inbound_concurrency_conns_ge_256: concurrency_ge[5],
+            inbound_concurrency_max: concurrency.max,
         }
     }
 
@@ -1759,6 +2474,19 @@ pub struct TransportSnapshot {
     pub inbound_queue_depth_hwm: u32,
     /// Inbound packets the listener dropped because that channel was full.
     pub inbound_queue_drops: u64,
+    /// QUIC upgrade control messages received and ignored (#5940 e1).
+    pub upgrade_control_received: u64,
+    /// Hole-punch handshake packets dropped because they were not
+    /// encrypted under the attempt's inbound session key (per packet).
+    pub handshake_unauthenticated_dropped: u64,
+    /// Times the QUIC endpoint went down while the node held it; the node
+    /// then runs with QUIC off (#5940 e4).
+    pub quic_endpoint_down: u64,
+    /// QUIC connections this node closed, by close code
+    /// ([`QuicCloseCode`]).
+    pub quic_close_sent_node_dropped_peer: u64,
+    pub quic_close_sent_downgrade: u64,
+    pub quic_close_sent_identity_mismatch: u64,
     /// Per-attempt records of the FIRST 8 failed outbound NAT traversals in
     /// the period (not a representative sample of a busy period);
     /// `nat_fail_samples_dropped` counts the rest. Read with the same
@@ -1808,6 +2536,101 @@ pub struct TransportSnapshot {
     pub dial_queue_wait_lt_1s: u32,
     pub dial_queue_wait_lt_3s: u32,
     pub dial_queue_wait_ge_3s: u32,
+    /// Inbound datagrams during the period by how the demultiplexer
+    /// classified their first byte, by [`DemuxClass`]. Quic and other
+    /// datagrams are dropped; legacy ones are passed on.
+    pub demux_legacy: u64,
+    pub demux_quic: u64,
+    pub demux_other: u64,
+    /// QUIC-class datagrams during the period by what the demultiplexer did
+    /// with them, by [`QuicIngressOutcome`]. They sum to `demux_quic`, up to a snapshot race.
+    pub quic_ingress_forwarded: u64,
+    pub quic_ingress_not_allowed: u64,
+    pub quic_ingress_queue_full: u64,
+    pub quic_ingress_source_full: u64,
+    pub quic_ingress_no_ingress: u64,
+    /// Datagrams sent during the period by how the node-wide egress cap
+    /// paced them, by [`EgressDecision`], with their bytes, the bytes and
+    /// total and longest wait (microseconds) of those that waited, the
+    /// gaps between one stream's fragments that reached
+    /// `egress_cap::LONG_WAIT` (2.5 s) and the streams failed at 5 s, both
+    /// by [`WaitCause`], the
+    /// largest unpaced debt in bytes, and the unpaced bytes forgiven
+    /// (sent, not charged) at the debt limit.
+    /// All zero unless `total-bandwidth-limit` is set.
+    pub egress_immediate: u64,
+    pub egress_waited: u64,
+    pub egress_unpaced: u64,
+    pub egress_bytes: u64,
+    pub egress_bytes_waited: u64,
+    pub egress_wait_us_sum: u64,
+    pub egress_wait_us_max: u64,
+    pub egress_long_waits_cap: u64,
+    pub egress_long_waits_connection: u64,
+    pub egress_long_waits_other: u64,
+    pub egress_streams_abandoned_cap: u64,
+    pub egress_streams_abandoned_connection: u64,
+    pub egress_streams_abandoned_other: u64,
+    pub egress_streams_refused_cap: u64,
+    pub egress_streams_refused_connection: u64,
+    pub egress_streams_refused_other: u64,
+    pub egress_debt_hwm_bytes: u64,
+    pub egress_debt_forgiven_bytes: u64,
+    /// Connection identity decisions during the period, by
+    /// [`ConnIdentity`] (the field suffix is its label). Counts only, no
+    /// addresses or keys.
+    pub conn_identity_set_dialed: u32,
+    pub conn_identity_expected_inbound_bound: u32,
+    pub conn_identity_expected_inbound_unbound: u32,
+    pub conn_identity_set_connect_request: u32,
+    pub conn_identity_same_connect_request: u32,
+    pub conn_identity_changed_connect_request: u32,
+    pub conn_identity_connect_request_known_addr: u32,
+    pub conn_identity_set_connect_peer: u32,
+    pub conn_identity_same_connect_peer: u32,
+    pub conn_identity_changed_connect_peer: u32,
+    pub conn_identity_changed_ring_promotion: u32,
+    pub conn_identity_own_key: u32,
+    pub conn_identity_duplicate_key: u32,
+    pub conn_identity_teardown_key_elsewhere: u32,
+    pub conn_identity_teardown_unidentified: u32,
+    pub conn_identity_teardown_key_unmapped: u32,
+    /// Inbound concurrency per connection during the period (one snapshot
+    /// window, `transport_snapshot_interval_secs`, default 30 s): an
+    /// estimate, at each inbound short message or admitted stream, of the
+    /// inbound QUIC streams the connection would hold open (open inbound
+    /// streams, plus short messages that arrived within one smoothed RTT +
+    /// 25 ms, plus packets still queued for the connection; see
+    /// `peer_connection::inbound_concurrency`). Of the connections sampled
+    /// in the window (`inbound_concurrency_conns_sampled`), how
+    /// many had a peak of at least T (`inbound_concurrency_conns_ge_<T>`,
+    /// cumulative), and the largest estimate on any of them
+    /// (`inbound_concurrency_max`). Sent in the uploaded JSON only when
+    /// non-zero.
+    ///
+    /// What it can decide: it is an estimate built to err high, not a
+    /// strict upper bound; `peer_connection::inbound_concurrency` lists the
+    /// known undercounts. So `ge_T /
+    /// conns_sampled` can support LOWERING `quic::config::MAX_UNI_STREAMS`
+    /// to T, never raising it; a limit that is too low costs only sender
+    /// back-pressure, and QUIC shadow mode (e5a) is expected to confirm
+    /// the value on real QUIC before any default changes. It says nothing
+    /// about the memory a peer opening streams on purpose can hold;
+    /// bounding that is the per-path ceiling's job.
+    /// `inbound_concurrency_max` is diagnostic only: one peer can drive it
+    /// to the cap with a burst or an inflated RTT. `conns_sampled` counts
+    /// only connections that received a short message or had a stream
+    /// admitted in the window, not every open connection. Packets a gateway
+    /// handshake buffered share one arrival stamp, which raises the
+    /// estimate for a new gateway connection.
+    pub inbound_concurrency_conns_sampled: u32,
+    pub inbound_concurrency_conns_ge_8: u32,
+    pub inbound_concurrency_conns_ge_16: u32,
+    pub inbound_concurrency_conns_ge_32: u32,
+    pub inbound_concurrency_conns_ge_64: u32,
+    pub inbound_concurrency_conns_ge_128: u32,
+    pub inbound_concurrency_conns_ge_256: u32,
+    pub inbound_concurrency_max: u32,
 }
 
 /// Per-connection RTT distribution fields of [`TransportSnapshot`]; see the
@@ -1825,6 +2648,111 @@ struct ConnRttSnapshot {
 }
 
 impl TransportSnapshot {
+    /// The field carrying a connection identity kind's period count.
+    /// Exhaustive on purpose: a new `ConnIdentity` fails to compile here
+    /// until it has a field.
+    pub(crate) fn conn_identity(&self, kind: ConnIdentity) -> u32 {
+        match kind {
+            ConnIdentity::SetDialed => self.conn_identity_set_dialed,
+            ConnIdentity::ExpectedInboundBound => self.conn_identity_expected_inbound_bound,
+            ConnIdentity::ExpectedInboundUnbound => self.conn_identity_expected_inbound_unbound,
+            ConnIdentity::SetConnectRequest => self.conn_identity_set_connect_request,
+            ConnIdentity::SameConnectRequest => self.conn_identity_same_connect_request,
+            ConnIdentity::ChangedConnectRequest => self.conn_identity_changed_connect_request,
+            ConnIdentity::ConnectRequestKnownAddr => self.conn_identity_connect_request_known_addr,
+            ConnIdentity::SetConnectPeer => self.conn_identity_set_connect_peer,
+            ConnIdentity::SameConnectPeer => self.conn_identity_same_connect_peer,
+            ConnIdentity::ChangedConnectPeer => self.conn_identity_changed_connect_peer,
+            ConnIdentity::ChangedRingPromotion => self.conn_identity_changed_ring_promotion,
+            ConnIdentity::OwnKey => self.conn_identity_own_key,
+            ConnIdentity::DuplicateKey => self.conn_identity_duplicate_key,
+            ConnIdentity::TeardownKeyElsewhere => self.conn_identity_teardown_key_elsewhere,
+            ConnIdentity::TeardownUnidentified => self.conn_identity_teardown_unidentified,
+            ConnIdentity::TeardownKeyUnmapped => self.conn_identity_teardown_key_unmapped,
+        }
+    }
+
+    /// The `conn_identity_<label>` JSON keys and counts of the kinds with a
+    /// non-zero period count. They are zero on almost every node in almost
+    /// every period, so the uploaded JSON carries only these.
+    pub(crate) fn nonzero_conn_identity(&self) -> impl Iterator<Item = (String, u32)> + '_ {
+        ConnIdentity::ALL.into_iter().filter_map(|kind| {
+            let count = self.conn_identity(kind);
+            (count != 0).then(|| (format!("conn_identity_{}", kind.label()), count))
+        })
+    }
+
+    /// The `inbound_concurrency_*` JSON keys and values, in field order.
+    fn inbound_concurrency_fields(&self) -> [(&'static str, u32); 8] {
+        [
+            (
+                "inbound_concurrency_conns_sampled",
+                self.inbound_concurrency_conns_sampled,
+            ),
+            (
+                "inbound_concurrency_conns_ge_8",
+                self.inbound_concurrency_conns_ge_8,
+            ),
+            (
+                "inbound_concurrency_conns_ge_16",
+                self.inbound_concurrency_conns_ge_16,
+            ),
+            (
+                "inbound_concurrency_conns_ge_32",
+                self.inbound_concurrency_conns_ge_32,
+            ),
+            (
+                "inbound_concurrency_conns_ge_64",
+                self.inbound_concurrency_conns_ge_64,
+            ),
+            (
+                "inbound_concurrency_conns_ge_128",
+                self.inbound_concurrency_conns_ge_128,
+            ),
+            (
+                "inbound_concurrency_conns_ge_256",
+                self.inbound_concurrency_conns_ge_256,
+            ),
+            ("inbound_concurrency_max", self.inbound_concurrency_max),
+        ]
+    }
+
+    /// The `inbound_concurrency_*` JSON keys and values that are non-zero.
+    /// A node that received nothing in the period has none, so its
+    /// uploaded JSON carries only these.
+    pub(crate) fn nonzero_inbound_concurrency(
+        &self,
+    ) -> impl Iterator<Item = (&'static str, u32)> + use<> {
+        self.inbound_concurrency_fields()
+            .into_iter()
+            .filter(|&(_, value)| value != 0)
+    }
+
+    /// The JSON uploaded for this snapshot: its serde form with only the
+    /// non-zero `conn_identity_*` and `inbound_concurrency_*` keys. Only
+    /// the uploaded JSON is sparse: the struct's serde, and so its bincode
+    /// form in the local event log, still carries every field, zero or not.
+    /// Adding fields changes that bincode layout: the event log reader
+    /// (`tracing::aof::LogFile::read_all_events`) decodes each record on its
+    /// own, so a transport snapshot written by an older release fails to
+    /// decode, is logged at WARN and dropped, and the other records are
+    /// still read.
+    pub(crate) fn upload_json(&self) -> serde_json::Result<serde_json::Value> {
+        let mut json = serde_json::to_value(self)?;
+        if let Some(map) = json.as_object_mut() {
+            map.retain(|key, _| {
+                !key.starts_with("conn_identity_") && !key.starts_with("inbound_concurrency_")
+            });
+            for (key, count) in self.nonzero_conn_identity() {
+                map.insert(key, serde_json::json!(count));
+            }
+            for (key, value) in self.nonzero_inbound_concurrency() {
+                map.insert(key.to_string(), serde_json::json!(value));
+            }
+        }
+        Ok(json)
+    }
+
     /// Copy the per-connection RTT distribution and the redesign-baseline
     /// period counters into this snapshot.
     fn with_extras(mut self, conn_rtt: ConnRttSnapshot, extras: SnapshotExtras) -> Self {
@@ -1859,6 +2787,12 @@ impl TransportSnapshot {
             max_transfer_ack_time_ms,
             inbound_queue_depth_hwm,
             inbound_queue_drops,
+            upgrade_control_received,
+            handshake_unauthenticated_dropped,
+            quic_endpoint_down,
+            quic_close_sent_node_dropped_peer,
+            quic_close_sent_downgrade,
+            quic_close_sent_identity_mismatch,
             nat_fail_samples,
             nat_fail_samples_dropped,
             inbound_stream_refused_invalid_length,
@@ -1883,6 +2817,56 @@ impl TransportSnapshot {
             dial_queue_wait_lt_1s,
             dial_queue_wait_lt_3s,
             dial_queue_wait_ge_3s,
+            demux_legacy,
+            demux_quic,
+            demux_other,
+            quic_ingress_forwarded,
+            quic_ingress_not_allowed,
+            quic_ingress_queue_full,
+            quic_ingress_source_full,
+            quic_ingress_no_ingress,
+            egress_immediate,
+            egress_waited,
+            egress_unpaced,
+            egress_bytes,
+            egress_bytes_waited,
+            egress_wait_us_sum,
+            egress_wait_us_max,
+            egress_long_waits_cap,
+            egress_long_waits_connection,
+            egress_long_waits_other,
+            egress_streams_abandoned_cap,
+            egress_streams_abandoned_connection,
+            egress_streams_abandoned_other,
+            egress_streams_refused_cap,
+            egress_streams_refused_connection,
+            egress_streams_refused_other,
+            egress_debt_hwm_bytes,
+            egress_debt_forgiven_bytes,
+            conn_identity_set_dialed,
+            conn_identity_expected_inbound_bound,
+            conn_identity_expected_inbound_unbound,
+            conn_identity_set_connect_request,
+            conn_identity_same_connect_request,
+            conn_identity_changed_connect_request,
+            conn_identity_connect_request_known_addr,
+            conn_identity_set_connect_peer,
+            conn_identity_same_connect_peer,
+            conn_identity_changed_connect_peer,
+            conn_identity_changed_ring_promotion,
+            conn_identity_own_key,
+            conn_identity_duplicate_key,
+            conn_identity_teardown_key_elsewhere,
+            conn_identity_teardown_unidentified,
+            conn_identity_teardown_key_unmapped,
+            inbound_concurrency_conns_sampled,
+            inbound_concurrency_conns_ge_8,
+            inbound_concurrency_conns_ge_16,
+            inbound_concurrency_conns_ge_32,
+            inbound_concurrency_conns_ge_64,
+            inbound_concurrency_conns_ge_128,
+            inbound_concurrency_conns_ge_256,
+            inbound_concurrency_max,
         } = extras;
         self.conn_rtt_connections = conn_rtt_connections;
         self.conn_srtt_p50_us = conn_srtt_p50_us;
@@ -1912,6 +2896,12 @@ impl TransportSnapshot {
         self.max_transfer_ack_time_ms = max_transfer_ack_time_ms;
         self.inbound_queue_depth_hwm = inbound_queue_depth_hwm;
         self.inbound_queue_drops = inbound_queue_drops;
+        self.upgrade_control_received = upgrade_control_received;
+        self.handshake_unauthenticated_dropped = handshake_unauthenticated_dropped;
+        self.quic_endpoint_down = quic_endpoint_down;
+        self.quic_close_sent_node_dropped_peer = quic_close_sent_node_dropped_peer;
+        self.quic_close_sent_downgrade = quic_close_sent_downgrade;
+        self.quic_close_sent_identity_mismatch = quic_close_sent_identity_mismatch;
         self.nat_fail_samples = nat_fail_samples;
         self.nat_fail_samples_dropped = nat_fail_samples_dropped;
         self.inbound_stream_refused_invalid_length = inbound_stream_refused_invalid_length;
@@ -1936,6 +2926,56 @@ impl TransportSnapshot {
         self.dial_queue_wait_lt_1s = dial_queue_wait_lt_1s;
         self.dial_queue_wait_lt_3s = dial_queue_wait_lt_3s;
         self.dial_queue_wait_ge_3s = dial_queue_wait_ge_3s;
+        self.demux_legacy = demux_legacy;
+        self.demux_quic = demux_quic;
+        self.demux_other = demux_other;
+        self.quic_ingress_forwarded = quic_ingress_forwarded;
+        self.quic_ingress_not_allowed = quic_ingress_not_allowed;
+        self.quic_ingress_queue_full = quic_ingress_queue_full;
+        self.quic_ingress_source_full = quic_ingress_source_full;
+        self.quic_ingress_no_ingress = quic_ingress_no_ingress;
+        self.egress_immediate = egress_immediate;
+        self.egress_waited = egress_waited;
+        self.egress_unpaced = egress_unpaced;
+        self.egress_bytes = egress_bytes;
+        self.egress_bytes_waited = egress_bytes_waited;
+        self.egress_wait_us_sum = egress_wait_us_sum;
+        self.egress_wait_us_max = egress_wait_us_max;
+        self.egress_long_waits_cap = egress_long_waits_cap;
+        self.egress_long_waits_connection = egress_long_waits_connection;
+        self.egress_long_waits_other = egress_long_waits_other;
+        self.egress_streams_abandoned_cap = egress_streams_abandoned_cap;
+        self.egress_streams_abandoned_connection = egress_streams_abandoned_connection;
+        self.egress_streams_abandoned_other = egress_streams_abandoned_other;
+        self.egress_streams_refused_cap = egress_streams_refused_cap;
+        self.egress_streams_refused_connection = egress_streams_refused_connection;
+        self.egress_streams_refused_other = egress_streams_refused_other;
+        self.egress_debt_hwm_bytes = egress_debt_hwm_bytes;
+        self.egress_debt_forgiven_bytes = egress_debt_forgiven_bytes;
+        self.conn_identity_set_dialed = conn_identity_set_dialed;
+        self.conn_identity_expected_inbound_bound = conn_identity_expected_inbound_bound;
+        self.conn_identity_expected_inbound_unbound = conn_identity_expected_inbound_unbound;
+        self.conn_identity_set_connect_request = conn_identity_set_connect_request;
+        self.conn_identity_same_connect_request = conn_identity_same_connect_request;
+        self.conn_identity_changed_connect_request = conn_identity_changed_connect_request;
+        self.conn_identity_connect_request_known_addr = conn_identity_connect_request_known_addr;
+        self.conn_identity_set_connect_peer = conn_identity_set_connect_peer;
+        self.conn_identity_same_connect_peer = conn_identity_same_connect_peer;
+        self.conn_identity_changed_connect_peer = conn_identity_changed_connect_peer;
+        self.conn_identity_changed_ring_promotion = conn_identity_changed_ring_promotion;
+        self.conn_identity_own_key = conn_identity_own_key;
+        self.conn_identity_duplicate_key = conn_identity_duplicate_key;
+        self.conn_identity_teardown_key_elsewhere = conn_identity_teardown_key_elsewhere;
+        self.conn_identity_teardown_unidentified = conn_identity_teardown_unidentified;
+        self.conn_identity_teardown_key_unmapped = conn_identity_teardown_key_unmapped;
+        self.inbound_concurrency_conns_sampled = inbound_concurrency_conns_sampled;
+        self.inbound_concurrency_conns_ge_8 = inbound_concurrency_conns_ge_8;
+        self.inbound_concurrency_conns_ge_16 = inbound_concurrency_conns_ge_16;
+        self.inbound_concurrency_conns_ge_32 = inbound_concurrency_conns_ge_32;
+        self.inbound_concurrency_conns_ge_64 = inbound_concurrency_conns_ge_64;
+        self.inbound_concurrency_conns_ge_128 = inbound_concurrency_conns_ge_128;
+        self.inbound_concurrency_conns_ge_256 = inbound_concurrency_conns_ge_256;
+        self.inbound_concurrency_max = inbound_concurrency_max;
         self
     }
 }
@@ -2003,6 +3043,19 @@ struct SnapshotExtras {
     pub inbound_queue_depth_hwm: u32,
     /// Inbound packets the listener dropped because that channel was full.
     pub inbound_queue_drops: u64,
+    /// QUIC upgrade control messages received and ignored (#5940 e1).
+    pub upgrade_control_received: u64,
+    /// Hole-punch handshake packets dropped because they were not
+    /// encrypted under the attempt's inbound session key (per packet).
+    pub handshake_unauthenticated_dropped: u64,
+    /// Times the QUIC endpoint went down while the node held it; the node
+    /// then runs with QUIC off (#5940 e4).
+    pub quic_endpoint_down: u64,
+    /// QUIC connections this node closed, by close code
+    /// ([`QuicCloseCode`]).
+    pub quic_close_sent_node_dropped_peer: u64,
+    pub quic_close_sent_downgrade: u64,
+    pub quic_close_sent_identity_mismatch: u64,
     /// Per-attempt records of the FIRST 8 failed outbound NAT traversals in
     /// the period (not a representative sample of a busy period);
     /// `nat_fail_samples_dropped` counts the rest. Read with the same
@@ -2052,6 +3105,75 @@ struct SnapshotExtras {
     pub dial_queue_wait_lt_1s: u32,
     pub dial_queue_wait_lt_3s: u32,
     pub dial_queue_wait_ge_3s: u32,
+    /// Inbound datagrams during the period by how the demultiplexer
+    /// classified their first byte, by [`DemuxClass`]. Quic and other
+    /// datagrams are dropped; legacy ones are passed on.
+    pub demux_legacy: u64,
+    pub demux_quic: u64,
+    pub demux_other: u64,
+    /// QUIC-class datagrams during the period by what the demultiplexer did
+    /// with them, by [`QuicIngressOutcome`]. They sum to `demux_quic`, up to a snapshot race.
+    pub quic_ingress_forwarded: u64,
+    pub quic_ingress_not_allowed: u64,
+    pub quic_ingress_queue_full: u64,
+    pub quic_ingress_source_full: u64,
+    pub quic_ingress_no_ingress: u64,
+    /// Datagrams sent during the period by how the node-wide egress cap
+    /// paced them, by [`EgressDecision`], with their bytes, the bytes and
+    /// total and longest wait (microseconds) of those that waited, the
+    /// gaps between one stream's fragments that reached
+    /// `egress_cap::LONG_WAIT` (2.5 s) and the streams failed at 5 s, both
+    /// by [`WaitCause`], the
+    /// largest unpaced debt in bytes, and the unpaced bytes forgiven
+    /// (sent, not charged) at the debt limit.
+    /// All zero unless `total-bandwidth-limit` is set.
+    pub egress_immediate: u64,
+    pub egress_waited: u64,
+    pub egress_unpaced: u64,
+    pub egress_bytes: u64,
+    pub egress_bytes_waited: u64,
+    pub egress_wait_us_sum: u64,
+    pub egress_wait_us_max: u64,
+    pub egress_long_waits_cap: u64,
+    pub egress_long_waits_connection: u64,
+    pub egress_long_waits_other: u64,
+    pub egress_streams_abandoned_cap: u64,
+    pub egress_streams_abandoned_connection: u64,
+    pub egress_streams_abandoned_other: u64,
+    pub egress_streams_refused_cap: u64,
+    pub egress_streams_refused_connection: u64,
+    pub egress_streams_refused_other: u64,
+    pub egress_debt_hwm_bytes: u64,
+    pub egress_debt_forgiven_bytes: u64,
+    /// Connection identity decisions during the period, by
+    /// [`ConnIdentity`] (the field suffix is its label). Counts only, no
+    /// addresses or keys.
+    pub conn_identity_set_dialed: u32,
+    pub conn_identity_expected_inbound_bound: u32,
+    pub conn_identity_expected_inbound_unbound: u32,
+    pub conn_identity_set_connect_request: u32,
+    pub conn_identity_same_connect_request: u32,
+    pub conn_identity_changed_connect_request: u32,
+    pub conn_identity_connect_request_known_addr: u32,
+    pub conn_identity_set_connect_peer: u32,
+    pub conn_identity_same_connect_peer: u32,
+    pub conn_identity_changed_connect_peer: u32,
+    pub conn_identity_changed_ring_promotion: u32,
+    pub conn_identity_own_key: u32,
+    pub conn_identity_duplicate_key: u32,
+    pub conn_identity_teardown_key_elsewhere: u32,
+    pub conn_identity_teardown_unidentified: u32,
+    pub conn_identity_teardown_key_unmapped: u32,
+    /// Inbound concurrency per connection during the period; see the
+    /// `inbound_concurrency_*` fields of [`TransportSnapshot`].
+    pub inbound_concurrency_conns_sampled: u32,
+    pub inbound_concurrency_conns_ge_8: u32,
+    pub inbound_concurrency_conns_ge_16: u32,
+    pub inbound_concurrency_conns_ge_32: u32,
+    pub inbound_concurrency_conns_ge_64: u32,
+    pub inbound_concurrency_conns_ge_128: u32,
+    pub inbound_concurrency_conns_ge_256: u32,
+    pub inbound_concurrency_max: u32,
 }
 
 impl SnapshotExtras {
@@ -2073,6 +3195,12 @@ impl SnapshotExtras {
             || self.observed_addr_reports != 0
             || self.transfers_acked != 0
             || self.inbound_queue_drops != 0
+            || self.upgrade_control_received != 0
+            || self.handshake_unauthenticated_dropped != 0
+            || self.quic_endpoint_down != 0
+            || self.quic_close_sent_node_dropped_peer != 0
+            || self.quic_close_sent_downgrade != 0
+            || self.quic_close_sent_identity_mismatch != 0
             || !self.nat_fail_samples.is_empty()
             || self.inbound_stream_refused_invalid_length != 0
             || self.inbound_stream_refused_connection_bytes != 0
@@ -2096,6 +3224,49 @@ impl SnapshotExtras {
             || self.dial_queue_wait_lt_1s != 0
             || self.dial_queue_wait_lt_3s != 0
             || self.dial_queue_wait_ge_3s != 0
+            || self.demux_legacy != 0
+            || self.demux_quic != 0
+            || self.demux_other != 0
+            || self.quic_ingress_forwarded != 0
+            || self.quic_ingress_not_allowed != 0
+            || self.quic_ingress_queue_full != 0
+            || self.quic_ingress_source_full != 0
+            || self.quic_ingress_no_ingress != 0
+            // The debt high-water mark alone is not activity: it is only set
+            // by a charge, which also counts a packet.
+            || self.egress_immediate != 0
+            || self.egress_waited != 0
+            || self.egress_unpaced != 0
+            || self.egress_long_waits_cap != 0
+            || self.egress_long_waits_connection != 0
+            || self.egress_long_waits_other != 0
+            || self.egress_streams_abandoned_cap != 0
+            || self.egress_streams_abandoned_connection != 0
+            || self.egress_streams_abandoned_other != 0
+            || self.egress_streams_refused_cap != 0
+            || self.egress_streams_refused_connection != 0
+            || self.egress_streams_refused_other != 0
+            || self.egress_debt_forgiven_bytes != 0
+            || self.conn_identity_set_dialed != 0
+            || self.conn_identity_expected_inbound_bound != 0
+            || self.conn_identity_expected_inbound_unbound != 0
+            || self.conn_identity_set_connect_request != 0
+            || self.conn_identity_same_connect_request != 0
+            || self.conn_identity_changed_connect_request != 0
+            || self.conn_identity_connect_request_known_addr != 0
+            || self.conn_identity_set_connect_peer != 0
+            || self.conn_identity_same_connect_peer != 0
+            || self.conn_identity_changed_connect_peer != 0
+            || self.conn_identity_changed_ring_promotion != 0
+            || self.conn_identity_own_key != 0
+            || self.conn_identity_duplicate_key != 0
+            || self.conn_identity_teardown_key_elsewhere != 0
+            || self.conn_identity_teardown_unidentified != 0
+            || self.conn_identity_teardown_key_unmapped != 0
+            // The thresholds and the maximum are set only with a sampled
+            // connection in the same period (`record_inbound_concurrency`
+            // updates them under one lock), so `conns_sampled` alone decides.
+            || self.inbound_concurrency_conns_sampled != 0
     }
 }
 
@@ -2849,6 +4020,111 @@ mod tests {
         assert_eq!(snap.inbound_queue_drops, 1);
     }
 
+    /// Received QUIC upgrade control messages reach the snapshot, count as
+    /// activity on their own, and reset.
+    #[test]
+    fn upgrade_control_received_reaches_snapshot_and_resets() {
+        let metrics = TransportMetrics::new();
+        metrics.record_upgrade_control_received();
+        metrics.record_upgrade_control_received();
+        let snap = metrics
+            .take_snapshot()
+            .expect("a received upgrade message is activity");
+        assert_eq!(snap.upgrade_control_received, 2);
+        assert_eq!(metrics.cumulative_upgrade_control_received(), 2);
+        let json = serde_json::to_value(&snap).unwrap();
+        assert_eq!(json["upgrade_control_received"], 2);
+        assert!(metrics.take_snapshot().is_none(), "the counter must reset");
+        assert_eq!(
+            metrics.cumulative_upgrade_control_received(),
+            2,
+            "the cumulative twin is never reset"
+        );
+    }
+
+    /// Dropped handshake packets reach the snapshot and its JSON, count as
+    /// activity on their own, and reset.
+    #[test]
+    fn handshake_unauthenticated_dropped_reaches_snapshot_and_resets() {
+        let metrics = TransportMetrics::new();
+        let remote: SocketAddr = "10.255.9.1:7".parse().unwrap();
+        assert!(
+            metrics.take_snapshot().is_none(),
+            "a fresh instance is idle"
+        );
+        metrics.record_handshake_unauthenticated_dropped(remote);
+        metrics.record_handshake_unauthenticated_dropped(remote);
+        metrics.record_handshake_unauthenticated_dropped(remote);
+        let snap = metrics
+            .take_snapshot()
+            .expect("dropped handshake packets alone are activity");
+        assert_eq!(snap.handshake_unauthenticated_dropped, 3);
+        let json = serde_json::to_value(&snap).unwrap();
+        assert_eq!(json["handshake_unauthenticated_dropped"], 3);
+        assert!(metrics.take_snapshot().is_none(), "the counter must reset");
+        assert_eq!(metrics.handshake_unauthenticated_dropped_from(remote), 3);
+    }
+
+    /// QUIC endpoint deaths reach the snapshot and its JSON, count as
+    /// activity on their own, and reset.
+    #[test]
+    fn quic_endpoint_down_reaches_snapshot_and_resets() {
+        let metrics = TransportMetrics::new();
+        let local: SocketAddr = "10.255.10.1:7".parse().unwrap();
+        assert!(
+            metrics.take_snapshot().is_none(),
+            "a fresh instance is idle"
+        );
+        metrics.record_quic_endpoint_down(local);
+        let snap = metrics
+            .take_snapshot()
+            .expect("an endpoint death alone is activity");
+        assert_eq!(snap.quic_endpoint_down, 1);
+        let json = serde_json::to_value(&snap).unwrap();
+        assert_eq!(json["quic_endpoint_down"], 1);
+        assert!(metrics.take_snapshot().is_none(), "the counter must reset");
+        assert_eq!(metrics.quic_endpoint_down_at(local), 1);
+    }
+
+    /// The snapshot field that carries the period count of closes sent
+    /// with `code`. Exhaustive on purpose: a new `QuicCloseCode` fails to
+    /// compile here until it is given a `TransportSnapshot` field.
+    fn quic_close_sent_count(snap: &TransportSnapshot, code: QuicCloseCode) -> u64 {
+        match code {
+            QuicCloseCode::NodeDroppedPeer => snap.quic_close_sent_node_dropped_peer,
+            QuicCloseCode::Downgrade => snap.quic_close_sent_downgrade,
+            QuicCloseCode::IdentityMismatch => snap.quic_close_sent_identity_mismatch,
+        }
+    }
+
+    /// Each close code is counted in its own snapshot field and JSON key
+    /// (`quic_close_sent_<label>`), alone counts as activity, and resets.
+    #[test]
+    fn quic_close_sent_counts_snapshot_and_reset() {
+        let remote: SocketAddr = "10.255.10.2:7".parse().unwrap();
+        for (i, code) in QuicCloseCode::ALL.into_iter().enumerate() {
+            let metrics = TransportMetrics::new();
+            for _ in 0..=i {
+                metrics.record_quic_close_sent(code, remote);
+            }
+            let snap = metrics
+                .take_snapshot()
+                .expect("a sent close alone is activity");
+            let json = serde_json::to_value(&snap).unwrap();
+            for other in QuicCloseCode::ALL {
+                let expected = if other == code { i as u64 + 1 } else { 0 };
+                assert_eq!(quic_close_sent_count(&snap, other), expected, "{other:?}");
+                assert_eq!(
+                    json[format!("quic_close_sent_{}", other.label())],
+                    expected,
+                    "{other:?}"
+                );
+            }
+            assert!(metrics.take_snapshot().is_none(), "the counter must reset");
+            assert_eq!(metrics.quic_close_sent_to(remote), vec![code; i + 1]);
+        }
+    }
+
     /// The snapshot field that carries `outcome`'s period count. Exhaustive
     /// on purpose: a new `InboundStreamOutcome` fails to compile here until it
     /// is given a `TransportSnapshot` field.
@@ -2957,6 +4233,15 @@ mod tests {
         );
         check(&StrayIntro::ALL, |v| v as usize, StrayIntro::label);
         check(&DialQueueWait::ALL, |v| v as usize, DialQueueWait::label);
+        check(&DemuxClass::ALL, |v| v as usize, DemuxClass::label);
+        check(
+            &QuicIngressOutcome::ALL,
+            |v| v as usize,
+            QuicIngressOutcome::label,
+        );
+        check(&EgressDecision::ALL, |v| v as usize, EgressDecision::label);
+        check(&WaitCause::ALL, |v| v as usize, WaitCause::label);
+        check(&ConnIdentity::ALL, |v| v as usize, ConnIdentity::label);
     }
 
     /// The snapshot fields carrying an origin's period attempts and
@@ -2980,12 +4265,412 @@ mod tests {
         }
     }
 
+    fn conn_identity_count(snap: &TransportSnapshot, kind: ConnIdentity) -> u32 {
+        snap.conn_identity(kind)
+    }
+
+    /// Connection identity decisions reach the snapshot and its JSON per
+    /// kind, each kind alone is activity, and they reset.
+    #[test]
+    fn conn_identity_counts_snapshot_json_and_reset() {
+        let metrics = TransportMetrics::new();
+        assert!(
+            metrics.take_snapshot().is_none(),
+            "a fresh instance is idle"
+        );
+        for (i, kind) in ConnIdentity::ALL.into_iter().enumerate() {
+            for _ in 0..=i {
+                metrics.record_conn_identity(TEST_REMOTE, kind);
+            }
+        }
+        let read = metrics.read_snapshot();
+        let snap = metrics
+            .take_snapshot()
+            .expect("connection identity decisions are activity");
+        let json = serde_json::to_value(&snap).unwrap();
+        for s in [&read, &snap] {
+            for (i, kind) in ConnIdentity::ALL.into_iter().enumerate() {
+                assert_eq!(conn_identity_count(s, kind), i as u32 + 1, "{kind:?}");
+            }
+        }
+        for (i, kind) in ConnIdentity::ALL.into_iter().enumerate() {
+            let key = format!("conn_identity_{}", kind.label());
+            assert_eq!(json[key.as_str()], i as u64 + 1, "JSON key {key}");
+        }
+        assert!(
+            metrics.take_snapshot().is_none(),
+            "connection identity counts must reset"
+        );
+        for kind in ConnIdentity::ALL {
+            let metrics = TransportMetrics::new();
+            metrics.record_conn_identity(TEST_REMOTE, kind);
+            let snap = metrics
+                .take_snapshot()
+                .unwrap_or_else(|| panic!("{kind:?} alone must be activity"));
+            assert_eq!(conn_identity_count(&snap, kind), 1, "{kind:?}");
+        }
+    }
+
+    /// Every `conn_identity_*` snapshot field is a `ConnIdentity` label, so
+    /// `upload_json`, which rebuilds those keys from the labels, cannot drop
+    /// a field added without one.
+    #[test]
+    fn every_conn_identity_field_has_a_label() {
+        let json = serde_json::to_value(TransportSnapshot::default()).unwrap();
+        let fields: std::collections::BTreeSet<String> = json
+            .as_object()
+            .unwrap()
+            .keys()
+            .filter(|key| key.starts_with("conn_identity_"))
+            .cloned()
+            .collect();
+        let labels: std::collections::BTreeSet<String> = ConnIdentity::ALL
+            .into_iter()
+            .map(|kind| format!("conn_identity_{}", kind.label()))
+            .collect();
+        assert_eq!(fields, labels);
+    }
+
+    /// The `inbound_concurrency_conns_ge_<T>` field for each threshold, in
+    /// threshold order.
+    fn concurrency_ge(snap: &TransportSnapshot) -> [u32; 6] {
+        [
+            snap.inbound_concurrency_conns_ge_8,
+            snap.inbound_concurrency_conns_ge_16,
+            snap.inbound_concurrency_conns_ge_32,
+            snap.inbound_concurrency_conns_ge_64,
+            snap.inbound_concurrency_conns_ge_128,
+            snap.inbound_concurrency_conns_ge_256,
+        ]
+    }
+
+    /// Samples racing snapshots never produce an impossible row: in every
+    /// period, ge_256 <= ... <= ge_8 <= conns_sampled, a non-zero maximum
+    /// has a sampled connection, and a non-zero ge_T has a maximum of at
+    /// least T. Each thread is one connection whose estimates climb to 300
+    /// and start again, so it keeps crossing every threshold and the start
+    /// of new periods.
+    #[test]
+    fn inbound_concurrency_rows_stay_consistent_under_concurrent_snapshots() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+
+        const THREADS: usize = 4;
+        let metrics = Arc::new(TransportMetrics::new());
+        let stop = Arc::new(AtomicBool::new(false));
+        let samplers: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let metrics = Arc::clone(&metrics);
+                let stop = Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    let mut conn = InboundConcurrencyPeak::default();
+                    let mut estimate = 0u32;
+                    while !stop.load(Ordering::Relaxed) {
+                        estimate = if estimate >= 300 { 1 } else { estimate + 1 };
+                        metrics.record_inbound_concurrency(&mut conn, estimate);
+                    }
+                })
+            })
+            .collect();
+
+        let check = |snap: &TransportSnapshot| -> Result<(), String> {
+            let ge = concurrency_ge(snap);
+            let sampled = snap.inbound_concurrency_conns_sampled;
+            let max = snap.inbound_concurrency_max;
+            let row = format!("sampled {sampled}, ge {ge:?}, max {max}");
+            if ge[0] > sampled {
+                return Err(format!("ge_8 above conns_sampled: {row}"));
+            }
+            if ge.windows(2).any(|pair| pair[1] > pair[0]) {
+                return Err(format!("thresholds out of order: {row}"));
+            }
+            if max > 0 && sampled == 0 {
+                return Err(format!("maximum with no sampled connection: {row}"));
+            }
+            for (count, threshold) in ge.iter().zip(INBOUND_CONCURRENCY_THRESHOLDS) {
+                if *count > 0 && max < threshold {
+                    return Err(format!("ge_{threshold} above the maximum: {row}"));
+                }
+            }
+            if sampled as usize > THREADS {
+                return Err(format!("more connections than samplers: {row}"));
+            }
+            Ok(())
+        };
+        // A fixed number of periods with samples in them, not a duration, so
+        // a slow runner checks as many rows as a fast one. The attempt cap
+        // only stops a hang (samplers that never run); it is far above what
+        // PERIODS needs while the samplers are running.
+        const PERIODS: usize = 200;
+        const MAX_ATTEMPTS: usize = 50_000_000;
+        let mut failure = None;
+        let mut periods = 0;
+        let mut attempts = 0;
+        while periods < PERIODS && attempts < MAX_ATTEMPTS && failure.is_none() {
+            attempts += 1;
+            // Four spinning samplers must not starve this loop on a small
+            // runner.
+            std::thread::yield_now();
+            if let Some(snap) = metrics.take_snapshot() {
+                periods += 1;
+                failure = check(&snap).err();
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        for sampler in samplers {
+            sampler.join().expect("sampler thread");
+        }
+        if let Some(failure) = failure {
+            panic!("after {periods} periods: {failure}");
+        }
+        assert_eq!(
+            periods, PERIODS,
+            "the samplers produced only {periods} periods in {attempts} snapshots"
+        );
+    }
+
+    /// Each threshold lands in its own field: six connections peaking at
+    /// exactly 8, 16, 32, 64, 128 and 256 give ge_8..ge_256 = 6, 5, 4, 3,
+    /// 2, 1, through the extras-to-snapshot copy (`take_snapshot` and
+    /// `read_snapshot`), the serde JSON and the uploaded JSON. A swap of
+    /// any two thresholds or fields changes one of these values.
+    #[test]
+    fn inbound_concurrency_thresholds_map_to_their_fields() {
+        // The tests below iterate the list, so a changed list would pass
+        // them; pin its value here.
+        assert_eq!(INBOUND_CONCURRENCY_THRESHOLDS, [8, 16, 32, 64, 128, 256]);
+        let metrics = TransportMetrics::new();
+        for peak in INBOUND_CONCURRENCY_THRESHOLDS {
+            metrics.record_inbound_concurrency(&mut InboundConcurrencyPeak::default(), peak);
+        }
+        let expected = [
+            ("inbound_concurrency_conns_ge_8", 6),
+            ("inbound_concurrency_conns_ge_16", 5),
+            ("inbound_concurrency_conns_ge_32", 4),
+            ("inbound_concurrency_conns_ge_64", 3),
+            ("inbound_concurrency_conns_ge_128", 2),
+            ("inbound_concurrency_conns_ge_256", 1),
+        ];
+        let read = metrics.read_snapshot();
+        let taken = metrics.take_snapshot().expect("activity");
+        for snap in [&read, &taken] {
+            assert_eq!(concurrency_ge(snap), [6, 5, 4, 3, 2, 1]);
+            assert_eq!(snap.inbound_concurrency_conns_sampled, 6);
+            assert_eq!(snap.inbound_concurrency_max, 256);
+        }
+        let serde = serde_json::to_value(&taken).unwrap();
+        let upload = taken.upload_json().unwrap();
+        for (key, value) in expected {
+            assert_eq!(serde[key], value, "serde value for {key}");
+            assert_eq!(upload[key], value, "uploaded value for {key}");
+        }
+    }
+
+    /// A connection's peak counts each threshold it reaches once per
+    /// period, and the connection itself once per period.
+    #[test]
+    fn inbound_concurrency_counts_each_threshold_once_per_period() {
+        let metrics = TransportMetrics::new();
+        let mut conn = InboundConcurrencyPeak::default();
+        metrics.record_inbound_concurrency(&mut conn, 40);
+        let snap = metrics.read_snapshot();
+        assert_eq!(snap.inbound_concurrency_conns_sampled, 1);
+        assert_eq!(concurrency_ge(&snap), [1, 1, 1, 0, 0, 0]);
+        assert_eq!(snap.inbound_concurrency_max, 40);
+
+        // The same and lower estimates in the same period add nothing.
+        metrics.record_inbound_concurrency(&mut conn, 40);
+        metrics.record_inbound_concurrency(&mut conn, 3);
+        let snap = metrics.read_snapshot();
+        assert_eq!(snap.inbound_concurrency_conns_sampled, 1);
+        assert_eq!(concurrency_ge(&snap), [1, 1, 1, 0, 0, 0]);
+
+        // A higher one counts only the thresholds it newly reaches.
+        metrics.record_inbound_concurrency(&mut conn, 300);
+        let snap = metrics
+            .take_snapshot()
+            .expect("inbound concurrency samples are activity");
+        assert_eq!(snap.inbound_concurrency_conns_sampled, 1);
+        assert_eq!(concurrency_ge(&snap), [1, 1, 1, 1, 1, 1]);
+        assert_eq!(snap.inbound_concurrency_max, 300);
+
+        // A new period: the same connection counts again from zero.
+        metrics.record_inbound_concurrency(&mut conn, 40);
+        let snap = metrics.read_snapshot();
+        assert_eq!(snap.inbound_concurrency_conns_sampled, 1);
+        assert_eq!(concurrency_ge(&snap), [1, 1, 1, 0, 0, 0]);
+        assert_eq!(snap.inbound_concurrency_max, 40);
+
+        // A second connection is counted beside it; the maximum is the
+        // larger of the two.
+        let mut other = InboundConcurrencyPeak::default();
+        metrics.record_inbound_concurrency(&mut other, 8);
+        metrics.record_inbound_concurrency(&mut other, 7);
+        let snap = metrics.read_snapshot();
+        assert_eq!(snap.inbound_concurrency_conns_sampled, 2);
+        assert_eq!(concurrency_ge(&snap), [2, 1, 1, 0, 0, 0]);
+        assert_eq!(snap.inbound_concurrency_max, 40);
+
+        // A threshold is reached at exactly T, not below it.
+        let metrics = TransportMetrics::new();
+        let mut conn = InboundConcurrencyPeak::default();
+        metrics.record_inbound_concurrency(&mut conn, 255);
+        assert_eq!(concurrency_ge(&metrics.read_snapshot()), [1, 1, 1, 1, 1, 0]);
+        metrics.record_inbound_concurrency(&mut conn, 256);
+        assert_eq!(concurrency_ge(&metrics.read_snapshot()), [1, 1, 1, 1, 1, 1]);
+    }
+
+    /// Inbound concurrency reaches the snapshot and its JSON, a sample is
+    /// activity on its own, the counts reset, and the uploaded JSON carries
+    /// the keys only when non-zero.
+    #[test]
+    fn inbound_concurrency_snapshot_json_and_reset() {
+        let metrics = TransportMetrics::new();
+        assert!(
+            metrics.take_snapshot().is_none(),
+            "a fresh instance is idle"
+        );
+        let mut conn = InboundConcurrencyPeak::default();
+        metrics.record_inbound_concurrency(&mut conn, 1);
+        let snap = metrics
+            .take_snapshot()
+            .expect("one sample alone is activity");
+        assert_eq!(snap.inbound_concurrency_conns_sampled, 1);
+        assert_eq!(snap.inbound_concurrency_max, 1);
+
+        let mut conn = InboundConcurrencyPeak::default();
+        metrics.record_inbound_concurrency(&mut conn, 70);
+        let snap = metrics.take_snapshot().expect("activity");
+        let json = serde_json::to_value(&snap).unwrap();
+        let upload = snap.upload_json().unwrap();
+        for (key, expected) in [
+            ("inbound_concurrency_conns_sampled", 1),
+            ("inbound_concurrency_conns_ge_8", 1),
+            ("inbound_concurrency_conns_ge_16", 1),
+            ("inbound_concurrency_conns_ge_32", 1),
+            ("inbound_concurrency_conns_ge_64", 1),
+            ("inbound_concurrency_max", 70),
+        ] {
+            assert_eq!(json[key], expected, "serde value for {key}");
+            assert_eq!(upload[key], expected, "uploaded value for {key}");
+        }
+        let uploaded: Vec<&String> = upload
+            .as_object()
+            .unwrap()
+            .keys()
+            .filter(|key| key.starts_with("inbound_concurrency_"))
+            .collect();
+        assert_eq!(
+            uploaded.len(),
+            6,
+            "the zero ge_128 and ge_256 are not uploaded: {uploaded:?}"
+        );
+
+        assert!(
+            metrics.take_snapshot().is_none(),
+            "inbound concurrency counts must reset"
+        );
+        let idle = metrics.read_snapshot();
+        assert_eq!(idle.inbound_concurrency_conns_sampled, 0);
+        assert_eq!(idle.inbound_concurrency_max, 0);
+        let upload = idle.upload_json().unwrap();
+        assert!(
+            !upload
+                .as_object()
+                .unwrap()
+                .keys()
+                .any(|key| key.starts_with("inbound_concurrency_")),
+            "a period with no samples uploads no inbound concurrency key"
+        );
+    }
+
+    /// Every `inbound_concurrency_*` snapshot field is in
+    /// `inbound_concurrency_fields`, so `upload_json`, which rebuilds those
+    /// keys from it, cannot drop one, and each carries its own field.
+    #[test]
+    fn every_inbound_concurrency_field_is_listed() {
+        let snap = TransportSnapshot {
+            inbound_concurrency_conns_sampled: 1,
+            inbound_concurrency_conns_ge_8: 2,
+            inbound_concurrency_conns_ge_16: 3,
+            inbound_concurrency_conns_ge_32: 4,
+            inbound_concurrency_conns_ge_64: 5,
+            inbound_concurrency_conns_ge_128: 6,
+            inbound_concurrency_conns_ge_256: 7,
+            inbound_concurrency_max: 8,
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&snap).unwrap();
+        let fields: std::collections::BTreeSet<String> = json
+            .as_object()
+            .unwrap()
+            .keys()
+            .filter(|key| key.starts_with("inbound_concurrency_"))
+            .cloned()
+            .collect();
+        let listed: std::collections::BTreeSet<String> = snap
+            .inbound_concurrency_fields()
+            .iter()
+            .map(|(key, _)| key.to_string())
+            .collect();
+        assert_eq!(fields, listed);
+        for (key, value) in snap.inbound_concurrency_fields() {
+            assert_eq!(json[key], value, "{key} carries its own field");
+        }
+    }
+
+    /// The test record holds only watched remotes, in order.
+    #[test]
+    fn conn_identity_test_record_is_per_watched_remote() {
+        let metrics = TransportMetrics::new();
+        let watched: SocketAddr = "10.255.9.2:7".parse().unwrap();
+        let other: SocketAddr = "10.255.9.3:7".parse().unwrap();
+        metrics.watch_conn_identity(watched);
+        metrics.record_conn_identity(watched, ConnIdentity::SetDialed);
+        metrics.record_conn_identity(other, ConnIdentity::OwnKey);
+        metrics.record_conn_identity(watched, ConnIdentity::SameConnectRequest);
+        assert_eq!(
+            metrics.conn_identity_from(watched),
+            vec![ConnIdentity::SetDialed, ConnIdentity::SameConnectRequest]
+        );
+        assert!(metrics.conn_identity_from(other).is_empty());
+    }
+
     /// The snapshot field carrying a stray-intro kind (exhaustive, as above).
     fn stray_count(snap: &TransportSnapshot, kind: StrayIntro) -> u32 {
         match kind {
             StrayIntro::AfterDeadline => snap.stray_intro_after_deadline,
             StrayIntro::SameIpOtherPort => snap.stray_intro_same_ip_other_port,
             StrayIntro::Other => snap.stray_intro_other,
+        }
+    }
+
+    /// The snapshot field carrying a demultiplexer class (exhaustive).
+    fn demux_count(snap: &TransportSnapshot, class: DemuxClass) -> u64 {
+        match class {
+            DemuxClass::Legacy => snap.demux_legacy,
+            DemuxClass::Quic => snap.demux_quic,
+            DemuxClass::Other => snap.demux_other,
+        }
+    }
+
+    /// The snapshot field carrying a QUIC ingress outcome (exhaustive).
+    fn quic_ingress_count(snap: &TransportSnapshot, outcome: QuicIngressOutcome) -> u64 {
+        match outcome {
+            QuicIngressOutcome::Forwarded => snap.quic_ingress_forwarded,
+            QuicIngressOutcome::NotAllowed => snap.quic_ingress_not_allowed,
+            QuicIngressOutcome::QueueFull => snap.quic_ingress_queue_full,
+            QuicIngressOutcome::SourceFull => snap.quic_ingress_source_full,
+            QuicIngressOutcome::NoIngress => snap.quic_ingress_no_ingress,
+        }
+    }
+
+    /// The snapshot field carrying an egress decision (exhaustive).
+    fn egress_count(snap: &TransportSnapshot, decision: EgressDecision) -> u64 {
+        match decision {
+            EgressDecision::Immediate => snap.egress_immediate,
+            EgressDecision::Waited => snap.egress_waited,
+            EgressDecision::Unpaced => snap.egress_unpaced,
         }
     }
 
@@ -3068,6 +4753,103 @@ mod tests {
         assert!(metrics.take_snapshot().is_none(), "stray intros must reset");
     }
 
+    /// Demultiplexer counts reach the snapshot per class and reset with it.
+    #[test]
+    fn demux_counts_snapshot_and_reset() {
+        let metrics = TransportMetrics::new();
+        for (i, class) in DemuxClass::ALL.into_iter().enumerate() {
+            for _ in 0..=i {
+                metrics.record_demux(TEST_REMOTE, class);
+            }
+        }
+        let read = metrics.read_snapshot();
+        let snap = metrics.take_snapshot().expect("demux counts are activity");
+        for s in [&read, &snap] {
+            for (i, class) in DemuxClass::ALL.into_iter().enumerate() {
+                assert_eq!(demux_count(s, class), i as u64 + 1, "{class:?}");
+            }
+        }
+        assert!(metrics.take_snapshot().is_none(), "demux counts must reset");
+    }
+
+    /// QUIC ingress outcomes reach the snapshot per outcome and reset with it.
+    #[test]
+    fn quic_ingress_counts_snapshot_and_reset() {
+        let metrics = TransportMetrics::new();
+        for (i, outcome) in QuicIngressOutcome::ALL.into_iter().enumerate() {
+            for _ in 0..=i {
+                metrics.record_quic_ingress(outcome);
+            }
+        }
+        let read = metrics.read_snapshot();
+        let snap = metrics
+            .take_snapshot()
+            .expect("quic ingress counts are activity");
+        for s in [&read, &snap] {
+            for (i, outcome) in QuicIngressOutcome::ALL.into_iter().enumerate() {
+                assert_eq!(quic_ingress_count(s, outcome), i as u64 + 1, "{outcome:?}");
+            }
+        }
+        assert!(
+            metrics.take_snapshot().is_none(),
+            "quic ingress counts must reset"
+        );
+    }
+
+    /// Egress cap counts reach the snapshot per decision, with bytes, waits,
+    /// long waits, debt and forgiveness, and all reset with it.
+    #[test]
+    fn egress_counts_snapshot_and_reset() {
+        let metrics = TransportMetrics::new();
+        for (i, decision) in EgressDecision::ALL.into_iter().enumerate() {
+            for _ in 0..=i {
+                let wait_us = match decision {
+                    EgressDecision::Waited => 300,
+                    EgressDecision::Immediate | EgressDecision::Unpaced => 0,
+                };
+                metrics.record_egress(decision, 100, wait_us);
+            }
+        }
+        metrics.record_egress(EgressDecision::Waited, 100, 3_000_000);
+        metrics.record_egress_long_wait(WaitCause::Connection);
+        metrics.record_egress_stream_abandoned(WaitCause::Cap);
+        metrics.record_egress_stream_abandoned(WaitCause::Cap);
+        metrics.record_egress_stream_abandoned(WaitCause::Other);
+        metrics.record_egress_stream_refused(WaitCause::Connection);
+        metrics.record_egress_debt(5_000);
+        metrics.record_egress_debt(2_000);
+        metrics.record_egress_forgiven(7);
+        let read = metrics.read_snapshot();
+        let snap = metrics.take_snapshot().expect("egress counts are activity");
+        for s in [&read, &snap] {
+            // 1 immediate, 2 + 1 waited, 3 unpaced, all of 100 bytes.
+            assert_eq!(s.egress_immediate, 1);
+            assert_eq!(s.egress_waited, 3);
+            assert_eq!(s.egress_unpaced, 3);
+            assert_eq!(s.egress_bytes, 700);
+            assert_eq!(s.egress_bytes_waited, 300);
+            assert_eq!(s.egress_wait_us_sum, 2 * 300 + 3_000_000);
+            assert_eq!(s.egress_wait_us_max, 3_000_000);
+            assert_eq!(s.egress_long_waits_cap, 0);
+            assert_eq!(s.egress_long_waits_connection, 1);
+            assert_eq!(s.egress_long_waits_other, 0);
+            assert_eq!(s.egress_streams_abandoned_cap, 2);
+            assert_eq!(s.egress_streams_abandoned_connection, 0);
+            assert_eq!(s.egress_streams_abandoned_other, 1);
+            assert_eq!(s.egress_streams_refused_cap, 0);
+            assert_eq!(s.egress_streams_refused_connection, 1);
+            assert_eq!(s.egress_streams_refused_other, 0);
+            assert_eq!(s.egress_debt_hwm_bytes, 5_000);
+            assert_eq!(s.egress_debt_forgiven_bytes, 7);
+        }
+        assert!(
+            metrics.take_snapshot().is_none(),
+            "egress counts must reset"
+        );
+        let after = metrics.read_snapshot();
+        assert_eq!(after.egress_debt_hwm_bytes, 0, "the high-water mark resets");
+    }
+
     /// Evictions from the recent-failure table reach the snapshot, count as
     /// activity on their own, and reset.
     #[test]
@@ -3143,6 +4925,38 @@ mod tests {
                 .unwrap_or_else(|| panic!("{kind:?} alone must be activity"));
             assert_eq!(stray_count(&snap, kind), 1, "{kind:?}");
         }
+        for decision in EgressDecision::ALL {
+            let metrics = TransportMetrics::new();
+            metrics.record_egress(decision, 1, 0);
+            let snap = metrics
+                .take_snapshot()
+                .unwrap_or_else(|| panic!("{decision:?} alone must be activity"));
+            assert_eq!(egress_count(&snap, decision), 1, "{decision:?}");
+        }
+        {
+            let metrics = TransportMetrics::new();
+            metrics.record_egress_forgiven(1);
+            assert!(
+                metrics.take_snapshot().is_some(),
+                "forgiven debt alone must be activity"
+            );
+        }
+        for class in DemuxClass::ALL {
+            let metrics = TransportMetrics::new();
+            metrics.record_demux(TEST_REMOTE, class);
+            let snap = metrics
+                .take_snapshot()
+                .unwrap_or_else(|| panic!("{class:?} alone must be activity"));
+            assert_eq!(demux_count(&snap, class), 1, "{class:?}");
+        }
+        for outcome in QuicIngressOutcome::ALL {
+            let metrics = TransportMetrics::new();
+            metrics.record_quic_ingress(outcome);
+            let snap = metrics
+                .take_snapshot()
+                .unwrap_or_else(|| panic!("{outcome:?} alone must be activity"));
+            assert_eq!(quic_ingress_count(&snap, outcome), 1, "{outcome:?}");
+        }
         for bucket in DialQueueWait::ALL {
             let metrics = TransportMetrics::new();
             metrics.dial_queue_wait[bucket as usize].fetch_add(1, Ordering::Relaxed);
@@ -3150,6 +4964,36 @@ mod tests {
                 .take_snapshot()
                 .unwrap_or_else(|| panic!("{bucket:?} alone must be activity"));
             assert_eq!(wait_count(&snap, bucket), 1, "{bucket:?}");
+        }
+        {
+            // The connections sampled are the inbound concurrency activity
+            // term, and the only one: the thresholds and the maximum never
+            // appear without it.
+            let sampled = SnapshotExtras {
+                inbound_concurrency_conns_sampled: 1,
+                ..Default::default()
+            };
+            assert!(sampled.has_activity(), "conns_sampled alone is activity");
+            let rest = SnapshotExtras {
+                inbound_concurrency_conns_ge_8: 1,
+                inbound_concurrency_conns_ge_16: 1,
+                inbound_concurrency_conns_ge_32: 1,
+                inbound_concurrency_conns_ge_64: 1,
+                inbound_concurrency_conns_ge_128: 1,
+                inbound_concurrency_conns_ge_256: 1,
+                inbound_concurrency_max: 1,
+                ..Default::default()
+            };
+            assert!(
+                !rest.has_activity(),
+                "thresholds and maximum are not activity terms"
+            );
+            let metrics = TransportMetrics::new();
+            metrics.record_inbound_concurrency(&mut InboundConcurrencyPeak::default(), 1);
+            let snap = metrics
+                .take_snapshot()
+                .expect("one inbound concurrency sample alone is activity");
+            assert_eq!(snap.inbound_concurrency_conns_sampled, 1);
         }
     }
 
@@ -3164,6 +5008,20 @@ mod tests {
         }
         for kind in StrayIntro::ALL {
             keys.push(format!("stray_intro_{}", kind.label()));
+        }
+        for class in DemuxClass::ALL {
+            keys.push(format!("demux_{}", class.label()));
+        }
+        for outcome in QuicIngressOutcome::ALL {
+            keys.push(format!("quic_ingress_{}", outcome.label()));
+        }
+        for decision in EgressDecision::ALL {
+            keys.push(format!("egress_{}", decision.label()));
+        }
+        for cause in WaitCause::ALL {
+            keys.push(format!("egress_long_waits_{}", cause.label()));
+            keys.push(format!("egress_streams_abandoned_{}", cause.label()));
+            keys.push(format!("egress_streams_refused_{}", cause.label()));
         }
         for bucket in DialQueueWait::ALL {
             keys.push(format!("dial_queue_wait_{}", bucket.label()));
@@ -3347,6 +5205,12 @@ mod tests {
             "max_transfer_ack_time_ms",
             "inbound_queue_depth_hwm",
             "inbound_queue_drops",
+            "upgrade_control_received",
+            "handshake_unauthenticated_dropped",
+            "quic_endpoint_down",
+            "quic_close_sent_node_dropped_peer",
+            "quic_close_sent_downgrade",
+            "quic_close_sent_identity_mismatch",
             "nat_fail_samples",
             "nat_fail_samples_dropped",
             "inbound_stream_refused_invalid_length",
@@ -3371,6 +5235,56 @@ mod tests {
             "dial_queue_wait_lt_1s",
             "dial_queue_wait_lt_3s",
             "dial_queue_wait_ge_3s",
+            "demux_legacy",
+            "demux_quic",
+            "demux_other",
+            "quic_ingress_forwarded",
+            "quic_ingress_not_allowed",
+            "quic_ingress_queue_full",
+            "quic_ingress_source_full",
+            "quic_ingress_no_ingress",
+            "egress_immediate",
+            "egress_waited",
+            "egress_unpaced",
+            "egress_bytes",
+            "egress_bytes_waited",
+            "egress_wait_us_sum",
+            "egress_wait_us_max",
+            "egress_long_waits_cap",
+            "egress_long_waits_connection",
+            "egress_long_waits_other",
+            "egress_streams_abandoned_cap",
+            "egress_streams_abandoned_connection",
+            "egress_streams_abandoned_other",
+            "egress_streams_refused_cap",
+            "egress_streams_refused_connection",
+            "egress_streams_refused_other",
+            "egress_debt_hwm_bytes",
+            "egress_debt_forgiven_bytes",
+            "conn_identity_set_dialed",
+            "conn_identity_expected_inbound_bound",
+            "conn_identity_expected_inbound_unbound",
+            "conn_identity_set_connect_request",
+            "conn_identity_same_connect_request",
+            "conn_identity_changed_connect_request",
+            "conn_identity_connect_request_known_addr",
+            "conn_identity_set_connect_peer",
+            "conn_identity_same_connect_peer",
+            "conn_identity_changed_connect_peer",
+            "conn_identity_changed_ring_promotion",
+            "conn_identity_own_key",
+            "conn_identity_duplicate_key",
+            "conn_identity_teardown_key_elsewhere",
+            "conn_identity_teardown_unidentified",
+            "conn_identity_teardown_key_unmapped",
+            "inbound_concurrency_conns_sampled",
+            "inbound_concurrency_conns_ge_8",
+            "inbound_concurrency_conns_ge_16",
+            "inbound_concurrency_conns_ge_32",
+            "inbound_concurrency_conns_ge_64",
+            "inbound_concurrency_conns_ge_128",
+            "inbound_concurrency_conns_ge_256",
+            "inbound_concurrency_max",
         ] {
             assert!(obj.contains_key(key), "missing key {key}");
         }

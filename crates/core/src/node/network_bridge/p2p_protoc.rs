@@ -22,7 +22,7 @@ use crate::contract::{ContractHandlerEvent, WaitingTransaction};
 use crate::message::{NetMessageV1, QueryResult};
 use crate::node::network_bridge::handshake::{
     Command as HandshakeCommand, CommandSender as HandshakeCommandSender, Event as HandshakeEvent,
-    HandshakeHandler,
+    HandshakeHandler, InboundMatch as HandshakeInboundMatch,
 };
 use crate::node::network_bridge::priority_select;
 use crate::operations::connect::ConnectMsg;
@@ -531,8 +531,10 @@ type PeerConnChannelRecv = Receiver<Either<NetMessage, ConnEvent>>;
 #[derive(Debug)]
 struct ConnectionEntry {
     sender: PeerConnChannelSender,
-    /// The peer's public key, learned from the first message.
-    /// None for transient connections before identity is established.
+    /// The peer's public key: the key dialled for an outbound connection, or
+    /// for an inbound one matched to an expected-inbound registration.
+    /// `None` for any other inbound connection until a ConnectPeer or the
+    /// peer's ConnectRequest names the peer.
     pub_key: Option<TransportPublicKey>,
     /// Unique ID for this connection entry. Used to distinguish stale
     /// TransportClosed events from replaced connections (e.g., after identity change).
@@ -716,6 +718,9 @@ pub(in crate::node) struct P2pConnManager {
     ledbat_min_ssthresh: Option<usize>,
     /// Congestion control configuration.
     congestion_config: CongestionControlConfig,
+    /// QUIC endpoint settings when `transport-quic` is on (#5940), `None`
+    /// when it is off. Only used to open the transport.
+    quic: Option<crate::transport::quic::QuicSettings>,
     /// Test-only override for the #5161 version-carrying-ack floor, threaded
     /// into the transport handler. `None` in production.
     /// See `NodeConfig::ack_version_floor_override`.
@@ -1285,6 +1290,22 @@ impl P2pConnManager {
                         total,
                         config.config.network_api.min_bandwidth_per_connection,
                     ));
+                    // The transport builds a node-wide egress cap from the
+                    // same total (`transport::egress_cap`); say so at startup,
+                    // and warn when it is low for the allowed connections.
+                    if total > 0 {
+                        crate::transport::egress_cap::log_startup_cap(
+                            total,
+                            config
+                                .config
+                                .network_api
+                                .min_bandwidth_per_connection
+                                .unwrap_or(
+                                    crate::transport::global_bandwidth::DEFAULT_MIN_PER_CONNECTION,
+                                ),
+                            config.config.network_api.max_connections,
+                        );
+                    }
                     // Phase 1.6 shadow telemetry (#4074): expose the
                     // effective aggregate rate R to the demand aggregator.
                     // Observation only — the manager is read, never written,
@@ -1294,6 +1315,7 @@ impl P2pConnManager {
                 }),
             ledbat_min_ssthresh: config.config.network_api.ledbat_min_ssthresh,
             congestion_config: config.config.network_api.build_congestion_config(),
+            quic: config.config.network_api.quic_settings(),
             blocked_addresses: config.blocked_addresses.clone(),
             broadcast_retries: HashMap::new(),
             broadcast_no_target_streak: HashMap::new(),
@@ -1353,6 +1375,7 @@ impl P2pConnManager {
                 ledbat_min_ssthresh: self.ledbat_min_ssthresh,
                 congestion_config: Some(self.congestion_config.clone()),
                 ack_version_floor_override: self.ack_version_floor_override,
+                quic: self.quic,
             },
         )
         .await?;
@@ -1398,6 +1421,7 @@ impl P2pConnManager {
             ledbat_min_ssthresh,
             congestion_config,
             ack_version_floor_override,
+            quic,
             blocked_addresses,
             broadcast_retries,
             broadcast_no_target_streak,
@@ -1448,6 +1472,7 @@ impl P2pConnManager {
             this_location,
             is_gateway,
             peer_ready,
+            Arc::new(InstantTimeSrc::new()),
         );
 
         let select_stream = priority_select::ProductionPrioritySelectStream::new(
@@ -1492,6 +1517,8 @@ impl P2pConnManager {
             // Already used by open_udp_transport in run_event_listener_with_socket;
             // kept for struct completeness, same as the two fields around it.
             ack_version_floor_override,
+            // Used by open_udp_transport like the fields above.
+            quic,
             blocked_addresses,
             broadcast_retries,
             broadcast_no_target_streak,
@@ -2252,28 +2279,16 @@ impl P2pConnManager {
                                             "Cleaning up connection due to channel closure"
                                         );
 
-                                        // Clean up ring state - construct PeerKeyLocation with pub_key if available
-                                        let peer = if let Some(pub_key) = pub_key_opt.clone() {
-                                            PeerKeyLocation::new(pub_key, peer_addr)
-                                        } else {
-                                            // Use our own pub_key as placeholder if we don't know the peer's
-                                            PeerKeyLocation::new(
-                                                (*ctx
-                                                    .bridge
-                                                    .op_manager
-                                                    .ring
-                                                    .connection_manager
-                                                    .pub_key)
-                                                    .clone(),
-                                                peer_addr,
-                                            )
-                                        };
+                                        // Clean up ring state
                                         let prune_result = ctx
                                             .bridge
                                             .op_manager
                                             .ring
                                             .prune_connection(
-                                                PeerId::new(peer.pub_key().clone(), peer_addr),
+                                                ctx.teardown_peer_id(
+                                                    peer_addr,
+                                                    pub_key_opt.as_ref(),
+                                                ),
                                                 crate::tracing::DisconnectReason::Explicit(
                                                     "shutdown".into(),
                                                 ),
@@ -2319,18 +2334,15 @@ impl P2pConnManager {
                                         // cleanup: the connection has already been removed from
                                         // ctx.connections / addr_by_pub_key and pruned from the
                                         // ring above. The only residue is the handshake driver's
-                                        // InboundMatcher entry (if any). That tracker is
-                                        // a per-SocketAddr HashMap with no TTL sweep, but the
-                                        // entry is benign and bounded: it is overwritten on the
-                                        // next register() for the same addr and consumed when a
-                                        // matching inbound arrives, so a missed DropConnection
-                                        // leaves at most one stale per-addr expectation, not an
-                                        // unbounded leak.
+                                        // InboundMatcher entry (if any) for the address, which
+                                        // the driver sweeps once it outlives
+                                        // EXPECTED_INBOUND_WINDOW and whose key it does not
+                                        // honour after that.
                                         if !handshake_cmd_sender.try_send(
-                                            HandshakeCommand::DropConnection { peer: peer.clone() },
+                                            HandshakeCommand::DropConnection { addr: peer_addr },
                                         ) {
                                             tracing::warn!(
-                                                peer = %peer,
+                                                peer_addr = %peer_addr,
                                                 phase = "cleanup",
                                                 "Handshake command channel full/closed during \
                                                  cleanup; skipping redundant drop notification"
@@ -2490,47 +2502,13 @@ impl P2pConnManager {
                                 )
                                 .await?;
                             }
-                            NodeEvent::ExpectPeerConnection { addr } => {
-                                tracing::debug!(
-                                    peer_addr = %addr,
-                                    direction = "inbound",
-                                    phase = "connect",
-                                    "Expecting peer connection - registering with handshake handler"
-                                );
-                                state.expected_inbound.expect_incoming(addr);
-                                // We don't know the peer's public key yet for expected inbound connections,
-                                // so use our own pub_key as a placeholder. The handshake will update it.
-                                let peer_placeholder = PeerKeyLocation::new(
-                                    (*ctx.bridge.op_manager.ring.connection_manager.pub_key)
-                                        .clone(),
+                            NodeEvent::ExpectPeerConnection { addr, peer_key } => {
+                                P2pConnManager::handle_expect_peer_connection(
                                     addr,
+                                    peer_key,
+                                    &state,
+                                    &handshake_cmd_sender,
                                 );
-                                // Non-blocking (#4145): this ExpectPeerConnection
-                                // handler runs on the event-loop task, so a
-                                // `.send().await` that back-pressures on the
-                                // handshake command channel (cap 128) would stall the
-                                // loop. Dropping the ExpectInbound registration is
-                                // recoverable: when the inbound connection actually
-                                // arrives without a matching expectation it is still
-                                // accepted provisionally (see handle_handshake_action,
-                                // "accepting provisionally"), and the originating
-                                // connect op retries if its handshake does not
-                                // complete. We `warn!` because a dropped expectation
-                                // makes admission less reliable under load.
-                                if !handshake_cmd_sender.try_send(HandshakeCommand::ExpectInbound {
-                                    peer: peer_placeholder,
-                                    transaction: None,
-                                    transient: false,
-                                }) {
-                                    tracing::warn!(
-                                        peer_addr = %addr,
-                                        phase = "connect",
-                                        "Handshake command channel full/closed; dropped \
-                                         ExpectInbound registration. Inbound connection will \
-                                         be accepted provisionally; connect op retries if the \
-                                         handshake does not complete."
-                                    );
-                                }
                             }
                             NodeEvent::QueryConnections { callback } => {
                                 // Reconstruct PeerKeyLocations from stored connections

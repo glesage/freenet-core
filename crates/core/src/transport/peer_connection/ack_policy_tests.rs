@@ -12,6 +12,7 @@ use bytes::Bytes;
 use super::*;
 use crate::transport::crypto::TransportKeypair;
 use crate::transport::packet_data::{PacketData, UnknownEncryption};
+use crate::transport::symmetric_message::UpgradeControl;
 
 type WireRx = mpsc::Receiver<(SocketAddr, Arc<[u8]>)>;
 
@@ -60,7 +61,9 @@ fn random_key() -> ([u8; 16], Aes128Gcm) {
 struct End {
     conn: PeerConnection<ChanSocket, RealTime>,
     /// Feed packets INTO this end (as if from the remote).
-    inbound: mpsc::Sender<PacketData<UnknownEncryption>>,
+    inbound: mpsc::Sender<InboundPacket>,
+    /// The connection's clock, to stamp fed packets as the listener does.
+    clock: RealTime,
     /// Datagrams this end SENT.
     wire: WireRx,
     /// Key this end encrypts with; decrypts what it sent.
@@ -91,6 +94,7 @@ fn end_with_wire_capacity(
 ) -> End {
     let _ = addr;
     let time_source = RealTime::new();
+    let clock = time_source.clone();
     let (inbound_tx, inbound_rx) = mpsc::channel(4096);
     let (wire_tx, wire_rx) = mpsc::channel(wire_capacity);
     let fail_sends = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -129,6 +133,7 @@ fn end_with_wire_capacity(
     End {
         conn: PeerConnection::new(remote_conn),
         inbound: inbound_tx,
+        clock,
         wire: wire_rx,
         outbound_key: outbound.1,
         inbound_key: inbound.1,
@@ -149,6 +154,15 @@ const CAPABLE: Option<(u8, u8, u16)> = Some(UNTRACKED_ACK_NOOP_MIN_VERSION);
 const OLD: Option<(u8, u8, u16)> = Some((0, 2, 141));
 
 impl End {
+    /// Queue `packet` for this end, stamped with its clock as the listener
+    /// stamps it.
+    fn queued(&self, packet: PacketData<UnknownEncryption>) -> InboundPacket {
+        InboundPacket {
+            packet,
+            queued_nanos: self.clock.now_nanos(),
+        }
+    }
+
     /// Forge a packet from the remote and deliver it to this end.
     async fn deliver(&self, packet_id: u32, payload: SymmetricMessagePayload, receipts: Vec<u32>) {
         let packet = SymmetricMessage::serialize_msg_to_packet_data(
@@ -159,7 +173,10 @@ impl End {
         )
         .expect("encrypt");
         self.inbound
-            .send(PacketData::<UnknownEncryption>::from_buf(packet.data()))
+            .send(InboundPacket {
+                packet: PacketData::<UnknownEncryption>::from_buf(packet.data()),
+                queued_nanos: self.clock.now_nanos(),
+            })
             .await
             .expect("deliver");
     }
@@ -189,6 +206,10 @@ fn short(bytes: &'static [u8]) -> SymmetricMessagePayload {
     SymmetricMessagePayload::ShortMessage {
         payload: Bytes::from_static(bytes),
     }
+}
+
+fn upgrade(control: UpgradeControl) -> SymmetricMessagePayload {
+    SymmetricMessagePayload::Upgrade(control)
 }
 
 fn receipts_for(sent: &[SymmetricMessage], id: u32) -> usize {
@@ -263,6 +284,13 @@ fn receipt_policy_table() {
             "the handshake ack is tracked at id 0: ack it, never dedup id 0"
         );
         assert_eq!(receipt_policy(&ack_v2, ack_noops), AckWithoutDedup);
+        assert_eq!(
+            receipt_policy(&upgrade(UpgradeControl::Accept { attempt: 1 }), ack_noops),
+            Ack {
+                reack_duplicate: true
+            },
+            "an upgrade message is tracked by its sender: ack it, dedup it, re-ack duplicates"
+        );
     }
 }
 
@@ -542,6 +570,7 @@ fn start(
 ) -> Running {
     let a_inbound = a.inbound.clone();
     let b_inbound = b.inbound.clone();
+    let (a_clock, b_clock) = (a.clock.clone(), b.clock.clone());
     let mut a_wire = std::mem::replace(&mut a.wire, mpsc::channel(1).1);
     let mut b_wire = std::mem::replace(&mut b.wire, mpsc::channel(1).1);
     let a_key = a.outbound_key.clone();
@@ -557,6 +586,10 @@ fn start(
             let m = SymmetricMessage::deser(p.try_decrypt_sym(&a_key).unwrap().data()).unwrap();
             let dropped = drop_a_to_b(&m);
             la.lock().push((tokio::time::Instant::now(), m));
+            let p = InboundPacket {
+                packet: p,
+                queued_nanos: b_clock.now_nanos(),
+            };
             if !dropped && b_inbound.send(p).await.is_err() {
                 return;
             }
@@ -568,6 +601,10 @@ fn start(
             let m = SymmetricMessage::deser(p.try_decrypt_sym(&b_key).unwrap().data()).unwrap();
             let dropped = drop_b_to_a(&m);
             lb.lock().push((tokio::time::Instant::now(), m));
+            let p = InboundPacket {
+                packet: p,
+                queued_nanos: a_clock.now_nanos(),
+            };
             if !dropped && a_inbound.send(p).await.is_err() {
                 return;
             }
@@ -1064,7 +1101,7 @@ async fn connection_ack_does_not_shadow_the_first_data_packet() {
     let mut e = single(CAPABLE);
     let ack = SymmetricMessage::ack_ok(&e.inbound_key, [0u8; 16], addr(2)).expect("ack");
     e.inbound
-        .send(PacketData::<UnknownEncryption>::from_buf(ack.data()))
+        .send(e.queued(PacketData::<UnknownEncryption>::from_buf(ack.data())))
         .await
         .expect("deliver ack");
     e.deliver(SymmetricMessage::FIRST_PACKET_ID, short(b"first"), vec![])
@@ -1123,7 +1160,7 @@ async fn connection_ack_exchange_is_bounded_and_clears_the_handshake_ack() {
         .lock()
         .report_sent_packet(SymmetricMessage::FIRST_PACKET_ID, a_ack.data().into());
     b.inbound
-        .send(PacketData::<UnknownEncryption>::from_buf(a_ack.data()))
+        .send(b.queued(PacketData::<UnknownEncryption>::from_buf(a_ack.data())))
         .await
         .expect("deliver");
     let a_tracker = a.conn.remote_conn.sent_tracker.clone();
@@ -1404,8 +1441,11 @@ async fn legacy_fragment_survives_cancellation_during_a_blocked_handoff() {
     };
     // The hand-off blocks on the full channel; cancel it (as the listener's
     // select does when an outbound message wins).
-    let blocked =
-        tokio::time::timeout(Duration::from_millis(10), e.conn.process_inbound(fragment)).await;
+    let blocked = tokio::time::timeout(
+        Duration::from_millis(10),
+        e.conn.process_inbound(fragment, 0),
+    )
+    .await;
     assert!(
         blocked.is_err(),
         "premise: the hand-off was blocked and cancelled"
@@ -1745,8 +1785,9 @@ fn holds_no_state(e: &End, stream_id: StreamId) -> bool {
 }
 
 async fn feed(e: &mut End, payload: SymmetricMessagePayload) -> Option<Vec<u8>> {
+    let queued_nanos = e.clock.now_nanos();
     e.conn
-        .process_inbound(payload)
+        .process_inbound(payload, queued_nanos)
         .await
         .expect("an inbound stream fragment must not fail the connection")
 }
@@ -2568,7 +2609,7 @@ async fn a_refusal_that_cannot_be_remembered_closes_the_connection() {
 
     let result = e
         .conn
-        .process_inbound(fragment(StreamId::next_transport_internal(), 0, 1))
+        .process_inbound(fragment(StreamId::next_transport_internal(), 0, 1), 0)
         .await;
     assert!(
         matches!(result, Err(TransportError::ConnectionClosed(_))),
@@ -2743,4 +2784,408 @@ async fn an_out_of_order_legacy_stream_completes_within_its_charge() {
         e.pump(Duration::from_millis(10)).await.as_deref(),
         Some(&data[..])
     );
+}
+
+/// A packet that decrypts under the session key but whose plaintext does not
+/// decode as a `SymmetricMessage` (for example a payload variant from a newer
+/// release) is dropped. `recv()` keeps running, delivers the next valid
+/// message, and does not count the dropped packet as a decryption failure.
+#[tokio::test(start_paused = true)]
+async fn undecodable_authenticated_packet_is_dropped_not_fatal() {
+    let mut e = single(CAPABLE);
+    // Three bytes cannot hold the leading `u32` packet id, so this fails to
+    // decode whatever the payload layout is. A payload variant from a newer
+    // release fails later in decoding but takes the same error arm.
+    let undecodable =
+        PacketData::<_, { crate::transport::packet_data::MAX_PACKET_SIZE }>::from_buf_plain([
+            0xFF, 0xFF, 0xFF,
+        ])
+        .encrypt_symmetric(&e.inbound_key);
+    assert!(SymmetricMessage::deser(&[0xFF, 0xFF, 0xFF]).is_err());
+    e.inbound
+        .send(e.queued(PacketData::<UnknownEncryption>::from_buf(
+            undecodable.data(),
+        )))
+        .await
+        .expect("deliver");
+    e.deliver(0, short(b"after"), vec![]).await;
+
+    assert_eq!(
+        e.pump(Duration::from_millis(10)).await.as_deref(),
+        Some(&b"after"[..])
+    );
+    assert_eq!(e.conn.failure_count, 0);
+    assert_eq!(e.conn.undecodable_count, 1);
+}
+
+// ---------------------------------------------------------------------------
+// QUIC upgrade control message (#5940 e1): decoded, counted, ignored
+// ---------------------------------------------------------------------------
+
+/// Anything this end sent other than receipt carriers and keepalive probes.
+fn replies(sent: &[SymmetricMessage]) -> Vec<&SymmetricMessage> {
+    sent.iter()
+        .filter(|m| {
+            !matches!(
+                m.payload,
+                SymmetricMessagePayload::NoOp | SymmetricMessagePayload::Ping { .. }
+            )
+        })
+        .collect()
+}
+
+/// Every form of the upgrade message, received on an established connection,
+/// is counted and ignored: nothing is delivered to the application, nothing
+/// but a receipt is sent back, and the connection carries on and delivers the
+/// next message. This holds whatever version the remote reports, because the
+/// receiver never answers.
+#[tokio::test(start_paused = true)]
+async fn upgrade_control_is_counted_and_ignored_without_reply() {
+    for version in [CAPABLE, OLD, None] {
+        let mut e = single(version);
+        // Never reset, so another test's `take_snapshot` cannot disturb it;
+        // other tests may only add to it, hence `>=`.
+        let cumulative_before =
+            crate::transport::TRANSPORT_METRICS.cumulative_upgrade_control_received();
+        let controls = [
+            UpgradeControl::Offer {
+                attempt: 1,
+                caps: u32::MAX,
+            },
+            UpgradeControl::Accept { attempt: 1 },
+            UpgradeControl::Decline {
+                attempt: 1,
+                reason: u8::MAX,
+            },
+        ];
+        for (id, control) in (1u32..).zip(controls) {
+            e.deliver(id, upgrade(control), vec![]).await;
+        }
+        e.deliver(4, short(b"after"), vec![]).await;
+        assert_eq!(
+            e.pump(Duration::from_secs(1)).await.as_deref(),
+            Some(&b"after"[..]),
+            "{version:?}: the upgrade messages are not delivered and the next message is"
+        );
+        assert_eq!(e.conn.telemetry_test_counts.upgrade_controls_ignored, 3);
+        assert!(
+            crate::transport::TRANSPORT_METRICS.cumulative_upgrade_control_received()
+                - cumulative_before
+                >= 3,
+            "{version:?}: each upgrade message must reach TRANSPORT_METRICS"
+        );
+        assert_eq!(e.conn.failure_count, 0);
+        assert_eq!(e.conn.undecodable_count, 0);
+
+        assert!(e.pump(Duration::from_secs(2)).await.is_none());
+        let sent = e.drain_sent();
+        assert!(
+            replies(&sent).is_empty(),
+            "{version:?}: the receiver must never answer an upgrade message, got {:?}",
+            replies(&sent)
+                .iter()
+                .map(|m| m.payload.to_string())
+                .collect::<Vec<_>>()
+        );
+        for id in 1..=3 {
+            assert_eq!(
+                receipts_for(&sent, id),
+                1,
+                "{version:?}: upgrade packet {id} is acked exactly once"
+            );
+        }
+    }
+}
+
+/// A retransmitted upgrade message (our receipt was lost) is re-acked, as a
+/// `ShortMessage` is, and not processed a second time.
+#[tokio::test(start_paused = true)]
+async fn duplicate_upgrade_control_is_reacked_and_not_recounted() {
+    let mut e = single(CAPABLE);
+    let offer = UpgradeControl::Offer {
+        attempt: 7,
+        caps: 0,
+    };
+    e.deliver(5, upgrade(offer), vec![]).await;
+    assert!(e.pump(Duration::from_millis(300)).await.is_none());
+    assert_eq!(receipts_for(&e.drain_sent(), 5), 1, "first ack");
+    assert_eq!(e.conn.telemetry_test_counts.upgrade_controls_ignored, 1);
+
+    tokio::time::advance(Duration::from_millis(700)).await;
+    e.deliver(5, upgrade(offer), vec![]).await;
+    e.deliver(6, short(b"next"), vec![]).await;
+    assert_eq!(
+        e.pump(Duration::from_secs(1)).await.as_deref(),
+        Some(&b"next"[..])
+    );
+    assert!(e.pump(Duration::from_millis(300)).await.is_none());
+    let sent = e.drain_sent();
+    assert_eq!(
+        receipts_for(&sent, 5),
+        1,
+        "the duplicate must be re-acked so the sender stops retransmitting"
+    );
+    assert!(replies(&sent).is_empty());
+    assert_eq!(
+        e.conn.telemetry_test_counts.upgrade_controls_ignored, 1,
+        "a duplicate is not processed again"
+    );
+}
+
+/// A newer peer's upgrade message with an inner variant this release does not
+/// know fails to decode and is dropped like any undecodable packet: no panic,
+/// no reply, not counted as an upgrade message, and the connection delivers
+/// the next message.
+#[tokio::test(start_paused = true)]
+async fn upgrade_control_with_unknown_inner_variant_is_dropped() {
+    const INNER_VARIANT_OFFSET: usize = 4 + 8 + 4;
+    let mut e = single(CAPABLE);
+    let mut bytes = bincode::serialize(&SymmetricMessage {
+        packet_id: 3,
+        confirm_receipt: vec![],
+        payload: upgrade(UpgradeControl::Accept { attempt: 1 }),
+    })
+    .unwrap();
+    bytes[INNER_VARIANT_OFFSET..INNER_VARIANT_OFFSET + 4].copy_from_slice(&3u32.to_le_bytes());
+    assert!(SymmetricMessage::deser(&bytes).is_err());
+    let packet =
+        PacketData::<_, { crate::transport::packet_data::MAX_PACKET_SIZE }>::from_buf_plain(&bytes)
+            .encrypt_symmetric(&e.inbound_key);
+    e.inbound
+        .send(e.queued(PacketData::<UnknownEncryption>::from_buf(packet.data())))
+        .await
+        .expect("deliver");
+    e.deliver(4, short(b"after"), vec![]).await;
+
+    assert_eq!(
+        e.pump(Duration::from_millis(10)).await.as_deref(),
+        Some(&b"after"[..])
+    );
+    assert_eq!(e.conn.undecodable_count, 1);
+    assert_eq!(e.conn.failure_count, 0);
+    assert_eq!(e.conn.telemetry_test_counts.upgrade_controls_ignored, 0);
+    assert!(e.pump(Duration::from_millis(300)).await.is_none());
+    let sent = e.drain_sent();
+    assert!(replies(&sent).is_empty());
+    assert_eq!(
+        receipts_for(&sent, 3),
+        0,
+        "an undecodable packet earns no receipt"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Inbound concurrency estimate (telemetry only)
+// ---------------------------------------------------------------------------
+
+/// Short messages received through `recv()` drive the estimate: each
+/// distinct one is one sample counting the short messages still inside the
+/// window, a duplicate is not sampled again, and one arriving after the
+/// window has passed counts alone.
+#[tokio::test(start_paused = true)]
+async fn received_short_messages_drive_the_inbound_concurrency_estimate() {
+    let mut e = single(CAPABLE);
+    assert_eq!(e.conn.remote_conn.rolling_rtt_stats.srtt(), None);
+    let messages: [(u32, &'static [u8]); 3] = [(1, b"a"), (2, b"b"), (3, b"c")];
+    for (id, msg) in messages {
+        e.deliver(id, short(msg), vec![]).await;
+        assert_eq!(e.pump(Duration::from_millis(1)).await.as_deref(), Some(msg));
+    }
+    // A retransmission of message 2 is re-acked, not delivered or sampled.
+    e.deliver(2, short(b"b"), vec![]).await;
+    assert!(e.pump(Duration::from_millis(1)).await.is_none());
+    let counts = &e.conn.telemetry_test_counts;
+    assert_eq!(counts.inbound_concurrency_samples, 3);
+    assert_eq!(
+        counts.inbound_concurrency_max, 3,
+        "three short messages inside one window"
+    );
+
+    // Past the no-RTT window (100 ms + 25 ms): only the new one counts.
+    tokio::time::advance(Duration::from_secs(1)).await;
+    e.deliver(4, short(b"d"), vec![]).await;
+    assert_eq!(
+        e.pump(Duration::from_millis(1)).await.as_deref(),
+        Some(&b"d"[..])
+    );
+    assert_eq!(e.conn.telemetry_test_counts.inbound_concurrency_samples, 4);
+    assert_eq!(
+        e.conn
+            .inbound_concurrency
+            .on_stream_admitted(e.conn.time_source.now_nanos(), None, 0),
+        1,
+        "the earlier three have left the window"
+    );
+}
+
+/// A new inbound stream is sampled once, on admission, counting itself; its
+/// later fragments are not sampled. Both reassembly paths.
+#[tokio::test(start_paused = true)]
+async fn an_admitted_inbound_stream_is_sampled_once() {
+    let length = 3 * super::streaming_buffer::FRAGMENT_PAYLOAD_SIZE as u64;
+    for stream_id in [StreamId::next(), StreamId::next_transport_internal()] {
+        let mut e = single(CAPABLE);
+        feed(&mut e, short(b"m")).await;
+        feed(&mut e, fragment(stream_id, length, 1)).await;
+        let counts = &e.conn.telemetry_test_counts;
+        assert_eq!(counts.inbound_concurrency_samples, 2, "{stream_id:?}");
+        assert_eq!(
+            counts.inbound_concurrency_max, 2,
+            "{stream_id:?}: the open stream plus the short message"
+        );
+        feed(&mut e, fragment(stream_id, length, 2)).await;
+        settle().await;
+        assert_eq!(
+            e.conn.telemetry_test_counts.inbound_concurrency_samples, 2,
+            "{stream_id:?}: a later fragment is not sampled"
+        );
+    }
+}
+
+/// Point `e`'s inbound concurrency samples at a private metrics instance,
+/// so other tests snapshotting `TRANSPORT_METRICS` cannot disturb them.
+fn private_concurrency_metrics(
+    e: &mut End,
+) -> &'static crate::transport::metrics::TransportMetrics {
+    let metrics = Box::leak(Box::new(crate::transport::metrics::TransportMetrics::new()));
+    e.conn.inbound_concurrency_metrics = metrics;
+    metrics
+}
+
+/// The connection's samples reach `TransportMetrics`: its peak is the
+/// period's maximum and is counted at each threshold it reached, once per
+/// period.
+#[tokio::test(start_paused = true)]
+async fn inbound_concurrency_peak_reaches_transport_metrics() {
+    let mut e = single(CAPABLE);
+    let metrics = private_concurrency_metrics(&mut e);
+    for id in 1..=9u32 {
+        e.deliver(id, short(b"s"), vec![]).await;
+        assert!(e.pump(Duration::from_millis(1)).await.is_some());
+    }
+    let snap = metrics.take_snapshot().expect("samples are activity");
+    assert_eq!(snap.inbound_concurrency_conns_sampled, 1);
+    assert_eq!(snap.inbound_concurrency_max, 9);
+    assert_eq!(snap.inbound_concurrency_conns_ge_8, 1);
+    assert_eq!(snap.inbound_concurrency_conns_ge_16, 0);
+
+    // The next period counts the connection again, from its own estimate.
+    tokio::time::advance(Duration::from_secs(1)).await;
+    e.deliver(10, short(b"t"), vec![]).await;
+    assert!(e.pump(Duration::from_millis(1)).await.is_some());
+    let snap = metrics.take_snapshot().expect("samples are activity");
+    assert_eq!(snap.inbound_concurrency_conns_sampled, 1);
+    assert_eq!(snap.inbound_concurrency_max, 1);
+    assert_eq!(snap.inbound_concurrency_conns_ge_8, 0);
+}
+
+/// With a smoothed RTT published, the window is that RTT + 25 ms, not the
+/// 125 ms fallback: two short messages 40 ms apart overlap without an RTT
+/// and do not overlap at a 10 ms RTT.
+#[tokio::test(start_paused = true)]
+async fn a_published_srtt_sets_the_inbound_concurrency_window() {
+    for (srtt, expected) in [(None, 2), (Some(Duration::from_millis(10)), 1)] {
+        let mut e = single(CAPABLE);
+        let metrics = private_concurrency_metrics(&mut e);
+        if let Some(srtt) = srtt {
+            e.conn.remote_conn.rolling_rtt_stats.publish_srtt(srtt);
+        }
+        assert_eq!(e.conn.remote_conn.rolling_rtt_stats.srtt(), srtt);
+        e.deliver(1, short(b"a"), vec![]).await;
+        assert!(e.pump(Duration::from_millis(1)).await.is_some());
+        tokio::time::advance(Duration::from_millis(40)).await;
+        e.deliver(2, short(b"b"), vec![]).await;
+        assert!(e.pump(Duration::from_millis(1)).await.is_some());
+        assert_eq!(
+            metrics.read_snapshot().inbound_concurrency_max,
+            expected,
+            "srtt {srtt:?}"
+        );
+    }
+}
+
+/// A legacy stream that arrives whole in one fragment is never charged and
+/// is counted as a short message: it stays in the window afterwards, and
+/// holds no open stream.
+#[tokio::test(start_paused = true)]
+async fn a_single_fragment_legacy_stream_is_sampled_as_a_short_message() {
+    let mut e = single(CAPABLE);
+    let stream_id = StreamId::next_transport_internal();
+    let delivered = feed(&mut e, fragment(stream_id, b"fragment".len() as u64, 1)).await;
+    assert!(
+        delivered.is_some(),
+        "a one-fragment stream completes at once"
+    );
+    assert_eq!(e.conn.inbound_budget.stream_count(), 0);
+    assert_eq!(e.conn.telemetry_test_counts.inbound_concurrency_samples, 1);
+    assert_eq!(e.conn.telemetry_test_counts.inbound_concurrency_max, 1);
+    assert_eq!(
+        e.conn
+            .inbound_concurrency
+            .on_stream_admitted(e.conn.time_source.now_nanos(), None, 0),
+        1,
+        "it is in the short-message window"
+    );
+}
+
+/// A stream refused at admission takes no sample, on either path.
+#[tokio::test(start_paused = true)]
+async fn a_refused_inbound_stream_is_not_sampled() {
+    for stream_id in [StreamId::next(), StreamId::next_transport_internal()] {
+        let mut e = single(CAPABLE);
+        assert!(feed(&mut e, fragment(stream_id, 0, 1)).await.is_none());
+        assert!(holds_no_state(&e, stream_id));
+        assert_eq!(
+            e.conn.telemetry_test_counts.inbound_concurrency_samples, 0,
+            "{stream_id:?}"
+        );
+    }
+}
+
+/// Short messages are timed from when the listener queued them, not from
+/// when the connection task got to them. The first arrives at 0 and is
+/// taken at once; the second and third arrive at 50 and 100 ms while the
+/// task is busy and are taken a second apart. By arrival all three fall in
+/// one no-RTT window (125 ms), so the third counts 3; timed by when they
+/// were taken, no sample would reach more than 2 (one short plus one still
+/// queued).
+#[tokio::test(start_paused = true)]
+async fn queued_short_messages_count_from_their_arrival() {
+    let mut e = single(CAPABLE);
+    let metrics = private_concurrency_metrics(&mut e);
+    e.deliver(1, short(b"q"), vec![]).await;
+    assert!(e.pump(Duration::from_millis(1)).await.is_some());
+    for id in 2..=3u32 {
+        tokio::time::advance(Duration::from_millis(50)).await;
+        e.deliver(id, short(b"q"), vec![]).await;
+    }
+    for _ in 0..2 {
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(e.pump(Duration::from_millis(1)).await.is_some());
+    }
+    assert_eq!(e.conn.telemetry_test_counts.inbound_concurrency_samples, 3);
+    assert_eq!(
+        metrics.read_snapshot().inbound_concurrency_max,
+        3,
+        "the three arrived within one window"
+    );
+}
+
+/// Packets still queued for the connection count: five short messages
+/// queued while the task is busy, and the first one taken already counts
+/// all five (itself plus four waiting).
+#[tokio::test(start_paused = true)]
+async fn queued_packets_count_toward_the_estimate() {
+    let mut e = single(CAPABLE);
+    let metrics = private_concurrency_metrics(&mut e);
+    for id in 1..=5u32 {
+        e.deliver(id, short(b"w"), vec![]).await;
+    }
+    assert!(e.pump(Duration::from_millis(1)).await.is_some());
+    assert_eq!(e.conn.telemetry_test_counts.inbound_concurrency_samples, 1);
+    assert_eq!(
+        e.conn.telemetry_test_counts.inbound_concurrency_max, 5,
+        "one short message plus four queued packets"
+    );
+    assert_eq!(metrics.read_snapshot().inbound_concurrency_max, 5);
 }

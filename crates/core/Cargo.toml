@@ -1,6 +1,6 @@
 [package]
 name = "freenet"
-version = "0.2.147"
+version = "0.2.150"
 edition = "2024"
 rust-version = "1.85"
 publish = true
@@ -119,6 +119,26 @@ rustls-native-certs = "0.8.4"
 # Keep it semver-compatible with reqwest's rustls: os_trust probes certificates
 # with it on the assumption that reqwest validates them identically.
 rustls = { version = "0.23", default-features = false, features = ["std"] }
+# QUIC endpoint (transport/quic.rs, #5940), inert unless `transport-quic` is
+# on. Only the ring rustls provider: no runtime-tokio (the endpoint runs on the
+# crate's own Runtime over TimeSource, so simulation drives it), no
+# platform-verifier (peers are authenticated by raw public keys, never by a CA
+# root store), and no aws-lc-rs (deny.toml bans it).
+quinn = { version = "0.11.12", default-features = false, features = ["rustls-ring"] }
+# quinn's protocol crate, already in the graph under quinn. Named directly only
+# for `InvalidCid`, which quinn does not re-export and a connection-ID
+# generator's `validate` must return (transport/quic/cid.rs). No features of
+# its own: quinn's `rustls-ring` decides them.
+quinn-proto = { version = "0.11.18", default-features = false }
+# Already in the graph via rustls's ring provider. Used directly for the QUIC
+# endpoint's stateless-reset HMAC key and handshake-token HKDF key, which
+# quinn-proto implements its key traits for. Renamed because the crate has its
+# own `ring` module (the DHT ring), and an extern crate of the same name makes
+# every `ring` path under a glob import ambiguous.
+ring-crypto = { package = "ring", version = "0.17" }
+# Constant-time MAC comparison for the QUIC connection-ID generator
+# (transport/quic/cid.rs). Already in the graph (rustls, ed25519-dalek).
+subtle = "2.6"
 # Hidden (no-echo) prompt for the `freenet secrets export/import` passphrase, so
 # secrets don't have to be passed on argv (where they leak via `ps`/history).
 rpassword = "7"
@@ -127,6 +147,11 @@ x25519-dalek = { workspace = true }
 # the auto-update path (commands/update.rs). Default features (native std) are
 # sufficient — only verification (and test-only signing) is needed here.
 ed25519-dalek = "2"
+# The QUIC identity check (transport/quic/identity.rs) refuses a peer key whose
+# Edwards point is small-order or has a torsion component. Already in the graph
+# at 4.1.3 (xeddsa, x25519-dalek, ed25519-dalek); no features of its own, and
+# renamed because the dev-dependency `curve25519-dalek` is 5.x.
+curve25519-dalek-v4 = { package = "curve25519-dalek", version = "4.1.3", default-features = false }
 sha2 = { workspace = true }
 
 # Tracing deps

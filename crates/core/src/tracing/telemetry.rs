@@ -996,7 +996,7 @@ impl TelemetryWorker {
             peer_id: self.local_peer_id.clone(),
             transaction_id: String::new(), // Not tied to a transaction
             event_type: "transport_snapshot".to_string(),
-            event_data: serde_json::to_value(snapshot).unwrap_or_else(|error| {
+            event_data: snapshot.upload_json().unwrap_or_else(|error| {
                 tracing::warn!(%error, "Failed to serialize transport snapshot");
                 serde_json::Value::Null
             }),
@@ -2778,6 +2778,30 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 serde_json::json!(snapshot.inbound_queue_drops),
             );
             m.insert(
+                "upgrade_control_received".into(),
+                serde_json::json!(snapshot.upgrade_control_received),
+            );
+            m.insert(
+                "handshake_unauthenticated_dropped".into(),
+                serde_json::json!(snapshot.handshake_unauthenticated_dropped),
+            );
+            m.insert(
+                "quic_endpoint_down".into(),
+                serde_json::json!(snapshot.quic_endpoint_down),
+            );
+            m.insert(
+                "quic_close_sent_node_dropped_peer".into(),
+                serde_json::json!(snapshot.quic_close_sent_node_dropped_peer),
+            );
+            m.insert(
+                "quic_close_sent_downgrade".into(),
+                serde_json::json!(snapshot.quic_close_sent_downgrade),
+            );
+            m.insert(
+                "quic_close_sent_identity_mismatch".into(),
+                serde_json::json!(snapshot.quic_close_sent_identity_mismatch),
+            );
+            m.insert(
                 "nat_fail_samples".into(),
                 serde_json::json!(snapshot.nat_fail_samples),
             );
@@ -2873,6 +2897,113 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 "dial_queue_wait_ge_3s".into(),
                 serde_json::json!(snapshot.dial_queue_wait_ge_3s),
             );
+            m.insert(
+                "demux_legacy".into(),
+                serde_json::json!(snapshot.demux_legacy),
+            );
+            m.insert("demux_quic".into(), serde_json::json!(snapshot.demux_quic));
+            m.insert(
+                "demux_other".into(),
+                serde_json::json!(snapshot.demux_other),
+            );
+            m.insert(
+                "quic_ingress_forwarded".into(),
+                serde_json::json!(snapshot.quic_ingress_forwarded),
+            );
+            m.insert(
+                "quic_ingress_not_allowed".into(),
+                serde_json::json!(snapshot.quic_ingress_not_allowed),
+            );
+            m.insert(
+                "quic_ingress_queue_full".into(),
+                serde_json::json!(snapshot.quic_ingress_queue_full),
+            );
+            m.insert(
+                "quic_ingress_source_full".into(),
+                serde_json::json!(snapshot.quic_ingress_source_full),
+            );
+            m.insert(
+                "quic_ingress_no_ingress".into(),
+                serde_json::json!(snapshot.quic_ingress_no_ingress),
+            );
+            m.insert(
+                "egress_immediate".into(),
+                serde_json::json!(snapshot.egress_immediate),
+            );
+            m.insert(
+                "egress_waited".into(),
+                serde_json::json!(snapshot.egress_waited),
+            );
+            m.insert(
+                "egress_unpaced".into(),
+                serde_json::json!(snapshot.egress_unpaced),
+            );
+            m.insert(
+                "egress_bytes".into(),
+                serde_json::json!(snapshot.egress_bytes),
+            );
+            m.insert(
+                "egress_bytes_waited".into(),
+                serde_json::json!(snapshot.egress_bytes_waited),
+            );
+            m.insert(
+                "egress_wait_us_sum".into(),
+                serde_json::json!(snapshot.egress_wait_us_sum),
+            );
+            m.insert(
+                "egress_wait_us_max".into(),
+                serde_json::json!(snapshot.egress_wait_us_max),
+            );
+            m.insert(
+                "egress_long_waits_cap".into(),
+                serde_json::json!(snapshot.egress_long_waits_cap),
+            );
+            m.insert(
+                "egress_long_waits_connection".into(),
+                serde_json::json!(snapshot.egress_long_waits_connection),
+            );
+            m.insert(
+                "egress_long_waits_other".into(),
+                serde_json::json!(snapshot.egress_long_waits_other),
+            );
+            m.insert(
+                "egress_streams_abandoned_cap".into(),
+                serde_json::json!(snapshot.egress_streams_abandoned_cap),
+            );
+            m.insert(
+                "egress_streams_abandoned_connection".into(),
+                serde_json::json!(snapshot.egress_streams_abandoned_connection),
+            );
+            m.insert(
+                "egress_streams_abandoned_other".into(),
+                serde_json::json!(snapshot.egress_streams_abandoned_other),
+            );
+            m.insert(
+                "egress_streams_refused_cap".into(),
+                serde_json::json!(snapshot.egress_streams_refused_cap),
+            );
+            m.insert(
+                "egress_streams_refused_connection".into(),
+                serde_json::json!(snapshot.egress_streams_refused_connection),
+            );
+            m.insert(
+                "egress_streams_refused_other".into(),
+                serde_json::json!(snapshot.egress_streams_refused_other),
+            );
+            m.insert(
+                "egress_debt_hwm_bytes".into(),
+                serde_json::json!(snapshot.egress_debt_hwm_bytes),
+            );
+            m.insert(
+                "egress_debt_forgiven_bytes".into(),
+                serde_json::json!(snapshot.egress_debt_forgiven_bytes),
+            );
+            for (key, count) in snapshot.nonzero_conn_identity() {
+                m.insert(key, serde_json::json!(count));
+            }
+            for (key, value) in snapshot.nonzero_inbound_concurrency() {
+                m.insert(key.into(), serde_json::json!(value));
+            }
             serde_json::Value::Object(m)
         }
         EventKind::InterestSync(interest_sync_event) => {
@@ -5285,6 +5416,58 @@ mod tests {
         let snapshot = crate::transport::metrics::TransportSnapshot::default();
         let event = worker.snapshot_to_telemetry(&snapshot);
         assert_eq!(event.event_type, "transport_snapshot");
+        let sent_identity_keys: Vec<&String> = event
+            .event_data
+            .as_object()
+            .expect("snapshot JSON object")
+            .keys()
+            .filter(|key| key.starts_with("conn_identity_"))
+            .collect();
+        assert!(
+            sent_identity_keys.is_empty(),
+            "zero connection identity counts are not uploaded: {sent_identity_keys:?}"
+        );
+        let event = worker.snapshot_to_telemetry(&crate::transport::metrics::TransportSnapshot {
+            conn_identity_duplicate_key: 3,
+            ..Default::default()
+        });
+        let sent_identity_keys: Vec<&String> = event
+            .event_data
+            .as_object()
+            .expect("snapshot JSON object")
+            .keys()
+            .filter(|key| key.starts_with("conn_identity_"))
+            .collect();
+        assert_eq!(sent_identity_keys, vec!["conn_identity_duplicate_key"]);
+        assert_eq!(event.event_data["conn_identity_duplicate_key"], 3);
+        let concurrency_keys = |event: &TelemetryEvent| -> Vec<String> {
+            event
+                .event_data
+                .as_object()
+                .expect("snapshot JSON object")
+                .keys()
+                .filter(|key| key.starts_with("inbound_concurrency_"))
+                .cloned()
+                .collect()
+        };
+        assert!(
+            concurrency_keys(&event).is_empty(),
+            "zero inbound concurrency values are not uploaded"
+        );
+        let event = worker.snapshot_to_telemetry(&crate::transport::metrics::TransportSnapshot {
+            inbound_concurrency_conns_sampled: 4,
+            inbound_concurrency_max: 5,
+            ..Default::default()
+        });
+        assert_eq!(
+            concurrency_keys(&event),
+            vec![
+                "inbound_concurrency_conns_sampled",
+                "inbound_concurrency_max"
+            ]
+        );
+        assert_eq!(event.event_data["inbound_concurrency_conns_sampled"], 4);
+        assert_eq!(event.event_data["inbound_concurrency_max"], 5);
         assert_eq!(
             event.peer_id, "snapshot-peer-id",
             "transport snapshots must be attributed to the emitting \
@@ -6496,21 +6679,28 @@ mod tests {
     #[test]
     fn transport_snapshot_json_lists_every_field() {
         let snapshot = crate::transport::metrics::TransportSnapshot::default();
+        // The connection identity and inbound concurrency keys are sent only
+        // when non-zero, so a default snapshot carries none of them (see the
+        // tests below).
         let mut expected: std::collections::BTreeSet<String> = serde_json::to_value(&snapshot)
             .unwrap()
             .as_object()
             .unwrap()
             .keys()
+            .filter(|key| {
+                !key.starts_with("conn_identity_") && !key.starts_with("inbound_concurrency_")
+            })
             .cloned()
             .collect();
         expected.insert("type".to_string());
-        let actual: std::collections::BTreeSet<String> =
-            event_kind_to_json(&super::super::EventKind::TransportSnapshot(snapshot))
-                .as_object()
-                .unwrap()
-                .keys()
-                .cloned()
-                .collect();
+        let actual: std::collections::BTreeSet<String> = event_kind_to_json(
+            &super::super::EventKind::TransportSnapshot(Box::new(snapshot)),
+        )
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect();
         assert_eq!(actual, expected);
     }
 
@@ -6535,10 +6725,38 @@ mod tests {
             dial_queue_wait_lt_1s: 15,
             dial_queue_wait_lt_3s: 16,
             dial_queue_wait_ge_3s: 17,
+            demux_legacy: 19,
+            demux_quic: 20,
+            demux_other: 21,
+            quic_ingress_forwarded: 46,
+            quic_ingress_not_allowed: 47,
+            quic_ingress_queue_full: 48,
+            quic_ingress_source_full: 50,
+            quic_ingress_no_ingress: 49,
+            egress_immediate: 22,
+            egress_waited: 23,
+            egress_unpaced: 25,
+            egress_bytes: 26,
+            egress_bytes_waited: 27,
+            egress_wait_us_sum: 28,
+            egress_wait_us_max: 29,
+            egress_long_waits_cap: 40,
+            egress_long_waits_connection: 41,
+            egress_long_waits_other: 42,
+            egress_streams_abandoned_cap: 43,
+            egress_streams_abandoned_connection: 44,
+            egress_streams_abandoned_other: 45,
+            egress_streams_refused_cap: 117,
+            egress_streams_refused_connection: 118,
+            egress_streams_refused_other: 119,
+            egress_debt_hwm_bytes: 30,
+            egress_debt_forgiven_bytes: 31,
             ..Default::default()
         };
         let reference = serde_json::to_value(&snapshot).unwrap();
-        let json = event_kind_to_json(&super::super::EventKind::TransportSnapshot(snapshot));
+        let json = event_kind_to_json(&super::super::EventKind::TransportSnapshot(Box::new(
+            snapshot,
+        )));
         for (key, expected) in [
             ("nat_attempts_connect_joiner", 1),
             ("nat_attempts_connect_acceptor", 2),
@@ -6556,6 +6774,32 @@ mod tests {
             ("dial_queue_wait_lt_1s", 15),
             ("dial_queue_wait_lt_3s", 16),
             ("dial_queue_wait_ge_3s", 17),
+            ("demux_legacy", 19),
+            ("demux_quic", 20),
+            ("demux_other", 21),
+            ("quic_ingress_forwarded", 46),
+            ("quic_ingress_not_allowed", 47),
+            ("quic_ingress_queue_full", 48),
+            ("quic_ingress_source_full", 50),
+            ("quic_ingress_no_ingress", 49),
+            ("egress_immediate", 22),
+            ("egress_waited", 23),
+            ("egress_unpaced", 25),
+            ("egress_bytes", 26),
+            ("egress_bytes_waited", 27),
+            ("egress_wait_us_sum", 28),
+            ("egress_wait_us_max", 29),
+            ("egress_long_waits_cap", 40),
+            ("egress_long_waits_connection", 41),
+            ("egress_long_waits_other", 42),
+            ("egress_streams_abandoned_cap", 43),
+            ("egress_streams_abandoned_connection", 44),
+            ("egress_streams_abandoned_other", 45),
+            ("egress_streams_refused_cap", 117),
+            ("egress_streams_refused_connection", 118),
+            ("egress_streams_refused_other", 119),
+            ("egress_debt_hwm_bytes", 30),
+            ("egress_debt_forgiven_bytes", 31),
         ] {
             assert_eq!(json[key], expected, "event-log value for {key}");
             assert_eq!(json[key], reference[key], "serde value for {key}");
@@ -6577,7 +6821,9 @@ mod tests {
             ..Default::default()
         };
         let reference = serde_json::to_value(&snapshot).unwrap();
-        let json = event_kind_to_json(&super::super::EventKind::TransportSnapshot(snapshot));
+        let json = event_kind_to_json(&super::super::EventKind::TransportSnapshot(Box::new(
+            snapshot,
+        )));
         for (key, expected) in [
             ("inbound_stream_refused_invalid_length", 1),
             ("inbound_stream_refused_connection_bytes", 2),
@@ -6588,6 +6834,210 @@ mod tests {
         ] {
             assert_eq!(json[key], expected, "event-log value for {key}");
             assert_eq!(json[key], reference[key], "serde value for {key}");
+        }
+    }
+
+    /// The event-log JSON carries the dropped-handshake-packet count.
+    #[test]
+    fn transport_snapshot_json_carries_handshake_unauthenticated_dropped() {
+        let snapshot = crate::transport::metrics::TransportSnapshot {
+            handshake_unauthenticated_dropped: 7,
+            ..Default::default()
+        };
+        let json = event_kind_to_json(&super::super::EventKind::TransportSnapshot(Box::new(
+            snapshot,
+        )));
+        assert_eq!(json["handshake_unauthenticated_dropped"], 7);
+    }
+
+    /// The event-log JSON carries each connection identity count under its
+    /// own key (distinct non-zero values, so a swapped key is caught).
+    #[test]
+    fn transport_snapshot_json_carries_conn_identity_values() {
+        let snapshot = crate::transport::metrics::TransportSnapshot {
+            conn_identity_set_dialed: 61,
+            conn_identity_expected_inbound_bound: 62,
+            conn_identity_expected_inbound_unbound: 80,
+            conn_identity_set_connect_request: 63,
+            conn_identity_same_connect_request: 64,
+            conn_identity_changed_connect_request: 65,
+            conn_identity_connect_request_known_addr: 66,
+            conn_identity_set_connect_peer: 67,
+            conn_identity_same_connect_peer: 68,
+            conn_identity_changed_connect_peer: 69,
+            conn_identity_changed_ring_promotion: 70,
+            conn_identity_own_key: 71,
+            conn_identity_duplicate_key: 72,
+            conn_identity_teardown_key_elsewhere: 73,
+            conn_identity_teardown_unidentified: 74,
+            conn_identity_teardown_key_unmapped: 79,
+            ..Default::default()
+        };
+        let reference = serde_json::to_value(&snapshot).unwrap();
+        let json = event_kind_to_json(&super::super::EventKind::TransportSnapshot(Box::new(
+            snapshot,
+        )));
+        for (key, expected) in [
+            ("conn_identity_set_dialed", 61),
+            ("conn_identity_expected_inbound_bound", 62),
+            ("conn_identity_expected_inbound_unbound", 80),
+            ("conn_identity_set_connect_request", 63),
+            ("conn_identity_same_connect_request", 64),
+            ("conn_identity_changed_connect_request", 65),
+            ("conn_identity_connect_request_known_addr", 66),
+            ("conn_identity_set_connect_peer", 67),
+            ("conn_identity_same_connect_peer", 68),
+            ("conn_identity_changed_connect_peer", 69),
+            ("conn_identity_changed_ring_promotion", 70),
+            ("conn_identity_own_key", 71),
+            ("conn_identity_duplicate_key", 72),
+            ("conn_identity_teardown_key_elsewhere", 73),
+            ("conn_identity_teardown_unidentified", 74),
+            ("conn_identity_teardown_key_unmapped", 79),
+        ] {
+            assert_eq!(json[key], expected, "event-log value for {key}");
+            assert_eq!(json[key], reference[key], "serde value for {key}");
+        }
+    }
+
+    /// The event-log JSON carries the QUIC endpoint-down and close-code
+    /// counts, with the same values serde gives.
+    #[test]
+    fn transport_snapshot_json_carries_quic_endpoint_and_close_counts() {
+        let snapshot = crate::transport::metrics::TransportSnapshot {
+            quic_endpoint_down: 1,
+            quic_close_sent_node_dropped_peer: 2,
+            quic_close_sent_downgrade: 3,
+            quic_close_sent_identity_mismatch: 4,
+            ..Default::default()
+        };
+        let reference = serde_json::to_value(&snapshot).unwrap();
+        let json = event_kind_to_json(&super::super::EventKind::TransportSnapshot(Box::new(
+            snapshot,
+        )));
+        for (key, expected) in [
+            ("quic_endpoint_down", 1),
+            ("quic_close_sent_node_dropped_peer", 2),
+            ("quic_close_sent_downgrade", 3),
+            ("quic_close_sent_identity_mismatch", 4),
+        ] {
+            assert_eq!(json[key], expected, "event-log value for {key}");
+            assert_eq!(json[key], reference[key], "serde value for {key}");
+        }
+    }
+
+    /// Each connection identity key is in the event-log JSON exactly when its
+    /// count is non-zero, and every serde `conn_identity_*` field is covered.
+    #[test]
+    fn transport_snapshot_json_sends_conn_identity_keys_only_when_nonzero() {
+        let to_json = |snapshot: crate::transport::metrics::TransportSnapshot| {
+            event_kind_to_json(&super::super::EventKind::TransportSnapshot(Box::new(
+                snapshot,
+            )))
+        };
+        let identity_keys = |json: &serde_json::Value| -> Vec<String> {
+            json.as_object()
+                .unwrap()
+                .keys()
+                .filter(|key| key.starts_with("conn_identity_"))
+                .cloned()
+                .collect()
+        };
+        let zero = crate::transport::metrics::TransportSnapshot::default();
+        assert!(identity_keys(&to_json(zero.clone())).is_empty());
+
+        let serde_keys = identity_keys(&serde_json::to_value(&zero).unwrap());
+        assert_eq!(
+            serde_keys.len(),
+            crate::transport::ConnIdentity::COUNT,
+            "one serde field per kind"
+        );
+        for kind in crate::transport::ConnIdentity::ALL {
+            let key = format!("conn_identity_{}", kind.label());
+            assert!(serde_keys.contains(&key), "serde field {key}");
+            let mut snapshot = zero.clone();
+            let mut serde_value = serde_json::to_value(&snapshot).unwrap();
+            serde_value[key.as_str()] = serde_json::json!(5);
+            snapshot = serde_json::from_value(serde_value).unwrap();
+            let json = to_json(snapshot);
+            assert_eq!(
+                identity_keys(&json),
+                vec![key.clone()],
+                "only {key} is sent"
+            );
+            assert_eq!(json[key.as_str()], 5, "value for {key}");
+        }
+    }
+
+    /// The event-log JSON carries each inbound concurrency value under its
+    /// own key (distinct non-zero values, so a swapped key is caught), with
+    /// the value serde gives.
+    #[test]
+    fn transport_snapshot_json_carries_inbound_concurrency_values() {
+        let snapshot = crate::transport::metrics::TransportSnapshot {
+            inbound_concurrency_conns_sampled: 81,
+            inbound_concurrency_conns_ge_8: 82,
+            inbound_concurrency_conns_ge_16: 83,
+            inbound_concurrency_conns_ge_32: 84,
+            inbound_concurrency_conns_ge_64: 85,
+            inbound_concurrency_conns_ge_128: 86,
+            inbound_concurrency_conns_ge_256: 87,
+            inbound_concurrency_max: 88,
+            ..Default::default()
+        };
+        let reference = serde_json::to_value(&snapshot).unwrap();
+        let json = event_kind_to_json(&super::super::EventKind::TransportSnapshot(Box::new(
+            snapshot,
+        )));
+        for (key, expected) in [
+            ("inbound_concurrency_conns_sampled", 81),
+            ("inbound_concurrency_conns_ge_8", 82),
+            ("inbound_concurrency_conns_ge_16", 83),
+            ("inbound_concurrency_conns_ge_32", 84),
+            ("inbound_concurrency_conns_ge_64", 85),
+            ("inbound_concurrency_conns_ge_128", 86),
+            ("inbound_concurrency_conns_ge_256", 87),
+            ("inbound_concurrency_max", 88),
+        ] {
+            assert_eq!(json[key], expected, "event-log value for {key}");
+            assert_eq!(json[key], reference[key], "serde value for {key}");
+        }
+    }
+
+    /// Each inbound concurrency key is in the event-log JSON exactly when
+    /// its value is non-zero, and every serde `inbound_concurrency_*` field
+    /// is covered.
+    #[test]
+    fn transport_snapshot_json_sends_inbound_concurrency_keys_only_when_nonzero() {
+        let to_json = |snapshot: crate::transport::metrics::TransportSnapshot| {
+            event_kind_to_json(&super::super::EventKind::TransportSnapshot(Box::new(
+                snapshot,
+            )))
+        };
+        let concurrency_keys = |json: &serde_json::Value| -> Vec<String> {
+            json.as_object()
+                .unwrap()
+                .keys()
+                .filter(|key| key.starts_with("inbound_concurrency_"))
+                .cloned()
+                .collect()
+        };
+        let zero = crate::transport::metrics::TransportSnapshot::default();
+        assert!(concurrency_keys(&to_json(zero.clone())).is_empty());
+
+        let serde_keys = concurrency_keys(&serde_json::to_value(&zero).unwrap());
+        assert_eq!(serde_keys.len(), 8, "one serde field per value");
+        for key in serde_keys {
+            let mut serde_value = serde_json::to_value(&zero).unwrap();
+            serde_value[key.as_str()] = serde_json::json!(5);
+            let snapshot = serde_json::from_value(serde_value).unwrap();
+            let json = to_json(snapshot);
+            assert_eq!(
+                concurrency_keys(&json),
+                vec![key.clone()],
+                "only {key} is sent"
+            );
+            assert_eq!(json[key.as_str()], 5, "value for {key}");
         }
     }
 }

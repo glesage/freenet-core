@@ -1,8 +1,13 @@
 mod contract_ops;
+#[cfg(test)]
+mod delegate_hop_context_tests;
 mod delegates;
 mod executor_impl;
 mod pool;
+mod reapply_probe;
 mod subscriptions;
+#[cfg(test)]
+mod unregister_tests;
 
 use super::*;
 use super::{
@@ -13,6 +18,8 @@ use crate::wasm_runtime::default_wasmtime_cache_size_bytes_for_dir;
 pub(crate) use contract_ops::ReclaimOutcome;
 pub use pool::RuntimePool;
 pub(crate) use pool::{ExportAdmission, ExportDone, MAX_CONCURRENT_EXPORTS};
+#[cfg(test)]
+pub(crate) use reapply_probe::{IdenticalIsNoOp, REAPPLY_PROBE_TIME_BUDGET};
 
 /// Maximum number of related contracts a single validation can request.
 /// Bounds worst-case first-time cost: N GETs of up to 50MB each.
@@ -31,6 +38,24 @@ const RELATED_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 /// Sample selection uses `GlobalRng` (deterministic under a fixed seed
 /// for simulation tests). See `Executor::maybe_probe_idempotency`.
 const IDEMPOTENCY_PROBE_PROBABILITY: f64 = 1.0 / 32.0;
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only: sample every eligible merge, so a test can drive the sampled
+    /// probe through the real merge path. Thread-local, so it only reaches the
+    /// `current_thread` test that sets it.
+    pub(crate) static IDEMPOTENCY_PROBE_ALWAYS: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Whether this merge is one of the [`IDEMPOTENCY_PROBE_PROBABILITY`] sample.
+fn idempotency_probe_sampled() -> bool {
+    #[cfg(test)]
+    if IDEMPOTENCY_PROBE_ALWAYS.with(std::cell::Cell::get) {
+        return true;
+    }
+    crate::config::GlobalRng::random_bool(IDEMPOTENCY_PROBE_PROBABILITY)
+}
 
 /// Maximum successive re-applies the deterministic identical-input probe
 /// (`Executor::probe_identical_input_idempotency`) runs while looking for a
@@ -325,6 +350,48 @@ impl ContractExecutor for Executor<Runtime> {
         )
     }
 
+    async fn execute_delegate_hop(
+        &mut self,
+        req: DelegateRequest<'_>,
+        caller_delegate: &DelegateKey,
+        connection_scope: crate::client_events::ConnectionScope,
+        user_context: Option<&UserSecretContext>,
+    ) -> Response {
+        // The hop's target runs under the originating user: that user's
+        // secrets and context (`None` on a node that is not hosted).
+        self.delegate_request(
+            req,
+            None,
+            Some(caller_delegate),
+            connection_scope,
+            user_context,
+        )
+    }
+
+    fn hosted_mode(&self) -> bool {
+        self.hosted_mode
+    }
+
+    fn take_delegate_context(
+        &mut self,
+        delegate: &DelegateKey,
+        user: Option<&crate::wasm_runtime::UserId>,
+    ) -> Option<Vec<u8>> {
+        self.runtime.delegate_contexts().take(delegate, user)
+    }
+
+    fn restore_delegate_context(
+        &mut self,
+        delegate: &DelegateKey,
+        user: Option<&crate::wasm_runtime::UserId>,
+        context: Vec<u8>,
+    ) {
+        // Logs if an entry is already there; see `DelegateContextStore::restore`.
+        self.runtime
+            .delegate_contexts()
+            .restore(delegate, user, context);
+    }
+
     // NOTE: `ContractExecutor::try_begin_export` / `finish_export` are NOT
     // overridden for a bare `Executor<Runtime>` — only the pooled `RuntimePool`
     // can admit a deferred export (it owns the executor pool + the export
@@ -389,7 +456,8 @@ impl Executor<Runtime> {
         let mut rt = Runtime::build(contract_store, delegate_store, secret_store, false).unwrap();
         // Backs the read-only `local_contract_state` delegate host function.
         rt.set_state_store_db(state_store.storage());
-        Executor::new(
+        let hosted_mode = config.ws_api.hosted_mode;
+        let mut executor = Executor::new(
             state_store,
             move || {
                 if let Err(error) = crate::util::set_cleanup_on_exit(config.paths()) {
@@ -401,7 +469,9 @@ impl Executor<Runtime> {
             rt,
             op_manager,
         )
-        .await
+        .await?;
+        executor.hosted_mode = hosted_mode;
+        Ok(executor)
     }
 
     /// Create an executor that shares compiled module caches and backend engine
@@ -504,14 +574,16 @@ impl Executor<Runtime> {
         )
         .unwrap();
         rt.set_state_store_db(db);
-        Executor::new(
+        let mut executor = Executor::new(
             shared_state_store,
             || Ok(()),
             OperationMode::Local,
             rt,
             op_manager,
         )
-        .await
+        .await?;
+        executor.hosted_mode = config.ws_api.hosted_mode;
+        Ok(executor)
     }
 
     pub async fn preload(
@@ -550,16 +622,16 @@ impl Executor<Runtime> {
     ) -> Response {
         match req {
             ClientRequest::ContractOp(op) => self.contract_requests(op, id, updates).await,
-            // Local-node path (no hosted-mode connection): always single-user
-            // (`user_context = None`), so secrets stay `SecretScope::Local`.
-            // `origin_contract` is `None` here, so the connection scope changes
-            // nothing about what this path can attest — pass `Local` so the
-            // behavior is byte-for-byte what it was.
+            // Always single-user (`user_context = None`), so secrets stay
+            // `SecretScope::Local`. This entry point is not told which
+            // connection a request came from, so it treats every request as
+            // remote: no attested origin is resolved, and `UnregisterDelegate`
+            // is refused.
             ClientRequest::DelegateOp(op) => self.delegate_request(
                 op,
                 None,
                 None,
-                crate::client_events::ConnectionScope::Local,
+                crate::client_events::ConnectionScope::Remote,
                 None,
             ),
             ClientRequest::Disconnect { cause } => {

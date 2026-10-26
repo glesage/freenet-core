@@ -8,6 +8,7 @@
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::task::{Context, Poll};
 use std::{borrow::Cow, io, net::SocketAddr};
 
 use futures::Future;
@@ -188,7 +189,10 @@ pub fn get_open_connection_count() -> usize {
 mod boundary;
 pub mod connection_handler;
 mod crypto;
+pub(crate) mod demux;
+pub(crate) mod egress_cap;
 pub mod in_memory_socket;
+pub(crate) mod quic;
 
 /// Mock transport infrastructure for testing and benchmarking.
 /// Provides MockSocket and helper functions to create mock peer connections
@@ -238,7 +242,7 @@ pub use congestion_control::{
     CongestionControlStats, CongestionController,
 };
 // Re-export transport metrics for periodic telemetry snapshots
-pub(crate) use metrics::NatAttemptOrigin;
+pub(crate) use metrics::{ConnIdentity, NatAttemptOrigin};
 pub use metrics::{TRANSPORT_METRICS, TransportMetrics, TransportSnapshot};
 // Re-export reset functions for deterministic simulation testing
 pub use self::boundary::StreamId;
@@ -352,6 +356,12 @@ pub(crate) use self::connection_handler::ExpectedInboundTracker;
 pub use self::connection_handler::create_connection_handler;
 pub(crate) use self::connection_handler::{UdpTransportConfig, open_udp_transport};
 pub use self::crypto::{TransportKeypair, TransportPublicKey};
+/// Returned (wrapped around the socket type) by [`create_connection_handler`].
+pub use self::demux::DemuxSocket;
+/// Named by [`Socket::egress_cap`] and [`Socket::send_to_paced`]; only the
+/// transport itself can construct or use them.
+#[doc(hidden)]
+pub use self::egress_cap::{EgressCap, EgressTake};
 pub use self::{
     connection_handler::{InboundConnectionHandler, OutboundConnectionHandler},
     peer_connection::PeerConnection,
@@ -391,6 +401,13 @@ pub enum TransportError {
     /// Opaque above the transport: classify it with [`Self::scope`].
     #[error(transparent)]
     Udp(UdpError),
+    /// An error only the QUIC path produces (#5940): a quinn connection,
+    /// stream or endpoint error, or a framing error, mapped to a stable
+    /// kind. Opaque above the transport like [`Self::Udp`]: classify it with
+    /// [`Self::scope`]. Nothing produces one while `transport-quic` carries
+    /// no traffic.
+    #[error(transparent)]
+    Quic(QuicError),
 }
 
 /// An error only the UDP transport produces, inside [`TransportError::Udp`].
@@ -422,6 +439,122 @@ pub(in crate::transport) enum UdpErrorKind {
     PubKeyDecryptionError(crypto::DecryptionError),
     #[error(transparent)]
     Serialization(bincode::Error),
+}
+
+/// An error only the QUIC path produces, inside [`TransportError::Quic`].
+/// Its kind is private to the transport; `quic::error` maps quinn's and the
+/// framing's errors to it.
+#[derive(Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error(transparent)]
+pub struct QuicError(pub(in crate::transport) QuicErrorKind);
+
+impl std::fmt::Debug for QuicError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.0, f)
+    }
+}
+
+/// What went wrong in a [`QuicError`]. A small, stable set: quinn has many
+/// more error variants, and `quic::error` decides which kind each is.
+///
+/// Scope (see [`TransportError::scope`]): `Reset` and `Stopped` are
+/// transient (a retry may succeed) unless their code refuses the message
+/// itself, then stream scope like `InvalidFrame` and `StreamClosed`; the
+/// rest end the QUIC connection (or the attempt to make one). A connection-scope kind ends
+/// the QUIC path only: the peer's UDP session stays up, and e5 falls back
+/// to it inside the transport, so a connection-scope QUIC error is never
+/// surfaced to the operations above it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub(in crate::transport) enum QuicErrorKind {
+    /// The connection ended: the peer closed it with
+    /// `close_code::NODE_DROPPED_PEER` or a code this node does not know,
+    /// this node closed it, the peer's QUIC stack closed it without an
+    /// error, or the peer answered with a stateless reset (it lost the
+    /// connection, usually by restarting). Connection scope; handled inside
+    /// the transport (fallback to UDP), never surfaced to operations.
+    #[error("QUIC connection lost")]
+    ConnectionLost,
+    /// The stream was reset with this code: by the peer while this node was
+    /// reading it, or by this node, which abandoned a send whose source
+    /// failed (`reset_code::SENDER_ABORTED`). Transient or stream scope by
+    /// code (`quic::error::reset_is_retryable`).
+    #[error("QUIC stream reset with code {code}")]
+    Reset { code: u64 },
+    /// The peer stopped the stream (STOP_SENDING) with this code
+    /// (`stop_code`). Transient or stream scope by code
+    /// (`quic::error::stop_is_retryable`).
+    #[error("QUIC stream stopped by the peer with code {code}")]
+    Stopped { code: u64 },
+    /// The connection was refused, or ended by a refusal. Connection scope.
+    #[error("QUIC connection refused: {reason}")]
+    Refused { reason: QuicRefusal },
+    /// Nothing was heard from the peer for the idle timeout. Connection
+    /// scope.
+    #[error("QUIC connection timed out")]
+    TimedOut,
+    /// The node's QUIC endpoint is gone: its driver ended, or it was
+    /// closed. Connection scope, for every connection of that endpoint
+    /// (one per node), whose `QuicAvailability` reports it.
+    #[error("the QUIC endpoint is down")]
+    EndpointDown,
+    /// The peer broke the QUIC protocol (a QUIC transport error code other
+    /// than a TLS alert, sent by the peer or detected here). Connection
+    /// scope.
+    #[error("QUIC protocol error {code:#x}")]
+    Protocol { code: u64 },
+    /// A message could not be framed: its header would be refused
+    /// (`framing::HeaderError`). Stream scope, and the same message fails
+    /// the same way on every attempt.
+    #[error("QUIC frame refused before sending")]
+    InvalidFrame,
+    /// The stream was already closed on this side (a misuse of quinn's
+    /// stream API; not expected). Stream scope.
+    #[error("QUIC stream already closed")]
+    StreamClosed,
+}
+
+/// Why a QUIC connection was refused ([`QuicErrorKind::Refused`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub(in crate::transport) enum QuicRefusal {
+    /// The TLS handshake failed (a TLS alert, QUIC crypto error 0x100 to
+    /// 0x1ff, either side): a key other than the expected one, a foreign
+    /// key type, another ALPN.
+    #[error("the TLS handshake failed")]
+    Handshake,
+    /// The peer does not speak QUIC version 1.
+    #[error("no common QUIC version")]
+    Version,
+    /// The peer's QUIC stack refused the connection (transport error
+    /// CONNECTION_REFUSED), for example because it was not accepting.
+    #[error("the peer's QUIC stack refused the connection")]
+    ConnectionRefused,
+    /// The peer closed with `close_code::DOWNGRADE`: fall back to UDP.
+    #[error("the peer asked to fall back to UDP")]
+    Downgrade,
+    /// The peer closed with `close_code::IDENTITY_MISMATCH`: the key this
+    /// node proved is not the one the peer has on record for it.
+    #[error("the peer reported an identity mismatch")]
+    IdentityMismatch,
+    /// The demux socket's allow-set is full.
+    #[error("the QUIC allow-set is full")]
+    AllowSetFull,
+    /// The address is already allowed for another key.
+    #[error("the address is already allowed for another key")]
+    KeyConflict,
+    /// The peer's transport key cannot be a QUIC identity.
+    #[error("the peer's key is not usable for QUIC")]
+    UnusableKey,
+    /// This node could not start the connection: its TLS or quinn
+    /// configuration refused it (an invalid address, no connection IDs
+    /// left).
+    #[error("this node could not start the connection")]
+    Local,
+}
+
+impl From<QuicErrorKind> for TransportError {
+    fn from(kind: QuicErrorKind) -> Self {
+        TransportError::Quic(QuicError(kind))
+    }
 }
 
 impl From<UdpErrorKind> for TransportError {
@@ -484,7 +617,30 @@ impl TransportError {
         match self {
             TransportError::OutboundStreamFailed(..)
             | TransportError::Udp(UdpError(UdpErrorKind::SendFailed(..))) => ErrorScope::Transient,
-            TransportError::OutboundStreamInvalidLength(..) => ErrorScope::Stream,
+            TransportError::Quic(QuicError(QuicErrorKind::Stopped { code }))
+                if quic::error::stop_is_retryable(*code) =>
+            {
+                ErrorScope::Transient
+            }
+            TransportError::Quic(QuicError(QuicErrorKind::Reset { code }))
+                if quic::error::reset_is_retryable(*code) =>
+            {
+                ErrorScope::Transient
+            }
+            TransportError::OutboundStreamInvalidLength(..)
+            | TransportError::Quic(QuicError(
+                QuicErrorKind::Reset { .. }
+                | QuicErrorKind::Stopped { .. }
+                | QuicErrorKind::InvalidFrame
+                | QuicErrorKind::StreamClosed,
+            )) => ErrorScope::Stream,
+            TransportError::Quic(QuicError(
+                QuicErrorKind::ConnectionLost
+                | QuicErrorKind::Refused { .. }
+                | QuicErrorKind::TimedOut
+                | QuicErrorKind::EndpointDown
+                | QuicErrorKind::Protocol { .. },
+            )) => ErrorScope::Connection,
             TransportError::ChannelClosed
             | TransportError::ConnectionClosed(_)
             | TransportError::ConnectionEstablishmentFailure { .. }
@@ -562,6 +718,86 @@ pub trait Socket: Sized + Send + Sync + 'static {
     /// Used by MockSocket implementations in tests.
     #[allow(dead_code)]
     fn send_to_blocking(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize>;
+
+    /// The node-wide egress cap this socket charges, if any. Only
+    /// [`DemuxSocket`] can have one (when `total-bandwidth-limit` is set);
+    /// every other socket returns `None`. Pacing points take from it through
+    /// `egress_cap::try_take`.
+    #[doc(hidden)]
+    fn egress_cap(&self) -> Option<&EgressCap> {
+        None
+    }
+
+    /// Send a datagram whose bytes a pacing point already took from
+    /// [`Self::egress_cap`]. The socket returns what the datagram did not use
+    /// instead of charging it a second time.
+    ///
+    /// A take exists only for a socket with a cap, so the default (for
+    /// sockets without one) just returns the take and sends.
+    #[doc(hidden)]
+    fn send_to_paced(
+        &self,
+        buf: &[u8],
+        target: SocketAddr,
+        take: EgressTake<'_>,
+    ) -> impl Future<Output = io::Result<usize>> + Send {
+        drop(take);
+        self.send_to(buf, target)
+    }
+
+    /// Send a datagram without waiting: when the socket cannot take it now,
+    /// return `WouldBlock` instead of sleeping or awaiting. For a sender that
+    /// must never block, such as a QUIC endpoint's driver (#5940). Charged
+    /// like [`Self::send_to`] once sent; a datagram that was not sent is not
+    /// charged.
+    ///
+    /// The default returns `Unsupported`; the UDP sockets, the in-memory
+    /// sockets and [`DemuxSocket`] implement it.
+    #[doc(hidden)]
+    fn try_send_to(&self, _buf: &[u8], _target: SocketAddr) -> io::Result<usize> {
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
+
+    /// Poll whether the socket can take a send now. `Ready` means a
+    /// [`Self::try_send_to`] may succeed (it can still return `WouldBlock`);
+    /// `Pending` arms `cx`'s waker for when the socket becomes writable.
+    ///
+    /// The default is always ready, which is right for sockets that never
+    /// return `WouldBlock`.
+    #[doc(hidden)]
+    fn poll_send_ready(&self, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    /// Read one datagram, saying whether it is for the caller
+    /// ([`SocketRead::Datagram`]) or was consumed by the socket
+    /// ([`SocketRead::Diverted`]: [`DemuxSocket`] counted it and dropped it
+    /// or passed it to its QUIC ingress). The listener reads through this so
+    /// it sees every datagram the socket received, of any class, for its
+    /// socket-health signal.
+    ///
+    /// Cancellation-safe when [`Self::recv_from`] is: the default is one
+    /// `recv_from`.
+    #[doc(hidden)]
+    fn recv_classified(
+        &self,
+        buf: &mut [u8],
+    ) -> impl Future<Output = io::Result<SocketRead>> + Send {
+        async move {
+            let (len, from) = self.recv_from(buf).await?;
+            Ok(SocketRead::Datagram(len, from))
+        }
+    }
+}
+
+/// What one [`Socket::recv_classified`] read produced.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SocketRead {
+    /// A datagram for the caller: its length in the buffer and its source.
+    Datagram(usize, SocketAddr),
+    /// The socket received a datagram and consumed it itself.
+    Diverted,
 }
 
 /// Normalize an IPv4-mapped IPv6 address (`::ffff:x.x.x.x`) to plain IPv4.
@@ -717,6 +953,28 @@ impl Socket for UdpSocket {
         let local_is_ipv6 = self.local_addr().map(|a| a.is_ipv6()).unwrap_or(false);
         send_to_blocking_mapped(self, buf, target, local_is_ipv6)
     }
+
+    fn try_send_to(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
+        let local_is_ipv6 = self.local_addr().map(|a| a.is_ipv6()).unwrap_or(false);
+        try_send_to_mapped(self, buf, target, local_is_ipv6)
+    }
+
+    fn poll_send_ready(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        UdpSocket::poll_send_ready(self, cx)
+    }
+}
+
+/// One non-blocking send, metered like `send_to` when it succeeds. Returns
+/// `WouldBlock` when the kernel send buffer is full.
+fn try_send_to_mapped(
+    sock: &UdpSocket,
+    buf: &[u8],
+    target: SocketAddr,
+    local_is_ipv6: bool,
+) -> io::Result<usize> {
+    let sent = sock.try_send_to(buf, map_addr_for_send(local_is_ipv6, target))?;
+    metrics::TRANSPORT_METRICS.record_packet_sent(target, sent as u64);
+    Ok(sent)
 }
 
 /// Blocking send shared by the `Socket` impls.
@@ -731,16 +989,12 @@ fn send_to_blocking_mapped(
     target: SocketAddr,
     local_is_ipv6: bool,
 ) -> io::Result<usize> {
-    let mapped_target = map_addr_for_send(local_is_ipv6, target);
     let mut backoff_us = 1u64; // Start at 1μs
     const MAX_BACKOFF_US: u64 = 1000; // Cap at 1ms
 
     loop {
-        match sock.try_send_to(buf, mapped_target) {
-            Ok(n) => {
-                metrics::TRANSPORT_METRICS.record_packet_sent(target, n as u64);
-                return Ok(n);
-            }
+        match try_send_to_mapped(sock, buf, target, local_is_ipv6) {
+            Ok(n) => return Ok(n),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                 // Kernel buffer full - exponential backoff
                 std::thread::sleep(std::time::Duration::from_micros(backoff_us));
@@ -819,6 +1073,14 @@ impl Socket for UdpTransportSocket {
         // Same as the `UdpSocket` impl, minus the per-call getsockname.
         send_to_blocking_mapped(&self.sock, buf, target, self.is_ipv6)
     }
+
+    fn try_send_to(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
+        try_send_to_mapped(&self.sock, buf, target, self.is_ipv6)
+    }
+
+    fn poll_send_ready(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.sock.poll_send_ready(cx)
+    }
 }
 
 #[cfg(test)]
@@ -826,6 +1088,43 @@ mod tests {
     use super::*;
     use crate::transport::received_packet_tracker::ReportResult;
     use crate::transport::sent_packet_tracker::ResendAction;
+
+    /// The production socket's non-blocking send: a fresh socket becomes
+    /// ready to send, the datagram goes out from `try_send_to` with no await, and
+    /// arrives. (Its `WouldBlock` path needs a full kernel send buffer,
+    /// which loopback cannot be made to produce reliably; `DemuxSocket`'s
+    /// tests cover passing `WouldBlock` through.)
+    #[tokio::test]
+    async fn udp_transport_socket_try_send_to_sends_without_waiting() {
+        let localhost: SocketAddr = (std::net::Ipv4Addr::LOCALHOST, 0).into();
+        let sender = <UdpTransportSocket as Socket>::bind(localhost)
+            .await
+            .unwrap();
+        let receiver = <UdpTransportSocket as Socket>::bind(localhost)
+            .await
+            .unwrap();
+        let to = receiver.local_addr().unwrap();
+        // Tokio reports writable once its reactor has seen it, so the first
+        // poll may be Pending; it must become Ready with the waker it armed.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            std::future::poll_fn(|cx| sender.poll_send_ready(cx)),
+        )
+        .await
+        .expect("a fresh socket becomes writable")
+        .unwrap();
+        assert_eq!(Socket::try_send_to(&sender, &[0x01, 2, 3], to).unwrap(), 3);
+        let mut buf = [0u8; 16];
+        let (len, from) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            Socket::recv_from(&receiver, &mut buf),
+        )
+        .await
+        .expect("the datagram arrives")
+        .unwrap();
+        assert_eq!(&buf[..len], &[0x01, 2, 3]);
+        assert_eq!(from, sender.local_addr().unwrap());
+    }
 
     /// Each UDP-only error displays exactly as the `TransportError` variant
     /// it replaced did, and classifies the same way.
@@ -896,6 +1195,28 @@ mod tests {
                 TransportError::Udp(UdpError(UdpErrorKind::Serialization(_))) => {
                     (ErrorScope::Connection, false, true)
                 }
+                TransportError::Quic(QuicError(kind)) => match kind {
+                    // Codes that refuse the message itself, written out per
+                    // namespace: stops 0x11 HEADER_REFUSED, 0x15 OVERLONG,
+                    // 0x18 FRAGMENT_REFUSED; resets 0x22 LENGTH_MISMATCH.
+                    // Every other code in each namespace, known or not, is
+                    // retryable.
+                    QuicErrorKind::Stopped { code } if ![0x11, 0x15, 0x18].contains(code) => {
+                        (ErrorScope::Transient, true, false)
+                    }
+                    QuicErrorKind::Reset { code } if *code != 0x22 => {
+                        (ErrorScope::Transient, true, false)
+                    }
+                    QuicErrorKind::Reset { .. }
+                    | QuicErrorKind::Stopped { .. }
+                    | QuicErrorKind::InvalidFrame
+                    | QuicErrorKind::StreamClosed => (ErrorScope::Stream, false, false),
+                    QuicErrorKind::ConnectionLost
+                    | QuicErrorKind::Refused { .. }
+                    | QuicErrorKind::TimedOut
+                    | QuicErrorKind::EndpointDown
+                    | QuicErrorKind::Protocol { .. } => (ErrorScope::Connection, false, true),
+                },
             }
         }
 
@@ -915,6 +1236,31 @@ mod tests {
             TransportError::Other(anyhow::anyhow!("x")),
             TransportError::from(crypto::DecryptionError::DecryptionFailed),
             TransportError::from(bincode::deserialize::<u64>(&[]).unwrap_err()),
+            TransportError::from(QuicErrorKind::ConnectionLost),
+            TransportError::from(QuicErrorKind::Reset { code: 0x21 }),
+            TransportError::from(QuicErrorKind::Stopped { code: 0x12 }),
+            TransportError::from(QuicErrorKind::Stopped { code: 0x14 }),
+            TransportError::from(QuicErrorKind::Stopped { code: 0x16 }),
+            TransportError::from(QuicErrorKind::Stopped { code: 0x11 }),
+            TransportError::from(QuicErrorKind::Reset { code: 0x15 }),
+            TransportError::from(QuicErrorKind::Stopped { code: 0x13 }),
+            TransportError::from(QuicErrorKind::Stopped { code: 0x17 }),
+            TransportError::from(QuicErrorKind::Stopped { code: 0x18 }),
+            TransportError::from(QuicErrorKind::Reset { code: 0x22 }),
+            TransportError::from(QuicErrorKind::Stopped { code: 0x1f }),
+            // Cross-namespace values: a reset carrying a deterministic stop
+            // value, and a stop carrying the deterministic reset value.
+            TransportError::from(QuicErrorKind::Reset { code: 0x11 }),
+            TransportError::from(QuicErrorKind::Reset { code: 0x18 }),
+            TransportError::from(QuicErrorKind::Stopped { code: 0x22 }),
+            TransportError::from(QuicErrorKind::Refused {
+                reason: QuicRefusal::Downgrade,
+            }),
+            TransportError::from(QuicErrorKind::TimedOut),
+            TransportError::from(QuicErrorKind::EndpointDown),
+            TransportError::from(QuicErrorKind::Protocol { code: 0xa }),
+            TransportError::from(QuicErrorKind::InvalidFrame),
+            TransportError::from(QuicErrorKind::StreamClosed),
         ];
         for err in &cases {
             let (scope, old_transient, closes) = expected(err);

@@ -19,6 +19,8 @@ pub(crate) enum ValidateOverride {
     Invalid,
     /// Return `RequestRelated` with an empty vec (malformed request).
     EmptyRequestRelated,
+    /// `Valid` exactly when the predicate holds for the state bytes.
+    ValidWhen(fn(&[u8]) -> bool),
 }
 
 /// Configurable `update_state` behavior for testing related contract flows.
@@ -68,6 +70,22 @@ pub(crate) enum UpdateOverride {
     /// merge canonicalizes, every later one is a fixpoint. The
     /// identical-input probe must NOT flag this shape.
     CanonicalizeOnce,
+    /// A full-state merge given as a pure function `merge(current, incoming)`,
+    /// folded over every `State` entry in the batch. Lets a test run the
+    /// executor's probes against a merge with known algebraic properties.
+    MergeWith(fn(&[u8], &[u8]) -> Vec<u8>),
+    /// [`Self::MergeWith`] for a merge that can refuse: `None` is returned as a
+    /// contract error (`InvalidUpdateWithInfo`).
+    TryMergeWith(fn(&[u8], &[u8]) -> Option<Vec<u8>>),
+    /// [`Self::MergeWith`], except that when the batch carries no
+    /// `RelatedState` entry and `needs(current)` holds, it returns
+    /// `requires(related)`. Models a contract that needs related state only
+    /// for some stored states.
+    RequiresRelatedWhen {
+        related: ContractInstanceId,
+        needs: fn(&[u8]) -> bool,
+        merge: fn(&[u8], &[u8]) -> Vec<u8>,
+    },
 }
 
 /// A lightweight mock runtime at the `ContractRuntimeInterface` level that lets
@@ -96,11 +114,14 @@ pub(crate) struct MockWasmRuntime {
     pub(crate) delegate_calls: DelegateCallLog,
     /// Model of the runtime's real `DelegateContextCache` (#5544 S7).
     ///
-    /// Keyed by `DelegateKey`, last-write-wins — deliberately the same shape as
-    /// the real thing, INCLUDING the property that makes it hazardous. Without
-    /// this the mock could only show that an extra `process()` happened; with
-    /// it, a test can show that the extra run CORRUPTED a parked continuation,
-    /// which is the thing that actually matters.
+    /// One entry per delegate and hosted user, last-write-wins, like the real
+    /// cache. The user is the one named by the run's `user_context`; a run
+    /// with no `user_context` uses the delegate's entry for no user, which is
+    /// the only entry a node that is not hosted ever uses. Last-write-wins is
+    /// the property that makes a second run of a parked delegate hazardous.
+    /// Without this model the mock could only show that an extra `process()`
+    /// happened; with it, a test can show that the extra run CORRUPTED a
+    /// parked continuation, which is the thing that actually matters.
     ///
     /// Two exclusion bypasses (the notification path and the inter-delegate
     /// hop) shipped in this PR's first round and were caught by review rather
@@ -177,6 +198,9 @@ pub(crate) struct DelegateObservation {
     pub observed_context: Option<Vec<u8>>,
     /// The parameters the run was given (empty for registration requests).
     pub params: Vec<u8>,
+    /// The hosted user whose secrets the run was given, or `None` for a run
+    /// with no user (`SecretScope::Local`).
+    pub secret_user: Option<crate::wasm_runtime::UserId>,
 }
 
 /// Shared handle to a mock delegate's scripted runs.
@@ -186,9 +210,14 @@ pub(crate) type DelegateScript =
 /// Shared handle to the log of delegate invocations.
 pub(crate) type DelegateCallLog = std::sync::Arc<std::sync::Mutex<Vec<DelegateKey>>>;
 
-/// Shared handle to the modelled per-delegate context store.
+/// Key of the modelled context store: the delegate and the hosted user whose
+/// context it is (`None` for a run with no user).
+pub(crate) type DelegateContextKey = (DelegateKey, Option<crate::wasm_runtime::UserId>);
+
+/// Shared handle to the modelled context store, one entry per delegate and
+/// hosted user.
 pub(crate) type DelegateContexts =
-    std::sync::Arc<std::sync::Mutex<std::collections::HashMap<DelegateKey, Vec<u8>>>>;
+    std::sync::Arc<std::sync::Mutex<std::collections::HashMap<DelegateContextKey, Vec<u8>>>>;
 
 /// Shared handle to the per-invocation observation log.
 pub(crate) type DelegateObservations = std::sync::Arc<std::sync::Mutex<Vec<DelegateObservation>>>;
@@ -249,6 +278,13 @@ impl ContractRuntimeInterface for MockWasmRuntime {
                 ValidateOverride::AlwaysRequestRelated(ids) => ValidateResult::RequestRelated(ids),
                 ValidateOverride::Invalid => ValidateResult::Invalid,
                 ValidateOverride::EmptyRequestRelated => ValidateResult::RequestRelated(vec![]),
+                ValidateOverride::ValidWhen(valid) => {
+                    if valid(_state.as_ref()) {
+                        ValidateResult::Valid
+                    } else {
+                        ValidateResult::Invalid
+                    }
+                }
             });
         }
         Ok(ValidateResult::Valid)
@@ -392,6 +428,57 @@ impl ContractRuntimeInterface for MockWasmRuntime {
                     let out = logical[canonical_start..].to_vec();
                     return Ok(UpdateModification::valid(out.into()));
                 }
+                UpdateOverride::TryMergeWith(merge) => {
+                    let mut out = _state.as_ref().to_vec();
+                    for update in update_data {
+                        if let UpdateData::State(incoming) = update {
+                            let Some(next) = merge(&out, incoming.as_ref()) else {
+                                use crate::wasm_runtime::ContractExecError;
+                                use freenet_stdlib::prelude::ContractError as StdlibContractError;
+                                let inner_err = StdlibContractError::InvalidUpdateWithInfo {
+                                    reason: "merge refused".into(),
+                                };
+                                return Err(crate::wasm_runtime::ContractError::from(
+                                    ContractExecError::ContractError(inner_err),
+                                ));
+                            };
+                            out = next;
+                        }
+                    }
+                    return Ok(UpdateModification::valid(out.into()));
+                }
+                UpdateOverride::RequiresRelatedWhen {
+                    related,
+                    needs,
+                    merge,
+                } => {
+                    let has_related = update_data
+                        .iter()
+                        .any(|u| matches!(u, UpdateData::RelatedState { .. }));
+                    if !has_related && needs(_state.as_ref()) {
+                        return Ok(UpdateModification::requires(vec![RelatedContract {
+                            contract_instance_id: related,
+                            mode: RelatedMode::StateOnce,
+                        }])
+                        .map_err(|e| anyhow::anyhow!("{e}"))?);
+                    }
+                    let mut out = _state.as_ref().to_vec();
+                    for update in update_data {
+                        if let UpdateData::State(incoming) = update {
+                            out = merge(&out, incoming.as_ref());
+                        }
+                    }
+                    return Ok(UpdateModification::valid(out.into()));
+                }
+                UpdateOverride::MergeWith(merge) => {
+                    let mut out = _state.as_ref().to_vec();
+                    for update in update_data {
+                        if let UpdateData::State(incoming) = update {
+                            out = merge(&out, incoming.as_ref());
+                        }
+                    }
+                    return Ok(UpdateModification::valid(out.into()));
+                }
             }
         }
         // Accept the last full state or delta from update_data as the new state
@@ -473,6 +560,121 @@ impl ContractStoreBridge for MockWasmRuntime {
 }
 
 impl crate::wasm_runtime::ContractRuntimeBridge for MockWasmRuntime {}
+
+impl Executor<MockWasmRuntime, MockStateStorage> {
+    /// The scripted delegate run behind both `execute_delegate_request` and
+    /// `execute_delegate_hop`. `context_user` selects the context entry, as
+    /// in the real runtime.
+    fn scripted_delegate_request(
+        &mut self,
+        req: DelegateRequest<'_>,
+        secret_user: Option<crate::wasm_runtime::UserId>,
+        context_user: Option<crate::wasm_runtime::UserId>,
+    ) -> Response {
+        // Scripted, for the #5544 park/resume tests. Without a script this
+        // stays the "not supported" error it has always been, so no existing
+        // test changes behaviour.
+        let key = req.key().clone();
+        if self
+            .runtime
+            .delegate_wrong_variant
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            // An internal invariant violation: the executor answering a
+            // delegate request with something that is not a delegate response.
+            // Any non-delegate variant does; `StreamChunk` is simply the
+            // cheapest to construct.
+            return Ok(freenet_stdlib::client_api::HostResponse::StreamChunk {
+                stream_id: 0,
+                index: 0,
+                total: 1,
+                data: Default::default(),
+            });
+        }
+
+        if self
+            .runtime
+            .unregistered_delegates
+            .lock()
+            .unwrap()
+            .contains(&key)
+        {
+            return Err(ExecutorError::request(
+                freenet_stdlib::client_api::DelegateError::Missing(key),
+            ));
+        }
+
+        // Model the real `DelegateContextCache` read-modify-write around every
+        // invocation (#5544 S7): read on entry, record what was seen, write on
+        // exit. Same key (delegate and hosted user), same last-write-wins
+        // semantics as the runtime's.
+        let context_key: DelegateContextKey = (key.clone(), context_user);
+        let observed_context = self
+            .runtime
+            .delegate_contexts
+            .lock()
+            .unwrap()
+            .get(&context_key)
+            .cloned();
+        // Only `ApplicationMessages` carries inbound to classify; the
+        // registration variants carry none. The wildcard is required by
+        // `#[non_exhaustive]` and is listed alongside the known variants so a
+        // future one is not silently swallowed.
+        let (inbound_kinds, params): (Vec<&'static str>, Vec<u8>) = match &req {
+            DelegateRequest::ApplicationMessages {
+                inbound, params, ..
+            } => (
+                inbound.iter().map(inbound_kind).collect(),
+                params.as_ref().to_vec(),
+            ),
+            DelegateRequest::RegisterDelegate { .. }
+            | DelegateRequest::UnregisterDelegate(_)
+            | _ => (Vec::new(), Vec::new()),
+        };
+
+        let script = self.runtime.delegate_script.lock().unwrap().pop_front();
+        let record = |rt: &MockWasmRuntime, writes: Option<Vec<u8>>| {
+            rt.delegate_calls.lock().unwrap().push(key.clone());
+            rt.delegate_observations
+                .lock()
+                .unwrap()
+                .push(DelegateObservation {
+                    delegate_key: key.clone(),
+                    inbound_kinds: inbound_kinds.clone(),
+                    observed_context: observed_context.clone(),
+                    params: params.clone(),
+                    secret_user,
+                });
+            if let Some(bytes) = writes {
+                rt.delegate_contexts
+                    .lock()
+                    .unwrap()
+                    .insert(context_key.clone(), bytes);
+            }
+        };
+
+        let Some(run) = script else {
+            if self.runtime.delegate_calls.lock().unwrap().is_empty() {
+                return Err(ExecutorError::other(anyhow::anyhow!(
+                    "delegates not supported in MockWasmRuntime"
+                )));
+            }
+            // Script exhausted after a real scripted run: the delegate has
+            // nothing more to say. Record the entry so exclusion assertions
+            // still see it.
+            record(&self.runtime, None);
+            return Ok(freenet_stdlib::client_api::HostResponse::DelegateResponse {
+                key,
+                values: Vec::new(),
+            });
+        };
+        record(&self.runtime, run.writes_context);
+        Ok(freenet_stdlib::client_api::HostResponse::DelegateResponse {
+            key,
+            values: run.outbound,
+        })
+    }
+}
 
 impl ContractExecutor for Executor<MockWasmRuntime, MockStateStorage> {
     fn lookup_key(&self, instance_id: &ContractInstanceId) -> Option<ContractKey> {
@@ -564,107 +766,50 @@ impl ContractExecutor for Executor<MockWasmRuntime, MockStateStorage> {
         _origin_contract: Option<&ContractInstanceId>,
         _caller_delegate: Option<&DelegateKey>,
         _connection_scope: crate::client_events::ConnectionScope,
-        _user_context: Option<&UserSecretContext>,
+        user_context: Option<&UserSecretContext>,
     ) -> Response {
-        // Scripted, for the #5544 park/resume tests. Without a script this
-        // stays the "not supported" error it has always been, so no existing
-        // test changes behaviour.
-        let key = req.key().clone();
-        if self
-            .runtime
-            .delegate_wrong_variant
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
-            // An internal invariant violation: the executor answering a
-            // delegate request with something that is not a delegate response.
-            // Any non-delegate variant does; `StreamChunk` is simply the
-            // cheapest to construct.
-            return Ok(freenet_stdlib::client_api::HostResponse::StreamChunk {
-                stream_id: 0,
-                index: 0,
-                total: 1,
-                data: Default::default(),
-            });
-        }
+        let user = user_context.map(|u| *u.user_id());
+        self.scripted_delegate_request(req, user, user)
+    }
 
-        if self
-            .runtime
-            .unregistered_delegates
-            .lock()
-            .unwrap()
-            .contains(&key)
-        {
-            return Err(ExecutorError::request(
-                freenet_stdlib::client_api::DelegateError::Missing(key),
-            ));
-        }
+    async fn execute_delegate_hop(
+        &mut self,
+        req: DelegateRequest<'_>,
+        _caller_delegate: &DelegateKey,
+        _connection_scope: crate::client_events::ConnectionScope,
+        user_context: Option<&UserSecretContext>,
+    ) -> Response {
+        let user = user_context.map(|u| *u.user_id());
+        self.scripted_delegate_request(req, user, user)
+    }
 
-        // Model the real `DelegateContextCache` read-modify-write around every
-        // invocation (#5544 S7): read on entry, record what was seen, write on
-        // exit. Same key, same last-write-wins semantics as the runtime's.
-        let observed_context = self
-            .runtime
+    fn hosted_mode(&self) -> bool {
+        self.hosted_mode
+    }
+
+    fn take_delegate_context(
+        &mut self,
+        delegate: &DelegateKey,
+        user: Option<&crate::wasm_runtime::UserId>,
+    ) -> Option<Vec<u8>> {
+        self.runtime
             .delegate_contexts
             .lock()
             .unwrap()
-            .get(&key)
-            .cloned();
-        // Only `ApplicationMessages` carries inbound to classify; the
-        // registration variants carry none. The wildcard is required by
-        // `#[non_exhaustive]` and is listed alongside the known variants so a
-        // future one is not silently swallowed.
-        let (inbound_kinds, params): (Vec<&'static str>, Vec<u8>) = match &req {
-            DelegateRequest::ApplicationMessages {
-                inbound, params, ..
-            } => (
-                inbound.iter().map(inbound_kind).collect(),
-                params.as_ref().to_vec(),
-            ),
-            DelegateRequest::RegisterDelegate { .. }
-            | DelegateRequest::UnregisterDelegate(_)
-            | _ => (Vec::new(), Vec::new()),
-        };
+            .remove(&(delegate.clone(), user.copied()))
+    }
 
-        let script = self.runtime.delegate_script.lock().unwrap().pop_front();
-        let record = |rt: &MockWasmRuntime, writes: Option<Vec<u8>>| {
-            rt.delegate_calls.lock().unwrap().push(key.clone());
-            rt.delegate_observations
-                .lock()
-                .unwrap()
-                .push(DelegateObservation {
-                    delegate_key: key.clone(),
-                    inbound_kinds: inbound_kinds.clone(),
-                    observed_context: observed_context.clone(),
-                    params: params.clone(),
-                });
-            if let Some(bytes) = writes {
-                rt.delegate_contexts
-                    .lock()
-                    .unwrap()
-                    .insert(key.clone(), bytes);
-            }
-        };
-
-        let Some(run) = script else {
-            if self.runtime.delegate_calls.lock().unwrap().is_empty() {
-                return Err(ExecutorError::other(anyhow::anyhow!(
-                    "delegates not supported in MockWasmRuntime"
-                )));
-            }
-            // Script exhausted after a real scripted run: the delegate has
-            // nothing more to say. Record the entry so exclusion assertions
-            // still see it.
-            record(&self.runtime, None);
-            return Ok(freenet_stdlib::client_api::HostResponse::DelegateResponse {
-                key,
-                values: Vec::new(),
-            });
-        };
-        record(&self.runtime, run.writes_context);
-        Ok(freenet_stdlib::client_api::HostResponse::DelegateResponse {
-            key,
-            values: run.outbound,
-        })
+    fn restore_delegate_context(
+        &mut self,
+        delegate: &DelegateKey,
+        user: Option<&crate::wasm_runtime::UserId>,
+        context: Vec<u8>,
+    ) {
+        self.runtime
+            .delegate_contexts
+            .lock()
+            .unwrap()
+            .insert((delegate.clone(), user.copied()), context);
     }
 
     fn get_subscription_info(&self) -> Vec<crate::message::SubscriptionInfo> {

@@ -429,6 +429,25 @@ Current wire-gated floors:
   wrongly-suppressed peer waits for the ~5-minute interest heartbeat. Bias
   high, but understand that neither direction is free.
 
+- `QUIC_UPGRADE_MIN_VERSION` in
+  `crates/core/src/transport/symmetric_message.rs` (the QUIC upgrade control
+  message `SymmetricMessagePayload::Upgrade`, #5940 step e1).
+
+  Set to **`(0, 2, 149)`**, the release intended to first ship the decoder.
+  Nothing sends the message yet; a later step sends it only to peers that pass
+  `may_send_upgrade`, which reads this floor. Guarded by
+  `QUIC_UPGRADE_SHIPPED_IN`, checked by
+  `symmetric_message.rs::upgrade_floor_tracks_the_shipping_release`. It is set
+  to `Some((0, 2, 149))` ahead of the 0.2.149 cut, because the decoder (#5970)
+  is on `main` and therefore in every tag from 0.2.149 on. If 0.2.149 is cut
+  from a tree without #5970, that claim is false and the floor must be raised
+  instead; nothing can detect that slip once the marker says `Some`. Bias HIGH: a peer at or below
+  0.2.147 panics on a payload it cannot decode and 0.2.148 drops it, so a floor
+  set too low lets a later sender crash old peers. The decoder MUST ship in a
+  release before any release that sends the message.
+  `upgrade_floor_stays_above_every_release_without_the_decoder` catches the
+  floor being lowered.
+
 When a NEW wire-gated feature first ships (not this one), set its floor to
 **exactly that release version** and freeze it, as described above.
 
@@ -870,6 +889,15 @@ that, Gate B requires its download to finish (`MARKER_STAGE_DONE`) and
 path that silently falls back to the stop-phase download is caught; it then
 installs once more with no staged download, so the installer's own download
 path stays covered. What no gate can show is the time budget itself.
+
+Since #5799, a node that cannot fetch the release stays on its current version
+instead of exiting 42, and retries after a cooldown. Once the previous release
+contains that, a staging failure on the runner shows up in Gate B as a node
+that never exited (the canary's deadline stops it) rather than as an exit 42
+after a failed download. Gate B classifies both the same way: if the staging
+failure line says GitHub rate-limited the runner, the result is UNVERIFIED
+(exit 75, environmental, re-run the job); any other staging failure is a
+failure.
 
 **Gate A checks the COMPARISON in one direction only.** Since #5236 it checks
 the version the node says it observed (`latest=`) against the tag

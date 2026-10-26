@@ -35,6 +35,10 @@ pub use wasm_backend::WasmBackend;
 
 /// Default maximum number of connections for the peer.
 pub const DEFAULT_MAX_CONNECTIONS: usize = crate::ring::Ring::DEFAULT_MAX_CONNECTIONS;
+
+/// Memory assumed for sizing the QUIC windows when the OS query fails: 1 GiB,
+/// the same fallback the caches use.
+const QUIC_FALLBACK_TOTAL_RAM: usize = 1024 * 1024 * 1024;
 /// Default minimum number of connections for the peer.
 pub const DEFAULT_MIN_CONNECTIONS: usize = crate::ring::Ring::DEFAULT_MIN_CONNECTIONS;
 /// Default threshold for randomizing potential peers for new connections.
@@ -335,6 +339,7 @@ impl Default for ConfigArgs {
                 ledbat_min_ssthresh: None, // Uses default from NetworkApiConfig
                 congestion_control: None,  // Default: fixedrate (set in NetworkApiConfig)
                 bbr_startup_rate: None,    // Uses default from BBR config
+                transport_quic: None,      // Default: off
             },
             ws_api: WebsocketApiArgs {
                 // `None`, NOT an explicit address: this is the "operator said
@@ -1018,6 +1023,14 @@ impl ConfigArgs {
             if self.network_api.bbr_startup_rate.is_none() {
                 self.network_api.bbr_startup_rate = cfg.network_api.bbr_startup_rate;
             }
+            // Any value in the file is merged, "off" included: an operator
+            // who wrote "off" must keep it even if a later release changes
+            // the default. A value this binary does not know is kept as well
+            // (and treated as off when used), so a later release's setting
+            // survives a rollback's rewrite of the file.
+            if self.network_api.transport_quic.is_none() {
+                self.network_api.transport_quic = cfg.network_api.transport_quic.clone();
+            }
             if let Some(limit) = cfg.network_api.total_bandwidth_limit {
                 self.network_api.total_bandwidth_limit.get_or_insert(limit);
             }
@@ -1533,6 +1546,7 @@ impl ConfigArgs {
                     .clone()
                     .unwrap_or_else(default_congestion_control),
                 bbr_startup_rate: self.network_api.bbr_startup_rate,
+                transport_quic: self.network_api.transport_quic.clone(),
                 skip_load_from_network: self.network_api.skip_load_from_network,
                 dropped_persisted_loopback: dropped_persisted_network_loopback,
             },
@@ -2278,9 +2292,9 @@ impl Config {
                 %address,
                 allowed_hosts = ?self.ws_api.allowed_hosts,
                 hosted_mode = self.ws_api.hosted_mode,
-                "Client API exposure: {reason}. A connection that presents no per-user \
-                 token drives this node's SHARED namespace and can read and modify its \
-                 contract state, identities and keys. Bind loopback \
+                "Client API exposure: {reason}. On a node that is not in hosted mode, a \
+                 connection drives this node's SHARED namespace and can read and modify \
+                 its contract state, identities and keys. Bind loopback \
                  (--ws-api-address ::1) unless you intend this."
             );
         }
@@ -2364,9 +2378,11 @@ pub struct NetworkArgs {
     #[arg(long)]
     pub bandwidth_limit: Option<usize>,
 
-    /// Total bandwidth limit across all connections, in bytes per second. Each
-    /// connection is allowed total / active_connections. Overrides the
-    /// per-connection `--bandwidth-limit`.
+    /// Cap on everything this node sends over UDP, in bytes per second,
+    /// across all connections: data, handshakes, ACKs, keepalives and
+    /// retransmissions. Each connection is also paced at
+    /// total / active_connections (at least --min-bandwidth-per-connection).
+    /// Overrides the per-connection `--bandwidth-limit`.
     #[arg(long)]
     #[serde(
         rename = "total-bandwidth-limit",
@@ -2374,9 +2390,10 @@ pub struct NetworkArgs {
     )]
     pub total_bandwidth_limit: Option<usize>,
 
-    /// Minimum bandwidth per connection when using total_bandwidth_limit (bytes/sec).
-    /// Prevents connection starvation when many connections are active.
-    /// Default: 1 MB/s (1,000,000 bytes/second)
+    /// Minimum pacing rate per connection when using total_bandwidth_limit
+    /// (bytes/sec). Prevents connection starvation when many connections are
+    /// active. Never takes the node above total_bandwidth_limit, and is
+    /// clamped to it. Default: 1 MB/s (1,000,000 bytes/second)
     #[arg(long)]
     #[serde(
         rename = "min-bandwidth-per-connection",
@@ -2475,6 +2492,16 @@ pub struct NetworkArgs {
     #[arg(long, env = "FREENET_BBR_STARTUP_RATE")]
     #[serde(rename = "bbr-startup-rate", skip_serializing_if = "Option::is_none")]
     pub bbr_startup_rate: Option<u64>,
+
+    /// QUIC transport (#5940): `off` (default) or `prefer`.
+    ///
+    /// `prefer` builds a QUIC endpoint on the network port. In this release
+    /// the endpoint accepts no connections and opens none, so the node
+    /// behaves as with `off`. An unknown value is treated as `off`, with a
+    /// warning in the log.
+    #[arg(long, env = "FREENET_TRANSPORT_QUIC", value_name = "off|prefer")]
+    #[serde(rename = "transport-quic", skip_serializing_if = "Option::is_none")]
+    pub transport_quic: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2620,12 +2647,20 @@ pub struct NetworkApiConfig {
     #[serde(alias = "bandwidth-limit", skip_serializing_if = "Option::is_none")]
     pub bandwidth_limit: Option<usize>,
 
-    /// Total bandwidth limit across ALL connections (in bytes per second).
-    /// When set, individual connection rates are computed as: `total / active_connections`.
-    /// This overrides the per-connection `bandwidth_limit`.
+    /// Cap on everything the node sends over UDP, across ALL connections (in
+    /// bytes per second of UDP payload): stream data, short messages,
+    /// handshakes, ACKs, keepalives and retransmissions. Every datagram is
+    /// charged to one node-wide token bucket (`transport::egress_cap`);
+    /// stream fragments wait for it, and the rest is sent at once and paid
+    /// back by later waits, so the cap holds on average. A cap too low for
+    /// the number of concurrent streams fails streams (see the bandwidth
+    /// configuration guide). When set, individual connection rates are also
+    /// computed as: `total / active_connections`. This overrides the
+    /// per-connection `bandwidth_limit`.
     ///
     /// Example: With 50 MB/s total and 5 connections, each gets 10 MB/s.
-    /// Default: None (use per-connection `bandwidth_limit` instead)
+    /// A value of 0 is ignored (with a warning) rather than taken as a cap.
+    /// Default: None (use per-connection `bandwidth_limit` instead; no cap)
     #[serde(
         alias = "total-bandwidth-limit",
         skip_serializing_if = "Option::is_none"
@@ -2635,7 +2670,10 @@ pub struct NetworkApiConfig {
     /// Minimum bandwidth per connection when using `total_bandwidth_limit` (bytes/sec).
     /// Prevents connection starvation when many connections are active.
     ///
-    /// If `total / N < min`, each connection gets `min` (exceeding total is possible).
+    /// If `total / N < min`, each connection is paced at `min`, but the
+    /// node-wide cap still holds the node at `total`: the minimum is a pacing
+    /// floor inside the total, not an allowance above it. A minimum above the
+    /// total is clamped to the total.
     /// Default: 1 MB/s (1,000,000 bytes/second)
     #[serde(
         alias = "min-bandwidth-per-connection",
@@ -2720,6 +2758,16 @@ pub struct NetworkApiConfig {
     )]
     pub bbr_startup_rate: Option<u64>,
 
+    /// QUIC transport (#5940): `off` (the default when unset) or `prefer`.
+    /// Kept as written, so a value from a later release round-trips; see
+    /// [`Self::quic_settings`] for how it is read.
+    #[serde(
+        default,
+        rename = "transport-quic",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub transport_quic: Option<String>,
+
     /// When true, this node is part of a local/test network and does not load
     /// gateways from the public remote index. Used to disable the relay-ready
     /// gate and other production-only features. The on-disk gateways.toml is
@@ -2744,6 +2792,22 @@ pub struct NetworkApiConfig {
 }
 
 impl NetworkApiConfig {
+    /// The QUIC endpoint settings when `transport-quic` turns QUIC on, or
+    /// `None` when it is off, unset or a value this binary does not know
+    /// (which logs a warning). Reads the node's memory limit, since the
+    /// endpoint's flow-control windows are sized from it.
+    pub(crate) fn quic_settings(&self) -> Option<crate::transport::quic::QuicSettings> {
+        use crate::transport::quic::QuicMode;
+        match QuicMode::from_config_value(self.transport_quic.as_deref()) {
+            QuicMode::Off => None,
+            QuicMode::Prefer => Some(crate::transport::quic::QuicSettings {
+                max_connections: self.max_connections,
+                memory_limit: crate::wasm_runtime::read_total_ram_bytes()
+                    .unwrap_or(QUIC_FALLBACK_TOTAL_RAM),
+            }),
+        }
+    }
+
     /// Build a `CongestionControlConfig` from the current network API configuration.
     ///
     /// This parses the `congestion_control` string to determine the algorithm
@@ -3332,10 +3396,18 @@ pub struct WebsocketApiConfig {
     /// gets a per-user delegate-secret namespace derived from that token; when
     /// `false` (the default), the `userToken` parameter is ignored entirely and
     /// every connection is single-user — byte-for-byte the pre-#4381 behavior.
+    /// A hosted node serves its client API only to a connection that presents a
+    /// user token.
     ///
-    /// This flag ONLY governs whether the WS boundary derives a per-user
-    /// context; everything downstream is driven by whether a context was
-    /// derived, so with the flag off the entire feature is inert.
+    /// The flag also governs the rest of hosted mode:
+    /// - the permission routes require a user token, show each user only their
+    ///   own prompts, and the permission routes a hosted node does not serve
+    ///   are refused;
+    /// - imports into the node-local secret scope are refused;
+    /// - the node sends no contract notifications to delegates;
+    /// - the executor refuses a delegate run that has no user.
+    ///
+    /// With the flag off none of these apply.
     #[serde(default, rename = "hosted-mode")]
     pub hosted_mode: bool,
 
@@ -3767,33 +3839,24 @@ fn resolve_ws_api_address(
 /// machine while connections can land in ONE shared secret namespace, and if
 /// so, why. `None` means stay quiet.
 ///
-/// The shared namespace is the danger. `decide_user_token` hands a connection
-/// the node's single-user context whenever hosted mode is off **or the
-/// connection simply omits `userToken`** — so hosted mode ADDS a per-user
-/// namespace for well-behaved clients, it does not remove the shared one.
+/// The shared namespace is the danger. A node that is not in hosted mode hands
+/// every connection its single-user context. A hosted node serves its client
+/// API only to a connection that presents a user token, so it hands none of
+/// them that context.
 ///
 /// Two triggers:
-/// - a **non-loopback bind** warns regardless of hosted mode, because any host
-///   that can route to the address can omit a token and land in the shared
-///   namespace;
+/// - a **non-loopback bind** warns regardless of hosted mode: without hosted
+///   mode any host that can route to the address lands in the shared
+///   namespace, and with it a user token is honoured only from a loopback
+///   source, so a wide bind is not the deployment hosted mode expects;
 /// - **`--allowed-host` on a loopback bind with hosted mode OFF** warns. That
 ///   flag names a reverse proxy, and a proxy terminates the connection itself,
 ///   so every visitor arrives wearing the proxy's source address and the node's
 ///   own source-IP filters cannot tell them apart.
 ///
-/// **Loopback + hosted mode stays quiet, and that is a known gap, not an
-/// assertion of safety.** A connection that omits `userToken` reads the shared
-/// namespace there too, and behind a public proxy that is any visitor;
-/// containment on the flagship deployment today is that the shared namespace is
-/// empty (measured: zero files outside `*/users/*`), which is a fact about
-/// current state rather than a structural guarantee. Making this branch fire
-/// only when the shared namespace actually holds something needs a probe of the
-/// secrets tree, which is a separate change with its own failure modes — it is
-/// tracked in advisory GHSA-824h-7x5x-wfmf §8, with the measured tree shape and
-/// the requirements, rather than bolted onto a default-hardening PR, because a
-/// probe that is wrong in either direction is worse than no warning: too eager
-/// and it fires on every boot of the flagship and trains operators to ignore the
-/// one signal there is.
+/// **Loopback + hosted mode stays quiet.** A hosted node serves its client API
+/// only to a connection that presents a user token, and each token has its own
+/// namespace, including behind a public proxy.
 fn ws_api_shares_one_namespace_with_remote_clients(
     hosted_mode: bool,
     address: IpAddr,
@@ -3802,8 +3865,9 @@ fn ws_api_shares_one_namespace_with_remote_clients(
     if !address.is_loopback() {
         return Some(if hosted_mode {
             "the client API is bound to a non-loopback address, and hosted mode does \
-             not close that: a connection which simply omits `userToken` still lands \
-             in this node's shared single-user namespace"
+             not serve remote clients that way: it serves the client API only to a \
+             connection that presents a user token, and honours a token only from a \
+             loopback source behind a TLS proxy, so bind loopback behind the proxy"
         } else {
             "the client API is bound to a non-loopback address, so any host that can \
              route to it can drive this node"
@@ -3840,6 +3904,344 @@ pub struct ConfigPathsArgs {
     pub log_dir: Option<PathBuf>,
 }
 
+/// Directory under which `ConfigPathsArgs::default_dirs` places the
+/// `freenet-{id}` temp data dirs.
+///
+/// Outside unit tests this is the OS temp dir, unchanged. In a unit-test
+/// build it is a directory private to this process
+/// (`$TMPDIR/freenet-test-<pid>`, see [`test_temp_root`]). `default_dirs`
+/// deletes any existing `freenet-{id}` dir before reusing the name, and the
+/// ids are fixed strings in the tests, so with a shared root a second test
+/// process (another worktree's `cargo test` on the same machine, or a second
+/// binary run in parallel) deleted this process's live data dirs mid-test and
+/// the test failed with `build Config: No such file or directory`.
+#[cfg(not(test))]
+fn default_temp_root() -> PathBuf {
+    std::env::temp_dir()
+}
+
+#[cfg(test)]
+fn default_temp_root() -> PathBuf {
+    static ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    ROOT.get_or_init(|| test_temp_root::claim(&std::env::temp_dir()))
+        .clone()
+}
+
+/// Per-process temp roots for unit-test builds.
+///
+/// A root is `freenet-test-<pid>`, or `freenet-test-<pid>-<n>` if that name
+/// is held by another live process (for example one with the same pid in
+/// another pid namespace that shares `/tmp`). Ownership is an exclusive
+/// `flock` on `<root>/.owner.lock`, held for the life of the process and
+/// released by the kernel when it exits. Liveness is decided by that lock
+/// alone, never by the pid in the name: pid reuse, pid namespaces and other
+/// users' processes all make a pid check unreliable. `flock` is only
+/// reliable on a local filesystem; on NFS mounted with `nolock` or
+/// `local_lock` a live root can look unlocked to another host, so `TMPDIR`
+/// must be local.
+///
+/// On first use the sweep removes stale roots. It only touches an entry
+/// whose name matches exactly what `claim` produces (`freenet-test-<digits>`
+/// or `freenet-test-<digits>-<digits>`) or a tombstone
+/// (`.freenet-test-reap-<digits>-<digits>`), that is a real directory (not a
+/// symlink) and that is owned by this user. A root is stale when this
+/// process acquires its lock and the locked file is still the one at that
+/// path. While still holding the lock, the sweeper renames the root to a
+/// tombstone, a name no claimer uses, and only then deletes it, so a process
+/// claiming the same name meanwhile finds no directory and creates a fresh
+/// one instead of having its new lock deleted by the sweeper's
+/// `remove_dir_all`.
+///
+/// A root with NO lock file may belong to a process between `mkdir` and
+/// `flock`, so it is left alone until its mtime is older than
+/// [`test_temp_root::LOCKLESS_ROOT_MAX_AGE`]; it is then reaped the same way,
+/// after the sweeper creates and takes its lock (so a claimer racing for the
+/// name loses the `flock` and moves on). This covers a process that died in
+/// that window and a partially removed root that lost its lock file. It also
+/// means a LIVE owner's root is reaped if something else deletes its
+/// `.owner.lock` (a manual `rm`, a `/tmp` cleaner) and the root's own entries
+/// then go unchanged for that long, because nothing distinguishes it from a
+/// dead owner's.
+///
+/// Non-unix builds have no `flock` here: they get a pid-named root (pids are
+/// not shared across namespaces there), and the sweep removes other roots of
+/// the right name only by the same age rule, skipping this process's own.
+/// A live test process older than that age can therefore lose its root on
+/// non-unix.
+#[cfg(test)]
+mod test_temp_root {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, SystemTime};
+
+    pub(super) const PREFIX: &str = "freenet-test-";
+    /// A root with no lock file is reaped once its mtime is older than this.
+    /// Its owner can only legitimately lack a lock between `mkdir` and
+    /// `flock`, which takes microseconds, so a day leaves a wide margin.
+    pub(super) const LOCKLESS_ROOT_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+    #[cfg(unix)]
+    pub(super) const LOCK: &str = ".owner.lock";
+    #[cfg(unix)]
+    pub(super) const TOMBSTONE_PREFIX: &str = ".freenet-test-reap-";
+    /// Sequential names tried before falling back to random suffixes.
+    #[cfg(unix)]
+    pub(super) const SEQUENTIAL_NAMES: u32 = 64;
+
+    /// A fresh random value from the std hasher's per-instance keys, so no
+    /// RNG dependency is needed in this test-only code.
+    pub(super) fn random_u64() -> u64 {
+        use std::hash::{BuildHasher, Hasher};
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u128(
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        );
+        h.finish()
+    }
+
+    pub(super) fn claim(tmp: &Path) -> PathBuf {
+        let pid = std::process::id();
+        #[cfg(unix)]
+        {
+            sweep(tmp, SystemTime::now());
+            let mut last_failure = String::new();
+            let sequential = (0..SEQUENTIAL_NAMES).map(|n| {
+                if n == 0 {
+                    format!("{PREFIX}{pid}")
+                } else {
+                    format!("{PREFIX}{pid}-{n}")
+                }
+            });
+            // Never fall back to an unlocked or shared root.
+            let random = (0..16).map(|_| format!("{PREFIX}{pid}-{}", random_u64()));
+            for name in sequential.chain(random) {
+                let root = tmp.join(name);
+                match unix::try_own(&root) {
+                    Ok(()) => return root,
+                    Err(why) => last_failure = format!("{root:?}: {why}"),
+                }
+            }
+            panic!(
+                "every candidate test temp root name was refused under TMPDIR={tmp:?} \
+                 (last: {last_failure}). TMPDIR must be a writable local filesystem where \
+                 flock works (not NFS with nolock/local_lock)."
+            );
+        }
+        #[cfg(not(unix))]
+        {
+            let root = tmp.join(format!("{PREFIX}{pid}"));
+            sweep_aged_roots(tmp, &root, SystemTime::now());
+            let _created = fs::create_dir_all(&root);
+            root
+        }
+    }
+
+    /// `s` is `min..=max` dash-separated segments, each one or more ASCII
+    /// digits.
+    fn digit_segments(s: &str, min: usize, max: usize) -> bool {
+        let mut count = 0;
+        for segment in s.split('-') {
+            if segment.is_empty() || !segment.bytes().all(|b| b.is_ascii_digit()) {
+                return false;
+            }
+            count += 1;
+        }
+        (min..=max).contains(&count)
+    }
+
+    /// Exactly the names `claim` produces: `freenet-test-<digits>` or
+    /// `freenet-test-<digits>-<digits>`.
+    pub(super) fn is_root_name(name: &str) -> bool {
+        name.strip_prefix(PREFIX)
+            .is_some_and(|s| digit_segments(s, 1, 2))
+    }
+
+    /// Exactly the names `reap` produces: `.freenet-test-reap-<digits>-<digits>`.
+    #[cfg(unix)]
+    pub(super) fn is_tombstone_name(name: &str) -> bool {
+        name.strip_prefix(TOMBSTONE_PREFIX)
+            .is_some_and(|s| digit_segments(s, 2, 2))
+    }
+
+    /// The entry's mtime is more than [`LOCKLESS_ROOT_MAX_AGE`] before `now`.
+    /// An unreadable or future mtime is not aged.
+    pub(super) fn is_aged(meta: &fs::Metadata, now: SystemTime) -> bool {
+        meta.modified()
+            .ok()
+            .and_then(|mtime| now.duration_since(mtime).ok())
+            .is_some_and(|age| age > LOCKLESS_ROOT_MAX_AGE)
+    }
+
+    /// The non-unix sweep (no `flock` there): remove root-named real
+    /// directories other than `own` whose mtime is older than
+    /// [`LOCKLESS_ROOT_MAX_AGE`]. Compiled everywhere so unix tests cover it.
+    pub(super) fn sweep_aged_roots(tmp: &Path, own: &Path, now: SystemTime) {
+        let Ok(entries) = fs::read_dir(tmp) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path == own
+                || !entry.file_name().to_str().is_some_and(is_root_name)
+                || !entry.file_type().is_ok_and(|t| t.is_dir())
+                || !fs::symlink_metadata(&path).is_ok_and(|m| is_aged(&m, now))
+            {
+                continue;
+            }
+            let _stale = fs::remove_dir_all(&path);
+        }
+    }
+
+    #[cfg(unix)]
+    pub(super) fn sweep(tmp: &Path, now: SystemTime) {
+        let Ok(entries) = fs::read_dir(tmp) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            // `DirEntry::file_type` does not follow symlinks.
+            if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+                continue;
+            }
+            let path = entry.path();
+            if !unix::owned_by_me(&path) {
+                continue;
+            }
+            if is_tombstone_name(name) {
+                // Left by a sweeper that died mid-removal. A tombstone is
+                // never a live root, so removing it again is harmless.
+                let _stale = fs::remove_dir_all(&path);
+                continue;
+            }
+            if !is_root_name(name) {
+                continue;
+            }
+            let lock = match unix::try_lock_existing(&path) {
+                Some(lock) => lock,
+                None if fs::symlink_metadata(&path).is_ok_and(|m| is_aged(&m, now)) => {
+                    // No lock we could take, but old enough to be dead if
+                    // lockless. Create and take the lock ourselves: if it
+                    // exists and is held (a live owner), or a claimer racing
+                    // for this name took it first, the flock fails and the
+                    // root is kept.
+                    match unix::open_lock(&path, true).and_then(|f| unix::lock_if_current(&path, f))
+                    {
+                        Some(lock) => lock,
+                        None => continue,
+                    }
+                }
+                None => continue,
+            };
+            let _reaped = reap(tmp, &path, lock, || {});
+        }
+    }
+
+    /// Remove a root whose lock `_lock` holds (until this returns): rename it
+    /// to a tombstone, run `between` (a test hook standing in for a
+    /// concurrent claimer), then delete the tombstone.
+    #[cfg(unix)]
+    pub(super) fn reap(
+        tmp: &Path,
+        root: &Path,
+        _lock: fs::File,
+        between: impl FnOnce(),
+    ) -> std::io::Result<()> {
+        let pid = std::process::id();
+        let tombstone = tmp.join(format!("{TOMBSTONE_PREFIX}{pid}-{}", random_u64()));
+        fs::rename(root, &tombstone)?;
+        between();
+        fs::remove_dir_all(&tombstone)
+    }
+
+    #[cfg(unix)]
+    pub(super) mod unix {
+        use super::LOCK;
+        use std::fs::{self, File, OpenOptions};
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        use std::os::unix::io::AsRawFd;
+        use std::path::Path;
+
+        /// A real directory (not a symlink) owned by this effective user.
+        pub(in super::super) fn owned_by_me(path: &Path) -> bool {
+            // SAFETY: geteuid has no preconditions and cannot fail.
+            let me = unsafe { libc::geteuid() };
+            fs::symlink_metadata(path).is_ok_and(|m| m.is_dir() && m.uid() == me)
+        }
+
+        /// Exclusive non-blocking `flock`; `true` when acquired.
+        fn flock_exclusive(file: &File) -> bool {
+            // SAFETY: the fd is valid for the lifetime of `file`.
+            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
+        }
+
+        /// The locked file is still the one at `<root>/LOCK`, i.e. nobody
+        /// removed or replaced it between our open and our flock.
+        fn still_at_path(root: &Path, file: &File) -> bool {
+            match (fs::symlink_metadata(root.join(LOCK)), file.metadata()) {
+                (Ok(on_disk), Ok(held)) => {
+                    on_disk.dev() == held.dev() && on_disk.ino() == held.ino()
+                }
+                _ => false,
+            }
+        }
+
+        pub(in super::super) fn open_lock(root: &Path, create: bool) -> Option<File> {
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(create)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(root.join(LOCK))
+                .ok()
+        }
+
+        /// Lock `file` and confirm it is still `<root>/LOCK`.
+        pub(in super::super) fn lock_if_current(root: &Path, file: File) -> Option<File> {
+            (flock_exclusive(&file) && still_at_path(root, &file)).then_some(file)
+        }
+
+        /// Lock an existing root's lock file; `None` if it has none, its
+        /// owner is alive, or it changed under us.
+        pub(in super::super) fn try_lock_existing(root: &Path) -> Option<File> {
+            lock_if_current(root, open_lock(root, false)?)
+        }
+
+        /// Create (or adopt a dead owner's) root and hold its lock for the
+        /// rest of the process. `Err` says why the name could not be taken.
+        pub(in super::super) fn try_own(root: &Path) -> Result<(), String> {
+            fs::create_dir_all(root).map_err(|e| format!("create_dir_all failed: {e}"))?;
+            if !owned_by_me(root) {
+                return Err("not a real directory owned by this user".into());
+            }
+            let file = open_lock(root, true).ok_or("could not open the lock file")?;
+            let file = lock_if_current(root, file)
+                .ok_or("flock failed (held by a live process) or the lock file was replaced")?;
+            // A dead owner's leftovers (same pid, reused): start empty.
+            if let Ok(entries) = fs::read_dir(root) {
+                for entry in entries.flatten() {
+                    if entry.file_name() == LOCK {
+                        continue;
+                    }
+                    let path = entry.path();
+                    let _leftover = if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                        fs::remove_dir_all(&path)
+                    } else {
+                        fs::remove_file(&path)
+                    };
+                }
+            }
+            // Held until the process exits; the kernel releases it then.
+            std::mem::forget(file);
+            Ok(())
+        }
+    }
+}
+
 impl ConfigPathsArgs {
     fn merge(&mut self, other: ConfigPaths) {
         self.config_dir.get_or_insert(other.config_dir);
@@ -3855,7 +4257,7 @@ impl ConfigPathsArgs {
             } else {
                 "freenet".into()
             };
-            let temp_path = std::env::temp_dir().join(&base_name);
+            let temp_path = default_temp_root().join(&base_name);
 
             // Clean up stale temp directories from previous test runs that may have
             // different permissions (common on shared CI runners). If we can't remove
@@ -3863,7 +4265,7 @@ impl ConfigPathsArgs {
             // fallback path with process ID to avoid conflicts.
             if temp_path.exists() && fs::remove_dir_all(&temp_path).is_err() {
                 let unique_path =
-                    std::env::temp_dir().join(format!("{}-{}", base_name, std::process::id()));
+                    default_temp_root().join(format!("{}-{}", base_name, std::process::id()));
                 // Clean up any stale unique path too (unlikely but possible)
                 let _cleanup = fs::remove_dir_all(&unique_path);
                 return Ok(Either::Right(unique_path));
@@ -5902,6 +6304,341 @@ mod tests {
 
     use super::*;
 
+    /// A test's `freenet-{id}` data dir is private to this process. The ids
+    /// are fixed strings and `default_dirs` deletes an existing dir of that
+    /// name, so a dir in a root shared with other processes was deleted by
+    /// any other process running the same test, failing this one with
+    /// `build Config: No such file or directory`. The dir another process
+    /// holds at the old shared location must survive. The id is unique
+    /// beyond the pid, so concurrent runs of this test (including ones with
+    /// the same pid in another pid namespace) do not share `shared` either.
+    #[test]
+    fn default_temp_dir_is_private_to_the_process() {
+        let pid = std::process::id();
+        let id = format!(
+            "default-dir-isolation-{pid}-{}",
+            test_temp_root::random_u64()
+        );
+        let shared = std::env::temp_dir().join(format!("freenet-{id}"));
+        fs::create_dir_all(shared.join("db")).unwrap();
+
+        let Either::Right(dir) = ConfigPathsArgs::default_dirs(Some(&id)).unwrap() else {
+            panic!("an id must resolve to a temp dir");
+        };
+
+        let survived = shared.join("db").exists();
+        let _cleanup = fs::remove_dir_all(&shared);
+        assert!(
+            survived,
+            "another process's dir at the shared path was deleted"
+        );
+        let root = dir.parent().expect("data dir has a parent");
+        assert_eq!(root.parent(), Some(std::env::temp_dir().as_path()));
+        let name = root.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let own = format!("freenet-test-{pid}");
+        assert!(
+            name == own || name.starts_with(&format!("{own}-")),
+            "data dir root {root:?} is not private to pid {pid}"
+        );
+    }
+
+    /// The sweep removes only a root whose owner lock nobody holds. A live
+    /// owner, a root still being created (no lock file yet), a symlink and an
+    /// unrelated name must all survive; a dead sweeper's tombstone is removed.
+    #[cfg(unix)]
+    #[test]
+    fn stale_test_root_sweep_spares_live_and_foreign_entries() {
+        use test_temp_root::{LOCK, PREFIX, TOMBSTONE_PREFIX, sweep, unix};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mk = |name: &str, lock: bool| {
+            let root = tmp.path().join(name);
+            fs::create_dir_all(root.join("freenet-x/db")).unwrap();
+            if lock {
+                fs::write(root.join(LOCK), b"").unwrap();
+            }
+            root
+        };
+        let stale = mk(&format!("{PREFIX}4000000001"), true);
+        let live = mk(&format!("{PREFIX}4000000002-1"), true);
+        let creating = mk(&format!("{PREFIX}4000000003"), false);
+        let unrelated = mk(&format!("{PREFIX}abc"), true);
+        let tombstone = mk(&format!("{TOMBSTONE_PREFIX}1-2"), false);
+        let odd_tombstone = mk(&format!("{TOMBSTONE_PREFIX}1-2-3"), false);
+        let odd_root = mk(&format!("{PREFIX}1--2"), true);
+        let target = mk("not-a-test-root", true);
+        let link = tmp.path().join(format!("{PREFIX}4000000004"));
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let _held = unix::try_lock_existing(&live).expect("lock the live root");
+        sweep(tmp.path(), std::time::SystemTime::now());
+
+        assert!(!stale.exists(), "unlocked root was not swept");
+        assert!(!tombstone.exists(), "leftover tombstone was not removed");
+        assert!(live.join("freenet-x/db").exists(), "live root was swept");
+        assert!(
+            creating.join("freenet-x/db").exists(),
+            "lockless root was swept"
+        );
+        assert!(unrelated.exists(), "non-matching name was swept");
+        assert!(odd_tombstone.exists(), "malformed tombstone name was swept");
+        assert!(odd_root.exists(), "malformed root name was swept");
+        assert!(link.symlink_metadata().is_ok(), "symlink was removed");
+        let leftovers: Vec<_> = fs::read_dir(tmp.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| test_temp_root::is_tombstone_name(&e.file_name().to_string_lossy()))
+            .collect();
+        assert!(leftovers.is_empty(), "reap left a tombstone: {leftovers:?}");
+    }
+
+    /// The type and owner checks the sweep relies on: a symlink to a dir
+    /// this user owns, a regular file, and a dir owned by another user are
+    /// all rejected.
+    #[cfg(unix)]
+    #[test]
+    fn sweep_owner_check_rejects_symlinks_files_and_foreign_dirs() {
+        use test_temp_root::unix::owned_by_me;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("d");
+        fs::create_dir(&dir).unwrap();
+        let link = tmp.path().join("l");
+        std::os::unix::fs::symlink(&dir, &link).unwrap();
+        let file = tmp.path().join("f");
+        fs::write(&file, b"").unwrap();
+
+        assert!(owned_by_me(&dir));
+        assert!(!owned_by_me(&link), "symlink accepted");
+        assert!(!owned_by_me(&file), "regular file accepted");
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } != 0 {
+            assert!(!owned_by_me(Path::new("/")), "root-owned dir accepted");
+        }
+    }
+
+    /// A lock file replaced after it was opened must not count as held:
+    /// otherwise a sweeper could lock a stale inode and delete a root a new
+    /// owner holds through the replacement.
+    #[cfg(unix)]
+    #[test]
+    fn lock_on_a_replaced_lock_file_is_rejected() {
+        use test_temp_root::{LOCK, unix};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("r");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join(LOCK), b"").unwrap();
+        let stale = unix::open_lock(&root, false).unwrap();
+        fs::remove_file(root.join(LOCK)).unwrap();
+        fs::write(root.join(LOCK), b"").unwrap();
+
+        assert!(unix::lock_if_current(&root, stale).is_none());
+        assert!(unix::try_lock_existing(&root).is_some());
+    }
+
+    /// While a sweeper reaps a dead root, a process claiming the same name
+    /// must end up with a fresh, intact, locked root: the sweeper renames
+    /// the root away before deleting anything.
+    #[cfg(unix)]
+    #[test]
+    fn reap_renames_before_removing_so_a_concurrent_claim_survives() {
+        use test_temp_root::{LOCK, reap, unix};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("freenet-test-4000000005");
+        fs::create_dir_all(root.join("old")).unwrap();
+        fs::write(root.join(LOCK), b"").unwrap();
+        let lock = unix::try_lock_existing(&root).unwrap();
+
+        let mut claimed = false;
+        reap(tmp.path(), &root, lock, || {
+            claimed = unix::try_own(&root).is_ok();
+            fs::create_dir_all(root.join("new")).unwrap();
+        })
+        .unwrap();
+
+        assert!(claimed, "claimer could not take the name during the reap");
+        assert!(
+            root.join("new").exists(),
+            "the new owner's data was deleted"
+        );
+        assert!(!root.join("old").exists());
+        assert!(root.join(LOCK).exists(), "the new owner's lock was deleted");
+        assert!(
+            unix::try_lock_existing(&root).is_none(),
+            "the new owner's root is not locked"
+        );
+    }
+
+    /// A root adopted from a dead owner with the same name starts empty,
+    /// apart from its lock file.
+    #[cfg(unix)]
+    #[test]
+    fn adopted_root_is_emptied_before_reuse() {
+        use test_temp_root::{LOCK, unix};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("r");
+        fs::create_dir_all(root.join("freenet-old/db")).unwrap();
+        fs::write(root.join("stray"), b"x").unwrap();
+        fs::write(root.join(LOCK), b"").unwrap();
+
+        assert!(unix::try_own(&root).is_ok());
+        let left: Vec<_> = fs::read_dir(&root)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(left, vec![std::ffi::OsString::from(LOCK)]);
+    }
+
+    /// A root whose name is already held by a live process is not shared:
+    /// `claim` moves on to another name, each claimed root is locked, and
+    /// once the sequential names are exhausted the random fallback is still
+    /// a locked root the sweep recognises.
+    #[cfg(unix)]
+    #[test]
+    fn claim_never_shares_a_held_root() {
+        use test_temp_root::{SEQUENTIAL_NAMES, claim, is_root_name, unix};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let roots: Vec<_> = (0..=SEQUENTIAL_NAMES).map(|_| claim(tmp.path())).collect();
+        let distinct: std::collections::HashSet<_> = roots.iter().collect();
+        assert_eq!(distinct.len(), roots.len(), "a root was handed out twice");
+        for root in &roots {
+            assert!(
+                unix::try_lock_existing(root).is_none(),
+                "{root:?} is not locked"
+            );
+            let name = root.file_name().and_then(|n| n.to_str()).unwrap();
+            assert!(is_root_name(name), "{name} would never be swept");
+        }
+        // The 65th root must come from the random fallback, not a
+        // sequential name. A random u64 is <= SEQUENTIAL_NAMES with
+        // probability ~65/2^64.
+        let pid = std::process::id();
+        let last = roots.last().unwrap().file_name().unwrap().to_str().unwrap();
+        let suffix: u64 = last
+            .strip_prefix(&format!("freenet-test-{pid}-"))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| panic!("unexpected fallback name {last}"));
+        assert!(
+            suffix > u64::from(SEQUENTIAL_NAMES),
+            "fallback {last} is a sequential name"
+        );
+    }
+
+    /// The sweep only deletes names `claim` and `reap` can produce.
+    #[test]
+    fn test_temp_root_name_grammar() {
+        use test_temp_root::is_root_name;
+        for ok in ["freenet-test-1", "freenet-test-123", "freenet-test-123-4"] {
+            assert!(is_root_name(ok), "{ok} rejected");
+        }
+        for bad in [
+            "freenet-test-",
+            "freenet-test--1",
+            "freenet-test-1-",
+            "freenet-test-1--2",
+            "freenet-test-1-2-3",
+            "freenet-test-1a",
+            "freenet-test-abc",
+            "freenet-test-run-20261025-101010",
+            "freenet-1",
+            "xfreenet-test-1",
+        ] {
+            assert!(!is_root_name(bad), "{bad} accepted");
+        }
+        #[cfg(unix)]
+        {
+            use test_temp_root::is_tombstone_name;
+            assert!(is_tombstone_name(".freenet-test-reap-12-34"));
+            for bad in [
+                ".freenet-test-reap-12",
+                ".freenet-test-reap-12-",
+                ".freenet-test-reap-12--34",
+                ".freenet-test-reap-1-2-3",
+                ".freenet-test-reap-1-x",
+                "freenet-test-reap-1-2",
+            ] {
+                assert!(!is_tombstone_name(bad), "{bad} accepted");
+            }
+        }
+    }
+
+    /// Backdate a directory's mtime by `age`.
+    fn set_age(dir: &Path, age: std::time::Duration) {
+        let mtime = std::time::SystemTime::now() - age;
+        File::open(dir).unwrap().set_modified(mtime).unwrap();
+    }
+
+    /// A lockless root (its owner died between mkdir and flock, or a partial
+    /// removal took its lock file) is reaped once older than
+    /// LOCKLESS_ROOT_MAX_AGE; a fresh lockless root and an aged root whose
+    /// lock is held are kept.
+    #[cfg(unix)]
+    #[test]
+    fn aged_lockless_test_root_is_reaped() {
+        use test_temp_root::{LOCK, LOCKLESS_ROOT_MAX_AGE, PREFIX, sweep, unix};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let old = LOCKLESS_ROOT_MAX_AGE + std::time::Duration::from_secs(3600);
+        let mk = |name: &str| {
+            let root = tmp.path().join(name);
+            fs::create_dir_all(root.join("freenet-x/db")).unwrap();
+            root
+        };
+        let aged = mk(&format!("{PREFIX}4000000011"));
+        let fresh = mk(&format!("{PREFIX}4000000012"));
+        let held = mk(&format!("{PREFIX}4000000013"));
+        fs::write(held.join(LOCK), b"").unwrap();
+        let _held_lock = unix::try_lock_existing(&held).expect("lock the live root");
+        set_age(&aged, old);
+        set_age(&held, old);
+
+        sweep(tmp.path(), std::time::SystemTime::now());
+
+        assert!(!aged.exists(), "aged lockless root was not reaped");
+        assert!(
+            fresh.join("freenet-x/db").exists(),
+            "fresh lockless root was reaped"
+        );
+        assert!(
+            held.join("freenet-x/db").exists(),
+            "aged root with a held lock was reaped"
+        );
+    }
+
+    /// The non-unix sweep: aged roots of the right name are removed; this
+    /// process's own root, fresh roots and other names are kept.
+    #[test]
+    fn non_unix_age_sweep_spares_own_fresh_and_foreign_roots() {
+        use test_temp_root::{LOCKLESS_ROOT_MAX_AGE, PREFIX, sweep_aged_roots};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let old = LOCKLESS_ROOT_MAX_AGE + std::time::Duration::from_secs(3600);
+        let mk = |name: &str, aged: bool| {
+            let root = tmp.path().join(name);
+            fs::create_dir_all(root.join("db")).unwrap();
+            if aged {
+                set_age(&root, old);
+            }
+            root
+        };
+        let stale = mk(&format!("{PREFIX}4000000021"), true);
+        let own = mk(&format!("{PREFIX}4000000022"), true);
+        let fresh = mk(&format!("{PREFIX}4000000023"), false);
+        let foreign = mk(&format!("{PREFIX}run-1"), true);
+
+        sweep_aged_roots(tmp.path(), &own, std::time::SystemTime::now());
+
+        assert!(!stale.exists(), "aged root was not removed");
+        assert!(own.join("db").exists(), "own root was removed");
+        assert!(fresh.join("db").exists(), "fresh root was removed");
+        assert!(foreign.join("db").exists(), "non-matching name was removed");
+    }
+
     /// The pool size is the multiplier in every per-worker memory budget
     /// (#5268 defect 3), so its clamp boundaries are load-bearing, not cosmetic:
     /// the divisor the budgets use and the count the pool actually creates come
@@ -6156,6 +6893,48 @@ shutdown-drain-secs = 42
         let cfg: Config = toml::from_str(RELEASED_CONFIG_TOML)
             .expect("a config.toml written by any release must still parse");
         assert_seeded_values_bound(&cfg);
+    }
+
+    /// `transport-quic` (#5940) is read from `config.toml` in kebab-case, is
+    /// absent from a file that does not set it (so a release that predates
+    /// it sees nothing new), and survives a rewrite of the file even when
+    /// this binary does not know its value: a crash-loop rollback reinstalls
+    /// an older binary, which must neither refuse to start nor drop a value
+    /// a later release wrote. An unknown value turns QUIC off.
+    #[test]
+    fn transport_quic_round_trips_and_unknown_values_are_off() {
+        let unset: Config = toml::from_str(RELEASED_CONFIG_TOML).unwrap();
+        assert_eq!(unset.network_api.transport_quic, None);
+        assert!(unset.network_api.quic_settings().is_none());
+        assert!(
+            !toml::to_string(&unset).unwrap().contains("transport-quic"),
+            "an unset key is not written"
+        );
+
+        for (value, on) in [("prefer", true), ("off", false), ("a-later-mode", false)] {
+            let text = RELEASED_CONFIG_TOML.replacen(
+                "mode = \"network\"\n",
+                &format!("mode = \"network\"\ntransport-quic = \"{value}\"\n"),
+                1,
+            );
+            assert_ne!(text, RELEASED_CONFIG_TOML, "the key was inserted");
+            let cfg: Config = toml::from_str(&text)
+                .unwrap_or_else(|e| panic!("transport-quic = {value:?} must parse: {e}"));
+            assert_eq!(cfg.network_api.transport_quic.as_deref(), Some(value));
+            assert_eq!(
+                cfg.network_api.quic_settings().is_some(),
+                on,
+                "transport-quic = {value:?}"
+            );
+            if let Some(settings) = cfg.network_api.quic_settings() {
+                assert_eq!(settings.max_connections, cfg.network_api.max_connections);
+            }
+            let rewritten = toml::to_string(&cfg).unwrap();
+            assert!(
+                rewritten.contains(&format!("transport-quic = \"{value}\"")),
+                "written back as it was read: {rewritten}"
+            );
+        }
     }
 
     /// The two spellings must be genuinely interchangeable, not merely both
@@ -8364,6 +9143,39 @@ shutdown-drain-secs = 42
         );
     }
 
+    /// `transport-quic` survives a bare restart through `build()`'s merge,
+    /// including an explicit "off" (an operator's opt-out must outlive a
+    /// later change of the default) and a value this binary does not know (a
+    /// rollback must keep a later release's setting), and a value on the
+    /// command line wins over the file.
+    #[tokio::test]
+    async fn transport_quic_survives_a_bare_build_and_cli_overrides_it() {
+        for value in ["prefer", "off", "a-later-mode"] {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let mut first = local_args(temp_dir.path());
+            first.network_api.transport_quic = Some(value.to_string());
+            first.build().await.unwrap();
+
+            let cfg = local_args(temp_dir.path()).build().await.unwrap();
+            assert_eq!(
+                cfg.network_api.transport_quic.as_deref(),
+                Some(value),
+                "transport-quic = {value:?} must survive a bare build"
+            );
+
+            let other = if value == "prefer" { "off" } else { "prefer" };
+            let mut cli = local_args(temp_dir.path());
+            cli.network_api.transport_quic = Some(other.to_string());
+            let cfg = cli.build().await.unwrap();
+            assert_eq!(
+                cfg.network_api.transport_quic.as_deref(),
+                Some(other),
+                "the command line overrides the file"
+            );
+            assert_eq!(cfg.network_api.quic_settings().is_some(), other == "prefer");
+        }
+    }
+
     #[tokio::test]
     async fn cli_total_bandwidth_limit_overrides_file_config() {
         // CLI args still take precedence over the file value: the new merge
@@ -8635,6 +9447,7 @@ shutdown-drain-secs = 42
                 ledbat_min_ssthresh: Some(200_000),
                 congestion_control: "bbr".to_string(),
                 bbr_startup_rate: Some(5_000),
+                transport_quic: Some("prefer".to_string()),
                 skip_load_from_network: true,
                 // serde-skip: a per-boot migration record, never persisted.
                 dropped_persisted_loopback: None,
@@ -8850,6 +9663,7 @@ shutdown-drain-secs = 42
             ledbat_min_ssthresh,
             congestion_control,
             bbr_startup_rate,
+            transport_quic,
             skip_load_from_network,
             dropped_persisted_loopback: _, // serde-skip: per-boot migration record
         } = network_api;
@@ -8911,6 +9725,10 @@ shutdown-drain-secs = 42
         assert_eq!(
             bbr_startup_rate, seed.network_api.bbr_startup_rate,
             "bbr_startup_rate"
+        );
+        assert_eq!(
+            transport_quic, seed.network_api.transport_quic,
+            "transport_quic"
         );
         assert_eq!(
             skip_load_from_network, seed.network_api.skip_load_from_network,
@@ -10772,9 +11590,9 @@ shutdown-drain-secs = 42
     }
 
     /// The exposure warning fires on a non-loopback bind REGARDLESS of hosted
-    /// mode (an untokened connection reaches the shared namespace either way),
-    /// and additionally on (non-loopback bind OR
-    /// an `--allowed-host` reverse-proxy grant). Both triggers matter: a proxy
+    /// mode (hosted mode does not expect a wide bind), and additionally on
+    /// (non-loopback bind OR an `--allowed-host` reverse-proxy grant with hosted
+    /// mode off). Both triggers matter: a proxy
     /// terminates the connection itself, so every visitor looks local to the
     /// node's own source-IP filters even when the bind is `127.0.0.1`.
     #[test]
@@ -10788,12 +11606,8 @@ shutdown-drain-secs = 42
             ws_api_shares_one_namespace_with_remote_clients(false, loopback, &[]),
             None
         );
-        // Quiet: try.freenet.org's shape. A KNOWN GAP rather than a safety
-        // claim — an untokened connection reads the shared namespace here too.
-        // Containment today is that the namespace is empty; making the warning
-        // conditional on that needs a probe of the secrets tree, tracked
-        // separately so a probe that is wrong in either direction cannot ride
-        // in on a default-hardening change.
+        // Quiet: try.freenet.org's shape. A hosted node serves its client API
+        // only to a connection that presents a user token.
         assert_eq!(
             ws_api_shares_one_namespace_with_remote_clients(true, loopback, &proxy),
             None
@@ -10805,8 +11619,8 @@ shutdown-drain-secs = 42
             .expect("a wildcard bind with hosted mode off must warn");
         assert!(bind_reason.contains("non-loopback"), "{bind_reason}");
 
-        // Fires: hosted mode does NOT make a wide bind safe. `decide_user_token`
-        // returns the shared context whenever a connection omits `userToken`.
+        // Fires: hosted mode does NOT make a wide bind safe. It honours a
+        // token only from a loopback source behind a TLS proxy.
         let hosted_wide = ws_api_shares_one_namespace_with_remote_clients(true, wildcard, &proxy)
             .expect("a wildcard bind must warn even in hosted mode");
         assert!(hosted_wide.contains("hosted mode does"), "{hosted_wide}");
