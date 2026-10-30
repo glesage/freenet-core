@@ -32,9 +32,10 @@ use freenet::conformance::generator::Corpus;
 use freenet::conformance::host_clock;
 use freenet::conformance::verifier::Bytes;
 use freenet::conformance::{
-    ConformanceCase, ConformanceEvidence, ConformanceProperty, EvidenceRejected, GeneratorConfig,
-    IdempotenceSettling, Inconclusive, MinimizeConfig, OracleBuildError, PropertyOutcome,
-    ReplayBundle, RuntimeOracle, Severity, Transition, generate_cases, minimize, verify_case,
+    ConformanceCase, ConformanceEvidence, ConformanceProperty, EvidenceRejected, GeneratedCases,
+    GeneratorConfig, IdempotenceSettling, Inconclusive, MinimizeConfig, OracleBuildError,
+    PropertyOutcome, RemovalTier, ReplayBundle, RuntimeOracle, Severity, Transition,
+    generate_cases_counted, minimize_toward, removal_tier, verify_case,
 };
 use freenet_stdlib::prelude::{CodeHash, ContractCode, ContractInstanceId, State, UpdateData};
 use serde::Serialize;
@@ -44,8 +45,13 @@ use serde::Serialize;
 /// Runs the *exact* checks the network's own conformance checker runs; see
 /// `freenet::conformance` for why the two must never be allowed to drift.
 /// Diagnostics (efficiency reports, e.g. a self-delta as large as the state
-/// it is against) never fail this command — only an enforceable
-/// (`Severity::Violation`) merge-law break does.
+/// it is against) never fail this command. Every merge-law break
+/// (`Severity::Violation`) does, including a break of a law the network only
+/// reports and never acts on (`freenet::conformance::policy::removal_tier`): an
+/// author should hear about every broken law, whatever the network does about it.
+/// Cases skipped for size or for the case budget do not change the exit code while
+/// any case runs; the report counts them per property. A run where every case was
+/// skipped checked nothing and exits non-zero.
 #[derive(clap::Parser, Clone)]
 pub struct ConformanceConfig {
     /// Path to the compiled contract WASM. Required unless `--bundle` supplies
@@ -112,6 +118,21 @@ pub struct ConformanceConfig {
     #[arg(long)]
     pub(crate) max_cases: Option<usize>,
 
+    /// Skip any generated case whose inputs (states, deltas and summary) total
+    /// more than this many bytes. Defaults to the generator's own default
+    /// (currently 4 MiB).
+    ///
+    /// Skipped cases never run, so a property can hold on the cases that ran
+    /// while the cases that would break it were skipped. The report counts the
+    /// cases skipped for size and for the case budget per property; cases left
+    /// out by state sampling are reported only as states sampled of total.
+    /// Skipped cases do not change the exit code, unless every case was skipped,
+    /// which exits non-zero. Raise this to check a contract at its size ceiling:
+    /// a merge that is wrong only for a full-size state is invisible below it.
+    /// Has no effect with `--evidence`, which re-checks one shipped case.
+    #[arg(long)]
+    pub(crate) max_case_bytes: Option<usize>,
+
     /// Restrict which laws to check, by name (e.g. `state_commutativity`).
     /// Repeat for multiple. Defaults to every property.
     #[arg(long = "property")]
@@ -121,8 +142,12 @@ pub struct ConformanceConfig {
     #[arg(long)]
     pub(crate) json: bool,
 
-    /// Write a framed evidence file per distinct enforceable
+    /// Write a framed evidence file per distinct removal-eligible
     /// violation into this directory (created if it does not exist).
+    ///
+    /// Report-only findings (`freenet::conformance::policy::removal_tier`) are
+    /// not written: a peer receiving one would only report it. They are counted
+    /// in the summary, and they still fail the command.
     #[arg(long = "evidence-out")]
     pub(crate) evidence_out: Option<PathBuf>,
 
@@ -179,31 +204,19 @@ pub async fn conformance(config: ConformanceConfig) -> anyhow::Result<()> {
         anyhow::bail!("no states to check: the corpus is empty");
     }
 
-    let mut generator_config = GeneratorConfig::default();
-    if let Some(max_cases) = config.max_cases {
-        generator_config.max_cases = max_cases;
-    }
-    if !properties.is_empty() {
-        generator_config.properties = properties;
-    }
-
-    let cases = generate_cases(&corpus, &generator_config);
+    let generator_config = generator_config(&config, properties);
+    let generated = generate_cases_counted(&corpus, &generator_config);
     // A run that checked nothing must not report success. Restricting to a property
     // whose inputs the corpus cannot supply (commutativity with one state, delta
     // idempotence with no captured deltas) otherwise prints "0 cases run" and exits
     // 0, which any automation reads as "this contract passed".
-    if cases.is_empty() {
+    if generated.cases.is_empty() {
         report_code_diagnostics_standalone(&code_diagnostics);
-        anyhow::bail!(
-            "no cases could be generated from this corpus: {} state(s), {} delta(s), \
-             {} summary/summaries for the selected properties. Nothing was checked, \
-             so this is not a pass — supply more states (commutativity and \
-             reconciliation need at least two), captured deltas for the delta \
-             properties, or --transition BASE RESULT for transition_path_agreement.",
-            corpus.states.len(),
-            corpus.deltas.len(),
-            corpus.summaries.len(),
-        );
+        anyhow::bail!(no_cases_message(
+            &corpus,
+            &generated.oversized,
+            generator_config.max_case_bytes,
+        ));
     }
 
     if let Some(path) = &config.bundle_out {
@@ -216,28 +229,26 @@ pub async fn conformance(config: ConformanceConfig) -> anyhow::Result<()> {
     let instance = oracle.instance_id();
     let _ = warn_on_reversed_transitions(&mut oracle, &hand_supplied_steps);
 
-    let outcomes: Vec<(ConformanceCase, PropertyOutcome)> = cases
-        .into_iter()
-        .map(|case| {
-            let outcome = verify_case(&mut oracle, &case);
-            (case, outcome)
-        })
-        .collect();
-
-    let evidence = match &config.evidence_out {
-        Some(dir) => Some(write_evidence(
-            dir,
-            instance,
-            &parameters,
-            &outcomes,
-            &mut oracle,
-            &corpus.states,
-            &corpus.deltas,
-        )?),
-        None => None,
-    };
-
-    let report = Report::build(&corpus, &outcomes, evidence, code_diagnostics);
+    let (report, outcomes) = check_cases(
+        &mut oracle,
+        &corpus,
+        &generator_config,
+        generated,
+        |outcomes, oracle| match &config.evidence_out {
+            Some(dir) => write_evidence(
+                dir,
+                instance,
+                &parameters,
+                outcomes,
+                oracle,
+                &corpus.states,
+                &corpus.deltas,
+            )
+            .map(Some),
+            None => Ok(None),
+        },
+        code_diagnostics,
+    )?;
     if config.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
@@ -261,6 +272,103 @@ pub async fn conformance(config: ConformanceConfig) -> anyhow::Result<()> {
         return Err(ConformanceViolations { count: enforceable }.into());
     }
     Ok(())
+}
+
+/// Run every generated case and build the report from the outcomes AND the skip
+/// counts.
+///
+/// Takes the whole [`GeneratedCases`] so the skip counts cannot be dropped between
+/// generating and reporting: a report built without them reads as a clean run while
+/// the over-size cases never ran (#5705). Generic over the oracle so that hand-off
+/// is testable without a WASM runtime.
+fn check_cases<O: ConformanceOracle + ?Sized>(
+    oracle: &mut O,
+    corpus: &Corpus,
+    generator_config: &GeneratorConfig,
+    mut generated: GeneratedCases,
+    evidence: impl FnOnce(
+        &[(ConformanceCase, PropertyOutcome)],
+        &mut O,
+    ) -> anyhow::Result<Option<EvidenceSummary>>,
+    code_diagnostics: Vec<CodeDiagnostic>,
+) -> anyhow::Result<(Report, Vec<(ConformanceCase, PropertyOutcome)>)> {
+    let outcomes: Vec<(ConformanceCase, PropertyOutcome)> = std::mem::take(&mut generated.cases)
+        .into_iter()
+        .map(|case| {
+            let outcome = verify_case(oracle, &case);
+            (case, outcome)
+        })
+        .collect();
+    let evidence = evidence(&outcomes, oracle)?;
+    let report = Report::build(
+        corpus,
+        generator_config,
+        &generated,
+        &outcomes,
+        evidence,
+        code_diagnostics,
+    );
+    Ok((report, outcomes))
+}
+
+/// The generator settings for this run: the defaults, overridden by the CLI.
+fn generator_config(
+    config: &ConformanceConfig,
+    properties: Vec<ConformanceProperty>,
+) -> GeneratorConfig {
+    let mut generator_config = GeneratorConfig::default();
+    if let Some(max_cases) = config.max_cases {
+        generator_config.max_cases = max_cases;
+    }
+    if let Some(max_case_bytes) = config.max_case_bytes {
+        generator_config.max_case_bytes = max_case_bytes;
+    }
+    if !properties.is_empty() {
+        generator_config.properties = properties;
+    }
+    generator_config
+}
+
+/// The error for a run that generated no case at all.
+///
+/// When cases WERE built and every one was over `--max-case-bytes`, saying "supply
+/// more states" sends the author the wrong way: the corpus was fine and the size
+/// limit removed all of it. So that cause is named, with the flag that lifts it.
+fn no_cases_message(
+    corpus: &Corpus,
+    oversized: &[(ConformanceProperty, usize)],
+    max_case_bytes: usize,
+) -> String {
+    let skipped: usize = oversized.iter().map(|(_, n)| n).sum();
+    // A property with nothing skipped and no case had no inputs at all, and the
+    // only fix for that is a richer corpus, whatever happened to the others.
+    let lacked_inputs = oversized.iter().any(|(_, n)| *n == 0);
+    let mut message = format!(
+        "no cases could be generated from this corpus: {} state(s), {} delta(s), \
+         {} summary/summaries for the selected properties. Nothing was checked, \
+         so this is not a pass",
+        corpus.states.len(),
+        corpus.deltas.len(),
+        corpus.summaries.len(),
+    );
+    let advice = "supply more states (commutativity and reconciliation need at \
+                  least two), captured deltas for the delta properties, or --transition \
+                  BASE RESULT for transition_path_agreement.";
+    if skipped == 0 {
+        message.push_str(&format!(" \u{2014} {advice}"));
+        return message;
+    }
+    message.push_str(&format!(
+        ". {skipped} case(s) were built and every one was skipped because its \
+         inputs exceeded --max-case-bytes ({max_case_bytes} bytes); raise \
+         --max-case-bytes to check them."
+    ));
+    if lacked_inputs {
+        message.push_str(&format!(
+            " The properties with no case at all need more inputs: {advice}"
+        ));
+    }
+    message
 }
 
 /// Warn when a hand-supplied `--transition BASE RESULT` pair looks reversed.
@@ -411,17 +519,21 @@ fn write_bundle(
 /// distinction CI needs and a single exit code cannot express.
 #[derive(Debug, thiserror::Error)]
 #[error(
-    "{count} merge-law violation(s) found. A violation is removal-eligible under \
-     enforcement; see each finding for what it means. NOTE: `state_idempotence` \
-     reporting `settled_after` is a real break whose harm is redundant anti-entropy \
-     rather than divergence \u{2014} expected against correct canonicalizing \
-     contracts until the PUT install path canonicalizes"
+    "{count} merge-law violation(s) found. Most laws are removal-eligible under \
+     enforcement and some are report-only; see each finding for what it means. \
+     NOTE: `state_idempotence` reporting `settled_after` is a real break whose harm \
+     is redundant anti-entropy rather than divergence, and is report-only \
+     \u{2014} expected against correct canonicalizing contracts until the PUT \
+     install path canonicalizes"
 )]
 pub struct ConformanceViolations {
     pub count: usize,
 }
 
-/// 0 when no [`PropertyOutcome`] is an enforceable violation, 1 otherwise.
+/// 0 when no [`PropertyOutcome`] is a merge-law violation, 1 otherwise.
+///
+/// Report-only laws count: the exit code tells the author a law broke, not what
+/// the network would do about it.
 ///
 /// Diagnostics (`Severity::Diagnostic`) never fail the exit code — only a
 /// `Severity::Violation` finding does. Split out from [`conformance`] so it
@@ -443,23 +555,26 @@ fn exit_code<'a>(outcomes: impl IntoIterator<Item = &'a PropertyOutcome>) -> i32
 /// callers can use the result directly as an override of
 /// [`GeneratorConfig::properties`] without a separate emptiness check.
 fn parse_properties(names: &[String]) -> anyhow::Result<Vec<ConformanceProperty>> {
-    names
-        .iter()
-        .map(|name| {
-            ConformanceProperty::ALL
-                .iter()
-                .copied()
-                .find(|p| p.as_str() == name)
-                .ok_or_else(|| {
-                    let valid = ConformanceProperty::ALL
-                        .iter()
-                        .map(|p| p.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    anyhow::anyhow!("unknown property {name:?}; valid properties: {valid}")
-                })
-        })
-        .collect()
+    let mut properties: Vec<ConformanceProperty> = Vec::new();
+    for name in names {
+        let property = ConformanceProperty::ALL
+            .iter()
+            .copied()
+            .find(|p| p.as_str() == name)
+            .ok_or_else(|| {
+                let valid = ConformanceProperty::ALL
+                    .iter()
+                    .map(|p| p.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                anyhow::anyhow!("unknown property {name:?}; valid properties: {valid}")
+            })?;
+        // A repeated `--property` would generate, run and count its cases twice.
+        if !properties.contains(&property) {
+            properties.push(property);
+        }
+    }
+    Ok(properties)
 }
 
 /// Re-check a finding someone else shipped, and reach an independent conclusion.
@@ -609,7 +724,14 @@ async fn verify_evidence(config: &ConformanceConfig, path: &PathBuf) -> anyhow::
             {
                 println!("  note     : a DIFFERENT law broke here than the sender reported");
             }
-            if v.severity == Severity::Violation {
+            if let Some(note) = reproduced_tier_note(v) {
+                println!("  note     : {note}");
+            }
+            // From the property, as `exit_code` and the report read it. `v` is
+            // this run's own verification, whose field `verify_case` fills from
+            // the property, so the two agree; one form keeps every exit decision
+            // reading the same source.
+            if v.property.severity() == Severity::Violation {
                 return Err(ConformanceViolations { count: 1 }.into());
             }
             Ok(())
@@ -959,7 +1081,22 @@ fn describe_oracle_build_error(err: OracleBuildError) -> anyhow::Error {
     }
 }
 
-/// Write one evidence file per distinct enforceable violation.
+/// What `verify-evidence` adds to a REPRODUCED verdict about the network's
+/// response: a reproduced break of a report-only law (`policy::removal_tier`) is
+/// real, and still fails the command, but a peer receiving it would only report
+/// it. That concerns conformance removal only: the live re-apply probe can still
+/// suppress the contract's propagation independently (see `removal_tier`'s
+/// rustdoc). `None` for a removal-eligible violation and for a diagnostic, whose
+/// severity already says it is report-only.
+fn reproduced_tier_note(v: &freenet::conformance::Violation) -> Option<&'static str> {
+    (v.property.severity() == Severity::Violation && removal_tier(v) == RemovalTier::ReportOnly)
+        .then_some(
+            "this law is report-only: a peer receiving this evidence would report it \
+             and never act on it",
+        )
+}
+
+/// Write one evidence file per distinct removal-eligible violation.
 ///
 /// "Distinct" is by [`ConformanceEvidence::id`] (a content hash of the
 /// inputs), so cases whose inputs coincide overwrite the same filename
@@ -984,6 +1121,7 @@ fn write_evidence<O: ConformanceOracle + ?Sized>(
     let mut written = HashSet::new();
     let mut oversized = 0usize;
     let mut local_only = 0usize;
+    let mut report_only = 0usize;
     let mut shrunk_from = 0usize;
     let mut shrunk_to = 0usize;
     // Grouped, not per-case. Both of these fire once per VIOLATED CASE, and a corpus
@@ -1014,13 +1152,32 @@ fn write_evidence<O: ConformanceOracle + ?Sized>(
             continue;
         }
 
+        // A report-only finding (`policy::removal_tier`) is not grounds for any
+        // peer to act, so evidence for it would make every recipient re-execute a
+        // case whose only possible outcome is a report. Checked after the
+        // local-only test so that count keeps meaning what it says, and before
+        // minimising for the same cost reason.
+        let Some(checked) = outcome.violation() else {
+            continue;
+        };
+        let tier = removal_tier(checked);
+        if tier == RemovalTier::ReportOnly {
+            report_only += 1;
+            continue;
+        }
+
         // Shrink before serializing. A case generated from large states can carry
         // several MB, well over the evidence size bound, and evidence that every
         // recipient rejects is not evidence. Shrinking also makes the file a usable
         // bug report rather than two large blobs that happen to disagree.
-        let (minimized, shrink) = minimize(
+        //
+        // Toward the finding checked above, not one `minimize` would re-derive by
+        // verifying the case again: a contract whose verdict changes between runs
+        // could otherwise be shrunk toward a different finding.
+        let (minimized, shrink) = minimize_toward(
             oracle,
             case,
+            (checked.property, tier),
             state_candidates,
             delta_candidates,
             &MinimizeConfig::default(),
@@ -1028,6 +1185,18 @@ fn write_evidence<O: ConformanceOracle + ?Sized>(
         shrunk_from += shrink.original_bytes;
         shrunk_to += shrink.final_bytes;
         let observed = verify_case(oracle, &minimized).violation().cloned();
+        // And the evidence carries what THIS verification found, so its tier is
+        // checked again. Against a contract whose verdict is not stable (it reads
+        // the clock, or is nondeterministic) the minimized case can come back
+        // report-only even though every shrink trial matched the target, and
+        // evidence of that is evidence no peer may act on.
+        if observed
+            .as_ref()
+            .is_some_and(|v| removal_tier(v) == RemovalTier::ReportOnly)
+        {
+            report_only += 1;
+            continue;
+        }
         let evidence =
             ConformanceEvidence::new(instance, parameters.to_vec(), &minimized, observed);
 
@@ -1067,6 +1236,7 @@ fn write_evidence<O: ConformanceOracle + ?Sized>(
         directory: dir.display().to_string(),
         files_written: written.len(),
         findings_local_only: local_only,
+        findings_report_only: report_only,
         findings_too_large: oversized,
         input_bytes_before_shrinking: shrunk_from,
         input_bytes_after_shrinking: shrunk_to,
@@ -1149,6 +1319,13 @@ struct EvidenceSummary {
     /// counted as "too large": the reason is permanent and has nothing to do with
     /// size. See `ConformanceProperty::premise_source`.
     findings_local_only: usize,
+    /// Findings of a report-only tier (`policy::removal_tier`), for which no
+    /// evidence is written because no peer may act on one. Checked before
+    /// minimisation, and again on the minimized case's own verification, since a
+    /// contract whose verdict is not stable can come back report-only. Findings
+    /// counted by the first check are excluded from the shrink byte totals
+    /// (minimisation never ran); by the second, they are included.
+    findings_report_only: usize,
     /// Findings that stayed over the evidence size bound even after shrinking.
     /// Reported rather than swallowed: they are real findings that simply cannot be
     /// propagated, and silently writing nothing would look like there were none.
@@ -1273,17 +1450,171 @@ struct Report {
     corpus_deltas: usize,
     corpus_summaries: usize,
     cases_run: usize,
+    /// Cases built and then skipped, never run, because their inputs exceeded
+    /// `max_case_bytes`. Summed over `properties[].cases_skipped_oversized`.
+    ///
+    /// Without it a property could read as held when the cases that would have
+    /// broken it were the ones skipped: a contract that is wrong only near its size
+    /// cap is exactly that shape (#5705).
+    cases_skipped_oversized: usize,
+    /// Cases within the size limit that never ran because the `--max-cases` budget
+    /// ran out first. Disjoint from `cases_skipped_oversized`. Summed over
+    /// `properties[].cases_skipped_budget`.
+    cases_skipped_budget: usize,
+    /// The `--max-case-bytes` limit this run used, so the count above says what it
+    /// is relative to.
+    max_case_bytes: usize,
+    /// How many of the `corpus_states` the state-based laws sampled. The
+    /// last-supplied and the largest state are always among them.
+    states_sampled: usize,
+    corpus_transitions: usize,
+    /// How many of the `corpus_transitions` were checked. The last-supplied one is
+    /// always among them.
+    transitions_sampled: usize,
+    /// Whether any law that samples states, or the transition law, was selected:
+    /// the human report mentions a sample only for laws that used it.
+    #[serde(skip)]
+    state_laws_selected: bool,
+    #[serde(skip)]
+    transition_law_selected: bool,
     holds: usize,
     violations: usize,
+    /// Law breaks (`Severity::Violation`), which fail this command, report-only
+    /// ones included. The name is kept for compatibility with existing `--json`
+    /// consumers; what the network may act on is `removal_eligible_violations`.
     enforceable_violations: usize,
+    /// The subset of `enforceable_violations` the network may act on
+    /// (`policy::removal_tier` is `RemovalEligible`).
+    removal_eligible_violations: usize,
     diagnostic_violations: usize,
     inconclusive: usize,
+    /// One row per property selected for this run, in selection order, plus a row
+    /// for any unselected law a violation escalated to (see `property_coverage`).
+    /// The totals above are over every property, so they cannot say that one law
+    /// ran on nothing while the others ran on plenty.
+    properties: Vec<PropertyCoverage>,
     findings: Vec<Finding>,
     inconclusive_reasons: Vec<InconclusiveReason>,
     evidence: Option<EvidenceSummary>,
     /// See [`CodeDiagnostic`]. Separate from `findings` because these are not
     /// property outcomes and must never be counted as violations.
     code_diagnostics: Vec<CodeDiagnostic>,
+}
+
+/// What one property's cases came to.
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+struct PropertyCoverage {
+    property: &'static str,
+    /// `violated` if any case broke the law. Otherwise, if any case held: `held`
+    /// when no case was skipped for size and none was inconclusive, `held_partial`
+    /// when some were, since those may be the cases that break it. Cases cut by the
+    /// budget are counted but do not change the verdict, since on a large corpus the
+    /// budget always cuts some. It cuts the pairs of later states first; see #6053.
+    /// Otherwise
+    /// `inconclusive` if any case was built (including a property whose cases were
+    /// ALL skipped, which is not a pass), or `not_checked`, meaning the corpus could
+    /// not supply a case at all.
+    verdict: &'static str,
+    /// Cases that ran for this law. A case whose violation escalated to another law
+    /// (see `property_coverage`) is counted under both: as run and inconclusive under
+    /// its own law, and as run and violated under the other. So the rows' `cases_run`
+    /// and `inconclusive` can sum to more than the report's totals.
+    cases_run: usize,
+    holds: usize,
+    violations: usize,
+    inconclusive: usize,
+    cases_skipped_oversized: usize,
+    cases_skipped_budget: usize,
+}
+
+impl PropertyCoverage {
+    fn new(property: ConformanceProperty) -> Self {
+        Self {
+            property: property.as_str(),
+            verdict: "not_checked",
+            cases_run: 0,
+            holds: 0,
+            violations: 0,
+            inconclusive: 0,
+            cases_skipped_oversized: 0,
+            cases_skipped_budget: 0,
+        }
+    }
+
+    fn cases_skipped(&self) -> usize {
+        self.cases_skipped_oversized + self.cases_skipped_budget
+    }
+
+    fn compute_verdict(&self) -> &'static str {
+        if self.violations > 0 {
+            "violated"
+        } else if self.holds > 0 && self.cases_skipped_oversized == 0 && self.inconclusive == 0 {
+            "held"
+        } else if self.holds > 0 {
+            "held_partial"
+        } else if self.cases_run > 0 || self.cases_skipped() > 0 {
+            "inconclusive"
+        } else {
+            "not_checked"
+        }
+    }
+}
+
+/// One row per property: the selected ones in selection order (duplicates
+/// collapsed), then any property that only appears in `outcomes`.
+fn property_coverage(
+    selected: &[ConformanceProperty],
+    generated: &GeneratedCases,
+    outcomes: &[(ConformanceCase, PropertyOutcome)],
+) -> Vec<PropertyCoverage> {
+    let mut rows: Vec<(ConformanceProperty, PropertyCoverage)> = Vec::new();
+    fn row(
+        rows: &mut Vec<(ConformanceProperty, PropertyCoverage)>,
+        property: ConformanceProperty,
+    ) -> &mut PropertyCoverage {
+        let at = match rows.iter().position(|(p, _)| *p == property) {
+            Some(at) => at,
+            None => {
+                rows.push((property, PropertyCoverage::new(property)));
+                rows.len() - 1
+            }
+        };
+        &mut rows[at].1
+    }
+    for property in selected {
+        row(&mut rows, *property);
+    }
+    for (property, skipped) in &generated.oversized {
+        row(&mut rows, *property).cases_skipped_oversized += skipped;
+    }
+    for (property, skipped) in &generated.budget_cut {
+        row(&mut rows, *property).cases_skipped_budget += skipped;
+    }
+    for (case, outcome) in outcomes {
+        let r = row(&mut rows, case.property);
+        r.cases_run += 1;
+        match outcome {
+            PropertyOutcome::Holds => r.holds += 1,
+            PropertyOutcome::Violated(v) if v.property == case.property => r.violations += 1,
+            // A violation that did not reproduce comes back as nondeterminism
+            // (`UpdateDeterminism`), not a break of the case's own law. The case
+            // decided nothing about its own law, so it is inconclusive there, and the
+            // violation is counted under the law it broke, as `findings` count it.
+            PropertyOutcome::Violated(v) => {
+                r.inconclusive += 1;
+                let broken = row(&mut rows, v.property);
+                broken.cases_run += 1;
+                broken.violations += 1;
+            }
+            PropertyOutcome::Inconclusive(_) => r.inconclusive += 1,
+        }
+    }
+    rows.into_iter()
+        .map(|(_, mut r)| {
+            r.verdict = r.compute_verdict();
+            r
+        })
+        .collect()
 }
 
 /// One violated case, at full per-case granularity: exactly the digests that
@@ -1306,6 +1637,10 @@ struct Finding {
     /// would leave the tool discarding structure it was handed — the defect
     /// #5461 fixed, one field over.
     settling: Option<IdempotenceSettling>,
+    /// `removal_eligible` or `report_only`: whether the network may act on this
+    /// finding (`policy::removal_tier`). Separate from `severity`, which says
+    /// whether a law broke.
+    tier: &'static str,
 }
 
 /// How many distinct detail texts the HUMAN report shows per inconclusive reason.
@@ -1386,6 +1721,8 @@ impl Report {
     /// in [`group_findings`].
     fn build(
         corpus: &Corpus,
+        generator: &GeneratorConfig,
+        generated: &GeneratedCases,
         outcomes: &[(ConformanceCase, PropertyOutcome)],
         evidence: Option<EvidenceSummary>,
         code_diagnostics: Vec<CodeDiagnostic>,
@@ -1393,6 +1730,7 @@ impl Report {
         let mut holds = 0usize;
         let mut violations = 0usize;
         let mut enforceable_violations = 0usize;
+        let mut removal_eligible_violations = 0usize;
         let mut diagnostic_violations = 0usize;
         let mut inconclusive = 0usize;
 
@@ -1404,13 +1742,22 @@ impl Report {
                 PropertyOutcome::Holds => holds += 1,
                 PropertyOutcome::Violated(v) => {
                     violations += 1;
-                    match v.severity {
+                    // Severity from the property, as `decide` and `exit_code` read
+                    // it, for both counts, so a removal-eligible count can never
+                    // include a diagnostic and the two counts cannot disagree on
+                    // what a law break is.
+                    let severity = v.property.severity();
+                    match severity {
                         Severity::Violation => enforceable_violations += 1,
                         Severity::Diagnostic => diagnostic_violations += 1,
                     }
+                    let tier = removal_tier(v);
+                    if severity == Severity::Violation && tier == RemovalTier::RemovalEligible {
+                        removal_eligible_violations += 1;
+                    }
                     findings.push(Finding {
                         property: v.property.as_str().to_string(),
-                        severity: match v.severity {
+                        severity: match severity {
                             Severity::Violation => "violation",
                             Severity::Diagnostic => "diagnostic",
                         },
@@ -1418,6 +1765,10 @@ impl Report {
                         left: v.left.to_string(),
                         right: v.right.to_string(),
                         settling: v.settling,
+                        tier: match tier {
+                            RemovalTier::RemovalEligible => "removal_eligible",
+                            RemovalTier::ReportOnly => "report_only",
+                        },
                     });
                 }
                 PropertyOutcome::Inconclusive(reason) => {
@@ -1464,11 +1815,26 @@ impl Report {
             corpus_deltas: corpus.deltas.len(),
             corpus_summaries: corpus.summaries.len(),
             cases_run: outcomes.len(),
+            cases_skipped_oversized: generated.oversized_total(),
+            cases_skipped_budget: generated.budget_cut_total(),
+            max_case_bytes: generator.max_case_bytes,
+            states_sampled: generated.states_paired,
+            corpus_transitions: corpus.transitions.len(),
+            transitions_sampled: generated.transitions_sampled,
+            state_laws_selected: generator
+                .properties
+                .iter()
+                .any(|p| *p != ConformanceProperty::TransitionPathAgreement),
+            transition_law_selected: generator
+                .properties
+                .contains(&ConformanceProperty::TransitionPathAgreement),
             holds,
             violations,
             enforceable_violations,
+            removal_eligible_violations,
             diagnostic_violations,
             inconclusive,
+            properties: property_coverage(&generator.properties, generated, outcomes),
             findings,
             inconclusive_reasons,
             evidence,
@@ -1498,16 +1864,92 @@ impl Report {
             "merge check: {} state(s), {} delta(s), {} summary/summaries in the corpus",
             self.corpus_states, self.corpus_deltas, self.corpus_summaries
         )?;
+        if self.state_laws_selected && self.states_sampled < self.corpus_states {
+            writeln!(
+                out,
+                "merge check: {} of the {} states sampled for the state-based laws, the \
+                 last supplied and the largest always sampled",
+                self.states_sampled, self.corpus_states
+            )?;
+        }
+        if self.transition_law_selected && self.transitions_sampled < self.corpus_transitions {
+            writeln!(
+                out,
+                "merge check: {} of the {} transitions sampled, the last supplied always sampled",
+                self.transitions_sampled, self.corpus_transitions
+            )?;
+        }
         writeln!(
             out,
-            "merge check: {} case(s) run \u{2014} {} held, {} violation(s) ({} enforceable, {} diagnostic-only), {} inconclusive",
+            "merge check: {} case(s) run \u{2014} {} held, {} violation(s) ({} merge-law break(s), {} of them removal-eligible; {} diagnostic-only), {} inconclusive",
             self.cases_run,
             self.holds,
             self.violations,
             self.enforceable_violations,
+            self.removal_eligible_violations,
             self.diagnostic_violations,
             self.inconclusive
         )?;
+        if self.cases_skipped_oversized > 0 {
+            writeln!(
+                out,
+                "merge check: {} case(s) NOT run because their inputs exceeded \
+                 --max-case-bytes ({} bytes); a law can hold on the cases that ran \
+                 and break on these",
+                self.cases_skipped_oversized, self.max_case_bytes
+            )?;
+        }
+        if self.cases_skipped_budget > 0 {
+            writeln!(
+                out,
+                "merge check: {} case(s) not run because the case budget (--max-cases) \
+                 ran out; it cuts the pairs of later states first (see freenet-core#6053)",
+                self.cases_skipped_budget
+            )?;
+        }
+        // Only when some law did not plainly hold or something was skipped: the
+        // totals above cannot say WHICH law lost cases or decided nothing.
+        if self.cases_skipped_oversized + self.cases_skipped_budget > 0
+            || self.properties.iter().any(|p| p.verdict != "held")
+        {
+            writeln!(out, "\nby property:")?;
+            for p in &self.properties {
+                let verdict = match p.verdict {
+                    "not_checked" => "not checked",
+                    other => other,
+                };
+                write!(out, "  {}: {verdict}", p.property)?;
+                if p.cases_run > 0 {
+                    write!(
+                        out,
+                        " \u{2014} {} run ({} held, {} violated, {} inconclusive)",
+                        case_count(p.cases_run),
+                        p.holds,
+                        p.violations,
+                        p.inconclusive
+                    )?;
+                } else if p.cases_skipped() == 0 {
+                    write!(out, " \u{2014} the corpus offered no case for it")?;
+                } else {
+                    write!(out, " \u{2014} no case run")?;
+                }
+                if p.cases_skipped_oversized > 0 {
+                    write!(
+                        out,
+                        "; {} NOT run (inputs over --max-case-bytes)",
+                        case_count(p.cases_skipped_oversized)
+                    )?;
+                }
+                if p.cases_skipped_budget > 0 {
+                    write!(
+                        out,
+                        "; {} not run (case budget, --max-cases)",
+                        case_count(p.cases_skipped_budget)
+                    )?;
+                }
+                writeln!(out)?;
+            }
+        }
 
         if !self.findings.is_empty() {
             writeln!(out, "\nfindings:")?;
@@ -1517,10 +1959,18 @@ impl Report {
                 } else {
                     format!("{count} cases")
                 };
+                // The tier on each violation line, so the summary's "M of them
+                // removal-eligible" can be traced to the findings it counts. A
+                // diagnostic is always report-only and says so by its severity.
+                let label = match (f.severity, f.tier) {
+                    ("violation", "removal_eligible") => "violation, removal-eligible",
+                    ("violation", _) => "violation, report-only",
+                    (severity, _) => severity,
+                };
                 writeln!(
                     out,
-                    "  [{}] {} ({cases}): {}\n      example \u{2014} left: {}; right: {}",
-                    f.severity, f.property, f.detail, f.left, f.right
+                    "  [{label}] {} ({cases}): {}\n      example \u{2014} left: {}; right: {}",
+                    f.property, f.detail, f.left, f.right
                 )?;
             }
         }
@@ -1616,6 +2066,15 @@ impl Report {
                     evidence.findings_local_only
                 )?;
             }
+            if evidence.findings_report_only > 0 {
+                writeln!(
+                    out,
+                    "  {} finding(s) came from a report-only law, which no peer may \
+                     act on, so no evidence was written for them; they are listed \
+                     above and still fail this command",
+                    evidence.findings_report_only
+                )?;
+            }
             if evidence.findings_too_large > 0 {
                 writeln!(
                     out,
@@ -1638,7 +2097,25 @@ impl Report {
         }
 
         if self.enforceable_violations == 0 {
-            writeln!(out, "\nno enforceable violations found.")?;
+            writeln!(out, "\nno merge-law violations found.")?;
+            // The line above is about the cases that ran. Without this, it is the last
+            // thing a reader sees about a run whose largest cases never ran.
+            if self.cases_skipped_oversized > 0 {
+                writeln!(
+                    out,
+                    "({} case(s) were skipped for size and never ran, so this result \
+                     does not cover them; see --max-case-bytes.)",
+                    self.cases_skipped_oversized
+                )?;
+            }
+            if self.cases_skipped_budget > 0 {
+                writeln!(
+                    out,
+                    "({} case(s) were left out by the case budget (--max-cases), which \
+                     cuts the pairs of later states first; see freenet-core#6053.)",
+                    self.cases_skipped_budget
+                )?;
+            }
             if self.diagnostic_violations > 0 {
                 writeln!(
                     out,
@@ -1647,7 +2124,7 @@ impl Report {
                 )?;
             }
             // Without this the line above is the last thing a reader sees, and
-            // "no enforceable violations found." reads as a clean bill of health
+            // "no merge-law violations found." reads as a clean bill of health
             // for a contract whose clock call will trap in a future release.
             if !self.code_diagnostics.is_empty() {
                 writeln!(
@@ -1677,7 +2154,7 @@ fn group_findings(findings: &[Finding]) -> Vec<(&Finding, usize)> {
     for f in findings {
         match groups
             .iter_mut()
-            .find(|(g, _)| g.property == f.property && g.detail == f.detail)
+            .find(|(g, _)| g.property == f.property && g.detail == f.detail && g.tier == f.tier)
         {
             Some((_, count)) => *count += 1,
             None => groups.push((f, 1)),
@@ -2307,7 +2784,7 @@ mod host_clock_diagnostic_pin {
     fn the_scrape_sees_real_code() {
         let body = code_only("pub async fn conformance(");
         assert!(
-            body.contains("Report::build("),
+            body.contains("check_cases("),
             "the scraped region is not `conformance`'s body any more:\n{body}"
         );
     }
@@ -2486,6 +2963,7 @@ mod tests {
             bundle: None,
             contract_store: None,
             max_cases: None,
+            max_case_bytes: None,
             properties: Vec::new(),
             json: false,
             evidence_out: None,
@@ -2700,7 +3178,7 @@ mod tests {
         let property = ConformanceProperty::TransitionPathAgreement;
         assert!(
             !property.is_self_verifying() && property.severity() == Severity::Violation,
-            "the fixture depends on this property being enforceable AND local-only"
+            "the fixture depends on this property being a Violation AND local-only"
         );
         let case = ConformanceCase::new(
             property,
@@ -2840,11 +3318,21 @@ mod tests {
             corpus_deltas: 1,
             corpus_summaries: 0,
             cases_run: 2,
+            cases_skipped_oversized: 0,
+            cases_skipped_budget: 0,
+            max_case_bytes: GeneratorConfig::default().max_case_bytes,
+            states_sampled: 0,
+            corpus_transitions: 0,
+            transitions_sampled: 0,
+            state_laws_selected: false,
+            transition_law_selected: false,
             holds: 0,
             violations: 2,
             enforceable_violations: 2,
+            removal_eligible_violations: 2,
             diagnostic_violations: 0,
             inconclusive: 0,
+            properties: Vec::new(),
             findings: Vec::new(),
             inconclusive_reasons: Vec::new(),
             code_diagnostics: Vec::new(),
@@ -2852,6 +3340,7 @@ mod tests {
                 directory: "/tmp/evidence".to_string(),
                 files_written: 0,
                 findings_local_only: 1,
+                findings_report_only: 1,
                 findings_too_large: 1,
                 input_bytes_before_shrinking: 0,
                 input_bytes_after_shrinking: 0,
@@ -2875,6 +3364,11 @@ mod tests {
             "an over-size finding drew no explanation, so the report says \
              'wrote 0 evidence file(s)' and nothing else — which reads exactly \
              like a clean run:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("came from a report-only law"),
+            "a report-only finding drew no explanation for its missing evidence \
+             file:\n{rendered}"
         );
     }
 
@@ -2946,11 +3440,21 @@ mod tests {
             corpus_deltas: 1,
             corpus_summaries: 0,
             cases_run: 1,
+            cases_skipped_oversized: 0,
+            cases_skipped_budget: 0,
+            max_case_bytes: GeneratorConfig::default().max_case_bytes,
+            states_sampled: 0,
+            corpus_transitions: 0,
+            transitions_sampled: 0,
+            state_laws_selected: false,
+            transition_law_selected: false,
             holds: 1,
             violations: 0,
             enforceable_violations: 0,
+            removal_eligible_violations: 0,
             diagnostic_violations: 0,
             inconclusive: 0,
+            properties: Vec::new(),
             findings: Vec::new(),
             inconclusive_reasons: Vec::new(),
             code_diagnostics: Vec::new(),
@@ -2958,6 +3462,7 @@ mod tests {
                 directory: "/tmp/evidence".to_string(),
                 files_written: 0,
                 findings_local_only: 0,
+                findings_report_only: 0,
                 findings_too_large: 0,
                 input_bytes_before_shrinking: 0,
                 input_bytes_after_shrinking: 0,
@@ -3301,6 +3806,7 @@ mod tests {
             bundle: None,
             contract_store: None,
             max_cases: None,
+            max_case_bytes: None,
             properties: Vec::new(),
             json: false,
             evidence_out: None,
@@ -3444,9 +3950,337 @@ mod tests {
         }
     }
 
+    /// A report-only finding gets no evidence file, is counted as such, and costs
+    /// no minimisation. A peer receiving that evidence could only report it.
+    ///
+    /// Both a report-only property (`PathAgreement`, which IS self-verifying, so it
+    /// passes the local-only check) and the report-only idempotence class (settled
+    /// after a rewrite) are covered, since the second is decided per finding.
+    #[test]
+    fn a_report_only_finding_writes_no_evidence_and_is_counted() {
+        let path_agreement = violation_of(ConformanceProperty::PathAgreement);
+        let settled = Violation {
+            settling: Some(IdempotenceSettling::SettledAfter(1)),
+            ..violation_of(ConformanceProperty::StateIdempotence)
+        };
+        for (property, violation, arity) in [
+            (ConformanceProperty::PathAgreement, path_agreement, 2),
+            (ConformanceProperty::StateIdempotence, settled, 1),
+        ] {
+            assert!(
+                property.is_self_verifying(),
+                "{property} must reach the tier check"
+            );
+            let dir = tempfile::tempdir().expect("temp dir");
+            let mut oracle = CountingOracle::default();
+            let case = ConformanceCase::new(
+                property,
+                (0..arity).map(|i| Bytes::from(vec![i as u8; 64])).collect(),
+            );
+            let summary = write_evidence(
+                &dir.path().join("evidence"),
+                ContractInstanceId::new([3u8; 32]),
+                &[],
+                &[(case, PropertyOutcome::Violated(violation))],
+                &mut oracle,
+                &[],
+                &[],
+            )
+            .expect("write evidence");
+            assert_eq!(summary.files_written, 0, "{property}");
+            assert_eq!(summary.findings_report_only, 1, "{property}");
+            assert_eq!(summary.findings_local_only, 0, "{property}");
+            assert_eq!(oracle.calls.get(), 0, "{property}: minimisation ran");
+        }
+    }
+
+    /// Minimisation must not trade a removal-eligible finding for a report-only one
+    /// of the same property and then write it. Short states here settle after one
+    /// rewrite (report-only); the original, longer one never settles. The only
+    /// smaller candidate is short, so a minimiser that kept only the property would
+    /// shrink to it and write report-only evidence counted as written.
+    #[test]
+    fn minimisation_keeps_a_removal_eligible_finding_removal_eligible() {
+        // Same contract as `SettlesOnlyWhenShort` in `freenet::conformance::minimize`'s
+        // tests, which this crate cannot reach; keep the two in step.
+        struct SettlesOnlyWhenShort;
+        impl freenet::conformance::ConformanceOracle for SettlesOnlyWhenShort {
+            fn validate_state(
+                &mut self,
+                _state: &[u8],
+                _related: &RelatedContracts<'_>,
+            ) -> Result<ValidateResult, OracleError> {
+                Ok(ValidateResult::Valid)
+            }
+            fn update_state(
+                &mut self,
+                state: &[u8],
+                _updates: &[UpdateData<'_>],
+            ) -> Result<UpdateModification<'static>, OracleError> {
+                let mut out = state.to_vec();
+                if out.len() > 4 {
+                    out.push(0);
+                } else {
+                    out.sort_unstable();
+                }
+                Ok(UpdateModification::valid(State::from(out)))
+            }
+            fn summarize_state(&mut self, state: &[u8]) -> Result<Vec<u8>, OracleError> {
+                Ok(state.to_vec())
+            }
+            fn get_state_delta(
+                &mut self,
+                state: &[u8],
+                _summary: &[u8],
+            ) -> Result<Vec<u8>, OracleError> {
+                Ok(state.to_vec())
+            }
+        }
+
+        let case = ConformanceCase::new(
+            ConformanceProperty::StateIdempotence,
+            vec![Bytes::from(vec![7u8; 64])],
+        );
+        let outcome = verify_case(&mut SettlesOnlyWhenShort, &case);
+        assert!(
+            outcome
+                .violation()
+                .is_some_and(|v| removal_tier(v) == RemovalTier::RemovalEligible),
+            "fixture: the original must be removal-eligible: {outcome:?}"
+        );
+        let dir = tempfile::tempdir().expect("temp dir");
+        let summary = write_evidence(
+            &dir.path().join("evidence"),
+            ContractInstanceId::new([3u8; 32]),
+            &[],
+            &[(case, outcome)],
+            &mut SettlesOnlyWhenShort,
+            &[Bytes::from(vec![3u8, 2, 1])],
+            &[],
+        )
+        .expect("write evidence");
+        assert_eq!(summary.files_written, 1);
+        assert_eq!(summary.findings_report_only, 0);
+        assert_eq!(
+            summary.input_bytes_after_shrinking, 64,
+            "the case was shrunk to the report-only candidate"
+        );
+    }
+
+    /// The minimized case's own verdict is checked before it is written. A
+    /// contract whose verdict changes between runs (here, flipped by the test)
+    /// can turn a removal-eligible original into a report-only minimized case,
+    /// and evidence of that is evidence no peer may act on: it must be counted as
+    /// report-only, not written.
+    #[test]
+    fn a_minimized_case_that_comes_back_report_only_is_not_written() {
+        struct Flips {
+            sorts: bool,
+        }
+        impl freenet::conformance::ConformanceOracle for Flips {
+            fn validate_state(
+                &mut self,
+                _state: &[u8],
+                _related: &RelatedContracts<'_>,
+            ) -> Result<ValidateResult, OracleError> {
+                Ok(ValidateResult::Valid)
+            }
+            fn update_state(
+                &mut self,
+                state: &[u8],
+                _updates: &[UpdateData<'_>],
+            ) -> Result<UpdateModification<'static>, OracleError> {
+                let mut out = state.to_vec();
+                if self.sorts {
+                    out.sort_unstable();
+                } else {
+                    out.push(0);
+                }
+                Ok(UpdateModification::valid(State::from(out)))
+            }
+            fn summarize_state(&mut self, state: &[u8]) -> Result<Vec<u8>, OracleError> {
+                Ok(state.to_vec())
+            }
+            fn get_state_delta(
+                &mut self,
+                state: &[u8],
+                _summary: &[u8],
+            ) -> Result<Vec<u8>, OracleError> {
+                Ok(state.to_vec())
+            }
+        }
+
+        let case = ConformanceCase::new(
+            ConformanceProperty::StateIdempotence,
+            vec![Bytes::from(vec![3u8, 2, 1])],
+        );
+        let mut oracle = Flips { sorts: false };
+        let outcome = verify_case(&mut oracle, &case);
+        assert!(
+            outcome
+                .violation()
+                .is_some_and(|v| removal_tier(v) == RemovalTier::RemovalEligible),
+            "fixture: the checked outcome must be removal-eligible: {outcome:?}"
+        );
+        oracle.sorts = true;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let summary = write_evidence(
+            &dir.path().join("evidence"),
+            ContractInstanceId::new([3u8; 32]),
+            &[],
+            &[(case, outcome)],
+            &mut oracle,
+            &[],
+            &[],
+        )
+        .expect("write evidence");
+        assert_eq!(summary.files_written, 0, "report-only evidence was written");
+        assert_eq!(summary.findings_report_only, 1);
+    }
+
+    /// A report-only finding still fails the command. The exit code tells an author
+    /// a law broke; what the network does about it is a separate question.
+    #[test]
+    fn exit_code_fails_on_a_report_only_violation() {
+        let outcome = PropertyOutcome::Violated(violation_of(ConformanceProperty::PathAgreement));
+        assert_eq!(exit_code([&outcome]), 1);
+    }
+
+    /// The report counts removal-eligible findings separately and tags each JSON
+    /// finding with its tier.
+    #[test]
+    fn the_report_separates_removal_eligible_from_report_only_findings() {
+        let outcomes = vec![
+            (
+                ConformanceCase::new(ConformanceProperty::StateCommutativity, vec![]),
+                PropertyOutcome::Violated(violation_of(ConformanceProperty::StateCommutativity)),
+            ),
+            (
+                ConformanceCase::new(ConformanceProperty::PathAgreement, vec![]),
+                PropertyOutcome::Violated(violation_of(ConformanceProperty::PathAgreement)),
+            ),
+            (
+                ConformanceCase::new(ConformanceProperty::StateIdempotence, vec![]),
+                PropertyOutcome::Violated(Violation {
+                    settling: Some(IdempotenceSettling::SettledAfter(1)),
+                    ..violation_of(ConformanceProperty::StateIdempotence)
+                }),
+            ),
+        ];
+        let report = Report::build(
+            &Corpus::default(),
+            &GeneratorConfig::default(),
+            &GeneratedCases::default(),
+            &outcomes,
+            None,
+            Vec::new(),
+        );
+        assert_eq!(report.enforceable_violations, 3);
+        assert_eq!(report.removal_eligible_violations, 1);
+        let tiers: Vec<(&str, &str)> = report
+            .findings
+            .iter()
+            .map(|f| (f.property.as_str(), f.tier))
+            .collect();
+        assert_eq!(
+            tiers,
+            vec![
+                ("state_commutativity", "removal_eligible"),
+                ("path_agreement", "report_only"),
+                ("state_idempotence", "report_only"),
+            ]
+        );
+        let json = serde_json::to_string(&report).expect("the report must serialize");
+        assert!(json.contains("\"tier\":\"report_only\""), "{json}");
+        assert!(json.contains("\"removal_eligible_violations\":1"), "{json}");
+
+        // The human report attributes the count: each violation line says its tier.
+        let rendered = render_human(&report);
+        let line = |property: &str| {
+            rendered
+                .lines()
+                .find(|l| l.contains(&format!("] {property} (")))
+                .unwrap_or_else(|| panic!("no finding line for {property}:\n{rendered}"))
+                .to_string()
+        };
+        assert!(
+            line("state_commutativity").contains("[violation, removal-eligible]"),
+            "{rendered}"
+        );
+        assert!(
+            line("path_agreement").contains("[violation, report-only]"),
+            "{rendered}"
+        );
+        assert!(
+            line("state_idempotence").contains("[violation, report-only]"),
+            "{rendered}"
+        );
+    }
+
+    /// Both law-break counts, the finding's severity and its human line read
+    /// severity from the PROPERTY, as `decide` and `exit_code` do, never from the
+    /// `Violation`'s own field. A field claiming `Diagnostic` on a law-break
+    /// property must not drop it from either count or relabel it.
+    #[test]
+    fn the_report_counts_severity_from_the_property() {
+        let outcomes = vec![(
+            ConformanceCase::new(ConformanceProperty::StateCommutativity, vec![]),
+            PropertyOutcome::Violated(Violation {
+                severity: Severity::Diagnostic,
+                ..violation_of(ConformanceProperty::StateCommutativity)
+            }),
+        )];
+        let report = Report::build(
+            &Corpus::default(),
+            &GeneratorConfig::default(),
+            &GeneratedCases::default(),
+            &outcomes,
+            None,
+            Vec::new(),
+        );
+        assert_eq!(
+            (
+                report.enforceable_violations,
+                report.removal_eligible_violations,
+                report.diagnostic_violations
+            ),
+            (1, 1, 0)
+        );
+        // And the line and the JSON say the same thing as the counts.
+        assert_eq!(report.findings[0].severity, "violation");
+        assert!(
+            render_human(&report).contains("[violation, removal-eligible] state_commutativity"),
+            "{}",
+            render_human(&report)
+        );
+    }
+
+    /// A reproduced report-only break says the network would only report it; a
+    /// removal-eligible break and a diagnostic get no such note.
+    #[test]
+    fn verify_evidence_notes_a_reproduced_report_only_law() {
+        assert!(
+            reproduced_tier_note(&violation_of(ConformanceProperty::PathAgreement))
+                .is_some_and(|n| n.contains("report-only"))
+        );
+        let settled = Violation {
+            settling: Some(IdempotenceSettling::SettledAfter(1)),
+            ..violation_of(ConformanceProperty::StateIdempotence)
+        };
+        assert!(reproduced_tier_note(&settled).is_some());
+        assert_eq!(
+            reproduced_tier_note(&violation_of(ConformanceProperty::StateCommutativity)),
+            None
+        );
+        assert_eq!(
+            reproduced_tier_note(&violation_of(ConformanceProperty::DeltaIdempotence)),
+            None
+        );
+    }
+
     /// The exit-code decision is the enforcement boundary: a diagnostic-only
     /// finding (e.g. the wasteful-self-delta checks) must never fail the
-    /// command, only an enforceable `Severity::Violation` finding may.
+    /// command, only a `Severity::Violation` finding may (report-only or not).
     #[test]
     fn exit_code_treats_diagnostic_violation_as_success() {
         // DeltaIdempotence is diagnostic-only: contested, and never removal-eligible.
@@ -3477,7 +4311,27 @@ mod tests {
             left: left.to_string(),
             right: right.to_string(),
             settling: None,
+            tier: "removal_eligible",
         }
+    }
+
+    /// Two findings that differ only in tier are two groups. The human report
+    /// labels each group with one tier, so merging them would label one of the
+    /// two wrongly.
+    #[test]
+    fn group_findings_keeps_findings_of_different_tiers_separate() {
+        let eligible = finding("state_idempotence", "same detail", "a", "b");
+        let report_only = Finding {
+            tier: "report_only",
+            ..finding("state_idempotence", "same detail", "c", "d")
+        };
+        let findings = [eligible, report_only];
+        let groups = group_findings(&findings);
+        assert_eq!(
+            groups.len(),
+            2,
+            "different tiers were merged into one group"
+        );
     }
 
     /// Regression pin: the original grouping keyed on the output digests,
@@ -3539,11 +4393,21 @@ mod tests {
             corpus_deltas: 0,
             corpus_summaries: 0,
             cases_run: 4,
+            cases_skipped_oversized: 0,
+            cases_skipped_budget: 0,
+            max_case_bytes: GeneratorConfig::default().max_case_bytes,
+            states_sampled: 0,
+            corpus_transitions: 0,
+            transitions_sampled: 0,
+            state_laws_selected: false,
+            transition_law_selected: false,
             holds: 4,
             violations: 0,
             enforceable_violations: 0,
+            removal_eligible_violations: 0,
             diagnostic_violations: 0,
             inconclusive: 0,
+            properties: Vec::new(),
             findings: Vec::new(),
             inconclusive_reasons: Vec::new(),
             evidence: None,
@@ -3588,7 +4452,14 @@ mod tests {
                 )
             })
             .collect();
-        Report::build(&Corpus::default(), &outcomes, None, Vec::new())
+        Report::build(
+            &Corpus::default(),
+            &GeneratorConfig::default(),
+            &GeneratedCases::default(),
+            &outcomes,
+            None,
+            Vec::new(),
+        )
     }
 
     /// Build a report whose only outcomes are inconclusive contract errors.
@@ -4023,7 +4894,14 @@ mod tests {
                 }),
             ),
         ];
-        let report = Report::build(&Corpus::default(), &outcomes, None, Vec::new());
+        let report = Report::build(
+            &Corpus::default(),
+            &GeneratorConfig::default(),
+            &GeneratedCases::default(),
+            &outcomes,
+            None,
+            Vec::new(),
+        );
         let json = serde_json::to_string(&report).expect("the report must serialize");
 
         assert!(
@@ -4259,6 +5137,8 @@ mod tests {
         )];
         let report = Report::build(
             &Corpus::default(),
+            &GeneratorConfig::default(),
+            &GeneratedCases::default(),
             &outcomes,
             None,
             vec![CodeDiagnostic {
@@ -4271,7 +5151,7 @@ mod tests {
             (0, 0),
             "a code diagnostic was counted as a merge-law violation; it is about \
              the contract's code, no law was checked, and counting it here makes \
-             it removal-eligible"
+             it fail the command"
         );
         assert_eq!(report.code_diagnostics.len(), 1);
         // `exit_code` reads outcomes, never the report, so no code diagnostic can
@@ -4297,7 +5177,7 @@ mod tests {
         );
         assert!(
             rendered.contains("code diagnostic(s) above"),
-            "'no enforceable violations found.' is the last thing this report \
+            "'no merge-law violations found.' is the last thing this report \
              says, so a contract whose clock call will trap in a future release \
              reads as a clean bill of health:\n{rendered}"
         );
@@ -4390,6 +5270,592 @@ mod tests {
         assert!(
             err.contains("at least one --state or --transition is required"),
             "this test is no longer exercising the no-corpus bail: {err}"
+        );
+    }
+
+    /// #5705: cases over `--max-case-bytes` were dropped without a count, so a law
+    /// whose breaking cases were too large read as held, and a law whose cases were
+    /// ALL too large did not appear at all.
+    ///
+    /// Three shapes in one report: a property that held on the cases that ran while
+    /// some were skipped for size and for budget (`held_partial`, with both counts),
+    /// a property every case of which was skipped (inconclusive, never held), and a
+    /// property the corpus offered nothing for.
+    #[test]
+    fn skipped_cases_are_counted_and_an_all_skipped_property_is_not_held() {
+        let generator = GeneratorConfig {
+            properties: vec![
+                ConformanceProperty::StateCommutativity,
+                ConformanceProperty::StateIdempotence,
+                ConformanceProperty::StateAssociativity,
+            ],
+            max_case_bytes: 1024,
+            ..Default::default()
+        };
+        let generated = GeneratedCases {
+            cases: Vec::new(),
+            oversized: vec![
+                (ConformanceProperty::StateCommutativity, 42),
+                (ConformanceProperty::StateIdempotence, 5),
+                (ConformanceProperty::StateAssociativity, 0),
+            ],
+            budget_cut: vec![
+                (ConformanceProperty::StateCommutativity, 3),
+                (ConformanceProperty::StateIdempotence, 0),
+                (ConformanceProperty::StateAssociativity, 0),
+            ],
+            states_paired: 0,
+            transitions_sampled: 0,
+        };
+        let held = |_| {
+            (
+                ConformanceCase::new(
+                    ConformanceProperty::StateCommutativity,
+                    vec![Bytes::from(vec![1u8]), Bytes::from(vec![2u8])],
+                ),
+                PropertyOutcome::Holds,
+            )
+        };
+        let outcomes: Vec<_> = (0..2).map(held).collect();
+        let report = Report::build(
+            &Corpus::default(),
+            &generator,
+            &generated,
+            &outcomes,
+            None,
+            Vec::new(),
+        );
+
+        let json: serde_json::Value =
+            serde_json::to_value(&report).expect("the report must serialize");
+        assert_eq!(json["cases_skipped_oversized"], 47);
+        assert_eq!(json["cases_skipped_budget"], 3);
+        assert_eq!(json["max_case_bytes"], 1024);
+        let rows: Vec<(String, String, u64, u64, u64)> = json["properties"]
+            .as_array()
+            .expect("properties is a list")
+            .iter()
+            .map(|r| {
+                (
+                    r["property"].as_str().unwrap().to_string(),
+                    r["verdict"].as_str().unwrap().to_string(),
+                    r["cases_run"].as_u64().unwrap(),
+                    r["cases_skipped_oversized"].as_u64().unwrap(),
+                    r["cases_skipped_budget"].as_u64().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "state_commutativity".into(),
+                    "held_partial".into(),
+                    2,
+                    42,
+                    3
+                ),
+                ("state_idempotence".into(), "inconclusive".into(), 0, 5, 0),
+                ("state_associativity".into(), "not_checked".into(), 0, 0, 0),
+            ],
+            "a property whose every case was skipped must be inconclusive, and a \
+             partially skipped one is held_partial and carries its counts"
+        );
+
+        let human = render_human(&report);
+        for expected in [
+            "47 case(s) NOT run because their inputs exceeded --max-case-bytes (1024 bytes)",
+            "3 case(s) not run because the case budget (--max-cases) ran out; it cuts the pairs of later states first (see freenet-core#6053)",
+            "state_commutativity: held_partial \u{2014} 2 cases run (2 held, 0 violated, 0 inconclusive); 42 cases NOT run (inputs over --max-case-bytes); 3 cases not run (case budget, --max-cases)",
+            "(3 case(s) were left out by the case budget (--max-cases)",
+            "state_idempotence: inconclusive \u{2014} no case run; 5 cases NOT run",
+            "state_associativity: not checked \u{2014} the corpus offered no case for it",
+            "(47 case(s) were skipped for size and never ran",
+        ] {
+            assert!(
+                human.contains(expected),
+                "the human report is missing {expected:?}:\n{human}"
+            );
+        }
+        // The caveat must follow the clean-result line, which is what a reader stops at.
+        let clean = human
+            .find("no merge-law violations found.")
+            .expect("no violations in this fixture");
+        let caveat = human
+            .find("were skipped for size and never ran")
+            .expect("caveat asserted above");
+        assert!(caveat > clean, "{human}");
+    }
+
+    /// The skip counts must survive from the generator to the report.
+    ///
+    /// `Report::build` is tested above with counts handed to it directly, so a caller
+    /// that passed `&[]` instead would leave those tests green while every real run
+    /// reported nothing skipped. This drives the command's own generate-check-report
+    /// path, with a fake oracle in place of the WASM runtime.
+    #[test]
+    fn check_cases_carries_the_skip_counts_into_the_report() {
+        let corpus = Corpus::from_states(vec![vec![1, 1], vec![2, 2], vec![3, 3], vec![9; 64]]);
+        let generator = GeneratorConfig {
+            properties: vec![
+                ConformanceProperty::StateCommutativity,
+                ConformanceProperty::StateIdempotence,
+            ],
+            max_case_bytes: 16,
+            ..Default::default()
+        };
+        let generated = generate_cases_counted(&corpus, &generator);
+        assert_eq!(
+            generated.oversized_total(),
+            4,
+            "fixture: the large state must push some cases over the limit"
+        );
+
+        let (report, outcomes) = check_cases(
+            &mut GrowOnly,
+            &corpus,
+            &generator,
+            generated,
+            |_, _| Ok(None),
+            Vec::new(),
+        )
+        .expect("no evidence is written, so nothing can fail");
+
+        assert_eq!(outcomes.len(), 6, "the cases under the limit must all run");
+        assert_eq!(report.cases_skipped_oversized, 4);
+        let skipped: Vec<(&str, usize)> = report
+            .properties
+            .iter()
+            .map(|p| (p.property, p.cases_skipped_oversized))
+            .collect();
+        assert_eq!(
+            skipped,
+            vec![("state_commutativity", 3), ("state_idempotence", 1)],
+            "the per-property skip counts were lost between generating and reporting"
+        );
+    }
+
+    /// Cases the `--max-cases` budget cut are counted too. They do not change the
+    /// verdict: on a large corpus the budget always cuts some, so `held_partial`
+    /// would fire on almost every run.
+    ///
+    /// With the size limit out of the way the budget is the only thing dropping
+    /// cases, which is exactly the run a developer gets after raising
+    /// `--max-case-bytes` to look at a large state.
+    #[test]
+    fn check_cases_counts_cases_the_budget_cut() {
+        let corpus = Corpus::from_states(vec![vec![1], vec![2], vec![3], vec![4]]);
+        let generator = GeneratorConfig {
+            properties: vec![ConformanceProperty::StateCommutativity],
+            max_cases: 2,
+            max_case_bytes: usize::MAX,
+            ..Default::default()
+        };
+        let generated = generate_cases_counted(&corpus, &generator);
+        let (report, outcomes) = check_cases(
+            &mut GrowOnly,
+            &corpus,
+            &generator,
+            generated,
+            |_, _| Ok(None),
+            Vec::new(),
+        )
+        .expect("no evidence is written, so nothing can fail");
+
+        assert_eq!(outcomes.len(), 2);
+        assert_eq!(report.cases_skipped_oversized, 0);
+        assert_eq!(report.cases_skipped_budget, 4, "6 pairs, 2 run");
+        assert_eq!(report.properties[0].verdict, "held");
+        assert!(
+            render_human(&report).contains("4 case(s) not run because the case budget"),
+            "{}",
+            render_human(&report)
+        );
+    }
+
+    /// `conformance()` must hand the generator's counts on whole: `check_cases` gets
+    /// the effective generator config and the whole `GeneratedCases`, and the
+    /// no-cases path gets the per-property size counts. The command itself needs a
+    /// WASM runtime, so these hand-offs are pinned at the source level; the tests
+    /// above cover what each callee does with them.
+    #[test]
+    fn conformance_hands_the_skip_counts_on_whole() {
+        let body: String = super::stdout_purity_pin::code_only("pub async fn conformance(")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        for expected in [
+            "letgenerator_config=generator_config(&config,properties);",
+            "letgenerated=generate_cases_counted(&corpus,&generator_config);",
+            "check_cases(&mutoracle,&corpus,&generator_config,generated,",
+            "no_cases_message(&corpus,&generated.oversized,generator_config.max_case_bytes,",
+        ] {
+            assert!(
+                body.contains(expected),
+                "conformance() no longer passes {expected:?}:\n{body}"
+            );
+        }
+    }
+
+    /// Write `states` as files and build a `verify-merge` config over them.
+    fn config_with_states(
+        dir: &std::path::Path,
+        states: &[Vec<u8>],
+        max_case_bytes: usize,
+    ) -> ConformanceConfig {
+        let wasm = dir.join("c.wasm");
+        std::fs::write(&wasm, minimal_contract_wasm(1)).expect("write wasm");
+        let states = states
+            .iter()
+            .enumerate()
+            .map(|(i, bytes)| {
+                let path = dir.join(format!("s{i}.bin"));
+                std::fs::write(&path, bytes).expect("write state");
+                path
+            })
+            .collect();
+        ConformanceConfig {
+            states,
+            max_case_bytes: Some(max_case_bytes),
+            properties: vec!["state_commutativity".into()],
+            ..wasm_only_config(Some(wasm))
+        }
+    }
+
+    /// A run in which the size limit skipped every case checked nothing, so it must
+    /// fail rather than exit 0.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_run_whose_cases_were_all_skipped_fails() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let config = config_with_states(dir.path(), &[vec![1; 64], vec![2; 64]], 16);
+        let err = conformance(config)
+            .await
+            .expect_err("a run that checked nothing must not succeed");
+        assert!(
+            err.to_string().contains("every one was skipped"),
+            "the error must name the size limit: {err}"
+        );
+    }
+
+    /// Skips do not change the exit code while any case runs: the report counts
+    /// them, and the run's outcome is decided by the cases that ran.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn skips_do_not_fail_a_run_in_which_some_cases_ran() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let config = config_with_states(dir.path(), &[vec![1], vec![2], vec![3; 64]], 16);
+        conformance(config)
+            .await
+            .expect("a run with some cases run and some skipped must not fail on the skips");
+    }
+
+    /// The per-property table also appears when nothing was skipped but some law
+    /// did not plainly hold, since the totals cannot say which one.
+    #[test]
+    fn the_table_shows_when_a_law_did_not_plainly_hold() {
+        let case = |p| ConformanceCase::new(p, vec![Bytes::from(vec![1u8])]);
+        let generator = GeneratorConfig {
+            properties: vec![
+                ConformanceProperty::StateCommutativity,
+                ConformanceProperty::StateIdempotence,
+            ],
+            ..Default::default()
+        };
+        let outcomes = vec![
+            (
+                case(ConformanceProperty::StateCommutativity),
+                PropertyOutcome::Holds,
+            ),
+            (
+                case(ConformanceProperty::StateIdempotence),
+                PropertyOutcome::Inconclusive(Inconclusive::RoundLimit),
+            ),
+        ];
+        let report = Report::build(
+            &Corpus::default(),
+            &generator,
+            &GeneratedCases::default(),
+            &outcomes,
+            None,
+            Vec::new(),
+        );
+        let human = render_human(&report);
+        assert!(
+            human.contains("by property:") && human.contains("state_idempotence: inconclusive"),
+            "{human}"
+        );
+    }
+
+    /// A repeated `--property` would generate, run and count its cases twice.
+    #[test]
+    fn a_repeated_property_is_checked_once() {
+        let names = [
+            "state_commutativity",
+            "state_idempotence",
+            "state_commutativity",
+        ]
+        .map(String::from);
+        assert_eq!(
+            parse_properties(&names).expect("valid names"),
+            vec![
+                ConformanceProperty::StateCommutativity,
+                ConformanceProperty::StateIdempotence,
+            ]
+        );
+    }
+
+    /// A run with nothing skipped says nothing about skipping in the human report,
+    /// and still reports an explicit zero in `--json`.
+    #[test]
+    fn a_run_with_nothing_skipped_reports_zero() {
+        let outcomes = vec![(
+            ConformanceCase::new(
+                ConformanceProperty::StateIdempotence,
+                vec![Bytes::from(vec![1u8])],
+            ),
+            PropertyOutcome::Holds,
+        )];
+        let generator = GeneratorConfig {
+            properties: vec![ConformanceProperty::StateIdempotence],
+            ..Default::default()
+        };
+        let generated = GeneratedCases {
+            oversized: vec![(ConformanceProperty::StateIdempotence, 0)],
+            budget_cut: vec![(ConformanceProperty::StateIdempotence, 0)],
+            ..Default::default()
+        };
+        let report = Report::build(
+            &Corpus::default(),
+            &generator,
+            &generated,
+            &outcomes,
+            None,
+            Vec::new(),
+        );
+        let json = serde_json::to_value(&report).expect("serialize");
+        assert_eq!(json["cases_skipped_oversized"], 0);
+        assert_eq!(json["cases_skipped_budget"], 0);
+        assert_eq!(json["properties"][0]["verdict"], "held");
+        assert!(!render_human(&report).contains("NOT run"));
+        assert!(
+            !render_human(&report).contains("by property:"),
+            "a run where every law held and nothing was skipped needs no table"
+        );
+    }
+
+    /// When every case was skipped for size, the error must say so and name the flag.
+    /// The generic "supply more states" advice sends the author the wrong way: the
+    /// corpus was fine and the size limit removed all of it. When some properties had
+    /// no inputs at all, that advice still applies to them, so both are given.
+    #[test]
+    fn no_cases_message_names_the_size_limit_when_it_removed_everything() {
+        use ConformanceProperty::{StateCommutativity, StateIdempotence};
+        let corpus = Corpus::from_states(vec![vec![0; 8], vec![1; 8]]);
+        let sized = no_cases_message(&corpus, &[(StateCommutativity, 3)], 4 * 1024 * 1024);
+        assert!(
+            sized.contains("3 case(s) were built and every one was skipped")
+                && sized.contains("--max-case-bytes (4194304 bytes)"),
+            "{sized}"
+        );
+        assert!(!sized.contains("supply more states"), "{sized}");
+
+        let thin = no_cases_message(&corpus, &[(StateCommutativity, 0)], 4 * 1024 * 1024);
+        assert!(thin.contains("supply more states"), "{thin}");
+        assert!(!thin.contains("--max-case-bytes"), "{thin}");
+
+        let mixed = no_cases_message(
+            &corpus,
+            &[(StateCommutativity, 3), (StateIdempotence, 0)],
+            4 * 1024 * 1024,
+        );
+        assert!(
+            mixed.contains("--max-case-bytes (4194304 bytes)")
+                && mixed.contains("supply more states"),
+            "{mixed}"
+        );
+    }
+
+    /// `--max-case-bytes` reaches the generator, and leaving it out keeps the
+    /// generator's default.
+    #[test]
+    fn max_case_bytes_flag_sets_the_generator_limit() {
+        use clap::Parser;
+        let raised =
+            ConformanceConfig::parse_from(["verify-merge", "--max-case-bytes", "12000000"]);
+        assert_eq!(
+            generator_config(&raised, Vec::new()).max_case_bytes,
+            12_000_000
+        );
+        let default = ConformanceConfig::parse_from(["verify-merge"]);
+        assert_eq!(
+            generator_config(&default, Vec::new()).max_case_bytes,
+            GeneratorConfig::default().max_case_bytes
+        );
+    }
+
+    /// A violation is counted under the law it broke, as `findings` count it. When a
+    /// violation does not reproduce, the verifier reports `UpdateDeterminism` for a
+    /// case generated for another law, and that law must not read `violated`.
+    ///
+    /// The case itself is counted as inconclusive under its own law, so that law
+    /// reads neither `violated` nor a clean `held`, nor `not_checked` when the
+    /// escalated case was its only one. Also covers the `violated` and `held_partial`
+    /// (inconclusive only) verdict branches.
+    #[test]
+    fn coverage_counts_a_violation_under_the_law_it_broke() {
+        use ConformanceProperty::{StateCommutativity, StateIdempotence, UpdateDeterminism};
+        let case = |p| ConformanceCase::new(p, vec![Bytes::from(vec![1u8])]);
+        let outcomes = vec![
+            (
+                case(StateCommutativity),
+                PropertyOutcome::Violated(violation_of(UpdateDeterminism)),
+            ),
+            (case(StateCommutativity), PropertyOutcome::Holds),
+            (case(StateIdempotence), PropertyOutcome::Holds),
+            (
+                case(StateIdempotence),
+                PropertyOutcome::Inconclusive(Inconclusive::RoundLimit),
+            ),
+        ];
+        let rows = property_coverage(
+            &[StateCommutativity, StateIdempotence, UpdateDeterminism],
+            &GeneratedCases::default(),
+            &outcomes,
+        );
+        let verdicts: Vec<(&str, &str, usize, usize, usize)> = rows
+            .iter()
+            .map(|r| {
+                (
+                    r.property,
+                    r.verdict,
+                    r.cases_run,
+                    r.violations,
+                    r.inconclusive,
+                )
+            })
+            .collect();
+        // The escalated case is inconclusive for commutativity, so that law reads
+        // held_partial: not violated, and not a clean hold either.
+        assert_eq!(
+            verdicts,
+            vec![
+                ("state_commutativity", "held_partial", 2, 0, 1),
+                ("state_idempotence", "held_partial", 2, 0, 1),
+                ("update_determinism", "violated", 1, 1, 0),
+            ]
+        );
+
+        // An escalated case alone must not leave its own law reading not_checked.
+        let only = property_coverage(
+            &[StateCommutativity],
+            &GeneratedCases::default(),
+            &outcomes[..1],
+        );
+        assert_eq!(
+            (only[0].property, only[0].verdict),
+            ("state_commutativity", "inconclusive")
+        );
+    }
+
+    /// Size and budget counts in one run, through the command's own path: neither
+    /// absorbs the other, and the size skips make the verdict `held_partial`.
+    #[test]
+    fn check_cases_reports_size_and_budget_skips_together() {
+        let corpus = Corpus::from_states(vec![vec![1], vec![2], vec![3], vec![4], vec![9; 64]]);
+        let generator = GeneratorConfig {
+            properties: vec![ConformanceProperty::StateCommutativity],
+            max_case_bytes: 16,
+            max_cases: 2,
+            ..Default::default()
+        };
+        let generated = generate_cases_counted(&corpus, &generator);
+        let (report, _) = check_cases(
+            &mut GrowOnly,
+            &corpus,
+            &generator,
+            generated,
+            |_, _| Ok(None),
+            Vec::new(),
+        )
+        .expect("no evidence is written, so nothing can fail");
+        // 10 pairs: 4 include the large state, and the budget runs 2 of the other 6.
+        let row = &report.properties[0];
+        assert_eq!(
+            (
+                row.cases_run,
+                row.cases_skipped_oversized,
+                row.cases_skipped_budget
+            ),
+            (2, 4, 4)
+        );
+        assert_eq!(row.verdict, "held_partial");
+        let human = render_human(&report);
+        assert!(
+            human.contains("4 case(s) NOT run because their inputs exceeded")
+                && human.contains("4 case(s) not run because the case budget"),
+            "{human}"
+        );
+    }
+
+    /// The sample sizes are reported against the corpus totals in `--json` always,
+    /// and in the human report only for the laws that used the sample.
+    #[test]
+    fn sampling_is_reported_against_the_corpus() {
+        use ConformanceProperty::{StateAssociativity, TransitionPathAgreement};
+        let corpus = Corpus {
+            transitions: (0..40u8)
+                .map(|i| (Bytes::from(vec![i]), Bytes::from(vec![i, 1])))
+                .collect(),
+            ..Corpus::from_states((0..100u8).map(|i| vec![i]).collect())
+        };
+        let report_for = |properties: Vec<ConformanceProperty>| {
+            let generator = GeneratorConfig {
+                properties,
+                ..Default::default()
+            };
+            let generated = generate_cases_counted(&corpus, &generator);
+            check_cases(
+                &mut GrowOnly,
+                &corpus,
+                &generator,
+                generated,
+                |_, _| Ok(None),
+                Vec::new(),
+            )
+            .expect("no evidence is written, so nothing can fail")
+            .0
+        };
+        let states_line = "24 of the 100 states sampled for the state-based laws, the last supplied and the largest always sampled";
+        let transitions_line = "24 of the 40 transitions sampled, the last supplied always sampled";
+
+        let both = report_for(vec![StateAssociativity, TransitionPathAgreement]);
+        let json = serde_json::to_value(&both).expect("serialize");
+        assert_eq!(
+            (
+                &json["states_sampled"],
+                &json["corpus_states"],
+                &json["transitions_sampled"],
+                &json["corpus_transitions"]
+            ),
+            (&24.into(), &100.into(), &24.into(), &40.into())
+        );
+        let human = render_human(&both);
+        assert!(
+            human.contains(states_line) && human.contains(transitions_line),
+            "{human}"
+        );
+
+        let states_only = render_human(&report_for(vec![StateAssociativity]));
+        assert!(states_only.contains(states_line), "{states_only}");
+        assert!(!states_only.contains(transitions_line), "{states_only}");
+
+        let transitions_only = render_human(&report_for(vec![TransitionPathAgreement]));
+        assert!(
+            transitions_only.contains(transitions_line),
+            "{transitions_only}"
+        );
+        assert!(
+            !transitions_only.contains(states_line),
+            "{transitions_only}"
         );
     }
 }

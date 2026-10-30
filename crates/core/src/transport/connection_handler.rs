@@ -38,7 +38,7 @@ use super::{
     packet_data::{
         MAX_PACKET_SIZE, MAX_RECV_PACKET_SIZE as RECV_BUF_SIZE, PacketData, SymmetricAES,
     },
-    peer_connection::{InboundPacket, PeerConnection, RemoteConnection},
+    peer_connection::{InboundPacket, PeerConnection, RemoteConnection, initial_paced_rate},
     sent_packet_tracker::SentPacketTracker,
     symmetric_message::{SymmetricMessage, SymmetricMessagePayload},
     token_bucket::TokenBucket,
@@ -106,17 +106,8 @@ const MIN_BUCKET_CAPACITY_BYTES: usize = 8192;
 
 pub type SerializedMessage = Vec<u8>;
 
-type GatewayConnectionFuture<S, T> = BoxFuture<
-    'static,
-    Result<
-        (
-            RemoteConnection<S, T>,
-            InboundRemoteConnection,
-            PacketData<SymmetricAES>,
-        ),
-        TransportError,
-    >,
->;
+type GatewayConnectionFuture<S, T> =
+    BoxFuture<'static, Result<(RemoteConnection<S, T>, InboundRemoteConnection), TransportError>>;
 
 type TraverseNatFuture<S, T> =
     BoxFuture<'static, Result<(RemoteConnection<S, T>, InboundRemoteConnection), TransportError>>;
@@ -179,6 +170,7 @@ pub async fn create_connection_handler<S: Socket>(
             // `create_connection_handler` is the test and tool entry point;
             // the node opens the transport through `open_udp_transport`.
             quic: None,
+            advertised_version_override: None,
         },
     )
     .await
@@ -201,6 +193,13 @@ pub(crate) struct UdpTransportConfig {
     /// QUIC endpoint settings when `transport-quic` is on, `None` (no
     /// endpoint, no QUIC ingress) when it is off. See `transport::quic`.
     pub(crate) quic: Option<super::quic::QuicSettings>,
+    /// Simulation-only: the version this node advertises in its handshakes
+    /// (the intro packet and `AckConnectionV2`), so a simulation can emulate
+    /// an older peer. Only what the node TELLS its peers changes; the node
+    /// still checks compatibility with its real version and still decodes
+    /// everything the real binary decodes. `None` (the real version) in
+    /// production.
+    pub(crate) advertised_version_override: Option<(u8, u8, u16)>,
 }
 
 pub(super) type UdpListenerParts<S> = (
@@ -231,18 +230,36 @@ pub(super) async fn bind_udp_listener<S: Socket>(
         "Binding UDP socket"
     );
 
+    // In simulation the QUIC endpoint runs on the network's `VirtualTime`,
+    // so quinn's timers (handshake, loss detection, idle) follow the
+    // simulated clock and a seeded run repeats. `None` outside simulation,
+    // where it runs on `RealTime`.
+    let quic_virtual_time = config
+        .quic
+        .as_ref()
+        .and_then(|_| get_socket_virtual_time(&bind_addr));
     // The node-wide egress cap exists only when `total-bandwidth-limit` is
-    // set (which is when `global_bandwidth` is), so a node without it pays
-    // nothing. The cap uses the same clock kind as the listener built below
-    // (`RealTime`); waiters sleep on their own connection's time source.
-    // That holds in simulation too: the listener and its connections run on
-    // `RealTime` there, so a cap on the network's `VirtualTime` would compute
-    // deficits on one clock for stream senders that sleep and time out on
-    // another. A sender on `VirtualTime` (the QUIC endpoint, #5940) must use
-    // the cap only once the cap and its other waiters share that clock.
+    // set and not 0 (`global_bandwidth` is set, and `from_total_limit`
+    // builds no cap for 0), so a node without it pays nothing. The cap runs
+    // on `RealTime`, as the listener built below does, in production and in
+    // simulation alike; waiters sleep on their own connection's time
+    // source. A cap on the network's `VirtualTime` would compute deficits on
+    // one clock for stream senders that sleep and time out on another.
+    //
+    // The QUIC endpoint must run on the cap's clock (see
+    // `QuicEndpoint::bind`), and in simulation it runs on `VirtualTime`, so
+    // a simulated node that has both a cap and QUIC is refused rather than
+    // run on two clocks.
     let egress_cap = config.global_bandwidth.as_ref().and_then(|manager| {
         super::egress_cap::EgressCap::from_total_limit(manager.total_limit(), RealTime::new())
     });
+    if quic_virtual_time.is_some() && egress_cap.is_some() {
+        return Err(TransportError::Other(anyhow::anyhow!(
+            "simulated node at {bind_addr} sets both transport-quic and \
+             total-bandwidth-limit: the egress cap runs on RealTime and the \
+             simulated QUIC endpoint on VirtualTime, so they cannot share a clock"
+        )));
+    }
     let socket = Arc::new(
         bind_socket_with_retry::<DemuxSocket<S>>(bind_addr, SOCKET_BIND_MAX_RETRIES)
             .await?
@@ -251,19 +268,36 @@ pub(super) async fn bind_udp_listener<S: Socket>(
     // With `transport-quic` off nothing is built and no QUIC ingress is
     // enabled, so QUIC-class datagrams stay `quic_ingress_no_ingress`. With
     // it on the endpoint runs on the egress cap's clock (`RealTime`, see
-    // above), authenticates with this node's transport key, and has an
-    // empty allow-set: nothing reaches it until an upgrade path allows a
-    // peer.
+    // above; the simulation's `VirtualTime` in a simulation, which has no
+    // cap), authenticates with this node's transport key, and has an empty
+    // allow-set: nothing reaches it until an upgrade path allows a peer.
     let quic_endpoint = config.quic.as_ref().and_then(|settings| {
-        super::quic::QuicEndpoint::bind_or_warn(
-            socket.clone(),
-            bind_addr,
-            RealTime::new(),
-            settings,
-            &keypair,
-        )
+        let socket = socket.clone();
+        match quic_virtual_time {
+            // Building the endpoint draws quinn's RNG seed from `GlobalRng`.
+            // A side stream (named by the bind address) keeps that draw out
+            // of the run's main stream, so an endpoint that is bound and idle
+            // does not change any later random choice of the run. Once it
+            // opens connections, quinn's connection-ID draws (the
+            // `initial_dst_cid_provider` in `quic::config` and the CID
+            // generator) take from the main stream inside quinn's tasks.
+            Some(time) => GlobalRng::with_side_stream(side_stream_of(bind_addr), || {
+                super::quic::QuicEndpoint::bind_or_warn(socket, bind_addr, time, settings, &keypair)
+            }),
+            None => super::quic::QuicEndpoint::bind_or_warn(
+                socket,
+                bind_addr,
+                RealTime::new(),
+                settings,
+                &keypair,
+            ),
+        }
     });
 
+    #[cfg(any(test, feature = "testing"))]
+    if let Some(endpoint) = &quic_endpoint {
+        super::in_memory_socket::record_quic_endpoint_clock(bind_addr, endpoint.clock_type());
+    }
     tracing::info!(
         target: "freenet_core::transport::send_debug",
         bind_addr = %bind_addr,
@@ -287,6 +321,16 @@ pub(super) async fn bind_udp_listener<S: Socket>(
     ))
 }
 
+/// A `GlobalRng` side-stream id for `addr`: the same address gives the same
+/// id in every run (FNV-1a over its text form).
+fn side_stream_of(addr: SocketAddr) -> u64 {
+    addr.to_string()
+        .bytes()
+        .fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        })
+}
+
 /// Open the UDP transport and return it as the node's [`TransportHandle`]
 /// (`super::TransportHandle`). Binds the same way as
 /// [`create_connection_handler`].
@@ -299,6 +343,13 @@ pub(crate) async fn open_udp_transport<S: Socket>(
 ) -> Result<super::TransportHandle, TransportError> {
     let (outbound, inbound, listen_task) =
         bind_udp_listener::<S>(keypair, listen_host, listen_port, is_gateway, config).await?;
+    // The QUIC crash-loop breaker (#5940) arms only now, with the socket
+    // bound and the endpoint built, so a failed start leaves no marker. In the
+    // binary the signal handlers are ready before the transport opens, so
+    // arming follows the endpoint immediately.
+    super::quic::breaker::arm_if_quic_up(
+        outbound.quic_availability().get() == super::quic::liveness::QuicAvailability::Up,
+    );
     Ok(udp_transport_handle(outbound, inbound, listen_task))
 }
 
@@ -479,6 +530,7 @@ impl<S: Socket> OutboundConnectionHandler<S> {
             ack_version_floor_override,
             // Used by `bind_udp_listener`, which built `quic_endpoint` from it.
             quic: _,
+            advertised_version_override,
         } = config;
         let (conn_handler_sender, conn_handler_receiver) = mpsc::channel(100);
         let (new_connection_sender, new_connection_notifier) = mpsc::channel(10);
@@ -519,6 +571,8 @@ impl<S: Socket> OutboundConnectionHandler<S> {
             time_source,
             congestion_config: Some(congestion_config.unwrap_or_default()),
             ack_version_floor_override,
+            advertised_version: advertised_version_override
+                .map_or(PROTOC_VERSION, version_cmp::encode_version),
             _quic_endpoint: quic_endpoint,
         };
         let connection_handler = OutboundConnectionHandler {
@@ -774,6 +828,7 @@ impl<S: Socket> OutboundConnectionHandler<S, crate::simulation::VirtualTime> {
             // Benchmarks measure throughput, not handshake encoding; the real
             // floor applies here exactly as in production.
             ack_version_floor_override: None,
+            advertised_version: PROTOC_VERSION,
         };
         let connection_handler = OutboundConnectionHandler {
             send_queue: conn_handler_sender,
@@ -950,6 +1005,11 @@ struct UdpPacketsListener<S = UdpSocket, T: TimeSource = RealTime> {
     /// itself, where a red sim could not be attributed between the feature and
     /// the version bump.
     ack_version_floor_override: Option<(u8, u8, u16)>,
+    /// The version this node advertises in its intro packets and
+    /// `AckConnectionV2`: `PROTOC_VERSION`, or a simulation's older version
+    /// (`UdpTransportConfig::advertised_version_override`). Compatibility
+    /// checks still use `PROTOC_VERSION`.
+    advertised_version: [u8; 8],
     /// The QUIC endpoint on this listener's socket, when `transport-quic`
     /// is on. Held here so it lives as long as the listener reading the
     /// socket that feeds it. Nothing uses it yet (#5940): it accepts no
@@ -978,14 +1038,7 @@ type OngoingConnectionResult<S, T> = Option<
 
 type GwOngoingConnectionResult<S, T> = Option<
     Result<
-        Result<
-            (
-                RemoteConnection<S, T>,
-                InboundRemoteConnection,
-                PacketData<SymmetricAES>,
-            ),
-            (TransportError, SocketAddr),
-        >,
+        Result<(RemoteConnection<S, T>, InboundRemoteConnection), (TransportError, SocketAddr)>,
         tokio::task::JoinError,
     >,
 >;
@@ -1600,6 +1653,27 @@ pub(super) const NAT_TRAVERSAL_MAX_ATTEMPTS: usize = 10;
 /// also the window in which the joiner must start dialling an acceptor.
 pub(crate) const NAT_TRAVERSAL_DEADLINE: Duration = Duration::from_secs(3);
 
+/// Packet id of a connection's first data packet. Id 0
+/// ([`SymmetricMessage::FIRST_PACKET_ID`]) is the handshake's success acks'
+/// id, and a remote answers every success ack it receives on an established
+/// connection with a receipt for id 0 (`receipt_policy`), including a resend
+/// of the handshake ack that crossed our completion on the wire. If our first
+/// data packet were id 0 too, that receipt would be credited to it: a false
+/// RTT sample, and the packet released as delivered, so never retransmitted
+/// if it was lost.
+///
+/// Only the sender changes. A receiver gives ids no meaning beyond identity
+/// (exact-id dedup for `RETAIN_TIME`, receipts by id) and already sees gaps,
+/// since untracked packets also take ids, so a peer on any release reads a
+/// connection that starts at 1. A remote that still starts at 0 is
+/// unaffected on our side: we ack its packets as before.
+pub(super) const FIRST_DATA_PACKET_ID: super::PacketId = SymmetricMessage::FIRST_PACKET_ID + 1;
+
+/// The id counter for a new connection's data packets.
+pub(super) fn data_packet_ids() -> Arc<AtomicU32> {
+    Arc::new(AtomicU32::new(FIRST_DATA_PACKET_ID))
+}
+
 impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
     #[tracing::instrument(level = "debug", name = "transport_listener", fields(peer = %self.this_peer_keypair.public), skip_all)]
     async fn listen(mut self) -> TransportError {
@@ -1977,10 +2051,14 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                         }
                     };
                     match task_result {
-                        // Successful gateway connection
-                        Ok((outbound_remote_conn, inbound_remote_connection, outbound_ack_packet)) => {
+                        // Successful gateway connection. The success ack is
+                        // not kept pending on the connection: our inbound key
+                        // is per remote address, so completing under it shows
+                        // the joiner holds that address's current key.
+                        // Tracking the ack at id 0 made it collide with the
+                        // first data packet (see `FIRST_DATA_PACKET_ID`).
+                        Ok((outbound_remote_conn, inbound_remote_connection)) => {
                             let remote_addr = outbound_remote_conn.remote_addr;
-                            let sent_tracker = outbound_remote_conn.sent_tracker.clone();
 
                             if self.connections.complete_gateway_handshake(remote_addr, inbound_remote_connection.inbound_packet_sender) {
                                 if self.new_connection_notifier
@@ -1990,10 +2068,6 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                     tracing::error!(peer_addr = %remote_addr, "Failed to notify new gateway connection");
                                     break 'outer TransportError::ConnectionClosed(self.this_addr);
                                 }
-                                sent_tracker.lock().report_sent_packet(
-                                    SymmetricMessage::FIRST_PACKET_ID,
-                                    outbound_ack_packet.prepared_send(),
-                                );
                             } else {
                                 tracing::debug!(peer_addr = %remote_addr, "Connection state changed during handshake");
                             }
@@ -2187,7 +2261,6 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
             .unwrap_or(version_cmp::GATEWAY_ACK_VERSION_MIN_VERSION)
     }
 
-    #[allow(clippy::type_complexity)]
     fn gateway_connection(
         &mut self,
         remote_intro_packet: PacketData<UnknownEncryption>,
@@ -2205,6 +2278,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
         let time_source = self.time_source.clone();
         let congestion_config = self.congestion_config.clone();
         let ack_version_floor = self.ack_version_floor();
+        let advertised_version = self.advertised_version;
 
         let (inbound_from_remote, mut next_inbound) =
             mpsc::channel::<PacketData<UnknownEncryption>>(100);
@@ -2292,6 +2366,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                 remote_addr,
                 remote_protoc_version,
                 ack_version_floor,
+                advertised_version,
             )?;
 
             tracing::trace!(
@@ -2302,7 +2377,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
             );
 
             socket
-                .send_to(&outbound_ack_packet.clone().prepared_send(), remote_addr)
+                .send_to(&outbound_ack_packet.prepared_send(), remote_addr)
                 .await
                 .map_err(|err| handshake_send_failed(remote_addr, "inbound", err))?;
 
@@ -2352,18 +2427,19 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                 .build_arc_with_time_source(time_source.clone());
 
             // Initialize token bucket for smooth packet pacing.
-            // Use global bandwidth manager if configured, otherwise use the
-            // congestion controller's configured rate. Previously defaulted to
+            // Use global bandwidth manager if configured, otherwise the
+            // congestion controller's rate, lowered to `bandwidth-limit` if set
+            // (`initial_paced_rate`). Previously defaulted to
             // 10 MB/s which is 8x higher than FixedRate's 1.25 MB/s — the
             // initial burst triggered packet loss and immediate loss_pause,
             // collapsing throughput. See #3702.
-            let initial_rate = if let Some(ref global) = global_bandwidth {
-                global.register_connection()
-            } else if let Some(limit) = bandwidth_limit {
-                limit
-            } else {
-                congestion_controller.current_rate(TOKEN_BUCKET_WINDOW)
-            };
+            let initial_rate = initial_paced_rate(
+                global_bandwidth
+                    .as_ref()
+                    .map(|global| global.register_connection()),
+                bandwidth_limit,
+                congestion_controller.current_rate(TOKEN_BUCKET_WINDOW),
+            );
             // Capacity = one TOKEN_BUCKET_WINDOW worth of tokens at the configured rate.
             // Previously 1MB, which allowed an immediate burst 800x larger
             // than FixedRate's per-100ms budget, triggering loss. See #3702.
@@ -2403,11 +2479,12 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                 outbound_symmetric_key: outbound_key,
                 remote_addr,
                 sent_tracker,
-                last_packet_id: Arc::new(AtomicU32::new(0)),
+                last_packet_id: data_packet_ids(),
                 inbound_packet_recv: inbound_packet_rx,
                 inbound_symmetric_key: inbound_key,
                 inbound_symmetric_key_bytes: inbound_key_bytes,
                 global_bandwidth: global_bandwidth.clone(),
+                bandwidth_limit,
                 my_address: None,
                 remote_protoc_version,
                 transport_secret_key: secret,
@@ -2427,7 +2504,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                 direction = "inbound",
                 "Returning connection at gateway"
             );
-            Ok((remote_conn, inbound_conn, outbound_ack_packet))
+            Ok((remote_conn, inbound_conn))
         };
         (f.boxed(), inbound_from_remote)
     }
@@ -2539,6 +2616,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
             mpsc::channel::<PacketData<UnknownEncryption>>(100);
         let this_addr = self.this_addr;
         let ack_version_floor = self.ack_version_floor();
+        let advertised_version = self.advertised_version;
         let f = async move {
             tracing::info!(
                 peer_addr = %remote_addr,
@@ -2562,12 +2640,10 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
             let mut remote_protoc_version: Option<(u8, u8, u16)> = None;
             let outbound_intro_packet = {
                 let mut data = [0u8; { 16 + PROTOC_VERSION.len() }];
-                data[..PROTOC_VERSION.len()].copy_from_slice(&PROTOC_VERSION);
+                data[..PROTOC_VERSION.len()].copy_from_slice(&advertised_version);
                 data[PROTOC_VERSION.len()..].copy_from_slice(&inbound_sym_key_bytes);
                 PacketData::<_, MAX_PACKET_SIZE>::encrypt_with_pubkey(&data, &remote_public_key)
             };
-
-            let mut sent_tracker = SentPacketTracker::new_with_time_source(time_source.clone());
 
             // A failed send is handled like a datagram lost on the wire: the
             // loop sends again on its next pass, so an error that clears (a
@@ -2633,21 +2709,13 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                 remote_addr,
                                 remote_protoc_version,
                                 ack_version_floor,
+                                advertised_version,
                             )?;
-                            // Bookkeeping hygiene only: this tracker is not
-                            // consumed after RemoteInbound (a successful
-                            // completion builds a fresh one), so skipping an
-                            // unsent packet changes no accounting.
-                            if send_failures.record(
+                            send_failures.record(
                                 socket.send_to(our_inbound.data(), remote_addr).await,
                                 remote_addr,
                                 "ack",
-                            ) {
-                                sent_tracker.report_sent_packet(
-                                    SymmetricMessage::FIRST_PACKET_ID,
-                                    our_inbound.data().into(),
-                                );
-                            }
+                            );
                             attempts += 1;
                         }
                     }
@@ -2798,17 +2866,18 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                                 .unwrap_or_default()
                                                 .build_arc_with_time_source(time_source.clone());
 
-                                            // Initialize token bucket at congestion controller's
-                                            // rate to avoid initial burst. See #3702.
-                                            let initial_rate =
-                                                if let Some(ref global) = global_bandwidth {
-                                                    global.register_connection()
-                                                } else if let Some(limit) = bandwidth_limit {
-                                                    limit
-                                                } else {
-                                                    congestion_controller
-                                                        .current_rate(TOKEN_BUCKET_WINDOW)
-                                                };
+                                            // Initialize token bucket at the global share, else
+                                            // the controller's rate lowered to bandwidth-limit
+                                            // (`initial_paced_rate`), to avoid an initial
+                                            // burst. See #3702.
+                                            let initial_rate = initial_paced_rate(
+                                                global_bandwidth
+                                                    .as_ref()
+                                                    .map(|global| global.register_connection()),
+                                                bandwidth_limit,
+                                                congestion_controller
+                                                    .current_rate(TOKEN_BUCKET_WINDOW),
+                                            );
                                             let bucket_capacity =
                                                 (initial_rate / 10).max(MIN_BUCKET_CAPACITY_BYTES);
                                             let token_bucket =
@@ -2834,9 +2903,13 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                                     outbound_symmetric_key: outbound_sym_key,
                                                     remote_addr,
                                                     sent_tracker: Arc::new(
-                                                        parking_lot::Mutex::new(sent_tracker),
+                                                        parking_lot::Mutex::new(
+                                                            SentPacketTracker::new_with_time_source(
+                                                                time_source.clone(),
+                                                            ),
+                                                        ),
                                                     ),
-                                                    last_packet_id: Arc::new(AtomicU32::new(0)),
+                                                    last_packet_id: data_packet_ids(),
                                                     inbound_packet_recv: inbound_recv,
                                                     inbound_symmetric_key: inbound_sym_key,
                                                     inbound_symmetric_key_bytes:
@@ -2855,6 +2928,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                                     token_bucket,
                                                     socket: socket.clone(),
                                                     global_bandwidth: global_bandwidth.clone(),
+                                                    bandwidth_limit,
                                                     rolling_rtt_stats,
                                                     time_source: time_source.clone(),
                                                 },
@@ -2985,15 +3059,16 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                     .unwrap_or_default()
                                     .build_arc_with_time_source(time_source.clone());
 
-                                // Initialize token bucket at congestion controller's
-                                // rate to avoid initial burst. See #3702.
-                                let initial_rate = if let Some(ref global) = global_bandwidth {
-                                    global.register_connection()
-                                } else if let Some(limit) = bandwidth_limit {
-                                    limit
-                                } else {
-                                    congestion_controller.current_rate(TOKEN_BUCKET_WINDOW)
-                                };
+                                // Initialize token bucket at the global share, else the
+                                // controller's rate lowered to bandwidth-limit
+                                // (`initial_paced_rate`), to avoid an initial burst. See #3702.
+                                let initial_rate = initial_paced_rate(
+                                    global_bandwidth
+                                        .as_ref()
+                                        .map(|global| global.register_connection()),
+                                    bandwidth_limit,
+                                    congestion_controller.current_rate(TOKEN_BUCKET_WINDOW),
+                                );
                                 let bucket_capacity =
                                     (initial_rate / 10).max(MIN_BUCKET_CAPACITY_BYTES);
                                 let token_bucket = Arc::new(TokenBucket::new_with_time_source(
@@ -3023,7 +3098,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                                 time_source.clone(),
                                             ),
                                         )),
-                                        last_packet_id: Arc::new(AtomicU32::new(0)),
+                                        last_packet_id: data_packet_ids(),
                                         inbound_packet_recv: inbound_recv,
                                         inbound_symmetric_key: inbound_sym_key,
                                         inbound_symmetric_key_bytes: inbound_sym_key_bytes,
@@ -3034,6 +3109,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                         token_bucket,
                                         socket: socket.clone(),
                                         global_bandwidth: global_bandwidth.clone(),
+                                        bandwidth_limit,
                                         rolling_rtt_stats,
                                         time_source: time_source.clone(),
                                     },
@@ -3139,7 +3215,7 @@ fn record_remote_inbound_completion(this_addr: SocketAddr, remote_addr: SocketAd
 /// Test-only: whether `this_addr` completed a handshake with `remote_addr`
 /// in the `RemoteInbound` arm.
 #[cfg(test)]
-fn completed_in_remote_inbound(this_addr: SocketAddr, remote_addr: SocketAddr) -> bool {
+pub(super) fn completed_in_remote_inbound(this_addr: SocketAddr, remote_addr: SocketAddr) -> bool {
     REMOTE_INBOUND_COMPLETIONS
         .lock()
         .contains(&(this_addr, remote_addr))
@@ -3407,13 +3483,14 @@ fn build_success_ack(
     remote_addr: SocketAddr,
     remote_protoc_version: Option<(u8, u8, u16)>,
     ack_version_floor: (u8, u8, u16),
+    advertised_version: [u8; 8],
 ) -> Result<PacketData<SymmetricAES>, bincode::Error> {
     if version_cmp::version_supports_ack_version(remote_protoc_version, ack_version_floor) {
         SymmetricMessage::ack_ok_with_version(
             outbound_sym_key,
             our_inbound_key,
             remote_addr,
-            PROTOC_VERSION,
+            advertised_version,
         )
     } else {
         SymmetricMessage::ack_ok(outbound_sym_key, our_inbound_key, remote_addr)
@@ -3757,6 +3834,12 @@ pub mod mock_transport {
         /// `PacketDelayPolicy::Uniform` (the link model is FIFO per path
         /// already).
         pending_inbound: std::sync::Mutex<PendingInbound>,
+        /// The sender this socket registered in `channels` under `this`.
+        /// Weak, so the socket does not keep its own inbound channel open.
+        /// On drop the socket removes `this` only while it still maps to
+        /// this sender, so a socket started at the same address before this
+        /// one is dropped (a node restarted at its address) keeps its entry.
+        registered: mpsc::WeakUnboundedSender<MockDatagram>,
     }
 
     /// A VirtualTime sleep kept across `recv_from` calls.
@@ -3789,6 +3872,7 @@ pub mod mock_transport {
             channels: Channels,
         ) -> Self {
             let (outbound, inbound) = mpsc::unbounded_channel();
+            let registered = outbound.downgrade();
             channels.insert(addr, outbound);
             static SEED: AtomicU64 = AtomicU64::new(0xfeedbeef);
             MockSocket {
@@ -3804,6 +3888,7 @@ pub mod mock_transport {
                 virtual_time: None,
                 link: None,
                 pending_inbound: std::sync::Mutex::new(PendingInbound::default()),
+                registered,
             }
         }
 
@@ -3819,6 +3904,7 @@ pub mod mock_transport {
             time_source: Option<crate::simulation::VirtualTime>,
         ) -> Self {
             let (outbound, inbound) = mpsc::unbounded_channel();
+            let registered = outbound.downgrade();
             channels.insert(addr, outbound);
             static SEED: AtomicU64 = AtomicU64::new(0xfeedbeef);
             MockSocket {
@@ -3834,6 +3920,7 @@ pub mod mock_transport {
                 virtual_time: time_source,
                 link: None,
                 pending_inbound: std::sync::Mutex::new(PendingInbound::default()),
+                registered,
             }
         }
     }
@@ -4068,7 +4155,12 @@ pub mod mock_transport {
 
     impl Drop for MockSocket {
         fn drop(&mut self) {
-            self.channels.remove(&self.this);
+            // Only this socket's own registration: a newer socket at the same
+            // address may already have replaced it.
+            if let Some(ours) = self.registered.upgrade() {
+                self.channels
+                    .remove_if(&self.this, |_, sender| sender.same_channel(&ours));
+            }
         }
     }
 
@@ -4200,6 +4292,33 @@ pub mod mock_transport {
             None,
         )
         .await
+    }
+
+    /// A mock node, a gateway or not, at a caller-chosen `addr` with a
+    /// caller-chosen `keypair`, so a test can stop a node and start another
+    /// at the same address with the same or a different key. Returns its
+    /// outbound handler and its accepted inbound connections.
+    pub async fn create_mock_node_at_addr(
+        gateway: bool,
+        addr: SocketAddr,
+        keypair: TransportKeypair,
+        channels: Channels,
+    ) -> anyhow::Result<(
+        OutboundConnectionHandler<MockSocket>,
+        mpsc::Receiver<PeerConnection<MockSocket>>,
+    )> {
+        let socket = Arc::new(
+            MockSocket::new(
+                PacketDropPolicy::ReceiveAll,
+                PacketDelayPolicy::NoDelay,
+                addr,
+                channels,
+            )
+            .await,
+        );
+        Ok(OutboundConnectionHandler::new_test(
+            addr, socket, keypair, gateway,
+        )?)
     }
 
     /// Create a mock (non-gateway) peer whose version-carrying-ack floor (#5161)
@@ -5048,6 +5167,189 @@ pub mod mock_transport {
             crate_at_or_above_floor,
             "joiner's view of the gateway version must follow the production floor exactly"
         );
+        Ok(())
+    }
+
+    /// Each node's configured `bandwidth-limit` reaches the connections it
+    /// establishes, on the gateway's accept path and on the joiner's path, so
+    /// the rate update can apply it (#6047). Each side gets a distinct limit,
+    /// so a site that passed the other node's value, or none, fails here.
+    #[tokio::test]
+    async fn bandwidth_limit_reaches_gateway_and_joiner_connections() -> anyhow::Result<()> {
+        const JOINER_LIMIT: usize = 400_000;
+        const GATEWAY_LIMIT: usize = 600_000;
+        let channels = Arc::new(DashMap::new());
+        let (_, (mut joiner, _joiner_inbound), _) = create_mock_peer_internal(
+            Default::default(),
+            Default::default(),
+            false,
+            channels.clone(),
+            Some(JOINER_LIMIT),
+            None,
+        )
+        .await?;
+        let (gw_pub, (_gw_out, mut gw_inbound), gw_addr) = create_mock_peer_internal(
+            Default::default(),
+            Default::default(),
+            true,
+            channels,
+            Some(GATEWAY_LIMIT),
+            None,
+        )
+        .await?;
+
+        let connecting = joiner.connect(gw_pub, gw_addr).await;
+        let (joiner_conn, gw_conn) = tokio::time::timeout(Duration::from_secs(30), async {
+            tokio::join!(connecting, gw_inbound.recv())
+        })
+        .await?;
+        let joiner_conn = joiner_conn?;
+        let gw_conn = gw_conn.ok_or_else(|| anyhow::anyhow!("gateway accepted nothing"))?;
+
+        assert_eq!(joiner_conn.bandwidth_limit(), Some(JOINER_LIMIT));
+        assert_eq!(gw_conn.bandwidth_limit(), Some(GATEWAY_LIMIT));
+        // Both limits bind (below FixedRate's rate), so each connection's
+        // initial rate, and with it the bucket's capacity, comes from its limit.
+        assert_eq!(
+            joiner_conn.pacing_capacity(),
+            (JOINER_LIMIT / 10).max(MIN_BUCKET_CAPACITY_BYTES),
+            "joiner initial burst"
+        );
+        assert_eq!(
+            gw_conn.pacing_capacity(),
+            (GATEWAY_LIMIT / 10).max(MIN_BUCKET_CAPACITY_BYTES),
+            "gateway initial burst"
+        );
+        Ok(())
+    }
+
+    /// A `bandwidth-limit` above the congestion controller's rate must not
+    /// give a new connection a larger initial burst than no limit would. The
+    /// bucket's capacity is set once from the initial rate (`rate / 10`), so
+    /// when the raw limit set the initial rate, a 10 MB/s limit under FixedRate
+    /// gave every connection a 1 MB burst for its whole life (the #3702 burst).
+    /// Checked on
+    /// both the gateway's accept path and the joiner's path.
+    #[tokio::test]
+    async fn bandwidth_limit_above_the_controller_rate_keeps_the_default_burst()
+    -> anyhow::Result<()> {
+        const LIMIT: usize = 10_000_000;
+        let fixed_rate = crate::transport::fixed_rate::DEFAULT_RATE_BYTES_PER_SEC;
+        assert!(LIMIT > fixed_rate, "test premise: the limit must not bind");
+        let expected_capacity = (fixed_rate / 10).max(MIN_BUCKET_CAPACITY_BYTES);
+
+        let channels = Arc::new(DashMap::new());
+        let (_, (mut joiner, _joiner_inbound), _) = create_mock_peer_internal(
+            Default::default(),
+            Default::default(),
+            false,
+            channels.clone(),
+            Some(LIMIT),
+            None,
+        )
+        .await?;
+        let (gw_pub, (_gw_out, mut gw_inbound), gw_addr) = create_mock_peer_internal(
+            Default::default(),
+            Default::default(),
+            true,
+            channels,
+            Some(LIMIT),
+            None,
+        )
+        .await?;
+
+        let connecting = joiner.connect(gw_pub, gw_addr).await;
+        let (joiner_conn, gw_conn) = tokio::time::timeout(Duration::from_secs(30), async {
+            tokio::join!(connecting, gw_inbound.recv())
+        })
+        .await?;
+        let joiner_conn = joiner_conn?;
+        let gw_conn = gw_conn.ok_or_else(|| anyhow::anyhow!("gateway accepted nothing"))?;
+
+        assert_eq!(joiner_conn.pacing_capacity(), expected_capacity, "joiner");
+        assert_eq!(gw_conn.pacing_capacity(), expected_capacity, "gateway");
+        Ok(())
+    }
+
+    /// Hole-punches A to B with B's intro dropped, so (as in
+    /// `nat_traversal_ack_racer_learns_version_from_the_ack`) A never parses an
+    /// intro and completes on B's ack, while B completes by answering A's intro
+    /// (`RemoteInbound`). Asserts each side's arm, then returns each side's
+    /// `(bandwidth_limit, pacing_capacity)`. Test-only: this module also builds
+    /// under the `bench` feature, where those accessors do not exist.
+    #[cfg(test)]
+    async fn hole_punch_with_limits(
+        a_limit: usize,
+        b_limit: usize,
+    ) -> anyhow::Result<((Option<usize>, usize), (Option<usize>, usize))> {
+        let channels = Arc::new(DashMap::new());
+        let (a_pub, mut peer_a, a_addr) = create_mock_peer_with_bandwidth(
+            PacketDropPolicy::ReceiveAll,
+            Default::default(),
+            channels.clone(),
+            Some(a_limit),
+        )
+        .await?;
+        let (b_pub, mut peer_b, b_addr) = create_mock_peer_with_bandwidth(
+            PacketDropPolicy::Ranges(vec![0..1]),
+            Default::default(),
+            channels,
+            Some(b_limit),
+        )
+        .await?;
+
+        let a_side = GlobalExecutor::spawn(async move {
+            let conn = peer_a.connect(b_pub, b_addr).await;
+            let conn = tokio::time::timeout(Duration::from_secs(30), conn).await??;
+            Ok::<_, anyhow::Error>((conn.bandwidth_limit(), conn.pacing_capacity()))
+        });
+        let b_side = GlobalExecutor::spawn(async move {
+            let conn = peer_b.connect(a_pub, a_addr).await;
+            let conn = tokio::time::timeout(Duration::from_secs(30), conn).await??;
+            Ok::<_, anyhow::Error>((conn.bandwidth_limit(), conn.pacing_capacity()))
+        });
+        let (a, b) = tokio::try_join!(a_side, b_side)?;
+        // Unwrap first, so a failed connect is not reported as a wrong arm.
+        let (a, b) = (a?, b?);
+        assert!(
+            !completed_in_remote_inbound(a_addr, b_addr),
+            "premise: A completed on the ack arm"
+        );
+        assert!(
+            completed_in_remote_inbound(b_addr, a_addr),
+            "premise: B completed in the RemoteInbound arm"
+        );
+        Ok((a, b))
+    }
+
+    /// The same as `bandwidth_limit_reaches_gateway_and_joiner_connections`
+    /// for a peer-to-peer hole-punch, with each side forced onto a different
+    /// traversal arm (see `hole_punch_with_limits`), so a regression in either
+    /// arm's setup site fails every run. Run twice with the binding and the
+    /// non-binding limit swapped between the arms, so each arm is checked both
+    /// for a limit that sets its initial burst (capacity = limit / 10) and for
+    /// one above FixedRate's 1.25 MB/s that must keep the default burst
+    /// (125 000 bytes).
+    #[tokio::test]
+    async fn bandwidth_limit_reaches_hole_punched_connections() -> anyhow::Result<()> {
+        // (A's limit, B's limit, A's expected capacity, B's expected capacity)
+        let runs = [
+            (400_000, 20_000_000, 40_000, 125_000),
+            (10_000_000, 600_000, 125_000, 60_000),
+        ];
+        for (a_limit, b_limit, a_capacity, b_capacity) in runs {
+            let (a, b) = hole_punch_with_limits(a_limit, b_limit).await?;
+            assert_eq!(
+                a,
+                (Some(a_limit), a_capacity),
+                "ack-arm connection, limits ({a_limit}, {b_limit})"
+            );
+            assert_eq!(
+                b,
+                (Some(b_limit), b_capacity),
+                "RemoteInbound-arm connection, limits ({a_limit}, {b_limit})"
+            );
+        }
         Ok(())
     }
 
@@ -7636,6 +7938,397 @@ pub mod mock_transport {
                 InRemoteInbound::Either,
             )
             .await
+        }
+
+        /// A connection's first data packet must not share packet id 0 with
+        /// the handshake's success acks. The remote answers every
+        /// `AckConnection` it receives on an established connection with a
+        /// receipt for id 0 (`receipt_policy`), including a resend of the
+        /// handshake ack that crossed our completion on the wire. Taken as a
+        /// receipt for the data packet, it gave a false RTT sample (50 ms on
+        /// a 250 ms path in the WAN bench) and released the packet as
+        /// delivered, so it was never retransmitted if lost.
+        mod first_data_packet {
+            use super::*;
+            use crate::simulation::TimeSource;
+            use bytes::Bytes;
+
+            /// Bounds every wait on the remote, so a regression fails with a
+            /// message instead of hanging the test.
+            const WAIT: Duration = Duration::from_secs(10);
+
+            fn open(packet: Vec<u8>, from_peer: [u8; 16]) -> Option<SymmetricMessage> {
+                let packet = PacketData::<_, MAX_PACKET_SIZE>::from_buf(packet);
+                let plain = packet.try_decrypt_sym(&cipher(from_peer)).ok()?;
+                SymmetricMessage::deser(plain.data()).ok()
+            }
+
+            /// Sends one message on `conn` and returns its packet id, read off
+            /// the wire at `remote`.
+            async fn send_first_message<T: TimeSource>(
+                conn: &mut PeerConnection<MockSocket, T>,
+                remote: &mut ScriptedRemote,
+                from_peer: [u8; 16],
+            ) -> anyhow::Result<u32> {
+                conn.send(b"first data".to_vec()).await?;
+                let data_id = tokio::time::timeout(WAIT, async {
+                    loop {
+                        if let Some(msg) = open(remote.recv().await, from_peer) {
+                            if matches!(msg.payload, SymmetricMessagePayload::ShortMessage { .. }) {
+                                break msg.packet_id;
+                            }
+                        }
+                    }
+                })
+                .await
+                .expect("the message reaches the remote");
+                assert_ne!(
+                    data_id,
+                    SymmetricMessage::FIRST_PACKET_ID,
+                    "the first data packet must not share the handshake ack's id"
+                );
+                assert!(
+                    conn.congestion_probe().flightsize > 0,
+                    "premise: the message is in flight"
+                );
+                Ok(data_id)
+            }
+
+            /// `remote` sends `receipts` in a NoOp, then a marker message on
+            /// the same in-order channel. Returns once `conn` delivers the
+            /// marker, so the receipts have been processed.
+            async fn deliver_receipts<T: TimeSource>(
+                conn: &mut PeerConnection<MockSocket, T>,
+                remote: &ScriptedRemote,
+                peer_addr: SocketAddr,
+                to_peer: [u8; 16],
+                receipts: Vec<u32>,
+                first_id: u32,
+            ) -> anyhow::Result<()> {
+                let noop = SymmetricMessage::serialize_msg_to_packet_data(
+                    first_id,
+                    SymmetricMessagePayload::NoOp,
+                    &cipher(to_peer),
+                    receipts,
+                )?;
+                remote.send(peer_addr, noop.data());
+                let marker = SymmetricMessage::serialize_msg_to_packet_data(
+                    first_id + 1,
+                    SymmetricMessagePayload::ShortMessage {
+                        payload: Bytes::from_static(b"marker"),
+                    },
+                    &cipher(to_peer),
+                    vec![],
+                )?;
+                remote.send(peer_addr, marker.data());
+                let got = tokio::time::timeout(WAIT, conn.recv()).await??;
+                assert_eq!(got, b"marker");
+                Ok(())
+            }
+
+            /// Sends one message on `conn` and has `remote` answer with a
+            /// receipt for packet id 0, as for a handshake ack. The receipt
+            /// must not be credited to the message: no RTT sample, and the
+            /// message stays in flight. Returns the message's packet id.
+            ///
+            /// `to_peer` is the key `remote` encrypts to the peer under,
+            /// `from_peer` the key the peer encrypts to `remote` under.
+            async fn receipt_for_id_0_is_not_credited<T: TimeSource>(
+                conn: &mut PeerConnection<MockSocket, T>,
+                remote: &mut ScriptedRemote,
+                peer_addr: SocketAddr,
+                to_peer: [u8; 16],
+                from_peer: [u8; 16],
+            ) -> anyhow::Result<u32> {
+                let data_id = send_first_message(conn, remote, from_peer).await?;
+                deliver_receipts(
+                    conn,
+                    remote,
+                    peer_addr,
+                    to_peer,
+                    vec![SymmetricMessage::FIRST_PACKET_ID],
+                    1_000,
+                )
+                .await?;
+                let probe = conn.congestion_probe();
+                assert_eq!(
+                    probe.min_rtt_sample, None,
+                    "a receipt for id 0 gave an RTT sample to the message (packet id {data_id})"
+                );
+                assert!(
+                    probe.flightsize > 0,
+                    "a receipt for id 0 released the message (packet id {data_id}) as delivered"
+                );
+                Ok(data_id)
+            }
+
+            /// The positive control: the message's own receipt is credited,
+            /// so the check above is not passing because receipts are ignored.
+            /// `rtt_sample`: whether that receipt yields an RTT sample (not for
+            /// a retransmitted message, by Karn's rule).
+            async fn receipt_for_the_message_is_credited<T: TimeSource>(
+                conn: &mut PeerConnection<MockSocket, T>,
+                remote: &ScriptedRemote,
+                peer_addr: SocketAddr,
+                to_peer: [u8; 16],
+                data_id: u32,
+                rtt_sample: bool,
+            ) -> anyhow::Result<()> {
+                deliver_receipts(conn, remote, peer_addr, to_peer, vec![data_id], 2_000).await?;
+                let probe = conn.congestion_probe();
+                assert_eq!(
+                    probe.flightsize, 0,
+                    "the message's own receipt must release it"
+                );
+                assert_eq!(
+                    probe.min_rtt_sample.is_some(),
+                    rtt_sample,
+                    "RTT sample from the message's own receipt: {:?}",
+                    probe.min_rtt_sample
+                );
+                Ok(())
+            }
+
+            /// Advances `vt` by up to `span` in 100 ms steps, polling `conn` at
+            /// each step so its timers run, and returns what `remote` received,
+            /// stopping early at the first message `stop` accepts.
+            async fn drive<T: TimeSource>(
+                vt: &VirtualTime,
+                conn: &mut PeerConnection<MockSocket, T>,
+                remote: &mut ScriptedRemote,
+                from_peer: [u8; 16],
+                span: Duration,
+                stop: impl Fn(&SymmetricMessage) -> bool,
+            ) -> Vec<SymmetricMessage> {
+                let step = Duration::from_millis(100);
+                let mut seen = Vec::new();
+                for _ in 0..(span.as_millis() / step.as_millis()) {
+                    vt.advance(step);
+                    if let Ok(r) =
+                        tokio::time::timeout(Duration::from_millis(10), conn.recv()).await
+                    {
+                        panic!("nothing was sent to the connection, got {r:?}");
+                    }
+                    while let Ok(packet) = remote.inbound.try_recv() {
+                        if let Some(msg) = open(packet.data, from_peer) {
+                            let done = stop(&msg);
+                            seen.push(msg);
+                            if done {
+                                return seen;
+                            }
+                        }
+                    }
+                }
+                seen
+            }
+
+            /// A gateway on a clock the test drives, with a scripted joiner
+            /// that has completed the handshake. Returns the gateway's side of
+            /// the connection, its address and the two session keys
+            /// (gateway's inbound, joiner's inbound).
+            async fn gateway_connection(
+                remote: &mut ScriptedRemote,
+                channels: &Channels,
+                vt: VirtualTime,
+            ) -> anyhow::Result<(
+                PeerConnection<MockSocket, VirtualTime>,
+                SocketAddr,
+                OutboundConnectionHandler<MockSocket, VirtualTime>,
+                [u8; 16],
+                [u8; 16],
+            )> {
+                let (gw_pub, (gw, mut gw_conns), gw_addr) = create_mock_peer_internal_vt(
+                    PacketDropPolicy::ReceiveAll,
+                    PacketDelayPolicy::NoDelay,
+                    true,
+                    channels.clone(),
+                    None,
+                    Some(vt),
+                )
+                .await?;
+                let mut joiner_key = [0u8; 16];
+                GlobalRng::fill_bytes(&mut joiner_key);
+                let mut payload = PROTOC_VERSION.to_vec();
+                payload.extend_from_slice(&joiner_key);
+                let intro =
+                    PacketData::<_, MAX_PACKET_SIZE>::encrypt_with_pubkey(&payload, &gw_pub);
+                remote.send(gw_addr, intro.data());
+                let gw_key = tokio::time::timeout(WAIT, async {
+                    loop {
+                        if let Some(msg) = open(remote.recv().await, joiner_key) {
+                            let (key, _, _) = ack_ok_parts(&msg.payload)
+                                .expect("the gateway answers with a success ack");
+                            break key;
+                        }
+                    }
+                })
+                .await
+                .expect("the gateway answers the intro");
+                let ack = SymmetricMessage::ack_ok(&cipher(gw_key), joiner_key, gw_addr)?;
+                remote.send(gw_addr, ack.data());
+                let conn = tokio::time::timeout(WAIT, gw_conns.recv())
+                    .await?
+                    .expect("the gateway hands over the connection");
+                Ok((conn, gw_addr, gw, gw_key, joiner_key))
+            }
+
+            /// Hole punch, the side that answered the remote's intro
+            /// (`RemoteInbound` arm): the WAN bench case.
+            #[tokio::test]
+            async fn hole_punch_remote_inbound() -> anyhow::Result<()> {
+                let channels: Channels = Arc::new(DashMap::new());
+                let mut remote = ScriptedRemote::new(&channels);
+                let (conn, peer_addr, _peer, peer_key, remote_key) =
+                    peer_waiting_for_completion(&mut remote, &channels).await?;
+                let ack = SymmetricMessage::ack_ok(&cipher(peer_key), remote_key, peer_addr)?;
+                remote.send(peer_addr, ack.data());
+                let mut conn = established(conn).await;
+                assert!(completed_in_remote_inbound(peer_addr, remote.addr));
+                let data_id = receipt_for_id_0_is_not_credited(
+                    &mut conn,
+                    &mut remote,
+                    peer_addr,
+                    peer_key,
+                    remote_key,
+                )
+                .await?;
+                receipt_for_the_message_is_credited(
+                    &mut conn, &remote, peer_addr, peer_key, data_id, true,
+                )
+                .await
+            }
+
+            /// Hole punch, the side that completed on the remote's ack (the
+            /// ack path), which then sends its own one-shot ack at id 0.
+            #[tokio::test]
+            async fn hole_punch_ack_path() -> anyhow::Result<()> {
+                let channels: Channels = Arc::new(DashMap::new());
+                let mut remote = ScriptedRemote::new(&channels);
+                let (_peer_pub, mut peer, peer_addr) = create_mock_peer_with_virtual_time(
+                    PacketDropPolicy::ReceiveAll,
+                    PacketDelayPolicy::NoDelay,
+                    channels.clone(),
+                    VirtualTime::new(),
+                )
+                .await?;
+                let conn = peer
+                    .connect(remote.keypair.public().clone(), remote.addr)
+                    .await;
+                let conn = tokio::spawn(conn);
+                let intro = remote.recv().await;
+                let decrypted = PacketData::<_, MAX_PACKET_SIZE>::from_buf(&intro)
+                    .try_decrypt_asym(remote.keypair.secret())
+                    .expect("the first packet is the peer's intro");
+                let (_, peer_key) =
+                    split_asym_intro_payload(decrypted.data()).expect("well-formed intro");
+                let mut remote_key = [0u8; 16];
+                GlobalRng::fill_bytes(&mut remote_key);
+                // Answer the intro with an ack instead of an intro of our
+                // own, so the peer completes on the ack path.
+                let ack = SymmetricMessage::ack_ok(&cipher(peer_key), remote_key, peer_addr)?;
+                remote.send(peer_addr, ack.data());
+                let mut conn = established(conn).await;
+                assert!(!completed_in_remote_inbound(peer_addr, remote.addr));
+                let data_id = receipt_for_id_0_is_not_credited(
+                    &mut conn,
+                    &mut remote,
+                    peer_addr,
+                    peer_key,
+                    remote_key,
+                )
+                .await?;
+                receipt_for_the_message_is_credited(
+                    &mut conn, &remote, peer_addr, peer_key, data_id, true,
+                )
+                .await
+            }
+
+            /// Gateway side: its success ack goes out at id 0. The message
+            /// must also still be retransmitted when its own receipt never
+            /// comes.
+            #[tokio::test]
+            async fn gateway() -> anyhow::Result<()> {
+                let channels: Channels = Arc::new(DashMap::new());
+                let mut remote = ScriptedRemote::new(&channels);
+                let vt = VirtualTime::new();
+                let (mut conn, gw_addr, _gw, gw_key, joiner_key) =
+                    gateway_connection(&mut remote, &channels, vt.clone()).await?;
+                let data_id = receipt_for_id_0_is_not_credited(
+                    &mut conn,
+                    &mut remote,
+                    gw_addr,
+                    gw_key,
+                    joiner_key,
+                )
+                .await?;
+                let is_message = |m: &SymmetricMessage| {
+                    m.packet_id == data_id
+                        && matches!(m.payload, SymmetricMessagePayload::ShortMessage { .. })
+                };
+                let seen = drive(
+                    &vt,
+                    &mut conn,
+                    &mut remote,
+                    joiner_key,
+                    Duration::from_secs(10),
+                    is_message,
+                )
+                .await;
+                assert!(
+                    seen.iter().any(is_message),
+                    "the message was never retransmitted (packet id {data_id})"
+                );
+                receipt_for_the_message_is_credited(
+                    &mut conn, &remote, gw_addr, gw_key, data_id, false,
+                )
+                .await
+            }
+
+            /// The gateway knows its success ack was delivered when the
+            /// handshake completes, so it does not keep it pending on the
+            /// connection or resend it.
+            #[tokio::test]
+            async fn gateway_does_not_resend_its_handshake_ack() -> anyhow::Result<()> {
+                let channels: Channels = Arc::new(DashMap::new());
+                let mut remote = ScriptedRemote::new(&channels);
+                let vt = VirtualTime::new();
+                let (mut conn, _gw_addr, _gw, _gw_key, joiner_key) =
+                    gateway_connection(&mut remote, &channels, vt.clone()).await?;
+                assert_eq!(conn.congestion_probe().flightsize, 0);
+                // Several RTOs, with no receipt for anything.
+                let seen = drive(
+                    &vt,
+                    &mut conn,
+                    &mut remote,
+                    joiner_key,
+                    Duration::from_secs(10),
+                    |_| false,
+                )
+                .await;
+                let acks = seen
+                    .iter()
+                    .filter(|m| ack_ok_parts(&m.payload).is_some())
+                    .count();
+                assert_eq!(acks, 0, "the gateway resent its handshake ack: {seen:?}");
+
+                // Premise: driving the clock this way does make the
+                // connection resend an unacknowledged packet.
+                let data_id = send_first_message(&mut conn, &mut remote, joiner_key).await?;
+                let seen = drive(
+                    &vt,
+                    &mut conn,
+                    &mut remote,
+                    joiner_key,
+                    Duration::from_secs(10),
+                    |m| m.packet_id == data_id,
+                )
+                .await;
+                assert!(
+                    seen.iter().any(|m| m.packet_id == data_id),
+                    "premise: an unacknowledged message is resent within the same span"
+                );
+                Ok(())
+            }
         }
     }
 }

@@ -54,6 +54,7 @@ use super::{
     token_bucket::TokenBucket,
 };
 use crate::util::time_source::InstantTimeSrc;
+use inbound_budget::InboundKey;
 
 type Result<T = (), E = TransportError> = std::result::Result<T, E>;
 
@@ -158,6 +159,9 @@ pub(crate) struct RemoteConnection<S = super::UdpSocket, T: TimeSource = RealTim
     /// Global bandwidth manager for fair sharing across connections.
     /// When Some, the token_bucket rate is periodically updated based on connection count.
     pub(super) global_bandwidth: Option<Arc<GlobalBandwidthManager>>,
+    /// Configured per-connection `bandwidth-limit` (bytes/sec), applied by
+    /// [`paced_rate`] on every rate update. Ignored while `global_bandwidth` is set.
+    pub(super) bandwidth_limit: Option<usize>,
     /// Shadow per-peer rolling RTT stats (issue #4074, Phase 1).
     /// Auto-registers with the global shadow registry on construction
     /// and removes itself on drop. Written here on each non-retransmitted
@@ -166,6 +170,108 @@ pub(crate) struct RemoteConnection<S = super::UdpSocket, T: TimeSource = RealTim
     pub(crate) rolling_rtt_stats: super::rolling_rtt_stats::RollingRttStatsHandle<T>,
     /// Time source for deterministic simulation support
     pub(super) time_source: T,
+}
+
+/// The rate a rate update paces a connection's token bucket at: the
+/// congestion controller's rate, capped by the node's fair share when
+/// `total-bandwidth-limit` is set, and otherwise by the per-connection
+/// `bandwidth-limit`. A cap only lowers the rate, never raises it.
+///
+/// Before #6047 the rate update ignored `bandwidth-limit`, which then only set
+/// the initial rate. `bandwidth_limit` is the value after
+/// [`effective_bandwidth_limit`].
+pub(super) fn paced_rate(
+    cc_rate: usize,
+    global_rate: Option<usize>,
+    bandwidth_limit: Option<usize>,
+) -> usize {
+    // 0 is unset here too: `create_connection_handler` callers can pass a raw
+    // value that never went through `effective_bandwidth_limit`.
+    match global_rate.or(bandwidth_limit.filter(|&limit| limit > 0)) {
+        Some(cap) => cc_rate.min(cap),
+        None => cc_rate,
+    }
+}
+
+/// A new connection's initial token-bucket rate, which also fixes the bucket's
+/// capacity (`rate / 10`) for the connection's life: the node's fair share
+/// when `total-bandwidth-limit` is set (unchanged by #6047), otherwise the
+/// controller's rate, lowered to `bandwidth-limit` if set. So a per-connection
+/// limit never gives a connection a larger burst than no limit would (#3702).
+pub(super) fn initial_paced_rate(
+    global_share: Option<usize>,
+    bandwidth_limit: Option<usize>,
+    cc_rate: usize,
+) -> usize {
+    match global_share {
+        Some(share) => share,
+        None => paced_rate(cc_rate, None, bandwidth_limit),
+    }
+}
+
+/// The lowest per-connection `bandwidth-limit` the transport applies: twice
+/// [`streaming::MIN_INBOUND_STREAM_RATE_BYTES_PER_SEC`], the slowest stream
+/// rate a receiver allows a long stream (it evicts one that has not completed
+/// within `length / that rate`, and at least 5 minutes). Pacing at exactly that
+/// rate would leave a long stream no margin, and every stream on a connection
+/// shares its bucket. The floor reduces that failure; it does not remove it for
+/// two or more long streams at once on one connection (two at the floor each
+/// get at most the receiver's rate), and it assumes receivers use the current
+/// `MIN_INBOUND_STREAM_RATE_BYTES_PER_SEC`. Low limits still slow
+/// large transfers past other deadlines (the 10-minute streaming PUT/GET
+/// attempt ceiling, the 120 s broadcast completion wait).
+pub(crate) const MIN_BANDWIDTH_LIMIT: usize =
+    2 * streaming::MIN_INBOUND_STREAM_RATE_BYTES_PER_SEC as usize;
+
+/// The per-connection `bandwidth-limit` the transport applies, given the
+/// configured one. Call it once, where the config enters the transport: it
+/// logs what it decided.
+///
+/// - Ignored (`None`) when `total-bandwidth-limit` is set, which overrides it.
+/// - 0 means unset.
+/// - A value below [`MIN_BANDWIDTH_LIMIT`] is raised to it, with a warning: a
+///   value that low would make long streams fail, and the failure would show on
+///   the receiver, not here.
+pub(crate) fn effective_bandwidth_limit(
+    configured: Option<usize>,
+    total_limit_set: bool,
+) -> Option<usize> {
+    let floor = MIN_BANDWIDTH_LIMIT;
+    match configured {
+        None => None,
+        Some(limit) if total_limit_set => {
+            tracing::warn!(
+                bandwidth_limit = limit,
+                "bandwidth-limit is ignored because total-bandwidth-limit is set"
+            );
+            None
+        }
+        Some(0) => {
+            tracing::warn!(
+                "bandwidth-limit = 0 is ignored; set total-bandwidth-limit to limit \
+                 what the node sends"
+            );
+            None
+        }
+        Some(limit) if limit < floor => {
+            tracing::warn!(
+                configured = limit,
+                applied = floor,
+                "bandwidth-limit is too low for long transfers to complete; raised to \
+                 the minimum. Use total-bandwidth-limit to limit what the node sends"
+            );
+            Some(floor)
+        }
+        Some(limit) => {
+            tracing::info!(
+                bandwidth_limit = limit,
+                "each connection streams large transfers at no more than \
+                 bandwidth-limit bytes/sec (binds only below the congestion \
+                 controller's rate)"
+            );
+            Some(limit)
+        }
+    }
 }
 
 impl<S, T: TimeSource> Drop for RemoteConnection<S, T> {
@@ -363,8 +469,10 @@ pub struct PeerConnection<S = super::UdpSocket, T: TimeSource = RealTime> {
     /// `InboundStreamOutcome` (also counted node-wide in `TRANSPORT_METRICS`).
     inbound_outcomes: [u64; super::metrics::InboundStreamOutcome::COUNT],
     /// Charges for every inbound stream holding reassembly state on this
-    /// connection, released when that state is gone.
-    inbound_budget: inbound_budget::InboundStreamBudget,
+    /// connection, released when that state is gone. Shareable with a QUIC
+    /// path to the same peer (see [`Self::inbound_budget`]), so the peer has
+    /// one allowance; this connection's charges are keyed `InboundKey::Udp`.
+    inbound_budget: inbound_budget::SharedInboundBudget,
     /// Telemetry only: recent short-message arrivals for the inbound
     /// concurrency estimate, and this connection's peak estimate in the
     /// current snapshot period (see `sample_inbound_concurrency`).
@@ -398,11 +506,13 @@ impl<S, T: TimeSource> Drop for PeerConnection<S, T> {
         // retired, too) would otherwise wait out the orphan timeout with
         // nothing accounting for them.
         if let Some(registry) = &self.inbound_stream_registry {
+            // Collected first, so the shared budget is not locked while the
+            // registry runs.
+            let live: Vec<_> = self.inbound_budget.lock().live_buffer_streams().collect();
             registry.cancel_unclaimed_streams(
                 self.remote_conn.remote_addr,
-                &mut self
-                    .inbound_budget
-                    .live_buffer_streams()
+                &mut live
+                    .into_iter()
                     .map(|(id, buffer)| (id, super::StreamIdentity::from_udp_buffer(buffer))),
             );
         }
@@ -441,7 +551,7 @@ const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(5);
 /// mapping refreshed comfortably under common UDP NAT idle timeouts (often
 /// 30 s). It was 60 s until #5795; the ack-only NoOp chatter that #5795
 /// removed used to mask that, so it must not be raised again.
-const MAX_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+pub(crate) const MAX_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 
 /// Returns the keepalive interval for the given number of unanswered pings.
 ///
@@ -534,8 +644,8 @@ enum ReceiptPolicy {
     /// a retransmission, i.e. our receipt was lost, so ack it again.
     Ack { reack_duplicate: bool },
     /// Ack it (every time it arrives) but do NOT record its id for dedup.
-    /// For connection acks, whose id 0 is shared with the remote's first data
-    /// packet.
+    /// For connection acks, whose id 0 an older remote also gives its first
+    /// data packet.
     AckWithoutDedup,
 }
 
@@ -553,12 +663,14 @@ enum ReceiptPolicy {
 /// - `Upgrade`: like `ShortMessage`. Its sender tracks it for retransmission,
 ///   so it is acked, recorded for dedup (a retransmitted offer is not
 ///   processed twice) and re-acked on duplicate.
-/// - `AckConnection*`: acked WITHOUT dedup recording. The handshake's
-///   completion ack is TRACKED by its sender (`report_sent_packet` at
-///   `FIRST_PACKET_ID` in `connection_handler.rs`) and retransmitted until a
-///   receipt for id 0 arrives, so it must be acked. But id 0 is also the id of
-///   the remote's first data packet, so recording it for dedup would make that
-///   packet look like a duplicate and drop it. Replying to a connection ack is
+/// - `AckConnection*`: acked WITHOUT dedup recording. A gateway on an
+///   earlier release TRACKS its success ack at `FIRST_PACKET_ID` on the
+///   connection and retransmits it until a receipt for id 0 arrives, so it
+///   must be acked. Such a remote also gives its first data packet id 0, so
+///   recording the ack for dedup would make that packet look like a duplicate
+///   and drop it. (This release tracks no handshake ack on a connection and
+///   starts data at `FIRST_DATA_PACKET_ID`, 1, so the receipts this sends for
+///   id 0 cannot be credited to its own data.) Replying to a connection ack is
 ///   separately limited to once per connection (`answered_connection_ack`).
 fn receipt_policy(payload: &SymmetricMessagePayload, ack_remote_noops: bool) -> ReceiptPolicy {
     match payload {
@@ -881,6 +993,16 @@ fn sweep_streaming_handles_inner(
 
 #[allow(private_bounds)]
 impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
+    /// A [`super::ReceiptStamp`] for this connection: when it last received
+    /// an authenticated packet, on this connection's clock.
+    pub(crate) fn receipt_stamp_handle(&self) -> super::ReceiptStamp {
+        let time_source = self.remote_conn.time_source.clone();
+        super::ReceiptStamp::new(
+            self.last_inbound_nanos.clone(),
+            std::sync::Arc::new(move || time_source.now_nanos()),
+        )
+    }
+
     pub(super) fn new(remote_conn: RemoteConnection<S, T>) -> Self {
         // Start the keep-alive task before creating Self
         let remote_addr = remote_conn.remote_addr;
@@ -1113,7 +1235,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             completed_inbound_streams: lru::LruCache::new(COMPLETED_STREAM_MEMORY),
             legacy_tokens: HashMap::new(),
             inbound_outcomes: [0; super::metrics::InboundStreamOutcome::COUNT],
-            inbound_budget: inbound_budget::InboundStreamBudget::new(
+            inbound_budget: inbound_budget::SharedInboundBudget::new(
                 streaming::MAX_INBOUND_STREAMS_PER_CONNECTION,
                 streaming::MAX_INBOUND_STREAM_BYTES_PER_CONNECTION,
             ),
@@ -1709,7 +1831,9 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                             // dropped (eviction). Its state is gone with it.
                             self.inbound_streams.remove(&stream_id);
                             self.legacy_tokens.remove(&stream_id);
-                            self.inbound_budget.release_if_gone(stream_id);
+                            self.inbound_budget
+                                .lock()
+                                .release_if_gone(InboundKey::Udp(stream_id));
                             tracing::debug!(
                                 peer_addr = %self.remote_conn.remote_addr,
                                 stream_id = %stream_id,
@@ -1720,7 +1844,9 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                     };
                     self.inbound_streams.remove(&stream_id);
                     self.legacy_tokens.remove(&stream_id);
-                    self.inbound_budget.release_if_gone(stream_id);
+                    self.inbound_budget
+                        .lock()
+                        .release_if_gone(InboundKey::Udp(stream_id));
                     self.completed_inbound_streams.put(stream_id, ());
                     // Record inbound bytes for dashboard metrics
                     let bytes_received = msg.len() as u64;
@@ -2096,27 +2222,24 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                     };
 
                     if should_update {
-                        let cc_rate = self.remote_conn.congestion_controller.current_rate(rtt) as u64;
+                        let cc_rate = self.remote_conn.congestion_controller.current_rate(rtt);
                         let cwnd = self.remote_conn.congestion_controller.current_cwnd();
                         let queuing_delay = self.remote_conn.congestion_controller.queuing_delay();
 
-                        // Apply global bandwidth limit if configured
-                        // Take minimum of congestion controller rate and global fair-share rate
-                        let (new_rate, global_limit) = if let Some(ref global) =
-                            self.remote_conn.global_bandwidth
-                        {
-                            let global_rate = global.current_per_connection_rate() as u64;
-                            (cc_rate.min(global_rate), Some(global_rate))
-                        } else {
-                            (cc_rate, None)
-                        };
+                        let global_limit = self
+                            .remote_conn
+                            .global_bandwidth
+                            .as_ref()
+                            .map(|global| global.current_per_connection_rate());
+                        let new_rate =
+                            paced_rate(cc_rate, global_limit, self.remote_conn.bandwidth_limit);
 
                         // Calculate time since last update for debugging RTT-adaptive timing
                         let since_last_update_ms = self.last_rate_update_nanos
                             .map(|last| Duration::from_nanos(now_nanos.saturating_sub(last)).as_millis())
                             .unwrap_or(0);
 
-                        self.remote_conn.token_bucket.set_rate(new_rate as usize);
+                        self.remote_conn.token_bucket.set_rate(new_rate);
                         self.last_rate_update_nanos = Some(now_nanos);
 
                         tracing::debug!(
@@ -2126,6 +2249,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                             new_rate_mbps = (new_rate as f64) / 1_000_000.0,
                             cc_rate_mbps = (cc_rate as f64) / 1_000_000.0,
                             global_limit_mbps = global_limit.map(|r| (r as f64) / 1_000_000.0),
+                            bandwidth_limit = ?self.remote_conn.bandwidth_limit,
                             // Congestion controller state
                             cwnd_bytes = cwnd,
                             cwnd_packets = cwnd / MAX_DATA_SIZE,
@@ -2151,6 +2275,20 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
 
     pub fn remote_addr(&self) -> SocketAddr {
         self.remote_conn.remote_addr
+    }
+
+    /// The per-connection `bandwidth-limit` this connection applies on every
+    /// rate update, for tests that check the listener hands it on (#6047).
+    #[cfg(test)]
+    pub(crate) fn bandwidth_limit(&self) -> Option<usize> {
+        self.remote_conn.bandwidth_limit
+    }
+
+    /// The token bucket's burst capacity, fixed when the connection was set up
+    /// from its initial rate, for tests of that initial rate (#6047).
+    #[cfg(test)]
+    pub(crate) fn pacing_capacity(&self) -> usize {
+        self.remote_conn.token_bucket.capacity()
     }
 
     /// Remote peer's negotiated protocol version, if known (None on joiner->gateway connections).
@@ -2244,11 +2382,22 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
         Arc::clone(&self.streaming_registry)
     }
 
+    /// This connection's inbound budget, to build a QUIC path to the same
+    /// peer on (`QuicPath::with_budget`), so the peer has one reassembly
+    /// allowance across both.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) fn inbound_budget(&self) -> inbound_budget::SharedInboundBudget {
+        self.inbound_budget.clone()
+    }
+
     /// Decide whether a new inbound stream declaring `total_length_bytes` may
     /// get reassembly state on this connection. Runs before anything is
-    /// created for it.
-    fn admit_inbound_stream(
+    /// created for it. `budget` is this connection's budget, locked by the
+    /// caller until the stream is charged (or found not to need a charge),
+    /// so a QUIC path sharing it cannot take the room in between.
+    fn admit_inbound_stream_locked(
         &mut self,
+        budget: &mut inbound_budget::InboundStreamBudget,
         stream_id: StreamId,
         total_length_bytes: u64,
     ) -> std::result::Result<(), InboundStreamRejection> {
@@ -2266,8 +2415,8 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
         }
         streaming::check_declared_stream_length(total_length_bytes)
             .map_err(InboundStreamRejection::Length)?;
-        self.inbound_budget
-            .check(total_length_bytes)
+        budget
+            .check(total_length_bytes, inbound_budget::Releaser::Udp)
             .map_err(InboundStreamRejection::Budget)
     }
 
@@ -2349,13 +2498,18 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             .last_warn_nanos
             .is_none_or(|last| now_nanos.saturating_sub(last) >= interval_nanos);
         if due {
+            // Peer-wide: includes a QUIC path's charges once shared.
+            let (open_streams, charged_bytes) = {
+                let budget = self.inbound_budget.lock();
+                (budget.stream_count(), budget.charged_bytes())
+            };
             tracing::warn!(
                 peer_addr = %self.remote_conn.remote_addr,
                 stream_id = %stream_id,
                 total_length_bytes,
                 ?rejection,
-                open_streams = self.inbound_budget.stream_count(),
-                charged_bytes = self.inbound_budget.charged_bytes(),
+                open_streams,
+                charged_bytes,
                 refusals_since_last_warning = self.refusal_log.suppressed,
                 "Refusing inbound stream"
             );
@@ -2402,7 +2556,9 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             // exemption must not be refreshable by no-progress traffic.
             if matches!(push_result, Ok(true)) {
                 *last_activity_nanos = now_nanos;
-                self.inbound_budget.note_progress(stream_id, now_nanos);
+                self.inbound_budget
+                    .lock()
+                    .note_progress(InboundKey::Udp(stream_id), now_nanos);
             }
             return match push_result {
                 Ok(inserted) => {
@@ -2416,7 +2572,9 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                     // to stop processing further fragments for this stream.
                     self.streaming_handles.remove(&stream_id);
                     self.streaming_registry.remove(stream_id);
-                    self.inbound_budget.release_if_gone(stream_id);
+                    self.inbound_budget
+                        .lock()
+                        .release_if_gone(InboundKey::Udp(stream_id));
                     tracing::debug!(
                         peer_addr = %self.remote_conn.remote_addr,
                         stream_id = %stream_id,
@@ -2438,7 +2596,12 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             };
         }
 
-        if self.inbound_budget.contains(stream_id) {
+        // Locked from the check to the charge (see
+        // `admit_inbound_stream_locked`).
+        let shared_budget = self.inbound_budget.clone();
+        let mut budget = shared_budget.lock();
+        if budget.contains(InboundKey::Udp(stream_id)) {
+            drop(budget);
             // Its handle was released (cancelled, swept or evicted) while a
             // consumer still holds the buffer; do not start it again.
             tracing::debug!(
@@ -2449,7 +2612,10 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             );
             return false;
         }
-        if let Err(rejection) = self.admit_inbound_stream(stream_id, total_length_bytes) {
+        if let Err(rejection) =
+            self.admit_inbound_stream_locked(&mut budget, stream_id, total_length_bytes)
+        {
+            drop(budget);
             // The caller checks `closed_by_stream_refusals`.
             self.note_refused_stream(stream_id, total_length_bytes, rejection, now_nanos);
             return false;
@@ -2459,13 +2625,14 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
         let streaming_handle = self
             .streaming_registry
             .register(stream_id, total_length_bytes);
-        self.inbound_budget.charge(
-            stream_id,
+        budget.charge(
+            InboundKey::Udp(stream_id),
             total_length_bytes,
             now_nanos,
             inbound_stream_age_limit(total_length_bytes),
             inbound_budget::Liveness::Buffer(streaming_handle.buffer_weak()),
         );
+        drop(budget);
         match streaming_handle.push_fragment(fragment_number, payload) {
             Err(streaming::StreamError::Cancelled) => {
                 // Stream was already cancelled, don't register it
@@ -2477,7 +2644,9 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                 );
                 self.streaming_registry.remove(stream_id);
                 drop(streaming_handle);
-                self.inbound_budget.release_if_gone(stream_id);
+                self.inbound_budget
+                    .lock()
+                    .release_if_gone(InboundKey::Udp(stream_id));
                 return false;
             }
             Err(e) => {
@@ -2537,7 +2706,9 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
         if complete {
             self.streaming_handles.remove(&stream_id);
             self.streaming_registry.remove(stream_id);
-            self.inbound_budget.release_if_gone(stream_id);
+            self.inbound_budget
+                .lock()
+                .release_if_gone(InboundKey::Udp(stream_id));
             self.completed_inbound_streams.put(stream_id, ());
         }
     }
@@ -2549,6 +2720,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
         let now_nanos = self.time_source.now_nanos();
         let expired = self
             .inbound_budget
+            .lock()
             .take_expired(now_nanos, streaming_handle_idle_timeout());
         let mut evicted = Vec::with_capacity(expired.len());
         for (stream_id, reason) in &expired {
@@ -2583,7 +2755,10 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                 "Evicted stale inbound streams"
             );
         }
-        self.inbound_budget.release_gone();
+        // Gone QUIC charges too (see `inbound_budget::Releaser::Udp`).
+        self.inbound_budget
+            .lock()
+            .release_gone(inbound_budget::Releaser::Udp);
         self.flush_refusal_log(now_nanos);
     }
 
@@ -2618,8 +2793,9 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
     fn sample_inbound_concurrency(&mut self, short: bool, queued_nanos: u64) {
         let now_nanos = queued_nanos;
         let srtt = self.remote_conn.rolling_rtt_stats.srtt();
-        // Packets still waiting in the channel would hold their QUIC slots
-        // unread. The count also includes ACK-only packets and fragments of
+        // The budget's count is peer-wide: it includes a QUIC path's streams
+        // once the budget is shared. Packets still waiting in the channel
+        // would hold their QUIC slots unread. The count also includes ACK-only packets and fragments of
         // streams already counted, so it errs high.
         let outstanding = self
             .inbound_budget
@@ -2698,8 +2874,9 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                 // the dedup window stopped that by accident (every connection
                 // ack has id 0, so the second one was dropped as a duplicate);
                 // connection acks are no longer recorded for dedup, so the
-                // limit is explicit. The remote's tracked handshake ack is
-                // still acked by receipt on every arrival (`receipt_policy`).
+                // limit is explicit. An earlier-release remote's tracked
+                // handshake ack is still acked by receipt on every arrival
+                // (`receipt_policy`).
                 if self.answered_connection_ack {
                     return Ok(None);
                 }
@@ -2825,7 +3002,12 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                     );
                     return Ok(None);
                 }
-                if self.inbound_budget.contains(stream_id) {
+                // Locked from the check to the charge (see
+                // `admit_inbound_stream_locked`).
+                let shared_budget = self.inbound_budget.clone();
+                let mut budget = shared_budget.lock();
+                if budget.contains(InboundKey::Udp(stream_id)) {
+                    drop(budget);
                     // Its reassembly state was evicted and is still winding
                     // down; do not start it again.
                     tracing::debug!(
@@ -2836,7 +3018,10 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                     );
                     return Ok(None);
                 }
-                if let Err(rejection) = self.admit_inbound_stream(stream_id, total_length_bytes) {
+                if let Err(rejection) =
+                    self.admit_inbound_stream_locked(&mut budget, stream_id, total_length_bytes)
+                {
+                    drop(budget);
                     self.note_refused_stream(stream_id, total_length_bytes, rejection, now_nanos);
                     return self.inbound_refusal_result();
                 }
@@ -2854,6 +3039,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                 let mut stream = inbound_stream::InboundStream::new(total_length_bytes)
                     .with_token(Arc::clone(&token));
                 if let Some(msg) = stream.push_fragment(fragment_number, payload) {
+                    drop(budget);
                     tracing::trace!(
                         peer_addr = %self.remote_conn.remote_addr,
                         stream_id = %stream_id,
@@ -2866,13 +3052,14 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                     self.sample_inbound_concurrency(true, queued_nanos);
                     return Ok(Some(msg));
                 }
-                self.inbound_budget.charge(
-                    stream_id,
+                budget.charge(
+                    InboundKey::Udp(stream_id),
                     total_length_bytes,
                     now_nanos,
                     inbound_stream_age_limit(total_length_bytes),
                     inbound_budget::Liveness::Task(Arc::downgrade(&token)),
                 );
+                drop(budget);
                 self.sample_inbound_concurrency(false, queued_nanos);
                 let (sender, receiver) = mpsc::channel(64);
                 self.inbound_streams.insert(stream_id, sender);
@@ -3439,6 +3626,15 @@ impl<S: super::Socket> super::PeerConnectionApi for PeerConnection<S> {
 
     fn close_reason(&self) -> Option<super::CloseReason> {
         close_reason_from_flags(self.closed_by_idle_timeout, self.closed_by_stream_refusals)
+    }
+
+    // The stamp is advanced only by authenticated packets on this UDP
+    // session. TODO(#5940, QUIC upgrade): once a connection's traffic moves
+    // to QUIC, packets received there must advance this stamp too, or a live
+    // upgraded connection looks quiet and loses its key to a newer claim
+    // (`node::network_bridge::p2p_protoc::identity::HOLD_WINDOW`).
+    fn receipt_stamp(&self) -> Option<super::ReceiptStamp> {
+        Some(self.receipt_stamp_handle())
     }
 
     fn send_bytes(
@@ -5256,7 +5452,7 @@ mod tests {
             outbound_symmetric_key: cipher.clone(),
             remote_addr,
             sent_tracker,
-            last_packet_id: Arc::new(AtomicU32::new(0)),
+            last_packet_id: crate::transport::connection_handler::data_packet_ids(),
             inbound_packet_recv: inbound_rx,
             inbound_symmetric_key: cipher.clone(),
             inbound_symmetric_key_bytes: key,
@@ -5267,6 +5463,7 @@ mod tests {
             token_bucket,
             socket,
             global_bandwidth: None,
+            bandwidth_limit: None,
             rolling_rtt_stats,
             time_source,
         };
@@ -5386,7 +5583,7 @@ mod tests {
             outbound_symmetric_key: cipher.clone(),
             remote_addr,
             sent_tracker,
-            last_packet_id: Arc::new(AtomicU32::new(0)),
+            last_packet_id: crate::transport::connection_handler::data_packet_ids(),
             inbound_packet_recv: inbound_rx,
             inbound_symmetric_key: cipher,
             inbound_symmetric_key_bytes: key,
@@ -5397,6 +5594,7 @@ mod tests {
             token_bucket,
             socket,
             global_bandwidth: None,
+            bandwidth_limit: None,
             rolling_rtt_stats,
             time_source: time_source.clone(),
         };
@@ -5479,7 +5677,7 @@ mod tests {
             outbound_symmetric_key: cipher.clone(),
             remote_addr,
             sent_tracker,
-            last_packet_id: Arc::new(AtomicU32::new(0)),
+            last_packet_id: crate::transport::connection_handler::data_packet_ids(),
             inbound_packet_recv: inbound_rx,
             inbound_symmetric_key: cipher.clone(),
             inbound_symmetric_key_bytes: key,
@@ -5490,6 +5688,7 @@ mod tests {
             token_bucket,
             socket,
             global_bandwidth: None,
+            bandwidth_limit: None,
             rolling_rtt_stats,
             time_source,
         };
@@ -5559,6 +5758,135 @@ mod tests {
         );
 
         // Cleanup so the singleton doesn't leak our address into other tests.
+        crate::transport::TRANSPORT_METRICS.remove_peer(remote_addr);
+    }
+
+    /// The receipt stamp the bridge reads (`receipt_stamp`) advances only on
+    /// a packet that authenticates: a packet that fails decryption leaves it
+    /// where it was, and an authenticated one moves it to now.
+    // Two worker threads: `recv` runs in its own task, and while it has
+    // nothing to return it does not yield to the runtime (measured: on a
+    // `current_thread` runtime the test's own task never runs again).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn receipt_stamp_advances_only_on_an_authenticated_packet() {
+        use crate::transport::crypto::TransportKeypair;
+        use crate::transport::packet_data::PacketData;
+        use crate::transport::symmetric_message::SymmetricMessagePayload;
+        use crate::util::time_source::SharedMockTimeSource;
+        use bytes::Bytes;
+
+        let time_source = SharedMockTimeSource::new();
+        let (inbound_tx, inbound_rx) = mpsc::channel(16);
+        let remote_addr = SocketAddr::new(Ipv4Addr::new(10, 99, 99, 2).into(), 50002);
+        let mut key = [0u8; 16];
+        crate::config::GlobalRng::fill_bytes(&mut key);
+        let cipher = Aes128Gcm::new(&key.into());
+        let keypair = TransportKeypair::new();
+        let remote_conn = RemoteConnection {
+            outbound_symmetric_key: cipher.clone(),
+            remote_addr,
+            sent_tracker: Arc::new(parking_lot::Mutex::new(
+                SentPacketTracker::new_with_time_source(time_source.clone()),
+            )),
+            last_packet_id: Arc::new(AtomicU32::new(0)),
+            inbound_packet_recv: inbound_rx,
+            inbound_symmetric_key: cipher.clone(),
+            inbound_symmetric_key_bytes: key,
+            my_address: None,
+            remote_protoc_version: None,
+            transport_secret_key: keypair.secret,
+            congestion_controller:
+                crate::transport::congestion_control::CongestionControlConfig::default()
+                    .build_arc_with_time_source(time_source.clone()),
+            token_bucket: Arc::new(TokenBucket::new_with_time_source(
+                10_000,
+                10_000_000,
+                time_source.clone(),
+            )),
+            socket: Arc::new(TestSocket::new(
+                mpsc::channel::<(SocketAddr, Arc<[u8]>)>(16).0,
+            )),
+            global_bandwidth: None,
+            bandwidth_limit: None,
+            rolling_rtt_stats: crate::transport::rolling_rtt_stats::RollingRttStatsHandle::new(
+                remote_addr,
+                time_source.clone(),
+            ),
+            time_source: time_source.clone(),
+        };
+        let mut conn = PeerConnection::new(remote_conn);
+        let stamp = conn.receipt_stamp_handle();
+        assert_eq!(stamp.since_last_receipt(), Duration::ZERO);
+
+        // A packet under another key does not authenticate.
+        time_source.advance_time(Duration::from_secs(10));
+        let mut other_key = [0u8; 16];
+        crate::config::GlobalRng::fill_bytes(&mut other_key);
+        let other_cipher = Aes128Gcm::new(&other_key.into());
+        let undecryptable = SymmetricMessage::serialize_msg_to_packet_data(
+            1,
+            SymmetricMessagePayload::ShortMessage {
+                payload: Bytes::from_static(b"not under the session key"),
+            },
+            &other_cipher,
+            vec![],
+        )
+        .expect("encrypt");
+        inbound_tx
+            .send(InboundPacket::unstamped(PacketData::<
+                crate::transport::packet_data::UnknownEncryption,
+            >::from_buf(
+                undecryptable.data()
+            )))
+            .await
+            .expect("send");
+        let receiver = tokio::spawn(async move { conn.recv().await.map(|_| ()) });
+        // The channel is back to full capacity once `recv` has taken the
+        // packet off it; it then fails to decrypt it, drops it and waits for
+        // the next one, so it has not returned.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while inbound_tx.capacity() < inbound_tx.max_capacity() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("recv takes the packet off the channel");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !receiver.is_finished(),
+            "premise: the packet was not accepted"
+        );
+        assert_eq!(
+            stamp.since_last_receipt(),
+            Duration::from_secs(10),
+            "a packet that does not authenticate must not advance the stamp"
+        );
+
+        // An authenticated packet moves it to now.
+        time_source.advance_time(Duration::from_secs(5));
+        let genuine = SymmetricMessage::serialize_msg_to_packet_data(
+            2,
+            SymmetricMessagePayload::ShortMessage {
+                payload: Bytes::from_static(b"under the session key"),
+            },
+            &cipher,
+            vec![],
+        )
+        .expect("encrypt");
+        inbound_tx
+            .send(InboundPacket::unstamped(PacketData::<
+                crate::transport::packet_data::UnknownEncryption,
+            >::from_buf(
+                genuine.data()
+            )))
+            .await
+            .expect("send");
+        tokio::time::timeout(Duration::from_secs(10), receiver)
+            .await
+            .expect("recv returns on the authenticated packet")
+            .expect("recv task")
+            .expect("recv");
+        assert_eq!(stamp.since_last_receipt(), Duration::ZERO);
         crate::transport::TRANSPORT_METRICS.remove_peer(remote_addr);
     }
 
@@ -5651,7 +5979,7 @@ mod tests {
             outbound_symmetric_key: cipher.clone(),
             remote_addr,
             sent_tracker,
-            last_packet_id: Arc::new(AtomicU32::new(0)),
+            last_packet_id: crate::transport::connection_handler::data_packet_ids(),
             inbound_packet_recv: inbound_rx,
             inbound_symmetric_key: cipher,
             inbound_symmetric_key_bytes: key,
@@ -5662,6 +5990,7 @@ mod tests {
             token_bucket,
             socket,
             global_bandwidth: None,
+            bandwidth_limit: None,
             rolling_rtt_stats,
             time_source,
         };
@@ -5749,6 +6078,21 @@ mod tests {
         PeerConnection<TestSocket, crate::simulation::RealTime>,
         mpsc::Sender<InboundPacket>,
     ) {
+        test_conn_with_bandwidth_limit(remote_addr, None)
+    }
+
+    /// [`test_conn_for_outbound_stream_arm`] with a configured per-connection
+    /// `bandwidth-limit`. The token bucket starts at 10 MB/s, above both the
+    /// default FixedRate rate and any limit the tests use, so a rate below that
+    /// can only come from a rate update.
+    #[allow(clippy::type_complexity)]
+    fn test_conn_with_bandwidth_limit(
+        remote_addr: SocketAddr,
+        bandwidth_limit: Option<usize>,
+    ) -> (
+        PeerConnection<TestSocket, crate::simulation::RealTime>,
+        mpsc::Sender<InboundPacket>,
+    ) {
         use crate::simulation::RealTime;
         use crate::transport::crypto::TransportKeypair;
 
@@ -5783,7 +6127,7 @@ mod tests {
             outbound_symmetric_key: cipher.clone(),
             remote_addr,
             sent_tracker,
-            last_packet_id: Arc::new(AtomicU32::new(0)),
+            last_packet_id: crate::transport::connection_handler::data_packet_ids(),
             inbound_packet_recv: inbound_rx,
             inbound_symmetric_key: cipher,
             inbound_symmetric_key_bytes: key,
@@ -5794,10 +6138,153 @@ mod tests {
             token_bucket,
             socket,
             global_bandwidth: None,
+            bandwidth_limit,
             rolling_rtt_stats,
             time_source,
         });
         (conn, inbound_tx)
+    }
+
+    /// Runs `conn`'s real `recv()` loop until its token bucket's rate is
+    /// `expected` or `limit` passes, and returns the rate it ended at.
+    /// `rate_update_check` first fires after `ACK_CHECK_INTERVAL` (100 ms) on
+    /// this fixture; `limit` is a generous upper bound for a loaded machine, and
+    /// the wait ends as soon as the rate is reached.
+    async fn rate_after_updates(
+        conn: &mut PeerConnection<TestSocket, crate::simulation::RealTime>,
+        expected: usize,
+        limit: Duration,
+    ) -> usize {
+        let token_bucket = conn.remote_conn.token_bucket.clone();
+        let reached = async {
+            while token_bucket.rate() != expected {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        tokio::select! {
+            result = conn.recv() => panic!("recv() ended on an idle connection: {:?}", result.err()),
+            _ = reached => {}
+            _ = tokio::time::sleep(limit) => {}
+        }
+        token_bucket.rate()
+    }
+
+    /// Regression test for #6047: a configured `bandwidth-limit` must hold for
+    /// the life of the connection. Before the fix the first rate update replaced
+    /// it with the congestion controller's rate (1.25 MB/s for FixedRate), so the
+    /// flag only set the initial rate. Fails without the fix: the rate settles at
+    /// 1.25 MB/s, never at the limit.
+    #[tokio::test]
+    async fn rate_update_keeps_the_configured_bandwidth_limit() {
+        const LIMIT: usize = 200_000;
+        let fixed_rate = crate::transport::fixed_rate::DEFAULT_RATE_BYTES_PER_SEC;
+        assert!(LIMIT < fixed_rate, "test premise: the limit must bind");
+
+        let remote_addr = SocketAddr::new(Ipv4Addr::new(10, 99, 99, 60).into(), 50060);
+        let (mut conn, _inbound_tx) = test_conn_with_bandwidth_limit(remote_addr, Some(LIMIT));
+
+        let rate = rate_after_updates(&mut conn, LIMIT, Duration::from_secs(5)).await;
+        assert_eq!(
+            rate, LIMIT,
+            "the rate update must keep the configured per-connection limit (#6047)"
+        );
+    }
+
+    /// The other side of #6047: with no `bandwidth-limit`, a rate update still
+    /// paces at the congestion controller's rate, and a limit above that rate
+    /// does not raise it.
+    #[tokio::test]
+    async fn rate_update_uses_the_controller_rate_when_the_limit_does_not_bind() {
+        let fixed_rate = crate::transport::fixed_rate::DEFAULT_RATE_BYTES_PER_SEC;
+        for (port, limit) in [(50061, None), (50062, Some(fixed_rate * 4))] {
+            let remote_addr = SocketAddr::new(Ipv4Addr::new(10, 99, 99, 61).into(), port);
+            let (mut conn, _inbound_tx) = test_conn_with_bandwidth_limit(remote_addr, limit);
+
+            let rate = rate_after_updates(&mut conn, fixed_rate, Duration::from_secs(5)).await;
+            assert_eq!(
+                rate, fixed_rate,
+                "with bandwidth_limit = {limit:?}, the rate update must pace at the \
+                 congestion controller's rate"
+            );
+        }
+    }
+
+    /// `paced_rate` caps the controller's rate by the node's fair share when
+    /// `total-bandwidth-limit` is set (the per-connection limit is then ignored,
+    /// even when it is lower), otherwise by `bandwidth-limit`. No limit raises
+    /// the rate.
+    #[test]
+    fn paced_rate_applies_the_configured_limit() {
+        const CC: usize = 1_250_000;
+        let cases = [
+            (None, None, CC),
+            (None, Some(200_000), 200_000),
+            (None, Some(10_000_000), CC),
+            (Some(500_000), None, 500_000),
+            (Some(500_000), Some(100_000), 500_000),
+            (Some(5_000_000), Some(100_000), CC),
+        ];
+        for (global_rate, bandwidth_limit, expected) in cases {
+            assert_eq!(
+                paced_rate(CC, global_rate, bandwidth_limit),
+                expected,
+                "paced_rate({CC}, {global_rate:?}, {bandwidth_limit:?})"
+            );
+        }
+    }
+
+    /// `effective_bandwidth_limit` turns the configured `bandwidth-limit` into
+    /// the one the transport applies: ignored under `total-bandwidth-limit`, 0
+    /// is unset, and a value below `MIN_BANDWIDTH_LIMIT` is raised to it, so a
+    /// stray small value cannot make every long stream fail.
+    #[test]
+    fn effective_bandwidth_limit_sanitizes_the_configured_value() {
+        let floor = MIN_BANDWIDTH_LIMIT;
+        assert!(
+            floor > streaming::MIN_INBOUND_STREAM_RATE_BYTES_PER_SEC as usize,
+            "the floor must leave margin over the receiver's slowest accepted rate"
+        );
+        let cases = [
+            (None, false, None),
+            (Some(0), false, None),
+            (Some(1), false, Some(floor)),
+            (Some(floor - 1), false, Some(floor)),
+            (Some(floor), false, Some(floor)),
+            (Some(500_000), false, Some(500_000)),
+            (Some(500_000), true, None),
+            (Some(1), true, None),
+            (None, true, None),
+        ];
+        for (configured, total_limit_set, expected) in cases {
+            assert_eq!(
+                effective_bandwidth_limit(configured, total_limit_set),
+                expected,
+                "effective_bandwidth_limit({configured:?}, total set: {total_limit_set})"
+            );
+        }
+    }
+
+    /// `initial_paced_rate`: the global share is taken as is (main's behaviour),
+    /// otherwise a per-connection limit can lower the controller's rate but not
+    /// raise it, and 0 is unset.
+    #[test]
+    fn initial_paced_rate_never_raises_the_controller_rate() {
+        const CC: usize = 1_250_000;
+        let cases = [
+            (None, None, CC),
+            (None, Some(200_000), 200_000),
+            (None, Some(10_000_000), CC),
+            (None, Some(0), CC),
+            (Some(5_000_000), Some(200_000), 5_000_000),
+            (Some(300_000), None, 300_000),
+        ];
+        for (global_share, bandwidth_limit, expected) in cases {
+            assert_eq!(
+                initial_paced_rate(global_share, bandwidth_limit, CC),
+                expected,
+                "initial_paced_rate({global_share:?}, {bandwidth_limit:?}, {CC})"
+            );
+        }
     }
 
     /// Serializes the #4827 `transfers_failed` tests. `TRANSPORT_METRICS` is a
@@ -6000,7 +6487,7 @@ mod tests {
             outbound_symmetric_key: cipher.clone(),
             remote_addr,
             sent_tracker,
-            last_packet_id: Arc::new(AtomicU32::new(0)),
+            last_packet_id: crate::transport::connection_handler::data_packet_ids(),
             inbound_packet_recv: inbound_rx,
             inbound_symmetric_key: cipher.clone(),
             inbound_symmetric_key_bytes: key,
@@ -6011,6 +6498,7 @@ mod tests {
             token_bucket,
             socket,
             global_bandwidth: None,
+            bandwidth_limit: None,
             rolling_rtt_stats,
             time_source: time_source.clone(),
         };

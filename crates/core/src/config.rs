@@ -326,7 +326,10 @@ impl Default for ConfigArgs {
                 gateways: None,
                 gateway: None,
                 location: None,
-                bandwidth_limit: Some(3_000_000), // 3 MB/s default for streaming transfers only
+                // Unset, as a bare CLI parse leaves it (NetworkArgs::bandwidth_limit).
+                // Since #6047 the limit caps every rate update, so a library default
+                // here would silently cap callers that pick a faster controller.
+                bandwidth_limit: None,
                 total_bandwidth_limit: None,
                 min_bandwidth_per_connection: None,
                 blocked_addresses: None,
@@ -340,6 +343,8 @@ impl Default for ConfigArgs {
                 congestion_control: None,  // Default: fixedrate (set in NetworkApiConfig)
                 bbr_startup_rate: None,    // Uses default from BBR config
                 transport_quic: None,      // Default: off
+                quic_max_paths: None,      // Default: max-number-of-connections
+                quic_ignore_crash_breaker: None,
             },
             ws_api: WebsocketApiArgs {
                 // `None`, NOT an explicit address: this is the "operator said
@@ -1031,6 +1036,16 @@ impl ConfigArgs {
             if self.network_api.transport_quic.is_none() {
                 self.network_api.transport_quic = cfg.network_api.transport_quic.clone();
             }
+            // Merged whatever it holds, an unparsable value included, like
+            // `transport-quic` above.
+            if let Some(limit) = cfg.network_api.quic_max_paths.clone() {
+                self.network_api.quic_max_paths.get_or_insert(limit);
+            }
+            if cfg.network_api.quic_ignore_crash_breaker {
+                self.network_api
+                    .quic_ignore_crash_breaker
+                    .get_or_insert(true);
+            }
             if let Some(limit) = cfg.network_api.total_bandwidth_limit {
                 self.network_api.total_bandwidth_limit.get_or_insert(limit);
             }
@@ -1547,6 +1562,11 @@ impl ConfigArgs {
                     .unwrap_or_else(default_congestion_control),
                 bbr_startup_rate: self.network_api.bbr_startup_rate,
                 transport_quic: self.network_api.transport_quic.clone(),
+                quic_max_paths: self.network_api.quic_max_paths.clone(),
+                quic_ignore_crash_breaker: self
+                    .network_api
+                    .quic_ignore_crash_breaker
+                    .unwrap_or(false),
                 skip_load_from_network: self.network_api.skip_load_from_network,
                 dropped_persisted_loopback: dropped_persisted_network_loopback,
             },
@@ -2374,7 +2394,17 @@ pub struct NetworkArgs {
     /// Bandwidth limit for large streaming data transfers, in bytes per second.
     /// Applies only to the streaming path used for large transfers; the general
     /// packet rate limiter is currently disabled for reliability reasons.
-    /// Default: 3 MB/s (3,000,000 bytes/second).
+    /// Applies to each connection separately and caps the congestion
+    /// controller's rate: it can lower a connection's rate, never raise it, and
+    /// N connections may send up to N times this. Short messages, ACKs and
+    /// retransmits are not paced. To limit what the node sends as a whole, use
+    /// --total-bandwidth-limit, which overrides this.
+    /// 0 means unset; a value below 64 KiB/s (65,536 bytes/second) is raised to
+    /// it with a warning. Low limits slow large transfers in proportion, and
+    /// very large ones (multi-MB contract states) can miss their deadlines.
+    /// Default: unset, so each connection is paced at the congestion
+    /// controller's rate, 1.25 MB/s (1,250,000 bytes/second) for the default
+    /// `fixedrate` controller.
     #[arg(long)]
     pub bandwidth_limit: Option<usize>,
 
@@ -2493,15 +2523,60 @@ pub struct NetworkArgs {
     #[serde(rename = "bbr-startup-rate", skip_serializing_if = "Option::is_none")]
     pub bbr_startup_rate: Option<u64>,
 
-    /// QUIC transport (#5940): `off` (default) or `prefer`.
+    /// QUIC transport (#5940): `off` (default), `shadow` or `prefer`.
     ///
-    /// `prefer` builds a QUIC endpoint on the network port. In this release
+    /// `shadow` builds a QUIC endpoint on the network port. In this release
     /// the endpoint accepts no connections and opens none, so the node
-    /// behaves as with `off`. An unknown value is treated as `off`, with a
-    /// warning in the log.
-    #[arg(long, env = "FREENET_TRANSPORT_QUIC", value_name = "off|prefer")]
+    /// behaves as with `off`. `prefer` runs as `shadow` in this release. An
+    /// unknown value is treated as `off`, with a warning in the log.
+    #[arg(long, env = "FREENET_TRANSPORT_QUIC", value_name = "off|shadow|prefer")]
     #[serde(rename = "transport-quic", skip_serializing_if = "Option::is_none")]
     pub transport_quic: Option<String>,
+
+    /// The most QUIC paths this node holds at once, counting paths being
+    /// offered or dialed (#5940).
+    ///
+    /// Default: `max-number-of-connections`; a larger value is lowered to it,
+    /// and 0 turns QUIC upgrades off. A value that is not a whole number is
+    /// ignored with a warning in the log. Unused in this release.
+    #[arg(
+        long = "quic-max-paths",
+        env = "FREENET_QUIC_MAX_PATHS",
+        value_name = "N"
+    )]
+    #[serde(
+        default,
+        rename = "quic-max-paths",
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_count::deserialize",
+        serialize_with = "lenient_count::serialize"
+    )]
+    pub quic_max_paths: Option<String>,
+
+    /// Run QUIC even when the crash-loop breaker would keep it off (unix
+    /// only; the breaker is off on Windows).
+    ///
+    /// If a run with QUIC enabled ends abnormally, the node starts with QUIC
+    /// off for 24 hours. Set this to run QUIC anyway. Default: false.
+    ///
+    /// Works as a bare flag after the subcommand: `--quic-ignore-crash-breaker`
+    /// turns it on, `--quic-ignore-crash-breaker=false` turns it off. Before
+    /// the subcommand give the value (`--quic-ignore-crash-breaker=true`). The environment
+    /// variable also accepts `1`/`0`, `yes`/`no` and `on`/`off`, so a value
+    /// written for another tool cannot fail argument parsing and make a
+    /// supervised node restart-loop.
+    #[arg(
+        long = "quic-ignore-crash-breaker",
+        env = "FREENET_QUIC_IGNORE_CRASH_BREAKER",
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    #[serde(
+        rename = "quic-ignore-crash-breaker",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub quic_ignore_crash_breaker: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2638,9 +2713,15 @@ pub struct NetworkApiConfig {
     pub ignore_protocol_version: bool,
 
     /// Bandwidth limit per connection for data transfers (in bytes per second).
-    /// NOTE: This applies to each connection independently - N connections may use N * bandwidth_limit total.
-    /// Each connection uses LEDBAT congestion control to yield to foreground traffic.
-    /// Default: 10 MB/s (10,000,000 bytes/second)
+    /// NOTE: This applies to each connection independently - N connections may use
+    /// N * bandwidth_limit total. It caps the congestion controller's rate for
+    /// streamed transfers (short messages, ACKs and retransmits are not paced), so it
+    /// can lower a connection's rate but never raise it. A value of 0 is treated as unset,
+    /// and one below `MIN_BANDWIDTH_LIMIT` (64 KiB/s) is raised to it
+    /// (`NetworkApiConfig::transport_bandwidth_limit`).
+    /// Default: None, so each connection is paced at the congestion controller's
+    /// rate: 1.25 MB/s (`fixed_rate::DEFAULT_RATE_BYTES_PER_SEC`) for the default
+    /// `fixedrate` controller, which does not adapt to queuing delay or other traffic.
     ///
     /// If `total_bandwidth_limit` is set, this field is ignored and per-connection rates
     /// are derived from: `total_bandwidth_limit / active_connections`.
@@ -2758,15 +2839,39 @@ pub struct NetworkApiConfig {
     )]
     pub bbr_startup_rate: Option<u64>,
 
-    /// QUIC transport (#5940): `off` (the default when unset) or `prefer`.
-    /// Kept as written, so a value from a later release round-trips; see
-    /// [`Self::quic_settings`] for how it is read.
+    /// QUIC transport (#5940): `off` (the default when unset), `shadow` or
+    /// `prefer`. Kept as written, so a value from a later release
+    /// round-trips; see [`Self::quic_settings`] for how it is read.
     #[serde(
         default,
         rename = "transport-quic",
         skip_serializing_if = "Option::is_none"
     )]
     pub transport_quic: Option<String>,
+
+    /// The most QUIC paths this node holds at once (#5940), stored as text so
+    /// a value this binary cannot parse does not stop it from starting (as
+    /// with `transport-quic`). An integer or string is kept as written; a
+    /// bool or float is kept as its text, and an array, table or datetime as
+    /// a placeholder ([`lenient_count`]). Read through
+    /// [`Self::quic_max_paths`].
+    #[serde(
+        default,
+        rename = "quic-max-paths",
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_count::deserialize",
+        serialize_with = "lenient_count::serialize"
+    )]
+    pub quic_max_paths: Option<String>,
+
+    /// Run QUIC even when the crash-loop breaker would keep it off
+    /// (`transport::quic::breaker`). Default false.
+    #[serde(
+        default,
+        rename = "quic-ignore-crash-breaker",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub quic_ignore_crash_breaker: bool,
 
     /// When true, this node is part of a local/test network and does not load
     /// gateways from the public remote index. Used to disable the relay-ready
@@ -2792,19 +2897,62 @@ pub struct NetworkApiConfig {
 }
 
 impl NetworkApiConfig {
+    /// The per-connection `bandwidth-limit` the node hands its transport
+    /// (#6047): the configured value after
+    /// [`effective_bandwidth_limit`](crate::transport::peer_connection::effective_bandwidth_limit),
+    /// which ignores it whenever `total-bandwidth-limit` is set. That includes
+    /// a total of 0: a global pool is built for any configured total, and its
+    /// share overrides the per-connection limit anyway. Logs what it decided,
+    /// so call it once per node.
+    pub(crate) fn transport_bandwidth_limit(&self) -> Option<usize> {
+        crate::transport::peer_connection::effective_bandwidth_limit(
+            self.bandwidth_limit,
+            self.total_bandwidth_limit.is_some(),
+        )
+    }
+
     /// The QUIC endpoint settings when `transport-quic` turns QUIC on, or
     /// `None` when it is off, unset or a value this binary does not know
     /// (which logs a warning). Reads the node's memory limit, since the
     /// endpoint's flow-control windows are sized from it.
     pub(crate) fn quic_settings(&self) -> Option<crate::transport::quic::QuicSettings> {
         use crate::transport::quic::QuicMode;
-        match QuicMode::from_config_value(self.transport_quic.as_deref()) {
-            QuicMode::Off => None,
-            QuicMode::Prefer => Some(crate::transport::quic::QuicSettings {
-                max_connections: self.max_connections,
-                memory_limit: crate::wasm_runtime::read_total_ram_bytes()
-                    .unwrap_or(QUIC_FALLBACK_TOTAL_RAM),
-            }),
+        if !QuicMode::from_config_value(self.transport_quic.as_deref()).builds_endpoint() {
+            return None;
+        }
+        Some(crate::transport::quic::QuicSettings {
+            max_connections: self.max_connections,
+            memory_limit: crate::wasm_runtime::read_total_ram_bytes()
+                .unwrap_or(QUIC_FALLBACK_TOTAL_RAM),
+            idle_timeout: None,
+        })
+    }
+
+    /// The most QUIC paths this node may hold at once: `quic-max-paths`,
+    /// lowered to [`Self::max_connections`], which is also the value when the
+    /// key is unset or cannot be parsed ([`Self::quic_max_paths_setting`]).
+    ///
+    /// The cap is `max_connections` because the endpoint's flow-control
+    /// windows are sized for that many connections
+    /// (`quic::config::connection_window_bytes`); more paths would exceed the
+    /// memory share they were sized for. At the default the limit rarely
+    /// binds: a connection has at most one path, but a permit is held from
+    /// the offer, so a path still closing can briefly hold a slot.
+    pub(crate) fn quic_max_paths(&self) -> usize {
+        match self.quic_max_paths_setting() {
+            QuicMaxPathsSetting::Set(limit) => limit.min(self.max_connections),
+            QuicMaxPathsSetting::Unset | QuicMaxPathsSetting::Invalid(_) => self.max_connections,
+        }
+    }
+
+    /// How `quic-max-paths` reads.
+    pub(crate) fn quic_max_paths_setting(&self) -> QuicMaxPathsSetting<'_> {
+        match self.quic_max_paths.as_deref() {
+            None => QuicMaxPathsSetting::Unset,
+            Some(raw) => match raw.trim().parse::<usize>() {
+                Ok(limit) => QuicMaxPathsSetting::Set(limit),
+                Err(_) => QuicMaxPathsSetting::Invalid(raw),
+            },
         }
     }
 
@@ -2854,6 +3002,91 @@ fn default_transient_ttl_secs() -> u64 {
 
 fn default_min_connections() -> usize {
     DEFAULT_MIN_CONNECTIONS
+}
+
+/// How the `quic-max-paths` key reads ([`NetworkApiConfig::quic_max_paths_setting`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QuicMaxPathsSetting<'a> {
+    Unset,
+    Set(usize),
+    /// Not a whole number: ignored, with a warning at startup.
+    Invalid(&'a str),
+}
+
+/// Serde for a count stored as text (`quic-max-paths`). Any TOML value is
+/// accepted, so a value this binary cannot parse does not stop `config.toml`
+/// from loading. An integer or string is stored as written and written back
+/// the same way; a bool or float is stored as its text and written back as a
+/// string; an array, table or datetime (which TOML hands over as a table) is
+/// stored as [`NOT_A_SCALAR`].
+mod lenient_count {
+    use std::fmt;
+
+    use serde::de::{self, IgnoredAny, MapAccess, SeqAccess, Visitor};
+    use serde::{Deserializer, Serializer};
+
+    /// Stored for an array or table, which has no text form to keep.
+    const NOT_A_SCALAR: &str = "<not a number>";
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<String>, D::Error> {
+        struct Any;
+        impl<'de> Visitor<'de> for Any {
+            type Value = Option<String>;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a whole number")
+            }
+            fn visit_bool<E: de::Error>(self, v: bool) -> Result<Self::Value, E> {
+                Ok(Some(v.to_string()))
+            }
+            fn visit_i64<E: de::Error>(self, v: i64) -> Result<Self::Value, E> {
+                Ok(Some(v.to_string()))
+            }
+            fn visit_u64<E: de::Error>(self, v: u64) -> Result<Self::Value, E> {
+                Ok(Some(v.to_string()))
+            }
+            fn visit_f64<E: de::Error>(self, v: f64) -> Result<Self::Value, E> {
+                Ok(Some(v.to_string()))
+            }
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(Some(v.to_string()))
+            }
+            fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+                Ok(None)
+            }
+            fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+                Ok(None)
+            }
+            fn visit_some<D: Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
+                d.deserialize_any(self)
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(Some(NOT_A_SCALAR.to_string()))
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+                Ok(Some(NOT_A_SCALAR.to_string()))
+            }
+        }
+        deserializer.deserialize_any(Any)
+    }
+
+    pub(super) fn serialize<S: Serializer>(
+        value: &Option<String>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        match value.as_deref() {
+            None => serializer.serialize_none(),
+            // i64, not u64: TOML integers are signed, so a larger value is
+            // kept as text.
+            Some(raw) => match raw.trim().parse::<i64>() {
+                Ok(count) => serializer.serialize_i64(count),
+                Err(_) => serializer.serialize_str(raw),
+            },
+        }
+    }
 }
 
 fn default_max_connections() -> usize {
@@ -5026,6 +5259,40 @@ impl GlobalRng {
         f()
     }
 
+    /// Runs `f` with this thread's seeded RNG replaced by one seeded from
+    /// the thread's seed and `stream`, then puts the thread's RNG back
+    /// exactly as it was (also if `f` panics). Draws inside `f` are
+    /// repeatable and do not move the main stream, so a component that
+    /// takes randomness when it is built (the simulated QUIC endpoint)
+    /// changes no other random choice in the run. Without a seed
+    /// (production) it runs `f` with the system RNG, unchanged.
+    pub fn with_side_stream<F, R>(stream: u64, f: F) -> R
+    where
+        F: FnOnce() -> R,
+    {
+        struct Restore(Option<SmallRng>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                let saved = self.0.take();
+                THREAD_RNG.with(|rng| *rng.borrow_mut() = saved);
+            }
+        }
+        let Some(seed) = THREAD_SEED.with(|s| s.get()) else {
+            return f();
+        };
+        // Both inputs pass through a mixer (SplitMix64's finalizer), so no
+        // stream id makes the side seed equal the main seed by construction.
+        fn mix(mut z: u64) -> u64 {
+            z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+        let side = SmallRng::seed_from_u64(mix(seed ^ mix(stream)));
+        let _restore = Restore(THREAD_RNG.with(|rng| rng.borrow_mut().replace(side)));
+        f()
+    }
+
     /// Executes a closure with access to the RNG.
     /// Uses seeded RNG if set via `set_seed()`, otherwise system RNG.
     #[inline]
@@ -6710,6 +6977,7 @@ streaming-threshold = 65537
 ledbat-min-ssthresh = 102401
 congestion-control = "bbr"
 bbr-startup-rate = 12345678
+quic-max-paths = 7
 skip_load_from_network = true
 ws-api-address = "127.0.0.1"
 ws-api-port = 7510
@@ -6871,6 +7139,8 @@ shutdown-drain-secs = 42
         assert_eq!(cfg.network_api.congestion_control, "bbr");
         assert_eq!(cfg.ws_api.per_user_op_burst, 101);
         assert_eq!(cfg.shutdown_drain_secs, 42);
+        assert_eq!(cfg.network_api.quic_max_paths.as_deref(), Some("7"));
+        assert_eq!(cfg.network_api.quic_max_paths(), 7);
     }
 
     /// THE BUG (#5124): a `config.toml` key could not be spelled the way the
@@ -6911,7 +7181,12 @@ shutdown-drain-secs = 42
             "an unset key is not written"
         );
 
-        for (value, on) in [("prefer", true), ("off", false), ("a-later-mode", false)] {
+        for (value, on) in [
+            ("shadow", true),
+            ("prefer", true),
+            ("off", false),
+            ("a-later-mode", false),
+        ] {
             let text = RELEASED_CONFIG_TOML.replacen(
                 "mode = \"network\"\n",
                 &format!("mode = \"network\"\ntransport-quic = \"{value}\"\n"),
@@ -6934,6 +7209,59 @@ shutdown-drain-secs = 42
                 rewritten.contains(&format!("transport-quic = \"{value}\"")),
                 "written back as it was read: {rewritten}"
             );
+        }
+
+        // `quic-max-paths`: kebab-case, and any value loads (so neither a
+        // later release's value nor a typo stops the node from starting).
+        // Integers and strings round-trip as written; other values are kept
+        // as text or a placeholder. Only the parsed value is lowered or
+        // ignored.
+        assert!(
+            toml::to_string(&unset)
+                .unwrap()
+                .contains("quic-max-paths = 7")
+        );
+        let without = RELEASED_CONFIG_TOML.replacen("quic-max-paths = 7\n", "", 1);
+        assert_ne!(without, RELEASED_CONFIG_TOML, "the key was removed");
+        let without: Config = toml::from_str(&without).unwrap();
+        assert_eq!(without.network_api.quic_max_paths, None);
+        assert!(
+            !toml::to_string(&without)
+                .unwrap()
+                .contains("quic-max-paths"),
+            "an unset key is not written"
+        );
+        for (written, kept, limit, rewritten) in [
+            ("5", "5", 5, "quic-max-paths = 5"),
+            ("1000000", "1000000", 200, "quic-max-paths = 1000000"),
+            ("\"lots\"", "lots", 200, "quic-max-paths = \"lots\""),
+            ("-3", "-3", 200, "quic-max-paths = -3"),
+            ("2.5", "2.5", 200, "quic-max-paths = \"2.5\""),
+            ("true", "true", 200, "quic-max-paths = \"true\""),
+            (
+                "[1, 2]",
+                "<not a number>",
+                200,
+                "quic-max-paths = \"<not a number>\"",
+            ),
+        ] {
+            let text = RELEASED_CONFIG_TOML.replacen(
+                "quic-max-paths = 7\n",
+                &format!("quic-max-paths = {written}\n"),
+                1,
+            );
+            assert_ne!(text, RELEASED_CONFIG_TOML, "the key was replaced");
+            let cfg: Config = toml::from_str(&text)
+                .unwrap_or_else(|e| panic!("quic-max-paths = {written} must parse: {e}"));
+            assert_eq!(cfg.network_api.max_connections, 200, "premise");
+            assert_eq!(
+                cfg.network_api.quic_max_paths.as_deref(),
+                Some(kept),
+                "{written}"
+            );
+            assert_eq!(cfg.network_api.quic_max_paths(), limit, "{written}");
+            let out = toml::to_string(&cfg).unwrap();
+            assert!(out.contains(rewritten), "{written}: {out}");
         }
     }
 
@@ -8653,6 +8981,39 @@ shutdown-drain-secs = 42
         }
     }
 
+    /// `--quic-ignore-crash-breaker` works as a bare flag and with an explicit
+    /// value. Only command-line forms, which clap prefers over the
+    /// environment, so the test does not depend on or change the environment;
+    /// the environment forms (including `1` and `0`) are tested in child
+    /// processes by the binary's
+    /// `quic_ignore_crash_breaker_prefers_the_command_line_over_the_environment`.
+    #[test]
+    fn quic_ignore_crash_breaker_accepts_a_bare_flag_and_a_value() {
+        use clap::Parser;
+        let parse = |argv: &[&str]| {
+            ConfigArgs::try_parse_from(argv)
+                .unwrap_or_else(|e| panic!("{argv:?} must parse: {e}"))
+                .network_api
+                .quic_ignore_crash_breaker
+        };
+        assert_eq!(
+            parse(&["freenet", "--quic-ignore-crash-breaker"]),
+            Some(true)
+        );
+        for (value, expected) in [
+            ("true", true),
+            ("false", false),
+            ("1", true),
+            ("off", false),
+        ] {
+            assert_eq!(
+                parse(&["freenet", &format!("--quic-ignore-crash-breaker={value}")]),
+                Some(expected),
+                "{value}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn max_hosting_storage_explicit_value_round_trips() {
         let temp_dir = tempfile::tempdir().unwrap();
@@ -9150,7 +9511,7 @@ shutdown-drain-secs = 42
     /// command line wins over the file.
     #[tokio::test]
     async fn transport_quic_survives_a_bare_build_and_cli_overrides_it() {
-        for value in ["prefer", "off", "a-later-mode"] {
+        for value in ["shadow", "prefer", "off", "a-later-mode"] {
             let temp_dir = tempfile::tempdir().unwrap();
             let mut first = local_args(temp_dir.path());
             first.network_api.transport_quic = Some(value.to_string());
@@ -9174,6 +9535,66 @@ shutdown-drain-secs = 42
             );
             assert_eq!(cfg.network_api.quic_settings().is_some(), other == "prefer");
         }
+    }
+
+    /// `quic-max-paths` (#5940) survives a bare restart, an unparsable value
+    /// included (it reads as the default and does not stop the build), a
+    /// value on the command line wins over the file, and unset reads as
+    /// `max-number-of-connections`.
+    #[tokio::test]
+    async fn quic_max_paths_survives_a_bare_build_and_defaults_to_max_connections() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cfg = local_args(temp_dir.path()).build().await.unwrap();
+        assert_eq!(cfg.network_api.quic_max_paths, None);
+        let max_connections = cfg.network_api.max_connections;
+        assert_eq!(cfg.network_api.quic_max_paths(), max_connections);
+
+        for (value, limit) in [("3", 3), ("lots", max_connections)] {
+            let mut first = local_args(temp_dir.path());
+            first.network_api.quic_max_paths = Some(value.to_string());
+            first.build().await.unwrap();
+            let cfg = local_args(temp_dir.path()).build().await.unwrap();
+            assert_eq!(
+                cfg.network_api.quic_max_paths.as_deref(),
+                Some(value),
+                "bare build"
+            );
+            assert_eq!(cfg.network_api.quic_max_paths(), limit, "{value}");
+        }
+
+        let mut cli = local_args(temp_dir.path());
+        cli.network_api.quic_max_paths = Some("0".to_string());
+        let cfg = cli.build().await.unwrap();
+        assert_eq!(
+            cfg.network_api.quic_max_paths(),
+            0,
+            "the command line overrides the file"
+        );
+    }
+
+    /// `--quic-max-paths` takes a value in either form, accepts one that is
+    /// not a number (it is ignored later, with a warning, rather than
+    /// refused here), and `--transport-quic shadow` parses. The environment
+    /// is not touched: `FREENET_QUIC_MAX_PATHS` and `FREENET_TRANSPORT_QUIC`
+    /// go through the same parser as the flags.
+    #[test]
+    fn quic_flags_parse_from_the_command_line() {
+        use clap::Parser as _;
+        for (argv, max_paths) in [
+            (&["freenet", "--quic-max-paths", "5"][..], "5"),
+            (&["freenet", "--quic-max-paths=5"][..], "5"),
+            (&["freenet", "--quic-max-paths", "lots"][..], "lots"),
+        ] {
+            let args = ConfigArgs::try_parse_from(argv).expect("parses");
+            assert_eq!(
+                args.network_api.quic_max_paths.as_deref(),
+                Some(max_paths),
+                "{argv:?}"
+            );
+        }
+        let args =
+            ConfigArgs::try_parse_from(["freenet", "--transport-quic", "shadow"]).expect("parses");
+        assert_eq!(args.network_api.transport_quic.as_deref(), Some("shadow"));
     }
 
     #[tokio::test]
@@ -9316,6 +9737,64 @@ shutdown-drain-secs = 42
         assert!(gateways_dropped_by_remote_replace(&[], &remote).is_empty());
     }
 
+    /// `transport_bandwidth_limit` is what a node hands its transport (#6047):
+    /// ignored under any `total-bandwidth-limit` (including 0, which still
+    /// builds a global pool), 0 means unset, and a value below the floor is
+    /// raised to it.
+    #[tokio::test]
+    async fn transport_bandwidth_limit_sanitizes_the_configured_limit() {
+        use crate::transport::peer_connection::MIN_BANDWIDTH_LIMIT;
+        // The library default leaves the limit unset, as the CLI does: a value
+        // here would silently cap callers that pick a faster controller.
+        assert_eq!(ConfigArgs::default().network_api.bandwidth_limit, None);
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut api = clap_bare_args(temp_dir.path())
+            .build()
+            .await
+            .unwrap()
+            .network_api;
+        let cases = [
+            (None, None, None),
+            (Some(500_000), None, Some(500_000)),
+            (Some(0), None, None),
+            (Some(1_000), None, Some(MIN_BANDWIDTH_LIMIT)),
+            (Some(500_000), Some(10_000_000), None),
+            (Some(500_000), Some(0), None),
+        ];
+        for (bandwidth_limit, total_bandwidth_limit, expected) in cases {
+            api.bandwidth_limit = bandwidth_limit;
+            api.total_bandwidth_limit = total_bandwidth_limit;
+            assert_eq!(
+                api.transport_bandwidth_limit(),
+                expected,
+                "bandwidth_limit {bandwidth_limit:?}, total {total_bandwidth_limit:?}"
+            );
+        }
+    }
+
+    /// The node hands its transport the sanitised limit, not the raw config
+    /// value (#6047). A cross-file scrape scoped to the `bandwidth_limit` field
+    /// of the `P2pConnManager` built in `P2pConnManager::build`, so it cannot
+    /// be satisfied by this test's own text or by another use of the name.
+    #[test]
+    fn p2p_conn_manager_takes_the_sanitised_bandwidth_limit() {
+        let source = include_str!("node/network_bridge/p2p_protoc.rs");
+        let at = source
+            .find("Ok(P2pConnManager {")
+            .expect("P2pConnManager::build constructs the manager");
+        let literal = &source[at..];
+        let literal = &literal[..literal.find("\n        })").expect("end of the literal")];
+        let field = literal
+            .lines()
+            .map(str::trim)
+            .find(|line| line.starts_with("bandwidth_limit:"))
+            .expect("the manager's bandwidth_limit field");
+        assert_eq!(
+            field, "bandwidth_limit: config.config.network_api.transport_bandwidth_limit(),",
+            "the transport must get the sanitised per-connection limit"
+        );
+    }
+
     /// A `ConfigArgs` mirroring a real bare `freenet network` parse: every
     /// optional field unset (None), pointed at `dir` in Local mode. Avoids
     /// `ConfigArgs::default()`, which pre-fills some fields with `Some(..)` that
@@ -9448,6 +9927,8 @@ shutdown-drain-secs = 42
                 congestion_control: "bbr".to_string(),
                 bbr_startup_rate: Some(5_000),
                 transport_quic: Some("prefer".to_string()),
+                quic_max_paths: Some("17".to_string()),
+                quic_ignore_crash_breaker: true,
                 skip_load_from_network: true,
                 // serde-skip: a per-boot migration record, never persisted.
                 dropped_persisted_loopback: None,
@@ -9664,6 +10145,8 @@ shutdown-drain-secs = 42
             congestion_control,
             bbr_startup_rate,
             transport_quic,
+            quic_max_paths,
+            quic_ignore_crash_breaker,
             skip_load_from_network,
             dropped_persisted_loopback: _, // serde-skip: per-boot migration record
         } = network_api;
@@ -9727,8 +10210,16 @@ shutdown-drain-secs = 42
             "bbr_startup_rate"
         );
         assert_eq!(
+            quic_ignore_crash_breaker, seed.network_api.quic_ignore_crash_breaker,
+            "quic_ignore_crash_breaker"
+        );
+        assert_eq!(
             transport_quic, seed.network_api.transport_quic,
             "transport_quic"
+        );
+        assert_eq!(
+            quic_max_paths, seed.network_api.quic_max_paths,
+            "quic_max_paths"
         );
         assert_eq!(
             skip_load_from_network, seed.network_api.skip_load_from_network,
@@ -10354,6 +10845,42 @@ shutdown-drain-secs = 42
         let config2: NetworkApiConfig = toml::from_str(&serialized).unwrap();
         assert_eq!(config2.congestion_control, "bbr");
         assert_eq!(config2.bbr_startup_rate, Some(5_000_000));
+    }
+
+    /// Draws inside `with_side_stream` repeat for one seed and stream,
+    /// differ between streams, and leave the main stream exactly where it
+    /// was, whether or not the main stream had drawn yet.
+    #[test]
+    fn side_stream_draws_repeat_and_leave_the_main_stream_alone() {
+        let draw = || GlobalRng::with_rng(|rng| rng.next_u64());
+        let run = |stream: u64, draw_first: bool| {
+            let _guard = GlobalRng::seed_guard(0x5940);
+            let before = draw_first.then(draw);
+            let side = GlobalRng::with_side_stream(stream, || (draw(), draw()));
+            (before, side, draw())
+        };
+        let main_untouched = {
+            let _guard = GlobalRng::seed_guard(0x5940);
+            draw()
+        };
+        let (_, side_a, main_a) = run(1, false);
+        let (_, side_a_again, _) = run(1, false);
+        let (_, side_b, _) = run(2, false);
+        assert_eq!(main_a, main_untouched, "the main stream did not move");
+        assert_eq!(side_a, side_a_again, "a side stream repeats");
+        assert_ne!(side_a, side_b, "streams differ");
+        let (_, side_zero, _) = run(0, false);
+        let main_pair = {
+            let _guard = GlobalRng::seed_guard(0x5940);
+            (draw(), draw())
+        };
+        assert_ne!(side_zero, main_pair, "stream 0 is not the main stream");
+        let (first, _, second) = run(1, true);
+        let expected = {
+            let _guard = GlobalRng::seed_guard(0x5940);
+            (draw(), draw())
+        };
+        assert_eq!((first.unwrap(), second), expected, "resumes mid-stream");
     }
 
     #[test]

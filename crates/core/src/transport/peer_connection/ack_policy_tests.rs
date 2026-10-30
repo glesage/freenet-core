@@ -104,7 +104,7 @@ fn end_with_wire_capacity(
         sent_tracker: Arc::new(parking_lot::Mutex::new(
             SentPacketTracker::new_with_time_source(time_source.clone()),
         )),
-        last_packet_id: Arc::new(AtomicU32::new(0)),
+        last_packet_id: crate::transport::connection_handler::data_packet_ids(),
         inbound_packet_recv: inbound_rx,
         inbound_symmetric_key: inbound.1.clone(),
         inbound_symmetric_key_bytes: inbound.0,
@@ -124,6 +124,7 @@ fn end_with_wire_capacity(
             fail: fail_sends.clone(),
         }),
         global_bandwidth: None,
+        bandwidth_limit: None,
         rolling_rtt_stats: crate::transport::rolling_rtt_stats::RollingRttStatsHandle::new(
             remote_addr,
             time_source.clone(),
@@ -281,7 +282,7 @@ fn receipt_policy_table() {
         assert_eq!(
             receipt_policy(&ack, ack_noops),
             AckWithoutDedup,
-            "the handshake ack is tracked at id 0: ack it, never dedup id 0"
+            "an earlier-release gateway tracks its handshake ack at id 0: ack it, never dedup id 0"
         );
         assert_eq!(receipt_policy(&ack_v2, ack_noops), AckWithoutDedup);
         assert_eq!(
@@ -955,11 +956,12 @@ async fn split_message_lost_ack_is_recovered_by_retransmitting_the_message() {
     let tracker = a.conn.remote_conn.sent_tracker.clone();
     a.conn.send(payload.clone()).await.expect("send");
 
-    // The message is the first packet A sends, so it has id 0. Drop B's first
-    // ack for it.
+    // The message is the first packet A sends, so it has the connection's
+    // first data id. Drop B's first ack for it.
+    const FIRST: u32 = crate::transport::connection_handler::FIRST_DATA_PACKET_ID;
     let mut dropped = false;
     let drop_first_ack: DropFilter = Box::new(move |m| {
-        if !dropped && m.confirm_receipt.contains(&0) {
+        if !dropped && m.confirm_receipt.contains(&FIRST) {
             dropped = true;
             return true;
         }
@@ -972,29 +974,33 @@ async fn split_message_lost_ack_is_recovered_by_retransmitting_the_message() {
 
     let first = &link.a_to_b[0].1;
     assert!(
-        first.packet_id == 0
+        first.packet_id == FIRST
             && matches!(first.payload, SymmetricMessagePayload::ShortMessage { .. }),
-        "premise: the message is A's first packet, id 0: {first:?}"
+        "premise: the message is A's first packet, id {FIRST}: {first:?}"
     );
     assert!(
         link.a_to_b
             .iter()
-            .filter(|(_, m)| m.packet_id != 0)
+            .filter(|(_, m)| m.packet_id != FIRST)
             .any(|(_, m)| m.confirm_receipt.contains(&10_000)),
         "premise: the receipts went in a separate packet with a fresh id"
     );
-    for (_, m) in link.a_to_b.iter().filter(|(_, m)| m.packet_id == 0) {
+    for (_, m) in link.a_to_b.iter().filter(|(_, m)| m.packet_id == FIRST) {
         assert!(
             matches!(m.payload, SymmetricMessagePayload::ShortMessage { .. }),
             "every packet sent under the message's id must be the message: {m:?}"
         );
     }
     assert!(
-        link.a_to_b.iter().filter(|(_, m)| m.packet_id == 0).count() >= 2,
+        link.a_to_b
+            .iter()
+            .filter(|(_, m)| m.packet_id == FIRST)
+            .count()
+            >= 2,
         "premise: the lost ack must have caused a retransmission"
     );
     assert!(
-        !tracker.lock().contains_packet(0),
+        !tracker.lock().contains_packet(FIRST),
         "the retransmitted message must be re-acked, clearing it from the tracker"
     );
     let expected = bincode::serialize(&payload).unwrap();
@@ -1094,8 +1100,8 @@ async fn lost_pongs_do_not_stretch_the_ping_interval_on_a_live_link() {
 }
 
 /// The handshake's connection ack always carries packet id 0, the same id as
-/// the remote's first data packet. Recording it for dedup made that data
-/// packet look like a duplicate and silently dropped it.
+/// the first data packet of a remote on an earlier release. Recording it for
+/// dedup made that data packet look like a duplicate and silently dropped it.
 #[tokio::test(start_paused = true)]
 async fn connection_ack_does_not_shadow_the_first_data_packet() {
     let mut e = single(CAPABLE);
@@ -1143,16 +1149,16 @@ fn is_connection_ack(m: &SymmetricMessage) -> bool {
     )
 }
 
-/// The handshake leaves each side's completion ack TRACKED at packet id 0,
-/// and our reply to a connection ack is itself a connection ack. Between two
-/// peers that both answered every one, a single ack bounced forever. Each
+/// A gateway on an earlier release keeps its completion ack TRACKED at packet
+/// id 0, and our reply to a connection ack is itself a connection ack. Between
+/// two peers that both answered every one, a single ack bounced forever. Each
 /// side answers at most once, and the tracked handshake ack still gets its
 /// receipt, so it stops being retransmitted.
 #[tokio::test(start_paused = true)]
 async fn connection_ack_exchange_is_bounded_and_clears_the_handshake_ack() {
     let (a, b) = pair(CAPABLE, CAPABLE);
-    // Production seed: A's completion ack, tracked at id 0 like
-    // `connection_handler` does, and delivered to B.
+    // A's completion ack, tracked at id 0 as a gateway on an earlier release
+    // does, and delivered to B.
     let a_ack = SymmetricMessage::ack_ok(&a.outbound_key, [0u8; 16], addr(2)).expect("ack");
     a.conn
         .remote_conn
@@ -1770,6 +1776,52 @@ fn fragment_with(
     }
 }
 
+impl<S: crate::transport::Socket, T: TimeSource> PeerConnection<S, T> {
+    /// [`Self::admit_inbound_stream_locked`] with the budget locked here.
+    fn admit_inbound_stream(
+        &mut self,
+        stream_id: StreamId,
+        total_length_bytes: u64,
+    ) -> std::result::Result<(), InboundStreamRejection> {
+        let shared_budget = self.inbound_budget.clone();
+        let mut budget = shared_budget.lock();
+        self.admit_inbound_stream_locked(&mut budget, stream_id, total_length_bytes)
+    }
+}
+
+/// Pin: both UDP admission paths (operations and legacy) hold ONE guard on
+/// the shared budget from the `contains` test through `check` to `charge`.
+/// The admission tests call the wrapper above, so they would still pass if
+/// a path dropped the guard and locked again between check and charge,
+/// which lets a QUIC path sharing the budget take the room in between.
+#[test]
+fn udp_admission_holds_one_budget_lock_from_check_to_charge() {
+    use super::inbound_budget::pin;
+    let source = include_str!("../peer_connection.rs");
+    for (signature, what) in [
+        ("fn process_operations_fragment(", "operations admission"),
+        ("async fn process_inbound(", "legacy admission"),
+    ] {
+        let body = pin::fn_body(source, signature);
+        let after = pin::assert_one_guard(
+            &body,
+            what,
+            "let mut budget = shared_budget.lock();",
+            &[
+                "if budget.contains(InboundKey::Udp(stream_id))",
+                "self.admit_inbound_stream_locked(&mut budget, stream_id, total_length_bytes)",
+            ],
+            "budget.charge(",
+        );
+        assert!(
+            after
+                .trim_start()
+                .starts_with("InboundKey::Udp(stream_id),"),
+            "{what}: the charge must be the UDP stream's"
+        );
+    }
+}
+
 /// What the connection's budget charges a stream declaring `declared` bytes.
 fn cost(declared: u64) -> u64 {
     super::inbound_budget::ChargeOverhead::DEFAULT.cost(declared)
@@ -1781,7 +1833,11 @@ fn holds_no_state(e: &End, stream_id: StreamId) -> bool {
         && e.conn.streaming_registry.get(stream_id).is_none()
         && !e.conn.inbound_streams.contains_key(&stream_id)
         && e.conn.inbound_stream_futures.is_empty()
-        && !e.conn.inbound_budget.contains(stream_id)
+        && !e
+            .conn
+            .inbound_budget
+            .lock()
+            .contains(InboundKey::Udp(stream_id))
 }
 
 async fn feed(e: &mut End, payload: SymmetricMessagePayload) -> Option<Vec<u8>> {
@@ -1961,7 +2017,10 @@ async fn inbound_stream_bytes_are_bounded_per_connection() {
             StreamId::next_transport_internal()
         };
         feed(&mut e, fragment(id, small, 1)).await;
-        assert!(e.conn.inbound_budget.contains(id), "stream {i} of {fit}");
+        assert!(
+            e.conn.inbound_budget.lock().contains(InboundKey::Udp(id)),
+            "stream {i} of {fit}"
+        );
     }
 
     for over in [StreamId::next(), StreamId::next_transport_internal()] {
@@ -1978,7 +2037,11 @@ fn holds_no_state_but_others(e: &End, stream_id: StreamId) -> bool {
     !e.conn.streaming_handles.contains_key(&stream_id)
         && e.conn.streaming_registry.get(stream_id).is_none()
         && !e.conn.inbound_streams.contains_key(&stream_id)
-        && !e.conn.inbound_budget.contains(stream_id)
+        && !e
+            .conn
+            .inbound_budget
+            .lock()
+            .contains(InboundKey::Udp(stream_id))
 }
 
 /// The number of streams per connection is bounded, so many small streams
@@ -1998,6 +2061,134 @@ async fn inbound_stream_count_is_bounded_per_connection() {
     assert_eq!(
         e.conn.inbound_budget.stream_count(),
         MAX_INBOUND_STREAMS_PER_CONNECTION
+    );
+}
+
+/// The connection's budget handle is the one a QUIC path to the same peer
+/// charges (`QuicPath::with_budget`): a QUIC charge refuses a UDP stream
+/// that no longer fits, and once its state is gone the room is the UDP
+/// side's again. Charges are keyed by path, so the same numeric id held on
+/// both is two charges, and releasing one leaves the other.
+#[tokio::test(start_paused = true)]
+async fn a_quic_charge_on_the_shared_budget_refuses_a_udp_stream() {
+    use super::inbound_budget::{LegacyStreamToken, Liveness};
+    use super::streaming::MAX_STREAM_TOTAL_BYTES;
+    use crate::transport::metrics::InboundStreamOutcome as O;
+    const AGE: Duration = Duration::from_secs(3600);
+    let mut e = single(CAPABLE);
+    let shared = e.conn.inbound_budget();
+
+    // A maximum-size QUIC stream leaves less room than another one costs.
+    let quic_token = LegacyStreamToken::new();
+    let refused = StreamId::next();
+    shared.lock().charge(
+        InboundKey::Quic(refused),
+        MAX_STREAM_TOTAL_BYTES,
+        0,
+        AGE,
+        Liveness::Task(Arc::downgrade(&quic_token)),
+    );
+    feed(&mut e, fragment(refused, MAX_STREAM_TOTAL_BYTES, 1)).await;
+    assert!(holds_no_state(&e, refused), "refused by the QUIC charge");
+    assert_eq!(
+        e.conn.inbound_outcomes[O::RefusedConnectionBytes as usize],
+        1
+    );
+    assert!(
+        shared.lock().contains(InboundKey::Quic(refused)),
+        "untouched"
+    );
+
+    // Once the QUIC stream's state is gone, the UDP side has the room.
+    drop(quic_token);
+    let id = StreamId::next();
+    feed(&mut e, fragment(id, MAX_STREAM_TOTAL_BYTES, 1)).await;
+    assert!(e.conn.streaming_handles.contains_key(&id), "admitted");
+    assert_eq!(
+        e.conn.inbound_budget.stream_count(),
+        1,
+        "QUIC charge released"
+    );
+
+    // The same id on the QUIC side is a second charge, released alone.
+    let quic_token = LegacyStreamToken::new();
+    {
+        let mut budget = shared.lock();
+        assert_eq!(
+            budget.check(1_000, super::inbound_budget::Releaser::Udp),
+            Ok(())
+        );
+        budget.charge(
+            InboundKey::Quic(id),
+            1_000,
+            0,
+            AGE,
+            Liveness::Task(Arc::downgrade(&quic_token)),
+        );
+        assert_eq!(budget.stream_count(), 2);
+    }
+    drop(quic_token);
+    assert!(shared.lock().release_if_gone(InboundKey::Quic(id)));
+    assert!(shared.lock().contains(InboundKey::Udp(id)));
+    assert_eq!(
+        e.conn.inbound_budget.charged_bytes(),
+        cost(MAX_STREAM_TOTAL_BYTES)
+    );
+    feed(&mut e, fragment(id, MAX_STREAM_TOTAL_BYTES, 2)).await;
+    let (handle, _) = e.conn.streaming_handles.get(&id).unwrap();
+    assert_eq!(handle.received_fragments(), 2, "the UDP stream carries on");
+}
+
+/// UDP admission under pressure releases the gone charges it needs room
+/// from, its own included (`Releaser::Udp` at the admission check): a gone
+/// UDP charge that no sweep has released yet does not refuse a new stream.
+#[tokio::test(start_paused = true)]
+async fn udp_admission_releases_its_own_gone_charges_for_room() {
+    use super::inbound_budget::{LegacyStreamToken, Liveness};
+    use super::streaming::MAX_STREAM_TOTAL_BYTES;
+    let mut e = single(CAPABLE);
+    let shared = e.conn.inbound_budget();
+    let gone = StreamId::next();
+    let token = LegacyStreamToken::new();
+    shared.lock().charge(
+        InboundKey::Udp(gone),
+        MAX_STREAM_TOTAL_BYTES,
+        0,
+        Duration::from_secs(3600),
+        Liveness::Task(Arc::downgrade(&token)),
+    );
+    drop(token);
+    let id = StreamId::next();
+    feed(&mut e, fragment(id, MAX_STREAM_TOTAL_BYTES, 1)).await;
+    assert!(e.conn.streaming_handles.contains_key(&id), "admitted");
+    assert!(!shared.lock().contains(InboundKey::Udp(gone)), "released");
+}
+
+/// The UDP sweep releases a gone QUIC charge on its own, with no later
+/// admission on either path: otherwise a QUIC path that stopped needing
+/// room (or is gone) would hold UDP's room until the next refusal.
+#[tokio::test(start_paused = true)]
+async fn the_udp_sweep_releases_a_gone_quic_charge() {
+    use super::inbound_budget::{LegacyStreamToken, Liveness};
+    let mut e = single(CAPABLE);
+    let shared = e.conn.inbound_budget();
+    let id = StreamId::next();
+    let token = LegacyStreamToken::new();
+    shared.lock().charge(
+        InboundKey::Quic(id),
+        1_000,
+        0,
+        Duration::from_secs(3600),
+        Liveness::Task(Arc::downgrade(&token)),
+    );
+    e.conn.sweep_inbound_streams();
+    assert!(shared.lock().contains(InboundKey::Quic(id)), "still held");
+    drop(token);
+    e.conn.sweep_inbound_streams();
+    assert_eq!(
+        e.conn.inbound_budget.stream_count(),
+        0,
+        "released by the sweep"
     );
 }
 
