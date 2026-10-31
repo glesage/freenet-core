@@ -4821,6 +4821,22 @@ impl Config {
         self.config_paths.secrets_dir(self.mode)
     }
 
+    /// Fetch the public gateway index into this node's `gateways.toml`, the
+    /// cache a start with `skip_load_from_network` reads. Embedders that start
+    /// from the cache, so a start never waits on the index, refresh it with
+    /// this in the background. Returns the number of gateways saved.
+    pub async fn refresh_gateway_cache(&self) -> anyhow::Result<usize> {
+        let gateways =
+            load_gateways_from_index(FREENET_GATEWAYS_INDEX, &self.config_paths.secrets_dir)
+                .await?;
+        anyhow::ensure!(
+            !gateways.gateways.is_empty(),
+            "the gateway index listed no gateways"
+        );
+        gateways.save_to_file(&self.config_dir().join("gateways.toml"))?;
+        Ok(gateways.gateways.len())
+    }
+
     pub fn event_log(&self) -> PathBuf {
         self.config_paths.event_log(self.mode)
     }

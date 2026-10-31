@@ -988,6 +988,31 @@ fn percent_decode_ascii(s: &str) -> String {
 /// are never handled here. Sub-resource fetches (`Sec-Fetch-Dest` =
 /// `script`/`style`/`image`/`empty`/...) and non-HTML asset paths fall
 /// through to `variable_content` so real assets still 404 normally.
+/// Whether a request under `/v{n}/contract/web/{key}` renders a shell page,
+/// the one response that issues an app auth token. Mirrors `web_home` (a root
+/// load outside the sandbox) and `web_subpages` (a deep-link document load).
+pub(crate) fn renders_shell(
+    path: &str,
+    query: Option<&str>,
+    headers: &axum::http::HeaderMap,
+) -> bool {
+    let is_sandbox = query.is_some_and(|qs| qs.split('&').any(|p| p == "__sandbox=1"));
+    if is_sandbox {
+        return false;
+    }
+    // `/v1/contract/web/{key}` + optional `/rest`.
+    let rest = path.splitn(5, '/').nth(4).unwrap_or("");
+    let sub_path = rest.split_once('/').map(|(_, sub)| sub).unwrap_or("");
+    if sub_path.is_empty() {
+        return true;
+    }
+    let fetch_dest = headers
+        .get("sec-fetch-dest")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    should_serve_shell_for_subpage(false, sub_path, fetch_dest)
+}
+
 fn should_serve_shell_for_subpage(is_sandbox: bool, last_path: &str, fetch_dest: &str) -> bool {
     !is_sandbox && is_html_page(last_path) && fetch_dest == "document"
 }
