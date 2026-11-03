@@ -47,6 +47,7 @@ async fn udp_handle_shares_one_expected_ip_set_and_reports_the_listener() {
         send_queue,
         expected_non_gateway: expected.clone(),
         quic_availability: crate::transport::quic::QuicAvailabilityWatch::disabled(),
+        upgrade_site: Default::default(),
         quic_endpoint: None,
     };
     let (inbound_tx, inbound_rx) = mpsc::channel(1);
@@ -64,6 +65,7 @@ async fn udp_handle_shares_one_expected_ip_set_and_reports_the_listener() {
         mut acceptor,
         expected_inbound,
         listener,
+        quic_endpoint: _,
     } = udp_transport_handle(outbound, inbound, listen_task);
 
     let inbound_addr: SocketAddr = "192.0.2.10:1000".parse().unwrap();
@@ -125,6 +127,7 @@ async fn listener_outlives_a_dropped_connector_while_a_clone_remains() {
         acceptor: _acceptor,
         expected_inbound: _expected,
         mut listener,
+        quic_endpoint: _,
     } = udp_transport_handle(outbound, inbound, listen_task);
     let keepalive = Arc::clone(&connector);
 
@@ -166,7 +169,9 @@ async fn udp_transport_config_reaches_the_listener_by_name() {
             congestion_config: None,
             ack_version_floor_override: Some((9, 8, 7)),
             quic: None,
+            quic_policy: None,
             advertised_version_override: Some((0, 2, 148)),
+            task_registrar: None,
         },
         None,
     );

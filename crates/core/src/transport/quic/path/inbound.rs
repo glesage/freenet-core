@@ -44,8 +44,9 @@
 //!   its first byte and is judged afresh. `ClosedTooManyRefusals` cannot
 //!   happen here.
 //! - A `Stream` whose id is already held on the path is refused
-//!   (`StreamIdInUse`). Completed ids are not remembered: that dedup is e5's,
-//!   where it sees both transports (`completed_inbound_streams`).
+//!   (`StreamIdInUse`). Completed ids are not remembered here: that dedup is in
+//!   the connection's stream arm, which sees both transports
+//!   (`completed_inbound_streams`).
 //! - Header refusals, truncation, overlong streams, resets and full channels
 //!   are counted in the path's own `QuicInboundOutcome` counters. A refused
 //!   header with an invalid declared length is also counted as
@@ -57,24 +58,16 @@
 //! one buffer that grows as data arrives and ends exactly the declared
 //! length (`ReadBuffer`), and keep no chunk. The payload of a `Stream` is
 //! copied into fragments by the `Rechunker`, each in a fresh buffer of
-//! exactly its length, except a chunk of at least a whole fragment, which
-//! is kept as a slice: it pins at most one datagram (1200 bytes) per
-//! fragment of `FRAGMENT_PAYLOAD_SIZE` (pinned by a const assertion).
-//!
-//! One exception: quinn-proto's `Assembler::defragment`, which the peer can
-//! trigger (by sending data out of order or in many small frames), merges
-//! buffered stream data into one allocation of up to the stream window,
-//! and whole-fragment slices taken from that chunk then share it. That
-//! memory is inside the stream's charge while its inbound state lives,
-//! but a slice keeps the whole allocation alive. e5 constraint: a fragment
-//! `Bytes` taken from an inbound `StreamHandle` must not outlive the
-//! inbound charge (for example, kept in an outbound pipe's retransmit
-//! state) without being copied.
+//! exactly its length, so a fragment pins only its own bytes whatever
+//! quinn's chunks were (including after quinn-proto's `Assembler::defragment`,
+//! which the peer can trigger and which merges buffered data into one large
+//! allocation). A fragment `Bytes` may therefore outlive the inbound charge.
 //!
 //! Simulation: `VirtualSleep` has no deregistration on drop, so each
 //! stream's last armed timer stays in `VirtualTime`'s pending wakeups until
 //! its deadline passes (one per ended stream; the timer is not replaced on
 //! progress, only when it fires).
+//!
 //! Streams with no budget charge (in the header phase, and control frames)
 //! get an age limit too ([`uncharged_age_limit`]), so a peer cannot hold
 //! one of its `MAX_UNI_STREAMS` stream slots by trickling bytes.
@@ -108,13 +101,19 @@ use crate::transport::peer_connection::inbound_budget::{
 };
 use crate::transport::peer_connection::streaming::{StreamError, StreamHandle};
 use crate::transport::peer_connection::streaming_buffer::FRAGMENT_PAYLOAD_SIZE;
-use crate::transport::peer_connection::{inbound_stream_age_limit, streaming_handle_idle_timeout};
+use crate::transport::peer_connection::{
+    fits_one_packet, inbound_stream_age_limit, streaming_handle_idle_timeout,
+};
 
 /// A short message from the peer. It holds its inbound budget charge until
 /// its payload is taken.
 pub(crate) struct InboundShort {
     payload: Bytes,
-    _charge: Arc<LegacyStreamToken>,
+    /// What the charge is held under, so the consumer can release it at once.
+    /// `None` for a message of one packet or less, which is not charged (as
+    /// on UDP).
+    key: Option<InboundKey>,
+    _charge: Option<Arc<LegacyStreamToken>>,
 }
 
 impl std::fmt::Debug for InboundShort {
@@ -126,15 +125,22 @@ impl std::fmt::Debug for InboundShort {
 }
 
 impl InboundShort {
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub(crate) fn payload(&self) -> &Bytes {
         &self.payload
     }
 
     /// The payload; its charge is released.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub(crate) fn into_payload(self) -> Bytes {
         self.payload
+    }
+
+    /// The payload and the key of its charge, if it holds one; the state is
+    /// then gone: release it with `release_if_gone`. Otherwise it holds room until something needs
+    /// room or the UDP sweep runs.
+    pub(in crate::transport) fn into_parts(self) -> (Bytes, Option<InboundKey>) {
+        (self.payload, self.key)
     }
 }
 
@@ -142,10 +148,9 @@ impl InboundShort {
 /// arrived and before its payload. Its bytes arrive in `handle` as they are
 /// received; the handle is cancelled if the stream fails.
 ///
-/// `handle` is the transport-internal `StreamHandle`; e5 must wrap it in a
-/// `boundary::IncomingStream` before anything above the transport sees it.
+/// `handle` is the transport-internal `StreamHandle`; the connection wraps it in
+/// a `boundary::IncomingStream` before anything above the transport sees it.
 #[derive(Debug)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct InboundStreamArrival {
     pub(crate) stream_id: StreamId,
     /// The message announcing the stream, if the sender sent one.
@@ -163,6 +168,8 @@ pub(in crate::transport::quic) struct Receiver<T> {
     controls: mpsc::Sender<Bytes>,
     /// Source of the budget keys short messages are charged under.
     next_short_key: AtomicU32,
+    /// Whether Short and Stream frames are read (`QuicPathLimits::accept_data`).
+    accept_data: bool,
     /// Panic on the next stream, to test the supervisor.
     #[cfg(test)]
     pub(in crate::transport::quic) panic_on_stream: bool,
@@ -176,6 +183,7 @@ impl<T: TimeSource> Receiver<T> {
         shorts: mpsc::Sender<InboundShort>,
         streams: mpsc::Sender<InboundStreamArrival>,
         controls: mpsc::Sender<Bytes>,
+        accept_data: bool,
     ) -> Self {
         Self {
             time,
@@ -185,6 +193,7 @@ impl<T: TimeSource> Receiver<T> {
             streams,
             controls,
             next_short_key: AtomicU32::new(1),
+            accept_data,
             #[cfg(test)]
             panic_on_stream: false,
         }
@@ -193,8 +202,9 @@ impl<T: TimeSource> Receiver<T> {
 
 /// Accept every uni stream of `connection` and read them all concurrently
 /// in this one task, until the connection ends; then let the readers see the
-/// loss and end. Reading never waits on a consumer (only `try_send`), so one
-/// stream cannot hold up another.
+/// loss and end. A reader may wait for room in a full channel, but only that
+/// reader: the readers are separate futures, so one stream cannot hold up
+/// another.
 pub(in crate::transport::quic) async fn receive<T: TimeSource>(
     connection: quinn::Connection,
     receiver: Arc<Receiver<T>>,
@@ -353,6 +363,33 @@ impl<T: TimeSource> BodyReader<T> {
         }
     }
 
+    /// Wait for `ready`, but not past the age deadline: `Err(Age)` if that
+    /// comes first. Idleness does not apply during the wait: the peer is not
+    /// the one being waited on, a consumer is. Holding the reader (and so the
+    /// `RecvStream`) while waiting withholds the stream's credit, which is
+    /// the back-pressure on the sender. When the wait ends in `Ok`, idleness
+    /// restarts from that moment, so the rest of the stream is evicted idle
+    /// as any other (a stall after a long wait must not run to the age
+    /// limit). Arms one new sleep for the wait and, if the idle deadline is
+    /// earlier than the age deadline, another after it, so call it only when
+    /// `ready` is not already available.
+    async fn until_age<F: Future>(&mut self, ready: F) -> Result<F::Output, ReadFailure> {
+        if self.timer_at != self.age_deadline {
+            self.timer_at = self.age_deadline;
+            self.timer = self.time.sleep_until(self.timer_at);
+        }
+        let out = tokio::select! {
+            out = ready => out,
+            () = &mut self.timer => return Err(ReadFailure::Age),
+        };
+        // Re-arming alone would fail a wait longer than the idle timeout as
+        // Idle at once, so progress is reset first.
+        self.last_progress = self.time.now_nanos();
+        self.timer_at = self.deadline();
+        self.timer = self.time.sleep_until(self.timer_at);
+        Ok(out)
+    }
+
     /// Exactly `len` bytes (`len` > 0), copied into one buffer
     /// ([`ReadBuffer`]) that grows as data arrives and ends exactly `len`
     /// bytes long, so no chunk (and no datagram it is a slice of) is kept and
@@ -393,6 +430,31 @@ impl<T: TimeSource> BodyReader<T> {
     /// ended.
     fn stop(&mut self, code: u32) {
         self.recv.stop(code.into()).ok();
+    }
+}
+
+/// Counts a reader dropped while it waits for room in a delivery channel.
+/// Teardown aborts the receive task, which drops every parked reader without
+/// running its code; this is the only record of those messages. Disarmed once
+/// the wait ends by any other route.
+struct WaitingGuard<'a> {
+    stats: &'a QuicPathStats,
+    outcome: QuicInboundOutcome,
+}
+
+impl<'a> WaitingGuard<'a> {
+    fn new(stats: &'a QuicPathStats, outcome: QuicInboundOutcome) -> Self {
+        Self { stats, outcome }
+    }
+
+    fn disarm(self) {
+        std::mem::forget(self);
+    }
+}
+
+impl Drop for WaitingGuard<'_> {
+    fn drop(&mut self) {
+        self.stats.record(self.outcome);
     }
 }
 
@@ -456,16 +518,6 @@ fn uncharged_age_limit() -> Duration {
 /// Numbered fragments, in order.
 type Fragments = Vec<(u32, Bytes)>;
 
-// The Rechunker keeps a payload chunk of at least a whole fragment as a
-// slice of its datagram, so a held fragment pins at most one datagram
-// (except after quinn defragments, see the module doc). That
-// is at most 1.2 x the fragment while a datagram is at most MAX_UDP_PAYLOAD;
-// raising MAX_UDP_PAYLOAD past that must revisit the zero-copy path.
-const _: () = assert!(
-    super::super::config::MAX_UDP_PAYLOAD as usize * 10 <= FRAGMENT_PAYLOAD_SIZE * 12,
-    "a kept datagram slice would pin more than 1.2 x a fragment"
-);
-
 /// Cuts a byte stream of `total` bytes into fragments of the UDP stream
 /// shape: fragment `i` holds bytes `[(i-1)F, iF)` with
 /// `F = FRAGMENT_PAYLOAD_SIZE`, so every fragment is full except the last,
@@ -501,7 +553,9 @@ impl Rechunker {
         self.total - self.received
     }
 
-    /// Take `chunk`, returning the fragments it completed, in order.
+    /// Take `chunk`, returning the fragments it completed, in order. Every
+    /// fragment is copied into a buffer of its own: none shares an
+    /// allocation with `chunk` or with another fragment.
     fn feed(&mut self, mut chunk: Bytes) -> Result<Fragments, ReadFailure> {
         let len = chunk.len() as u64;
         if len > self.remaining() {
@@ -513,10 +567,6 @@ impl Rechunker {
         while !chunk.is_empty() {
             // A fragment may go out only if it does not end the stream.
             let can_emit = self.emitted + (full as u64) < self.total;
-            if self.pending.is_empty() && chunk.len() >= full && can_emit {
-                out.push(self.emit(chunk.split_to(full)));
-                continue;
-            }
             if self.pending.is_empty() {
                 // A fresh buffer of exactly this fragment's length, so it
                 // never grows (a grown buffer would be kept, up to twice the
@@ -618,6 +668,20 @@ async fn read_one<T: TimeSource>(recv: quinn::RecvStream, receiver: Arc<Receiver
             return;
         }
     };
+    // Shadow mode: refuse data before the budget is looked at, so a data
+    // frame neither takes room from the UDP session sharing the budget nor
+    // leaves a refusal there.
+    if !receiver.accept_data && header.kind() != FrameKind::Control {
+        receiver
+            .stats
+            .record(QuicInboundOutcome::RefusedNotAcceptingData);
+        tracing::debug!(
+            kind = ?header.kind(),
+            "QUIC path: refusing data on a path that accepts none"
+        );
+        reader.stop(stop_code::NOT_ACCEPTING_DATA);
+        return;
+    }
     match header.kind() {
         FrameKind::Short => receiver.read_short(reader, header).await,
         FrameKind::Stream => receiver.read_stream(reader, header).await,
@@ -683,36 +747,45 @@ impl<T: TimeSource> Receiver<T> {
 
     async fn read_short(&self, mut reader: BodyReader<T>, header: FrameHeader) {
         let total = header.total_len();
-        let token = LegacyStreamToken::new();
-        let key = {
-            let mut budget = self.budget.lock();
-            if let Err(rejection) = budget.check(total, Releaser::Quic) {
-                drop(budget);
-                self.refuse(&mut reader, rejection, total);
-                return;
-            }
-            let key = self.short_key(&budget);
-            budget.charge(
+        // A message of one packet or less is not charged, as on UDP: the
+        // sender may see it acknowledged before any refusal arrives, so a
+        // refusal could lose it with the sender reading `Sent`. Its cost is
+        // bounded by the stream limit and the channel's capacity.
+        let charged = !fits_one_packet(total);
+        let mut guard = None;
+        if charged {
+            let token = LegacyStreamToken::new();
+            let key = {
+                let mut budget = self.budget.lock();
+                if let Err(rejection) = budget.check(total, Releaser::Quic) {
+                    drop(budget);
+                    self.refuse(&mut reader, rejection, total);
+                    return;
+                }
+                let key = self.short_key(&budget);
+                budget.charge(
+                    key,
+                    total,
+                    self.time.now_nanos(),
+                    inbound_stream_age_limit(total),
+                    Liveness::Task(Arc::downgrade(&token)),
+                );
+                key
+            };
+            // The guard holds the reader's only reference to the token.
+            guard = Some(StreamGuard {
+                budget: self.budget.clone(),
                 key,
-                total,
-                self.time.now_nanos(),
-                inbound_stream_age_limit(total),
-                Liveness::Task(Arc::downgrade(&token)),
-            );
-            key
-        };
-        // The guard holds the reader's only reference to the token.
-        let mut guard = StreamGuard {
-            budget: self.budget.clone(),
-            key,
-            handle: None,
-            token: Some(token),
-            complete: false,
-        };
-        reader.set_age_limit(inbound_stream_age_limit(total));
+                handle: None,
+                token: Some(token),
+                complete: false,
+            });
+            reader.set_age_limit(inbound_stream_age_limit(total));
+        }
+        let was_charged = if charged { Charged::Yes } else { Charged::No };
         // One buffer of the charged length (see `read_exact`).
         let read = {
-            let token = guard.token.as_ref();
+            let token = guard.as_ref().and_then(|guard| guard.token.as_ref());
             reader
                 .read_exact_with(clamp(total), |held| {
                     if let Some(token) = token {
@@ -724,30 +797,68 @@ impl<T: TimeSource> Receiver<T> {
         let payload = match read {
             Ok(payload) => payload,
             Err(failure) => {
-                self.fail(&mut reader, failure, Charged::Yes);
+                self.fail(&mut reader, failure, was_charged);
+                return;
+            }
+        };
+        // Wait for room in the channel rather than drop the message: the sender
+        // may have had every byte acknowledged, so a drop here would read as
+        // `Sent`. The wait comes BEFORE `expect_end`: reading the stream to its
+        // end frees it in quinn and returns its MAX_STREAMS credit, so waiting
+        // after that would not slow the sender, and the number of waiters (and
+        // the memory they hold) would grow with the peer's upload. While the
+        // stream is unfinished its credit is held, so at most `MAX_UNI_STREAMS`
+        // readers wait, and a one-packet Short (uncharged) is capped the same
+        // way. Only this reader waits (each reader is its own future), so a slow
+        // consumer slows the sender and not the other streams. Past the age
+        // limit the stream is stopped, which reaches the sender because the
+        // stream is still open.
+        let permit = match self.shorts.try_reserve() {
+            Ok(permit) => permit,
+            Err(mpsc::error::TrySendError::Full(())) => {
+                let waiting =
+                    WaitingGuard::new(&self.stats, QuicInboundOutcome::ShortAbandonedWaiting);
+                let waited = reader.until_age(self.shorts.reserve()).await;
+                waiting.disarm();
+                match waited {
+                    Ok(Ok(permit)) => permit,
+                    // The consumer is gone: the connection is ending.
+                    Ok(Err(_)) => {
+                        self.stats.record(QuicInboundOutcome::ShortDroppedFull);
+                        return;
+                    }
+                    Err(failure) => {
+                        self.fail(&mut reader, failure, was_charged);
+                        return;
+                    }
+                }
+            }
+            Err(mpsc::error::TrySendError::Closed(())) => {
+                self.stats.record(QuicInboundOutcome::ShortDroppedFull);
                 return;
             }
         };
         if let Err(failure) = reader.expect_end().await {
-            self.fail(&mut reader, failure, Charged::Yes);
+            self.fail(&mut reader, failure, was_charged);
             return;
         }
-        let Some(token) = guard.token.clone() else {
-            return;
-        };
-        token.mark_complete();
-        guard.complete = true;
-        let message = InboundShort {
-            payload,
-            _charge: token,
-        };
-        match self.shorts.try_send(message) {
-            Ok(()) => self.stats.record(QuicInboundOutcome::DeliveredShort),
-            Err(_) => {
-                self.stats.record(QuicInboundOutcome::ShortDroppedFull);
-                tracing::debug!(total, "QUIC path: short message channel full; dropping");
+        let (key, charge) = match guard.as_mut() {
+            Some(guard) => {
+                let Some(token) = guard.token.clone() else {
+                    return;
+                };
+                token.mark_complete();
+                guard.complete = true;
+                (Some(guard.key), Some(token))
             }
-        }
+            None => (None, None),
+        };
+        permit.send(InboundShort {
+            payload,
+            key,
+            _charge: charge,
+        });
+        self.stats.record(QuicInboundOutcome::DeliveredShort);
     }
 
     async fn read_stream(&self, mut reader: BodyReader<T>, header: FrameHeader) {
@@ -808,11 +919,36 @@ impl<T: TimeSource> Receiver<T> {
             metadata,
             handle: guard.handle().clone(),
         };
-        if self.streams.try_send(arrival).is_err() {
-            self.stats.record(QuicInboundOutcome::StreamDroppedFull);
-            reader.stop(stop_code::CHANNEL_FULL);
-            return;
-        }
+        // Wait for room rather than refuse: a small stream can be fully
+        // acknowledged before this point, and a refusal would then read as
+        // `Sent` at the sender. Only this reader waits (see `read_short`).
+        let permit = match self.streams.try_reserve() {
+            Ok(permit) => permit,
+            Err(mpsc::error::TrySendError::Full(())) => {
+                let waiting =
+                    WaitingGuard::new(&self.stats, QuicInboundOutcome::StreamAbandonedWaiting);
+                let waited = reader.until_age(self.streams.reserve()).await;
+                waiting.disarm();
+                match waited {
+                    Ok(Ok(permit)) => permit,
+                    Ok(Err(_)) => {
+                        self.stats.record(QuicInboundOutcome::StreamDroppedFull);
+                        reader.stop(stop_code::CHANNEL_FULL);
+                        return;
+                    }
+                    Err(failure) => {
+                        self.fail(&mut reader, failure, Charged::Yes);
+                        return;
+                    }
+                }
+            }
+            Err(mpsc::error::TrySendError::Closed(())) => {
+                self.stats.record(QuicInboundOutcome::StreamDroppedFull);
+                reader.stop(stop_code::CHANNEL_FULL);
+                return;
+            }
+        };
+        permit.send(arrival);
         self.stats.record(QuicInboundOutcome::AnnouncedStream);
 
         let mut rechunker = Rechunker::new(total);
@@ -1047,6 +1183,33 @@ mod tests {
             let mut more = data.to_vec();
             more.push(0);
             assert_eq!(long_in_one.feed(more.into()), Err(ReadFailure::Overlong));
+        }
+    }
+
+    /// A fragment never points into the chunk it was cut from, even when the
+    /// chunk is a whole fragment or more (one large allocation).
+    #[test]
+    fn fragments_share_no_allocation_with_the_chunk_or_each_other() {
+        let total = 4 * F + 9;
+        let chunk = bytes(total, 5);
+        let range = chunk.as_ptr() as usize..chunk.as_ptr() as usize + chunk.len();
+        let mut rechunker = Rechunker::new(total as u64);
+        let mut all = rechunker.feed(chunk.clone()).unwrap();
+        all.push(rechunker.finish().unwrap());
+        assert_eq!(all.len(), 5);
+        let mut spans = Vec::new();
+        for (number, fragment) in &all {
+            let start = fragment.as_ptr() as usize;
+            let end = start + fragment.len();
+            assert!(
+                end <= range.start || start >= range.end,
+                "fragment {number} points into the chunk"
+            );
+            spans.push((start, end));
+        }
+        spans.sort_unstable();
+        for pair in spans.windows(2) {
+            assert!(pair[0].1 <= pair[1].0, "two fragments overlap");
         }
     }
 }

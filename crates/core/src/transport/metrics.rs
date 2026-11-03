@@ -213,6 +213,30 @@ labelled_counters! {
         /// map holds every bound key; the cleanup then runs the per-peer
         /// cleanup unless the key is in the ring at another address.
         TeardownKeyUnmapped => "teardown_key_unmapped",
+        /// A connection was promoted into the ring under a key other than
+        /// the one bound to it, or with no key bound. Its transport is not
+        /// given the key. Not expected to be recorded: a connection is
+        /// promoted only under the key bound to it.
+        PromotionKeyMismatch => "promotion_key_mismatch",
+        /// A connection's transport, holding no peer key, was given the key
+        /// the connection was promoted under (an inbound connection).
+        TransportKeySet => "transport_key_set",
+        /// A connection's transport was given, at promotion, the key it
+        /// already held (the key it dialled).
+        TransportKeySame => "transport_key_same",
+        /// A connection's transport was given, at promotion, a key other
+        /// than the one it holds. It keeps the key it holds. Not expected to
+        /// be recorded.
+        TransportKeyRefused => "transport_key_refused",
+        /// The node handed a promoted connection's peer key to the
+        /// connection's task, to give to its transport (only with a QUIC
+        /// endpoint). Compare with `transport_key_set` + `_same` + `_refused`,
+        /// which the transport counts when it takes the key.
+        TransportKeySent => "transport_key_sent",
+        /// A promoted connection's peer key could not be handed to the
+        /// connection's task within 1 s (its channel stayed full), so its
+        /// transport holds no key from the promotion. Not re-sent.
+        TransportKeyUndelivered => "transport_key_undelivered",
     }
 }
 
@@ -234,6 +258,14 @@ labelled_counters! {
         EvictedIdle => "evicted_idle",
         /// Evicted: past its age limit.
         EvictedAge => "evicted_age",
+        /// A QUIC stream cancelled because its id was already used, on either
+        /// path. Only a faulty peer or a bug sends one.
+        StreamIdOnBothPaths => "stream_id_on_both_paths",
+        /// Neither a refusal nor an eviction, and not a limit being hit: a
+        /// complete stream, of either path, still held past its age limit by a
+        /// consumer that has not let go. Nothing evicts one. Read it as a
+        /// consumer that is slow to take what it was given.
+        CompleteChargePastAge => "complete_charge_past_age",
     }
 }
 
@@ -344,8 +376,166 @@ labelled_counters! {
         /// The peer kept sending but acknowledged none of this side's
         /// packets for `quic::recycle::ACK_WATCH_WINDOW`.
         PeerNotAcknowledging => "peer_not_acknowledging",
+        /// A control frame this node cannot read arrived while the path was
+        /// being set up (an unknown version or type).
+        ControlRefused => "control_refused",
     }
 }
+
+labelled_counters! {
+    /// What a QUIC upgrade negotiation decided, counted by the code making
+    /// the decision (`quic::upgrade::machine::Outcome`, recorded by the
+    /// driver) or, for the last three, where the event is seen. Exported per
+    /// period as `quic_upgrade_<label>`.
+    ///
+    /// Success rate on eligible pairs: `established_as_offerer` over
+    /// `accepted` (attempts the peer accepted, by its Accept or, if that was
+    /// lost, by its connection), reported beside `offered` and
+    /// `declined_uncharged`. Offers repeat every 60 s while a peer
+    /// answers Busy, NotReady or Backoff, so a per-offer rate is not
+    /// meaningful. `accept_sent` and `established` also count the client
+    /// side. Zero while QUIC is off.
+    pub(crate) enum QuicUpgradeOutcome {
+        /// This node sent an Offer.
+        Offered => "offered",
+        /// The peer accepted this node's Offer.
+        Accepted => "accepted",
+        /// This node accepted the peer's Offer.
+        AcceptSent => "accept_sent",
+        /// A path became active on this node's evidence (either role).
+        Established => "established",
+        /// As `established`, for a path this node offered (the server).
+        EstablishedAsOfferer => "established_as_offerer",
+        /// An Offer got no reply in time.
+        NoReply => "no_reply",
+        /// A setup stage ran out of time.
+        Timeout => "timeout",
+        /// The connection failed during setup, or a send of setup failed.
+        HandshakeFailed => "handshake_failed",
+        /// The key proved on the path is not the key on record. Counted on
+        /// both ends: a peer's close with the identity-mismatch code ends
+        /// this node's attempt as `identity_mismatch` too, so a sum across
+        /// the fleet counts one mismatch up to twice.
+        IdentityMismatch => "identity_mismatch",
+        /// Both sides acted as server, or the keys were equal.
+        RoleConflict => "role_conflict",
+        /// The `allow_peer` set was full.
+        AllowSetFull => "allow_set_full",
+        /// The key was already allowed for another address.
+        KeyConflict => "key_conflict",
+        /// A control frame this node cannot read ended the setup.
+        ControlRefused => "control_refused",
+        /// A peer below the version floor was not offered.
+        IneligibleVersion => "ineligible_version",
+        /// The peer declined this node's Offer, by reason.
+        DeclinedDisabled => "declined_disabled",
+        DeclinedBackoff => "declined_backoff",
+        DeclinedBusy => "declined_busy",
+        DeclinedNotReady => "declined_not_ready",
+        /// A reason this node does not know.
+        DeclinedUnknown => "declined_unknown",
+        /// A decline of any reason that the machine did not charge to the
+        /// peer's backoff (Busy, NotReady, Backoff).
+        DeclinedUncharged => "declined_uncharged",
+        /// This node declined the peer's Offer, by reason. Counted when the
+        /// decline passes the rate gate; one the gate holds back is not.
+        DeclineSentDisabled => "decline_sent_disabled",
+        DeclineSentBackoff => "decline_sent_backoff",
+        DeclineSentBusy => "decline_sent_busy",
+        DeclineSentNotReady => "decline_sent_not_ready",
+        /// A peer's upgrade message was dropped because the session's inbox
+        /// was full. A closed inbox (the session is ending) is not counted.
+        InboxOverflow => "inbox_overflow",
+        /// A QUIC connection attempt reached no session, a full or closed
+        /// session inbox, or no attempt waiting for it, and was ignored. It
+        /// counts attempts that reached this node, not dials: a client
+        /// retransmits its Initial, and each one that arrives can count.
+        AttemptUnrouted => "attempt_unrouted",
+        /// A QUIC connection attempt whose source address was not yet
+        /// validated: a Retry was attempted and the attempt did not take the
+        /// waiting slot. The Retry is not known to have been sent; a refused
+        /// send is `quic_send_refused`. An upgrade with no loss counts one.
+        /// Each Initial that arrives unvalidated counts, whoever sent it.
+        AttemptRetried => "attempt_retried",
+        /// A session's driver or a path's pump panicked.
+        TaskPanicked => "task_panicked",
+        /// The peer closed the connection of an attempt that was not yet
+        /// active with a downgrade-class code. After activation the same
+        /// close is `quic_fallback_downgrade_rx`.
+        SetupDowngraded => "setup_downgrade_rx",
+        /// The QUIC endpoint went down under an attempt that was not yet
+        /// active. After activation it is `quic_fallback_endpoint_down`.
+        SetupEndpointDown => "setup_endpoint_down",
+        /// The UDP session ended under an attempt that was not yet active
+        /// (a peer restart or a dropped connection). Together with the
+        /// setup outcomes above it accounts for an `accepted` that never
+        /// reached `established_as_offerer`.
+        SessionEndedSetup => "session_ended_setup",
+        /// The UDP session ended under a path that was active, or one
+        /// waiting out a protocol recheck after it was. Not a `quic_fallback`.
+        SessionEndedActive => "session_ended_active",
+    }
+}
+
+labelled_counters! {
+    /// Why a QUIC path that had been active ended and traffic stayed on UDP,
+    /// as the upgrade machine decided. Exported per period as
+    /// `quic_fallback_<label>`. An attempt that ended before it was active is
+    /// not here; see `quic_upgrade_*`. The UDP session ending under a path is
+    /// `quic_upgrade_session_ended_active`.
+    /// Not here: a close this node sent for `send_abort_limit` or
+    /// `peer_not_acknowledging` reaches the machine as a lost connection
+    /// (`reset`), and is counted by `quic_close_sent_*`; the same codes sent
+    /// by the peer are `downgrade_rx`, with the raw code in
+    /// `quic_close_received_*`. A key mismatch is
+    /// `quic_upgrade_identity_mismatch`.
+    pub(crate) enum QuicFallback {
+        /// The path timed out idle.
+        Idle => "idle",
+        /// The connection was lost or reset, or a send on it failed.
+        Reset => "reset",
+        /// A QUIC protocol error ended it.
+        Protocol => "protocol",
+        /// The peer closed it with a downgrade-class code.
+        DowngradeReceived => "downgrade_rx",
+        /// The QUIC endpoint went down.
+        EndpointDown => "endpoint_down",
+    }
+}
+
+labelled_counters! {
+    /// How long an active QUIC path lasted when it ended. Exported per period
+    /// as `quic_path_age_at_close_<label>`.
+    pub(crate) enum QuicPathAge {
+        /// Under 1 minute.
+        Lt1M => "lt_1m",
+        /// 1 minute to under 10 minutes (`STABLE_PATH`).
+        Lt10M => "lt_10m",
+        /// 10 minutes to under 1 hour.
+        Lt1H => "lt_1h",
+        /// 1 hour to under 1 day.
+        Lt1D => "lt_1d",
+        /// 1 day or more.
+        Ge1D => "ge_1d",
+    }
+}
+
+impl QuicPathAge {
+    /// The bucket for a path that lasted `age`.
+    pub(crate) fn bucket(age: std::time::Duration) -> Self {
+        match age.as_secs() {
+            0..60 => Self::Lt1M,
+            60..600 => Self::Lt10M,
+            600..3600 => Self::Lt1H,
+            3600..86400 => Self::Lt1D,
+            _ => Self::Ge1D,
+        }
+    }
+}
+
+/// Most establish-latency samples kept per period; `quic_establish_samples`
+/// counts all of them.
+const QUIC_ESTABLISH_SAMPLES_MAX: usize = 256;
 
 labelled_counters! {
     /// What took most of a paced stream's gap between fragments, for a gap
@@ -596,11 +786,14 @@ pub struct TransportMetrics {
     inbound_queue_drops: AtomicU64,
 
     /// QUIC upgrade control messages received (#5940 e1, reset each
-    /// snapshot). Nothing sends them yet, so a non-zero value means a newer
-    /// peer is offering upgrades this node only decodes and ignores.
+    /// snapshot).
     upgrade_control_received: AtomicU64,
     /// Never-reset twin of `upgrade_control_received`.
     cumulative_upgrade_control_received: AtomicU64,
+    /// `Decline` replies `DeclineGate` held back (reset each snapshot).
+    upgrade_decline_suppressed: AtomicU64,
+    /// Never-reset twin of `upgrade_decline_suppressed`.
+    cumulative_upgrade_decline_suppressed: AtomicU64,
 
     /// Packets that would have completed a hole-punch handshake on the
     /// side that answered the remote's intro, dropped because they were not
@@ -628,6 +821,12 @@ pub struct TransportMetrics {
     /// Times the QUIC crash-loop breaker tripped at startup (reset each
     /// snapshot; at most one per process).
     quic_breaker_trips: AtomicU64,
+    /// Sends the QUIC socket refused with `WouldBlock`, at the egress cap or
+    /// a full socket buffer (reset each snapshot). A connection waits for
+    /// write readiness before it sends, so this is chiefly a datagram quinn's
+    /// endpoint made on its own (a Retry, a close, a reset): quinn drops it
+    /// without retrying, and the peer's own retransmit is what recovers.
+    quic_send_refused: AtomicU64,
     /// Whether the crash-loop breaker keeps QUIC off in this process (a
     /// state, never reset).
     quic_breaker_suppressed: AtomicBool,
@@ -637,6 +836,25 @@ pub struct TransportMetrics {
     /// caught a panic); a panic between the count and quinn's transmit can
     /// still leave a counted close unsent, so this is an upper bound.
     quic_close_sent: [AtomicU64; QuicCloseCode::COUNT],
+    /// QUIC connections the peer (or the transport) ended with an application
+    /// close, by [`QuicCloseCode`]; the last slot is a code this node does
+    /// not know. One per connection, counted where quinn reports the close
+    /// (reset each snapshot).
+    quic_close_received: [AtomicU64; QuicCloseCode::COUNT + 1],
+    /// Upgrade decisions this period, by [`QuicUpgradeOutcome`].
+    quic_upgrade: [AtomicU64; QuicUpgradeOutcome::COUNT],
+    /// Path fallbacks this period, by [`QuicFallback`].
+    quic_fallback: [AtomicU64; QuicFallback::COUNT],
+    /// Active paths that ended this period, by [`QuicPathAge`].
+    quic_path_age: [AtomicU64; QuicPathAge::COUNT],
+    /// Establish latencies this period in ms (bounded), and how many there
+    /// were.
+    quic_establish_ms: parking_lot::Mutex<Vec<u64>>,
+    quic_establish_samples: AtomicU64,
+    /// Paths with a live attempt that is not active yet (state, never reset).
+    quic_paths_offered_or_dialing: AtomicU64,
+    /// Paths active on this node's evidence (state, never reset).
+    quic_paths_active: AtomicU64,
 
     /// The current snapshot period, starting at 1 and advanced by each
     /// `take_snapshot`. A connection's [`InboundConcurrencyPeak`] from an
@@ -810,6 +1028,10 @@ struct NatDetailCounters {
     /// (bounded).
     #[cfg(test)]
     quic_close_sent_to: parking_lot::Mutex<std::collections::VecDeque<(SocketAddr, QuicCloseCode)>>,
+    /// Test-only log of QUIC upgrade telemetry events, as `Debug` text with
+    /// the remote (bounded).
+    #[cfg(test)]
+    quic_events: parking_lot::Mutex<std::collections::VecDeque<(SocketAddr, String)>>,
     /// Test-only log of observed-address reporters (bounded).
     #[cfg(test)]
     observed_reporters: parking_lot::Mutex<std::collections::VecDeque<SocketAddr>>,
@@ -1023,13 +1245,24 @@ impl TransportMetrics {
             inbound_queue_drops: AtomicU64::new(0),
             upgrade_control_received: AtomicU64::new(0),
             cumulative_upgrade_control_received: AtomicU64::new(0),
+            upgrade_decline_suppressed: AtomicU64::new(0),
+            cumulative_upgrade_decline_suppressed: AtomicU64::new(0),
             handshake_unauthenticated_dropped: AtomicU64::new(0),
             conn_identity: Default::default(),
             quic_endpoint_down: AtomicU64::new(0),
             quic_adapter_panicked: AtomicU64::new(0),
             quic_breaker_trips: AtomicU64::new(0),
+            quic_send_refused: AtomicU64::new(0),
             quic_breaker_suppressed: AtomicBool::new(false),
             quic_close_sent: Default::default(),
+            quic_close_received: Default::default(),
+            quic_upgrade: Default::default(),
+            quic_fallback: Default::default(),
+            quic_path_age: Default::default(),
+            quic_establish_ms: Default::default(),
+            quic_establish_samples: AtomicU64::new(0),
+            quic_paths_offered_or_dialing: AtomicU64::new(0),
+            quic_paths_active: AtomicU64::new(0),
             inbound_concurrency_epoch: AtomicU64::new(1),
             inbound_concurrency: Default::default(),
             inbound_stream_outcomes: Default::default(),
@@ -1332,11 +1565,19 @@ impl TransportMetrics {
     }
 
     /// A QUIC upgrade control message arrived on an established connection
-    /// and was ignored (#5940 e1). Counted once per distinct packet.
+    /// (#5940 e1). Counted once per distinct packet.
     pub(crate) fn record_upgrade_control_received(&self) {
         self.cumulative_upgrade_control_received
             .fetch_add(1, Ordering::Relaxed);
         self.upgrade_control_received
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `DeclineGate` held back a `Decline` reply to an upgrade offer.
+    pub(crate) fn record_upgrade_decline_suppressed(&self) {
+        self.cumulative_upgrade_decline_suppressed
+            .fetch_add(1, Ordering::Relaxed);
+        self.upgrade_decline_suppressed
             .fetch_add(1, Ordering::Relaxed);
     }
 
@@ -1493,6 +1734,11 @@ impl TransportMetrics {
         self.quic_breaker_trips.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// The QUIC socket refused a send with `WouldBlock`.
+    pub(crate) fn record_quic_send_refused(&self) {
+        self.quic_send_refused.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Whether the crash-loop breaker keeps QUIC off in this process.
     pub(crate) fn set_quic_breaker_suppressed(&self, suppressed: bool) {
         self.quic_breaker_suppressed
@@ -1534,11 +1780,140 @@ impl TransportMetrics {
             .collect()
     }
 
+    /// Test-only: log one QUIC upgrade telemetry event of `remote`.
+    #[cfg(test)]
+    fn note_quic_event(&self, remote: SocketAddr, event: impl std::fmt::Debug) {
+        push_test_log(&self.nat_detail.quic_events, (remote, format!("{event:?}")));
+    }
+
+    /// Test-only: the QUIC upgrade telemetry events recorded for `remote`, in
+    /// order, as `Debug` text.
+    #[cfg(test)]
+    pub(crate) fn quic_events_of(&self, remote: SocketAddr) -> Vec<String> {
+        self.nat_detail
+            .quic_events
+            .lock()
+            .iter()
+            .filter(|(addr, _)| *addr == remote)
+            .map(|(_, event)| event.clone())
+            .collect()
+    }
+
+    /// The upgrade machine of the session with `remote` decided `outcome`
+    /// (`remote` is never exported).
+    pub(crate) fn record_quic_upgrade(&self, outcome: QuicUpgradeOutcome, remote: SocketAddr) {
+        #[cfg(test)]
+        self.note_quic_event(remote, outcome);
+        #[cfg(not(test))]
+        let _ = remote;
+        self.quic_upgrade[outcome as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A path to `remote` ended, and the upgrade machine named why.
+    pub(crate) fn record_quic_fallback(&self, cause: QuicFallback, remote: SocketAddr) {
+        #[cfg(test)]
+        self.note_quic_event(remote, cause);
+        #[cfg(not(test))]
+        let _ = remote;
+        self.quic_fallback[cause as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// quinn reported a QUIC connection to `remote` closed by the peer's
+    /// application close with raw `code`: counted under its [`QuicCloseCode`],
+    /// or under `unknown_code` when this node has no name for it.
+    pub(crate) fn record_quic_close_received(&self, code: u64, remote: SocketAddr) {
+        let known = QuicCloseCode::from_code(code);
+        #[cfg(test)]
+        self.note_quic_event(remote, ("close_received", known, code));
+        #[cfg(not(test))]
+        let _ = remote;
+        let slot = known.map_or(QuicCloseCode::COUNT, |known| known as usize);
+        self.quic_close_received[slot].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// An active path to `remote` ended after `age`.
+    pub(crate) fn record_quic_path_closed(&self, age: std::time::Duration, remote: SocketAddr) {
+        let bucket = QuicPathAge::bucket(age);
+        #[cfg(test)]
+        self.note_quic_event(remote, bucket);
+        #[cfg(not(test))]
+        let _ = remote;
+        self.quic_path_age[bucket as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A path to `remote` went from the Offer (or Accept) to active in `took`.
+    pub(crate) fn record_quic_establish_latency(
+        &self,
+        took: std::time::Duration,
+        remote: SocketAddr,
+    ) {
+        #[cfg(test)]
+        self.note_quic_event(remote, ("establish_ms", took.as_millis()));
+        #[cfg(not(test))]
+        let _ = remote;
+        {
+            let mut samples = self.quic_establish_ms.lock();
+            if samples.len() < QUIC_ESTABLISH_SAMPLES_MAX {
+                samples.push(u64::try_from(took.as_millis()).unwrap_or(u64::MAX));
+            }
+        }
+        self.quic_establish_samples.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A path with `remote` got a live attempt (an Offer under way or a dial).
+    pub(crate) fn quic_path_attempting(&self, remote: SocketAddr) {
+        #[cfg(test)]
+        self.note_quic_event(remote, "path_attempting");
+        #[cfg(not(test))]
+        let _ = remote;
+        self.quic_paths_offered_or_dialing
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The path with `remote` became active.
+    pub(crate) fn quic_path_activated(&self, remote: SocketAddr) {
+        #[cfg(test)]
+        self.note_quic_event(remote, "path_activated");
+        #[cfg(not(test))]
+        let _ = remote;
+        self.quic_paths_offered_or_dialing
+            .fetch_sub(1, Ordering::Relaxed);
+        self.quic_paths_active.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The attempt or path with `remote` ended; `was_active` says which gauge
+    /// it leaves.
+    pub(crate) fn quic_path_left(&self, was_active: bool, remote: SocketAddr) {
+        #[cfg(test)]
+        self.note_quic_event(remote, ("path_left", was_active));
+        #[cfg(not(test))]
+        let _ = remote;
+        let gauge = if was_active {
+            &self.quic_paths_active
+        } else {
+            &self.quic_paths_offered_or_dialing
+        };
+        let before = gauge.fetch_sub(1, Ordering::Relaxed);
+        debug_assert!(before > 0, "a QUIC path gauge went below zero");
+    }
+
+    /// Paths active on this node's evidence now.
+    pub(crate) fn quic_paths_active(&self) -> u64 {
+        self.quic_paths_active.load(Ordering::Relaxed)
+    }
+
     /// QUIC upgrade control messages received since process start, never
     /// reset (tests only).
     #[cfg(test)]
     pub(crate) fn cumulative_upgrade_control_received(&self) -> u64 {
         self.cumulative_upgrade_control_received
+            .load(Ordering::Relaxed)
+    }
+
+    /// Never-reset count of `Decline` replies held back (tests only).
+    #[cfg(test)]
+    pub(crate) fn cumulative_upgrade_decline_suppressed(&self) -> u64 {
+        self.cumulative_upgrade_decline_suppressed
             .load(Ordering::Relaxed)
     }
 
@@ -2100,6 +2475,16 @@ impl TransportMetrics {
         // Indexed by position in INBOUND_CONCURRENCY_THRESHOLDS; the const
         // assertion next to that list pins the order these fields assume.
         let concurrency_ge = concurrency.conns_ge;
+        let (establish_p50, establish_p90) = {
+            let mut samples = self.quic_establish_ms.lock();
+            let mut sorted = if reset {
+                std::mem::take(&mut *samples)
+            } else {
+                samples.clone()
+            };
+            sorted.sort_unstable();
+            (percentile(&sorted, 50), percentile(&sorted, 90))
+        };
         SnapshotExtras {
             packets_sent: get64(&l.packets_sent),
             packets_retransmitted: get64(&l.packets_retransmitted),
@@ -2123,10 +2508,12 @@ impl TransportMetrics {
             inbound_queue_depth_hwm: get32(&self.inbound_queue_depth_hwm),
             inbound_queue_drops: get64(&self.inbound_queue_drops),
             upgrade_control_received: get64(&self.upgrade_control_received),
+            upgrade_decline_suppressed: get64(&self.upgrade_decline_suppressed),
             handshake_unauthenticated_dropped: get64(&self.handshake_unauthenticated_dropped),
             quic_endpoint_down: get64(&self.quic_endpoint_down),
             quic_adapter_panicked: get64(&self.quic_adapter_panicked),
             quic_breaker_trips: get64(&self.quic_breaker_trips),
+            quic_send_refused: get64(&self.quic_send_refused),
             quic_breaker_suppressed: self.quic_breaker_suppressed.load(Ordering::Relaxed),
             quic_close_sent_node_dropped_peer: get64(
                 &self.quic_close_sent[QuicCloseCode::NodeDroppedPeer as usize],
@@ -2140,6 +2527,20 @@ impl TransportMetrics {
             quic_close_sent_send_abort_limit: get64(
                 &self.quic_close_sent[QuicCloseCode::SendAbortLimit as usize],
             ),
+            quic_close_sent_control_refused: get64(
+                &self.quic_close_sent[QuicCloseCode::ControlRefused as usize],
+            ),
+            quic_close_received: std::array::from_fn(|i| get64(&self.quic_close_received[i])),
+            quic_upgrade: std::array::from_fn(|i| get64(&self.quic_upgrade[i])),
+            quic_fallback: std::array::from_fn(|i| get64(&self.quic_fallback[i])),
+            quic_path_age_at_close: std::array::from_fn(|i| get64(&self.quic_path_age[i])),
+            quic_establish_ms_p50: establish_p50,
+            quic_establish_ms_p90: establish_p90,
+            quic_establish_samples: get64(&self.quic_establish_samples),
+            quic_paths_offered_or_dialing: self
+                .quic_paths_offered_or_dialing
+                .load(Ordering::Relaxed),
+            quic_paths_active: self.quic_paths_active.load(Ordering::Relaxed),
             quic_close_sent_peer_not_acknowledging: get64(
                 &self.quic_close_sent[QuicCloseCode::PeerNotAcknowledging as usize],
             ),
@@ -2168,6 +2569,12 @@ impl TransportMetrics {
             ),
             inbound_stream_evicted_age: get32(
                 &self.inbound_stream_outcomes[InboundStreamOutcome::EvictedAge as usize],
+            ),
+            inbound_stream_stream_id_on_both_paths: get32(
+                &self.inbound_stream_outcomes[InboundStreamOutcome::StreamIdOnBothPaths as usize],
+            ),
+            inbound_stream_complete_charge_past_age: get32(
+                &self.inbound_stream_outcomes[InboundStreamOutcome::CompleteChargePastAge as usize],
             ),
             nat_attempts_connect_joiner: get32(&attempts[NatAttemptOrigin::ConnectJoiner as usize]),
             nat_attempts_connect_acceptor: get32(
@@ -2274,6 +2681,24 @@ impl TransportMetrics {
             ),
             conn_identity_teardown_key_unmapped: get32(
                 &identity[ConnIdentity::TeardownKeyUnmapped as usize],
+            ),
+            conn_identity_promotion_key_mismatch: get32(
+                &identity[ConnIdentity::PromotionKeyMismatch as usize],
+            ),
+            conn_identity_transport_key_set: get32(
+                &identity[ConnIdentity::TransportKeySet as usize],
+            ),
+            conn_identity_transport_key_same: get32(
+                &identity[ConnIdentity::TransportKeySame as usize],
+            ),
+            conn_identity_transport_key_refused: get32(
+                &identity[ConnIdentity::TransportKeyRefused as usize],
+            ),
+            conn_identity_transport_key_sent: get32(
+                &identity[ConnIdentity::TransportKeySent as usize],
+            ),
+            conn_identity_transport_key_undelivered: get32(
+                &identity[ConnIdentity::TransportKeyUndelivered as usize],
             ),
             inbound_concurrency_conns_sampled: concurrency.conns_sampled,
             inbound_concurrency_conns_ge_8: concurrency_ge[0],
@@ -2647,8 +3072,10 @@ pub struct TransportSnapshot {
     pub inbound_queue_depth_hwm: u32,
     /// Inbound packets the listener dropped because that channel was full.
     pub inbound_queue_drops: u64,
-    /// QUIC upgrade control messages received and ignored (#5940 e1).
+    /// QUIC upgrade control messages received (#5940 e1).
     pub upgrade_control_received: u64,
+    /// `Decline` replies to upgrade offers held back by the per-connection gate.
+    pub upgrade_decline_suppressed: u64,
     /// Hole-punch handshake packets dropped because they were not
     /// encrypted under the attempt's inbound session key (per packet).
     pub handshake_unauthenticated_dropped: u64,
@@ -2659,9 +3086,14 @@ pub struct TransportSnapshot {
     /// endpoint); each turns that endpoint off unless the node had already
     /// released it (#5940). Not counted: a panic in a path's receive task.
     pub quic_adapter_panicked: u64,
-    /// Times the QUIC crash-loop breaker tripped: a run with QUIC enabled
-    /// ended abnormally, so this one started with QUIC off (#5940).
+    /// Times the QUIC crash-loop breaker tripped, so this run started with
+    /// QUIC off (#5940): on unix a run with QUIC enabled ended abnormally, on
+    /// Windows three runs in a row ended within ten minutes for any reason.
     pub quic_breaker_trips: u64,
+    /// Sends the QUIC socket refused with `WouldBlock` (egress cap or full
+    /// socket buffer). Chiefly datagrams quinn's endpoint made on its own,
+    /// such as a Retry, which it drops without retrying.
+    pub quic_send_refused: u64,
     /// Whether the crash-loop breaker keeps QUIC off in this process.
     pub quic_breaker_suppressed: bool,
     /// QUIC connections this node closed, by close code
@@ -2671,6 +3103,30 @@ pub struct TransportSnapshot {
     pub quic_close_sent_identity_mismatch: u64,
     pub quic_close_sent_send_abort_limit: u64,
     pub quic_close_sent_peer_not_acknowledging: u64,
+    pub quic_close_sent_control_refused: u64,
+    /// QUIC connections closed by the peer's application close, by
+    /// [`QuicCloseCode`] in order; the last slot is a code this node does not
+    /// know (`quic_close_received_<label>`, `..._unknown_code`).
+    pub quic_close_received: [u64; QuicCloseCode::COUNT + 1],
+    /// Upgrade decisions by [`QuicUpgradeOutcome`] (`quic_upgrade_<label>`).
+    pub quic_upgrade: [u64; QuicUpgradeOutcome::COUNT],
+    /// Path fallbacks by [`QuicFallback`] (`quic_fallback_<label>`).
+    pub quic_fallback: [u64; QuicFallback::COUNT],
+    /// Active paths that ended, by [`QuicPathAge`]
+    /// (`quic_path_age_at_close_<label>`).
+    pub quic_path_age_at_close: [u64; QuicPathAge::COUNT],
+    /// Median and p90 of this period's establish latencies, in ms (the
+    /// first `QUIC_ESTABLISH_SAMPLES_MAX` of them), and how many there were.
+    /// Both roles are mixed: a server times from its Offer to `ReadyAck`, a
+    /// client from its Accept to `Ready`, so the two measure different spans.
+    /// Past the cap, which samples are kept depends on arrival order.
+    pub quic_establish_ms_p50: Option<u64>,
+    pub quic_establish_ms_p90: Option<u64>,
+    pub quic_establish_samples: u64,
+    /// Gauges (never reset): paths with a live attempt not yet active, and
+    /// paths active on this node's evidence. Zero outside shadow mode.
+    pub quic_paths_offered_or_dialing: u64,
+    pub quic_paths_active: u64,
     /// Per-attempt records of the FIRST 8 failed outbound NAT traversals in
     /// the period (not a representative sample of a busy period);
     /// `nat_fail_samples_dropped` counts the rest. Read with the same
@@ -2684,12 +3140,16 @@ pub struct TransportSnapshot {
     /// Inbound streams refused or evicted during the period, by reason
     /// (see [`InboundStreamOutcome`]; the field suffix is its label). Counts
     /// only, no addresses. The never-reset twin feeds the OTel metric.
+    /// `inbound_stream_complete_charge_past_age` is neither a refusal nor an
+    /// eviction: complete streams a consumer still held past their age limit.
     pub inbound_stream_refused_invalid_length: u32,
     pub inbound_stream_refused_connection_bytes: u32,
     pub inbound_stream_refused_connection_streams: u32,
     pub inbound_stream_closed_too_many_refusals: u32,
     pub inbound_stream_evicted_idle: u32,
     pub inbound_stream_evicted_age: u32,
+    pub inbound_stream_stream_id_on_both_paths: u32,
+    pub inbound_stream_complete_charge_past_age: u32,
     /// Outbound NAT traversals started during the period, by
     /// [`NatAttemptOrigin`] (the field suffix is its label). They sum to
     /// `nat_traversal_attempts`, up to a snapshot race.
@@ -2783,6 +3243,12 @@ pub struct TransportSnapshot {
     pub conn_identity_teardown_key_elsewhere: u32,
     pub conn_identity_teardown_unidentified: u32,
     pub conn_identity_teardown_key_unmapped: u32,
+    pub conn_identity_promotion_key_mismatch: u32,
+    pub conn_identity_transport_key_set: u32,
+    pub conn_identity_transport_key_same: u32,
+    pub conn_identity_transport_key_refused: u32,
+    pub conn_identity_transport_key_sent: u32,
+    pub conn_identity_transport_key_undelivered: u32,
     /// Inbound concurrency per connection during the period (one snapshot
     /// window, `transport_snapshot_interval_secs`, default 30 s): an
     /// estimate, at each inbound short message or admitted stream, of the
@@ -2861,6 +3327,12 @@ impl TransportSnapshot {
             ConnIdentity::TeardownKeyElsewhere => self.conn_identity_teardown_key_elsewhere,
             ConnIdentity::TeardownUnidentified => self.conn_identity_teardown_unidentified,
             ConnIdentity::TeardownKeyUnmapped => self.conn_identity_teardown_key_unmapped,
+            ConnIdentity::PromotionKeyMismatch => self.conn_identity_promotion_key_mismatch,
+            ConnIdentity::TransportKeySet => self.conn_identity_transport_key_set,
+            ConnIdentity::TransportKeySame => self.conn_identity_transport_key_same,
+            ConnIdentity::TransportKeyRefused => self.conn_identity_transport_key_refused,
+            ConnIdentity::TransportKeySent => self.conn_identity_transport_key_sent,
+            ConnIdentity::TransportKeyUndelivered => self.conn_identity_transport_key_undelivered,
         }
     }
 
@@ -2980,16 +3452,28 @@ impl TransportSnapshot {
             inbound_queue_depth_hwm,
             inbound_queue_drops,
             upgrade_control_received,
+            upgrade_decline_suppressed,
             handshake_unauthenticated_dropped,
             quic_endpoint_down,
             quic_adapter_panicked,
             quic_breaker_trips,
+            quic_send_refused,
             quic_breaker_suppressed,
             quic_close_sent_node_dropped_peer,
             quic_close_sent_downgrade,
             quic_close_sent_identity_mismatch,
             quic_close_sent_send_abort_limit,
             quic_close_sent_peer_not_acknowledging,
+            quic_close_sent_control_refused,
+            quic_close_received,
+            quic_upgrade,
+            quic_fallback,
+            quic_path_age_at_close,
+            quic_establish_ms_p50,
+            quic_establish_ms_p90,
+            quic_establish_samples,
+            quic_paths_offered_or_dialing,
+            quic_paths_active,
             nat_fail_samples,
             nat_fail_samples_dropped,
             inbound_stream_refused_invalid_length,
@@ -2998,6 +3482,8 @@ impl TransportSnapshot {
             inbound_stream_closed_too_many_refusals,
             inbound_stream_evicted_idle,
             inbound_stream_evicted_age,
+            inbound_stream_stream_id_on_both_paths,
+            inbound_stream_complete_charge_past_age,
             nat_attempts_connect_joiner,
             nat_attempts_connect_acceptor,
             nat_attempts_gateway,
@@ -3060,6 +3546,12 @@ impl TransportSnapshot {
             conn_identity_teardown_key_elsewhere,
             conn_identity_teardown_unidentified,
             conn_identity_teardown_key_unmapped,
+            conn_identity_promotion_key_mismatch,
+            conn_identity_transport_key_set,
+            conn_identity_transport_key_same,
+            conn_identity_transport_key_refused,
+            conn_identity_transport_key_sent,
+            conn_identity_transport_key_undelivered,
             inbound_concurrency_conns_sampled,
             inbound_concurrency_conns_ge_8,
             inbound_concurrency_conns_ge_16,
@@ -3098,16 +3590,28 @@ impl TransportSnapshot {
         self.inbound_queue_depth_hwm = inbound_queue_depth_hwm;
         self.inbound_queue_drops = inbound_queue_drops;
         self.upgrade_control_received = upgrade_control_received;
+        self.upgrade_decline_suppressed = upgrade_decline_suppressed;
         self.handshake_unauthenticated_dropped = handshake_unauthenticated_dropped;
         self.quic_endpoint_down = quic_endpoint_down;
         self.quic_adapter_panicked = quic_adapter_panicked;
         self.quic_breaker_trips = quic_breaker_trips;
+        self.quic_send_refused = quic_send_refused;
         self.quic_breaker_suppressed = quic_breaker_suppressed;
         self.quic_close_sent_node_dropped_peer = quic_close_sent_node_dropped_peer;
         self.quic_close_sent_downgrade = quic_close_sent_downgrade;
         self.quic_close_sent_identity_mismatch = quic_close_sent_identity_mismatch;
         self.quic_close_sent_send_abort_limit = quic_close_sent_send_abort_limit;
         self.quic_close_sent_peer_not_acknowledging = quic_close_sent_peer_not_acknowledging;
+        self.quic_close_sent_control_refused = quic_close_sent_control_refused;
+        self.quic_close_received = quic_close_received;
+        self.quic_upgrade = quic_upgrade;
+        self.quic_fallback = quic_fallback;
+        self.quic_path_age_at_close = quic_path_age_at_close;
+        self.quic_establish_ms_p50 = quic_establish_ms_p50;
+        self.quic_establish_ms_p90 = quic_establish_ms_p90;
+        self.quic_establish_samples = quic_establish_samples;
+        self.quic_paths_offered_or_dialing = quic_paths_offered_or_dialing;
+        self.quic_paths_active = quic_paths_active;
         self.nat_fail_samples = nat_fail_samples;
         self.nat_fail_samples_dropped = nat_fail_samples_dropped;
         self.inbound_stream_refused_invalid_length = inbound_stream_refused_invalid_length;
@@ -3116,6 +3620,8 @@ impl TransportSnapshot {
         self.inbound_stream_closed_too_many_refusals = inbound_stream_closed_too_many_refusals;
         self.inbound_stream_evicted_idle = inbound_stream_evicted_idle;
         self.inbound_stream_evicted_age = inbound_stream_evicted_age;
+        self.inbound_stream_stream_id_on_both_paths = inbound_stream_stream_id_on_both_paths;
+        self.inbound_stream_complete_charge_past_age = inbound_stream_complete_charge_past_age;
         self.nat_attempts_connect_joiner = nat_attempts_connect_joiner;
         self.nat_attempts_connect_acceptor = nat_attempts_connect_acceptor;
         self.nat_attempts_gateway = nat_attempts_gateway;
@@ -3178,6 +3684,12 @@ impl TransportSnapshot {
         self.conn_identity_teardown_key_elsewhere = conn_identity_teardown_key_elsewhere;
         self.conn_identity_teardown_unidentified = conn_identity_teardown_unidentified;
         self.conn_identity_teardown_key_unmapped = conn_identity_teardown_key_unmapped;
+        self.conn_identity_promotion_key_mismatch = conn_identity_promotion_key_mismatch;
+        self.conn_identity_transport_key_set = conn_identity_transport_key_set;
+        self.conn_identity_transport_key_same = conn_identity_transport_key_same;
+        self.conn_identity_transport_key_refused = conn_identity_transport_key_refused;
+        self.conn_identity_transport_key_sent = conn_identity_transport_key_sent;
+        self.conn_identity_transport_key_undelivered = conn_identity_transport_key_undelivered;
         self.inbound_concurrency_conns_sampled = inbound_concurrency_conns_sampled;
         self.inbound_concurrency_conns_ge_8 = inbound_concurrency_conns_ge_8;
         self.inbound_concurrency_conns_ge_16 = inbound_concurrency_conns_ge_16;
@@ -3253,8 +3765,10 @@ struct SnapshotExtras {
     pub inbound_queue_depth_hwm: u32,
     /// Inbound packets the listener dropped because that channel was full.
     pub inbound_queue_drops: u64,
-    /// QUIC upgrade control messages received and ignored (#5940 e1).
+    /// QUIC upgrade control messages received (#5940 e1).
     pub upgrade_control_received: u64,
+    /// `Decline` replies to upgrade offers held back by the per-connection gate.
+    pub upgrade_decline_suppressed: u64,
     /// Hole-punch handshake packets dropped because they were not
     /// encrypted under the attempt's inbound session key (per packet).
     pub handshake_unauthenticated_dropped: u64,
@@ -3265,9 +3779,14 @@ struct SnapshotExtras {
     /// endpoint); each turns that endpoint off unless the node had already
     /// released it (#5940). Not counted: a panic in a path's receive task.
     pub quic_adapter_panicked: u64,
-    /// Times the QUIC crash-loop breaker tripped: a run with QUIC enabled
-    /// ended abnormally, so this one started with QUIC off (#5940).
+    /// Times the QUIC crash-loop breaker tripped, so this run started with
+    /// QUIC off (#5940): on unix a run with QUIC enabled ended abnormally, on
+    /// Windows three runs in a row ended within ten minutes for any reason.
     pub quic_breaker_trips: u64,
+    /// Sends the QUIC socket refused with `WouldBlock` (egress cap or full
+    /// socket buffer). Chiefly datagrams quinn's endpoint made on its own,
+    /// such as a Retry, which it drops without retrying.
+    pub quic_send_refused: u64,
     /// Whether the crash-loop breaker keeps QUIC off in this process.
     pub quic_breaker_suppressed: bool,
     /// QUIC connections this node closed, by close code
@@ -3277,6 +3796,30 @@ struct SnapshotExtras {
     pub quic_close_sent_identity_mismatch: u64,
     pub quic_close_sent_send_abort_limit: u64,
     pub quic_close_sent_peer_not_acknowledging: u64,
+    pub quic_close_sent_control_refused: u64,
+    /// QUIC connections closed by the peer's application close, by
+    /// [`QuicCloseCode`] in order; the last slot is a code this node does not
+    /// know (`quic_close_received_<label>`, `..._unknown_code`).
+    pub quic_close_received: [u64; QuicCloseCode::COUNT + 1],
+    /// Upgrade decisions by [`QuicUpgradeOutcome`] (`quic_upgrade_<label>`).
+    pub quic_upgrade: [u64; QuicUpgradeOutcome::COUNT],
+    /// Path fallbacks by [`QuicFallback`] (`quic_fallback_<label>`).
+    pub quic_fallback: [u64; QuicFallback::COUNT],
+    /// Active paths that ended, by [`QuicPathAge`]
+    /// (`quic_path_age_at_close_<label>`).
+    pub quic_path_age_at_close: [u64; QuicPathAge::COUNT],
+    /// Median and p90 of this period's establish latencies, in ms (the
+    /// first `QUIC_ESTABLISH_SAMPLES_MAX` of them), and how many there were.
+    /// Both roles are mixed: a server times from its Offer to `ReadyAck`, a
+    /// client from its Accept to `Ready`, so the two measure different spans.
+    /// Past the cap, which samples are kept depends on arrival order.
+    pub quic_establish_ms_p50: Option<u64>,
+    pub quic_establish_ms_p90: Option<u64>,
+    pub quic_establish_samples: u64,
+    /// Gauges (never reset): paths with a live attempt not yet active, and
+    /// paths active on this node's evidence. Zero outside shadow mode.
+    pub quic_paths_offered_or_dialing: u64,
+    pub quic_paths_active: u64,
     /// Per-attempt records of the FIRST 8 failed outbound NAT traversals in
     /// the period (not a representative sample of a busy period);
     /// `nat_fail_samples_dropped` counts the rest. Read with the same
@@ -3290,12 +3833,16 @@ struct SnapshotExtras {
     /// Inbound streams refused or evicted during the period, by reason
     /// (see [`InboundStreamOutcome`]; the field suffix is its label). Counts
     /// only, no addresses. The never-reset twin feeds the OTel metric.
+    /// `inbound_stream_complete_charge_past_age` is neither a refusal nor an
+    /// eviction: complete streams a consumer still held past their age limit.
     pub inbound_stream_refused_invalid_length: u32,
     pub inbound_stream_refused_connection_bytes: u32,
     pub inbound_stream_refused_connection_streams: u32,
     pub inbound_stream_closed_too_many_refusals: u32,
     pub inbound_stream_evicted_idle: u32,
     pub inbound_stream_evicted_age: u32,
+    pub inbound_stream_stream_id_on_both_paths: u32,
+    pub inbound_stream_complete_charge_past_age: u32,
     /// Outbound NAT traversals started during the period, by
     /// [`NatAttemptOrigin`] (the field suffix is its label). They sum to
     /// `nat_traversal_attempts`, up to a snapshot race.
@@ -3389,6 +3936,12 @@ struct SnapshotExtras {
     pub conn_identity_teardown_key_elsewhere: u32,
     pub conn_identity_teardown_unidentified: u32,
     pub conn_identity_teardown_key_unmapped: u32,
+    pub conn_identity_promotion_key_mismatch: u32,
+    pub conn_identity_transport_key_set: u32,
+    pub conn_identity_transport_key_same: u32,
+    pub conn_identity_transport_key_refused: u32,
+    pub conn_identity_transport_key_sent: u32,
+    pub conn_identity_transport_key_undelivered: u32,
     /// Inbound concurrency per connection during the period; see the
     /// `inbound_concurrency_*` fields of [`TransportSnapshot`].
     pub inbound_concurrency_conns_sampled: u32,
@@ -3421,15 +3974,25 @@ impl SnapshotExtras {
             || self.transfers_acked != 0
             || self.inbound_queue_drops != 0
             || self.upgrade_control_received != 0
+            || self.upgrade_decline_suppressed != 0
             || self.handshake_unauthenticated_dropped != 0
             || self.quic_endpoint_down != 0
             || self.quic_adapter_panicked != 0
             || self.quic_breaker_trips != 0
+            || self.quic_send_refused != 0
             || self.quic_close_sent_node_dropped_peer != 0
             || self.quic_close_sent_downgrade != 0
             || self.quic_close_sent_identity_mismatch != 0
             || self.quic_close_sent_send_abort_limit != 0
             || self.quic_close_sent_peer_not_acknowledging != 0
+            || self.quic_close_sent_control_refused != 0
+            || self.quic_close_received.iter().any(|n| *n != 0)
+            || self.quic_upgrade.iter().any(|n| *n != 0)
+            || self.quic_fallback.iter().any(|n| *n != 0)
+            || self.quic_path_age_at_close.iter().any(|n| *n != 0)
+            || self.quic_establish_samples != 0
+            || self.quic_paths_offered_or_dialing != 0
+            || self.quic_paths_active != 0
             || !self.nat_fail_samples.is_empty()
             || self.inbound_stream_refused_invalid_length != 0
             || self.inbound_stream_refused_connection_bytes != 0
@@ -3437,6 +4000,8 @@ impl SnapshotExtras {
             || self.inbound_stream_closed_too_many_refusals != 0
             || self.inbound_stream_evicted_idle != 0
             || self.inbound_stream_evicted_age != 0
+            || self.inbound_stream_stream_id_on_both_paths != 0
+            || self.inbound_stream_complete_charge_past_age != 0
             || self.nat_attempts_connect_joiner != 0
             || self.nat_attempts_connect_acceptor != 0
             || self.nat_attempts_gateway != 0
@@ -3496,6 +4061,12 @@ impl SnapshotExtras {
             || self.conn_identity_teardown_key_elsewhere != 0
             || self.conn_identity_teardown_unidentified != 0
             || self.conn_identity_teardown_key_unmapped != 0
+            || self.conn_identity_promotion_key_mismatch != 0
+            || self.conn_identity_transport_key_set != 0
+            || self.conn_identity_transport_key_same != 0
+            || self.conn_identity_transport_key_refused != 0
+            || self.conn_identity_transport_key_sent != 0
+            || self.conn_identity_transport_key_undelivered != 0
             // The thresholds and the maximum are set only with a sampled
             // connection in the same period (`record_inbound_concurrency`
             // updates them under one lock), so `conns_sampled` alone decides.
@@ -4256,6 +4827,22 @@ mod tests {
     /// Received QUIC upgrade control messages reach the snapshot, count as
     /// activity on their own, and reset.
     #[test]
+    fn upgrade_decline_suppressed_reaches_snapshot_and_resets() {
+        let metrics = TransportMetrics::new();
+        metrics.record_upgrade_decline_suppressed();
+        metrics.record_upgrade_decline_suppressed();
+        let snap = metrics
+            .take_snapshot()
+            .expect("a held back reply is activity");
+        assert_eq!(snap.upgrade_decline_suppressed, 2);
+        assert_eq!(metrics.cumulative_upgrade_decline_suppressed(), 2);
+        let json = serde_json::to_value(&snap).unwrap();
+        assert_eq!(json["upgrade_decline_suppressed"], 2);
+        assert!(metrics.take_snapshot().is_none(), "the counter must reset");
+        assert_eq!(metrics.cumulative_upgrade_decline_suppressed(), 2);
+    }
+
+    #[test]
     fn upgrade_control_received_reaches_snapshot_and_resets() {
         let metrics = TransportMetrics::new();
         metrics.record_upgrade_control_received();
@@ -4374,6 +4961,20 @@ mod tests {
         assert!(snap.quic_breaker_suppressed, "the state is not reset");
     }
 
+    #[test]
+    fn quic_send_refused_is_activity_reaches_snapshot_and_resets() {
+        let metrics = TransportMetrics::new();
+        assert!(metrics.take_snapshot().is_none());
+        metrics.record_quic_send_refused();
+        let snap = metrics
+            .take_snapshot()
+            .expect("a refused send alone is activity");
+        assert_eq!(snap.quic_send_refused, 1);
+        let json = serde_json::to_value(&snap).unwrap();
+        assert_eq!(json["quic_send_refused"], 1);
+        assert!(metrics.take_snapshot().is_none(), "the count must reset");
+    }
+
     /// The snapshot field that carries the period count of closes sent
     /// with `code`. Exhaustive on purpose: a new `QuicCloseCode` fails to
     /// compile here until it is given a `TransportSnapshot` field.
@@ -4384,6 +4985,7 @@ mod tests {
             QuicCloseCode::IdentityMismatch => snap.quic_close_sent_identity_mismatch,
             QuicCloseCode::SendAbortLimit => snap.quic_close_sent_send_abort_limit,
             QuicCloseCode::PeerNotAcknowledging => snap.quic_close_sent_peer_not_acknowledging,
+            QuicCloseCode::ControlRefused => snap.quic_close_sent_control_refused,
         }
     }
 
@@ -4415,6 +5017,135 @@ mod tests {
         }
     }
 
+    /// The slot counts of a family: one record per slot index plus one, so
+    /// each slot has its own value, alone counts as activity, and resets.
+    fn check_quic_family<const N: usize>(
+        record: impl Fn(&TransportMetrics, usize, SocketAddr),
+        read: impl Fn(&TransportSnapshot) -> [u64; N],
+    ) {
+        let remote: SocketAddr = "10.255.11.2:7".parse().unwrap();
+        for slot in 0..N {
+            let metrics = TransportMetrics::new();
+            for _ in 0..=slot {
+                record(&metrics, slot, remote);
+            }
+            let snap = metrics.take_snapshot().expect("a count alone is activity");
+            let mut expected = [0u64; N];
+            expected[slot] = slot as u64 + 1;
+            assert_eq!(read(&snap), expected, "slot {slot}");
+            assert!(metrics.take_snapshot().is_none(), "slot {slot} must reset");
+        }
+    }
+
+    #[test]
+    fn quic_upgrade_outcomes_count_snapshot_and_reset() {
+        check_quic_family(
+            |m, slot, remote| m.record_quic_upgrade(QuicUpgradeOutcome::ALL[slot], remote),
+            |snap| snap.quic_upgrade,
+        );
+    }
+
+    #[test]
+    fn quic_fallbacks_count_snapshot_and_reset() {
+        check_quic_family(
+            |m, slot, remote| m.record_quic_fallback(QuicFallback::ALL[slot], remote),
+            |snap| snap.quic_fallback,
+        );
+    }
+
+    /// A raw close code is counted under its name; one this node does not
+    /// know, under the last slot.
+    #[test]
+    fn quic_close_received_counts_by_raw_code_and_reset() {
+        let raw = |slot: usize| {
+            QuicCloseCode::ALL
+                .get(slot)
+                .map_or(0xAB, |code| u64::from(code.code()))
+        };
+        check_quic_family(
+            |m, slot, remote| m.record_quic_close_received(raw(slot), remote),
+            |snap| snap.quic_close_received,
+        );
+    }
+
+    #[test]
+    fn quic_path_age_buckets_count_snapshot_and_reset() {
+        let secs = [0, 59, 60, 599, 600, 3599, 3600, 86399, 86400];
+        let want = [2, 2, 2, 2, 1];
+        let metrics = TransportMetrics::new();
+        let remote: SocketAddr = "10.255.11.3:7".parse().unwrap();
+        for s in secs {
+            metrics.record_quic_path_closed(std::time::Duration::from_secs(s), remote);
+        }
+        let snap = metrics.take_snapshot().expect("a closed path is activity");
+        assert_eq!(snap.quic_path_age_at_close, want);
+        assert!(metrics.take_snapshot().is_none());
+        check_quic_family(
+            |m, slot, remote| {
+                let age = [0, 60, 600, 3600, 86400][slot];
+                m.record_quic_path_closed(std::time::Duration::from_secs(age), remote)
+            },
+            |snap| snap.quic_path_age_at_close,
+        );
+    }
+
+    #[test]
+    fn quic_establish_latency_reports_percentiles_and_resets() {
+        let metrics = TransportMetrics::new();
+        let remote: SocketAddr = "10.255.11.4:7".parse().unwrap();
+        assert!(metrics.take_snapshot().is_none());
+        for ms in 1..=10u64 {
+            metrics.record_quic_establish_latency(std::time::Duration::from_millis(ms), remote);
+        }
+        let snap = metrics.take_snapshot().expect("a sample is activity");
+        assert_eq!(
+            (
+                snap.quic_establish_ms_p50,
+                snap.quic_establish_ms_p90,
+                snap.quic_establish_samples
+            ),
+            (Some(5), Some(9), 10)
+        );
+        assert!(metrics.take_snapshot().is_none());
+        for _ in 0..QUIC_ESTABLISH_SAMPLES_MAX + 5 {
+            metrics.record_quic_establish_latency(std::time::Duration::from_millis(3), remote);
+        }
+        let snap = metrics.take_snapshot().unwrap();
+        assert_eq!(
+            snap.quic_establish_samples,
+            QUIC_ESTABLISH_SAMPLES_MAX as u64 + 5,
+            "the count includes samples past the bound"
+        );
+    }
+
+    /// The gauges follow attempts and paths, survive a snapshot, and are
+    /// activity while non-zero.
+    #[test]
+    fn quic_path_gauges_follow_paths_and_survive_snapshots() {
+        let metrics = TransportMetrics::new();
+        let remote: SocketAddr = "10.255.11.5:7".parse().unwrap();
+        metrics.quic_path_attempting(remote);
+        metrics.quic_path_attempting(remote);
+        let snap = metrics.take_snapshot().expect("a live attempt is activity");
+        assert_eq!(
+            (snap.quic_paths_offered_or_dialing, snap.quic_paths_active),
+            (2, 0)
+        );
+        metrics.quic_path_activated(remote);
+        let snap = metrics
+            .take_snapshot()
+            .expect("gauges stay across snapshots");
+        assert_eq!(
+            (snap.quic_paths_offered_or_dialing, snap.quic_paths_active),
+            (1, 1)
+        );
+        assert_eq!(metrics.quic_paths_active(), 1);
+        metrics.quic_path_left(true, remote);
+        metrics.quic_path_left(false, remote);
+        // The two leaves are activity of their own only through the gauges.
+        assert!(metrics.take_snapshot().is_none());
+    }
+
     /// The snapshot field that carries `outcome`'s period count. Exhaustive
     /// on purpose: a new `InboundStreamOutcome` fails to compile here until it
     /// is given a `TransportSnapshot` field.
@@ -4434,6 +5165,12 @@ mod tests {
             }
             InboundStreamOutcome::EvictedIdle => snap.inbound_stream_evicted_idle,
             InboundStreamOutcome::EvictedAge => snap.inbound_stream_evicted_age,
+            InboundStreamOutcome::StreamIdOnBothPaths => {
+                snap.inbound_stream_stream_id_on_both_paths
+            }
+            InboundStreamOutcome::CompleteChargePastAge => {
+                snap.inbound_stream_complete_charge_past_age
+            }
         }
     }
 
@@ -5496,16 +6233,28 @@ mod tests {
             "inbound_queue_depth_hwm",
             "inbound_queue_drops",
             "upgrade_control_received",
+            "upgrade_decline_suppressed",
             "handshake_unauthenticated_dropped",
             "quic_endpoint_down",
             "quic_adapter_panicked",
             "quic_breaker_trips",
+            "quic_send_refused",
             "quic_breaker_suppressed",
             "quic_close_sent_node_dropped_peer",
             "quic_close_sent_downgrade",
             "quic_close_sent_identity_mismatch",
             "quic_close_sent_send_abort_limit",
             "quic_close_sent_peer_not_acknowledging",
+            "quic_close_sent_control_refused",
+            "quic_close_received",
+            "quic_upgrade",
+            "quic_fallback",
+            "quic_path_age_at_close",
+            "quic_establish_ms_p50",
+            "quic_establish_ms_p90",
+            "quic_establish_samples",
+            "quic_paths_offered_or_dialing",
+            "quic_paths_active",
             "nat_fail_samples",
             "nat_fail_samples_dropped",
             "inbound_stream_refused_invalid_length",
@@ -5514,6 +6263,8 @@ mod tests {
             "inbound_stream_closed_too_many_refusals",
             "inbound_stream_evicted_idle",
             "inbound_stream_evicted_age",
+            "inbound_stream_stream_id_on_both_paths",
+            "inbound_stream_complete_charge_past_age",
             "nat_attempts_connect_joiner",
             "nat_attempts_connect_acceptor",
             "nat_attempts_gateway",
@@ -5576,6 +6327,12 @@ mod tests {
             "conn_identity_teardown_key_elsewhere",
             "conn_identity_teardown_unidentified",
             "conn_identity_teardown_key_unmapped",
+            "conn_identity_promotion_key_mismatch",
+            "conn_identity_transport_key_set",
+            "conn_identity_transport_key_same",
+            "conn_identity_transport_key_refused",
+            "conn_identity_transport_key_sent",
+            "conn_identity_transport_key_undelivered",
             "inbound_concurrency_conns_sampled",
             "inbound_concurrency_conns_ge_8",
             "inbound_concurrency_conns_ge_16",

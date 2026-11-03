@@ -3,10 +3,9 @@
 //! The endpoint reads only the QUIC-class datagrams the [`DemuxSocket`] queues
 //! for it, and sends through the same socket, so it shares the port, the
 //! node-wide egress cap and the simulation socket with the UDP transport.
-//! Nothing in the node connects to anyone yet: with `transport-quic =
-//! "prefer"` the node builds the endpoint at bind with an empty allow-set, so
-//! no datagram reaches it and it sends nothing. Upgrading a UDP transport
-//! session to QUIC comes later; until then only tests open QUIC connections.
+//! With `transport-quic` on, the node builds the endpoint at bind with an empty
+//! allow-set, so no datagram reaches it until an upgrade allows a peer
+//! ([`upgrade::driver`]). The paths it opens carry control frames only.
 //!
 //! Every connection is authenticated by the transport keys the two nodes
 //! already have ([`identity`]): [`QuicEndpoint::connect`] takes the server's
@@ -29,9 +28,9 @@
 //!   codes (connection close, stream stop and reset), one range each.
 //! - [`liveness`]: whether the endpoint is alive ([`QuicAvailability`]);
 //!   endpoint death turns QUIC off for the node and never stops it.
-//! - [`upgrade`]: upgrading a UDP session to QUIC. So far only the policy
-//!   ([`upgrade::policy`]): whether the node may upgrade at all, and how
-//!   many paths it may hold.
+//! - [`upgrade`]: upgrading a UDP session to QUIC: whether the node may
+//!   ([`upgrade::policy`]), the negotiation's decisions
+//!   ([`upgrade::machine`]) and carrying them out ([`upgrade::driver`]).
 //!
 //! [`DemuxSocket`]: super::DemuxSocket
 //! [`TransportPublicKey`]: super::TransportPublicKey
@@ -40,6 +39,7 @@
 pub(crate) mod breaker;
 pub(crate) mod cid;
 pub(crate) mod config;
+pub(crate) mod control;
 pub(crate) mod error;
 pub(crate) mod framing;
 pub(crate) mod identity;
@@ -70,7 +70,7 @@ use super::crypto::{TransportKeypair, TransportPublicKey};
 use super::demux::{DemuxSocket, QuicSourcePermit};
 use super::metrics::{QuicCloseCode, TRANSPORT_METRICS};
 use crate::config::GlobalExecutor;
-use crate::node::background_task_monitor::BackgroundTaskMonitor;
+use crate::node::background_task_monitor::LateRegistrar;
 use crate::simulation::TimeSource;
 use identity::{PeerKey, QuicIdentity};
 use liveness::EndpointHealth;
@@ -82,29 +82,30 @@ pub(crate) use liveness::QuicAvailabilityWatch;
 /// Whether the node may use QUIC: the `transport-quic` config key.
 ///
 /// Off is the default on every platform, and must stay the default on
-/// Windows until the crash-loop breaker works there (#6031): the breaker is
-/// unix-only ([`breaker`]).
+/// Windows until the crash-loop breaker has been confirmed on a real Windows
+/// machine (#6031). That breaker counts short runs instead of detecting
+/// crashes ([`breaker`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum QuicMode {
     /// No QUIC endpoint is built and no QUIC datagram is read. The default.
     #[default]
     Off,
-    /// The node builds a QUIC endpoint on its UDP port and may upgrade a UDP
+    /// The node builds a QUIC endpoint on its UDP port and upgrades a UDP
     /// session to a QUIC path that carries only control frames: all
-    /// application traffic stays on UDP. In this release nothing in the node
-    /// upgrades yet ([`upgrade::policy`] is not wired in), so the endpoint
-    /// accepts and opens no connection. It still differs from `Off` in three
-    /// ways: the demux socket has a QUIC ingress, so a QUIC-class datagram is
-    /// counted `quic_ingress_not_allowed` instead of
-    /// `quic_ingress_no_ingress`; quinn's endpoint driver runs as a task
-    /// (idle, waiting on the empty ingress queue); and the endpoint's memory.
-    /// If the endpoint cannot be built the node logs a warning and runs with
-    /// QUIC off.
+    /// application traffic stays on UDP. Besides the path, it differs from
+    /// `Off` in that the demux socket has a QUIC ingress, so a QUIC-class
+    /// datagram from an address not allowed is counted
+    /// `quic_ingress_not_allowed` instead of `quic_ingress_no_ingress`; quinn's
+    /// endpoint driver and one upgrade task per connection run; a promoted
+    /// connection's higher key sends `Upgrade` messages on its UDP session; and
+    /// the endpoint's memory. If the endpoint cannot be built the node logs a
+    /// warning and runs with QUIC off.
     Shadow,
-    /// Meant to carry application data over QUIC. Until that ships it acts
-    /// as [`Self::Shadow`] (see [`Self::effective`]), so a node that sets it
-    /// early starts carrying data over QUIC once it runs a release where
-    /// `prefer` does. That release's notes must say so.
+    /// Negotiates data on a path to a peer in the release's slice
+    /// (`upgrade::slice`). This release sends no data on any path, so it acts as
+    /// [`Self::Shadow`] on the wire apart from the caps bit. A node that sets it
+    /// early starts carrying data over QUIC once it runs a release that sends it.
+    /// That release's notes must say so.
     Prefer,
 }
 
@@ -141,16 +142,6 @@ impl QuicMode {
         match self {
             Self::Off => false,
             Self::Shadow | Self::Prefer => true,
-        }
-    }
-
-    /// The mode this release runs: `Off` and `Shadow` are themselves, and
-    /// `Prefer` runs as `Shadow`. Startup says so at INFO
-    /// ([`upgrade::policy::log_startup`]).
-    pub(crate) fn effective(self) -> Self {
-        match self {
-            Self::Off => Self::Off,
-            Self::Shadow | Self::Prefer => Self::Shadow,
         }
     }
 }
@@ -207,7 +198,7 @@ pub(crate) struct EndpointCore {
     /// The QUIC transmits the egress cap holds (`socket::CapHolds`).
     cap_holds: Arc<socket::CapHolds>,
     /// Test hooks that inject faults into quinn's drivers.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     faults: Arc<socket::SocketFaults>,
     /// The type name of the clock quinn runs on (tests).
     #[cfg(any(test, feature = "testing"))]
@@ -517,7 +508,7 @@ impl QuicEndpoint {
             clock,
         )?);
         let health = EndpointHealth::new(local_addr);
-        #[cfg(test)]
+        #[cfg(any(test, feature = "testing"))]
         let mut faults = None;
         let mut cap_holds = None;
         // If quinn refuses the socket after the ingress is enabled, the
@@ -531,7 +522,7 @@ impl QuicEndpoint {
                     health.clone(),
                 ));
                 cap_holds = Some(quic_socket.cap_holds());
-                #[cfg(test)]
+                #[cfg(any(test, feature = "testing"))]
                 {
                     faults = Some(quic_socket.faults());
                 }
@@ -556,7 +547,7 @@ impl QuicEndpoint {
         tracing::info!(
             %local_addr,
             window_bytes = settings.window_bytes(),
-            "QUIC endpoint built (transport-quic = prefer); nothing opens connections on it in this release"
+            "QUIC endpoint built; its paths carry control frames only, application traffic stays on UDP"
         );
         Ok(Self {
             owner: Arc::new(EndpointOwner {
@@ -574,7 +565,7 @@ impl QuicEndpoint {
                 health: health.clone(),
                 // Set by the closure, which ran: `endpoint` is built.
                 cap_holds: cap_holds.expect("the QUIC socket's cap holds"),
-                #[cfg(test)]
+                #[cfg(any(test, feature = "testing"))]
                 faults: faults.unwrap_or_default(),
                 #[cfg(any(test, feature = "testing"))]
                 clock: std::any::type_name::<T>(),
@@ -590,7 +581,7 @@ impl QuicEndpoint {
 
     /// Fail the endpoint's next receive, which ends quinn's endpoint driver
     /// as a socket that fails for good would (tests).
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     pub(crate) fn fail_driver(&self) {
         self.faults.fail_receive();
     }
@@ -607,8 +598,8 @@ impl QuicEndpoint {
         self.clock
     }
 
-    /// Accept connection attempts in a task registered with `monitor` as
-    /// `quic_accept_loop`, handing each to `attempts` without waiting. When
+    /// Accept connection attempts in a task registered through `registrar`
+    /// as `quic_accept_loop`, handing each to `attempts` without waiting. When
     /// `attempts` is full the attempt is ignored and counted
     /// ([`Self::accept_queue_full`], a WARN on the first and every 1024th):
     /// the client retransmits its Initial, as after a lost datagram.
@@ -626,11 +617,10 @@ impl QuicEndpoint {
     /// panic here is still a node failure, as for every monitored task; a
     /// quinn panic is not contained (see `liveness`).
     ///
-    /// `monitor` must not have started waiting yet
-    /// ([`BackgroundTaskMonitor::wait_for_any_exit`] drains it, and a task
-    /// registered after that is not monitored). In `run_node` that happens
-    /// before the event listener opens the transport, so e5 must register
-    /// this task through a monitor that is still live at that point.
+    /// The registrar is a [`LateRegistrar`] because in `run_node` the
+    /// monitor starts waiting before the event listener opens the transport,
+    /// which is where this is called; a task registered on the monitor
+    /// itself at that point would not be watched.
     ///
     /// Attempts already queued in `attempts` each hold a quinn `Incoming`,
     /// which holds the quinn endpoint: until the consumer drains or drops
@@ -641,11 +631,10 @@ impl QuicEndpoint {
     /// Call once per endpoint: two loops would split attempts between two
     /// consumers. A second call logs a WARN, starts nothing and returns
     /// `false`.
-    #[cfg_attr(not(test), allow(dead_code))]
     #[must_use = "false means no accept loop was started"]
     pub(crate) fn spawn_accept_loop(
         &self,
-        monitor: &BackgroundTaskMonitor,
+        registrar: &LateRegistrar,
         attempts: mpsc::Sender<QuicIncoming>,
     ) -> bool {
         if self
@@ -695,7 +684,7 @@ impl QuicEndpoint {
             drop(core);
             std::future::pending::<()>().await;
         });
-        monitor.register("quic_accept_loop", handle);
+        registrar.register("quic_accept_loop", handle);
         true
     }
 
@@ -804,6 +793,38 @@ impl QuicEndpoint {
         self.connect_with(addr, config, peer).await
     }
 
+    /// A client's first Initial to `to`, as bytes, built by a connection that
+    /// goes no further, for a test to deliver under any source address.
+    ///
+    /// # Panics
+    /// If `expected` is not a usable key.
+    #[cfg(any(test, feature = "testing"))]
+    pub(crate) fn initial_datagram(
+        &self,
+        to: SocketAddr,
+        expected: &TransportPublicKey,
+    ) -> Vec<u8> {
+        let peer = PeerKey::of(expected).expect("a usable key");
+        let tls = self.identity.client_tls(&peer).expect("client TLS");
+        let endpoint = config::endpoint_config().expect("endpoint configuration");
+        let mut client = quinn_proto::Endpoint::new(Arc::new(endpoint), None, true, None);
+        let now = tokio::time::Instant::now().into_std();
+        let (_, mut connection) = client
+            .connect(
+                now,
+                self.client_config(Arc::new(tls)),
+                to,
+                config::SERVER_NAME,
+            )
+            .expect("a connection to build the Initial with");
+        let mut datagram = Vec::new();
+        let sent = connection
+            .poll_transmit(now, 1, &mut datagram)
+            .expect("a new client connection has an Initial to send");
+        datagram.truncate(sent.size);
+        datagram
+    }
+
     /// [`Self::connect`] with a given client configuration, which must pin
     /// the server to `peer`.
     async fn connect_with(
@@ -903,6 +924,40 @@ pub(crate) struct QuicIncoming {
 }
 
 impl QuicIncoming {
+    /// The address the attempt came from, normalized as the allow-set does.
+    pub(crate) fn source(&self) -> SocketAddr {
+        self.permit.addr()
+    }
+
+    /// Drop the attempt without answering it: the client retransmits its
+    /// Initial, as after a lost datagram.
+    pub(crate) fn ignore(self) {
+        self.incoming.ignore();
+    }
+
+    /// Whether the sender has shown it can read datagrams sent to this
+    /// address, by returning the token of a Retry this endpoint sent there.
+    pub(crate) fn address_validated(&self) -> bool {
+        self.incoming.remote_address_validated()
+    }
+
+    /// Answer with a Retry and give up the attempt, with its permit and key
+    /// hold. Stateless: the endpoint keeps nothing until the token comes back,
+    /// which arrives as a new attempt. The token is sealed with the endpoint's
+    /// `token_key` and checked against that key and this address when it comes
+    /// back, before `accept_with`'s per-attempt configuration is involved.
+    ///
+    /// quinn sends it with `try_send`, so it is lost if the socket or the
+    /// egress cap has no room for it, as any datagram can be lost: the client
+    /// retransmits its Initial and is answered again.
+    pub(crate) fn retry(self) {
+        if let Err(refused) = self.incoming.retry() {
+            // quinn refuses only an attempt that already carries a Retry
+            // token, and that one reads as validated.
+            refused.into_incoming().ignore();
+        }
+    }
+
     /// Complete the handshake. On failure the permit is dropped with it.
     ///
     /// A socket-adapter panic in this connection's driver during the
@@ -1005,6 +1060,12 @@ impl QuicConnection {
                 }
             }
             let reason = watched.closed().await;
+            if let quinn::ConnectionError::ApplicationClosed(close) = &reason {
+                TRANSPORT_METRICS.record_quic_close_received(
+                    close.error_code.into_inner(),
+                    watched.remote_address(),
+                );
+            }
             tracing::debug!(%reason, remote = %watched.remote_address(), "QUIC connection ended");
             drop(hold);
             drop(permit);

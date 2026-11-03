@@ -47,6 +47,7 @@ use super::config::MAX_UDP_PAYLOAD;
 use super::liveness::EndpointHealth;
 use crate::transport::demux::{DemuxSocket, QuicIngressReceiver};
 use crate::transport::egress_cap::AdmissionWaiter;
+use crate::transport::metrics::TRANSPORT_METRICS;
 use crate::transport::{Socket, normalize_mapped_addr};
 
 /// QUIC transmits the egress cap is holding, node-wide: quinn has built
@@ -159,6 +160,8 @@ pub(crate) struct QuicSocket<S> {
     local_addr: SocketAddr,
     /// Sends that failed with an error other than `WouldBlock`.
     send_errors: AtomicU64,
+    /// Sends refused with `WouldBlock` (egress cap or full socket buffer).
+    send_refused: AtomicU64,
     /// Whether the ingress queue's sending side is gone has been logged.
     ingress_closed_logged: AtomicBool,
     /// Told of a panic caught here.
@@ -169,12 +172,13 @@ pub(crate) struct QuicSocket<S> {
     /// comes, since the endpoint's connections let their addresses go).
     receive_waker: futures::task::AtomicWaker,
     /// Test hooks: faults injected into quinn's drivers.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     faults: Arc<SocketFaults>,
 }
 
 /// Test hooks: faults injected into quinn's drivers through this socket.
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Default)]
 pub(crate) struct SocketFaults {
     /// What the endpoint's next receive does (`RECEIVE_*`).
@@ -193,28 +197,29 @@ pub(crate) struct SocketFaults {
     send_panics: AtomicU64,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 const RECEIVE_OK: u8 = 0;
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 const RECEIVE_ERROR: u8 = 1;
 /// A panic in the adapter's own code, which it catches.
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 const RECEIVE_PANIC: u8 = 2;
 /// A panic that unwinds through quinn, as one in quinn's own code would.
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 const RECEIVE_PANIC_IN_QUINN: u8 = 3;
 /// Every write-readiness poll panics in the adapter's own code.
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 const WRITABLE_PANIC: u8 = 1;
 /// The next write-readiness poll panics in the adapter's own code, once.
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 const WRITABLE_PANIC_ONCE: u8 = 2;
 /// Panics of a lasting write-readiness fault after which its hook reports
 /// `Pending` instead (tests only; see `QuicPoller::poll_ready`).
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 const WRITABLE_PANIC_LIMIT: u64 = 1000;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
+#[cfg_attr(not(test), allow(dead_code))]
 impl SocketFaults {
     /// Fail the endpoint's next receive with a socket error quinn's
     /// endpoint driver cannot get past, the way a socket that fails for
@@ -304,16 +309,17 @@ impl<S: Socket> QuicSocket<S> {
             ingress: parking_lot::Mutex::new(ingress),
             local_addr,
             send_errors: AtomicU64::new(0),
+            send_refused: AtomicU64::new(0),
             ingress_closed_logged: AtomicBool::new(false),
             health,
             receive_waker: futures::task::AtomicWaker::new(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "testing"))]
             faults: Arc::default(),
         }
     }
 
     /// The hooks that inject faults through this socket (tests).
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     pub(crate) fn faults(&self) -> Arc<SocketFaults> {
         self.faults.clone()
     }
@@ -343,6 +349,12 @@ impl<S: Socket> QuicSocket<S> {
         self.send_errors.load(Ordering::Relaxed)
     }
 
+    /// Sends refused with `WouldBlock`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn send_refused(&self) -> u64 {
+        self.send_refused.load(Ordering::Relaxed)
+    }
+
     /// The address quinn sees for a datagram from `from`: on an IPv6 socket
     /// an IPv4 peer is written `::ffff:a.b.c.d`, the form quinn uses for the
     /// addresses it connects to there, so its replies and its connection
@@ -354,6 +366,13 @@ impl<S: Socket> QuicSocket<S> {
             }
             addr @ (SocketAddr::V4(_) | SocketAddr::V6(_)) => addr,
         }
+    }
+
+    /// A send was refused with `WouldBlock`: quinn waits and resends what a
+    /// connection sent, but drops a datagram its endpoint made on its own.
+    fn count_send_refused(&self) {
+        self.send_refused.fetch_add(1, Ordering::Relaxed);
+        TRANSPORT_METRICS.record_quic_send_refused();
     }
 
     fn count_send_error(&self, error: &io::Error, target: SocketAddr) {
@@ -413,7 +432,7 @@ impl<S: Socket> AsyncUdpSocket for QuicSocket<S> {
         bufs: &mut [IoSliceMut<'_>],
         meta: &mut [RecvMeta],
     ) -> Poll<io::Result<usize>> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "testing"))]
         if self
             .faults
             .receive
@@ -475,12 +494,12 @@ fn adapter_panicked_error() -> io::Error {
 impl<S: Socket> QuicSocket<S> {
     /// [`AsyncUdpSocket::try_send`], below the panic catch.
     fn send_one(&self, transmit: &Transmit) -> io::Result<()> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "testing"))]
         if self.faults.panic_sends.load(Ordering::Acquire) {
             self.faults.send_panics.fetch_add(1, Ordering::AcqRel);
             panic!("injected panic in the QUIC socket adapter (send)");
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "testing"))]
         if self.faults.block_sends.load(Ordering::Acquire) {
             return Err(io::ErrorKind::WouldBlock.into());
         }
@@ -506,13 +525,19 @@ impl<S: Socket> QuicSocket<S> {
                     Ok(take) => self
                         .socket
                         .try_send_to_paced(transmit.contents, target, take),
-                    Err(_) => return Err(io::ErrorKind::WouldBlock.into()),
+                    Err(_) => {
+                        self.count_send_refused();
+                        return Err(io::ErrorKind::WouldBlock.into());
+                    }
                 }
             }
         };
         match sent {
             Ok(_) => Ok(()),
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Err(e),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                self.count_send_refused();
+                Err(e)
+            }
             Err(e) => {
                 self.count_send_error(&e, target);
                 Ok(())
@@ -530,7 +555,7 @@ impl<S: Socket> QuicSocket<S> {
         let (Some(buf), Some(slot)) = (bufs.first_mut(), meta.first_mut()) else {
             return Poll::Ready(Ok(0));
         };
-        #[cfg(test)]
+        #[cfg(any(test, feature = "testing"))]
         {
             match self.faults.receive.load(Ordering::Acquire) {
                 RECEIVE_ERROR => {
@@ -635,7 +660,7 @@ impl<S: Socket> UdpPoller for QuicPoller<S> {
 impl<S: Socket> QuicPoller<S> {
     /// [`UdpPoller::poll_writable`], below the panic catch.
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "testing"))]
         {
             let fault = self.socket.faults.writable.load(Ordering::Acquire);
             if fault == WRITABLE_PANIC_ONCE {

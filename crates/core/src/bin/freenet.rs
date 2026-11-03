@@ -410,8 +410,8 @@ async fn run_network_node_with_signals(
         .context("failed to install SIGTERM handler")?;
     // The QUIC crash-loop breaker arms its marker only from here on (#5940):
     // a SIGTERM before the handler exists ends the node without its clean
-    // exit, which would read as a crash.
-    #[cfg(unix)]
+    // exit, which would read as a crash. Windows has no such handler and arms
+    // once the transport is up.
     freenet::quic_breaker_signals_ready();
 
     // Set when THIS process asks the node to stop because an operator signalled
@@ -1708,11 +1708,25 @@ fn quic_ignore_crash_breaker_from(matches: &clap::ArgMatches) -> Option<bool> {
 fn freenet_main() -> anyhow::Result<()> {
     // Parsed in two steps so the node arms can see where a value came from
     // (`quic_ignore_crash_breaker_from`); errors exit as `Cli::parse` does.
-    let matches = <Cli as clap::CommandFactory>::command().get_matches();
+    // Decided before parsing, which would reject arguments macOS adds (#6093).
+    let argv: Vec<_> = std::env::args_os().collect();
+    let app_launch = cfg!(target_os = "macos") && commands::service::is_macos_app_launch(&argv);
+    let parser = <Cli as clap::CommandFactory>::command();
+    let matches = if app_launch {
+        parser.get_matches_from(argv.iter().take(1))
+    } else {
+        parser.get_matches()
+    };
     let cli =
         <Cli as clap::FromArgMatches>::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
 
-    match cli.command {
+    let command = if app_launch {
+        Some(Command::Service(ServiceCommand::RunWrapper))
+    } else {
+        cli.command
+    };
+
+    match command {
         // The link-handler commands need no node directories: skip building
         // ConfigPaths, which creates them (and has no default in debug builds).
         Some(Command::Service(ServiceCommand::UrlHandler(cmd))) => cmd.run(),

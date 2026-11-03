@@ -2066,6 +2066,16 @@ impl SimNetwork {
         self
     }
 
+    /// A record of what every node's QUIC upgrades do in this network, and the
+    /// faults a test can inject into them. Call it before the nodes start. The
+    /// handle stays readable after the run has consumed the network.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn quic_upgrade_trace(
+        &self,
+    ) -> crate::transport::quic::upgrade::sim_trace::QuicUpgradeTrace {
+        crate::transport::in_memory_socket::quic_upgrade_trace(&self.name)
+    }
+
     /// Gives every node's QUIC endpoint the idle timeout `timeout` instead
     /// of its clock's (24 h on `VirtualTime`), so a silent QUIC path times
     /// out within a simulation. No effect on a node with QUIC off.
@@ -2073,6 +2083,29 @@ impl SimNetwork {
     pub fn with_quic_idle_timeout(&mut self, timeout: Duration) -> &mut Self {
         for label in self.pending_labels() {
             self.node_config_mut(&label).quic_idle_timeout_override = Some(timeout);
+        }
+        self
+    }
+
+    /// Sets `quic-data-percent` to `percent` on the node `label`, as `config.toml`
+    /// would. Call before the simulation starts. No effect unless the node is in
+    /// `prefer` mode.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn with_node_quic_data_percent(&mut self, label: &NodeLabel, percent: u8) -> &mut Self {
+        let config = self.node_config_mut(label);
+        Arc::make_mut(&mut config.config)
+            .network_api
+            .quic_data_percent = Some(percent.to_string());
+        self
+    }
+
+    /// Sets `quic-max-paths` to `limit` on every node, as `config.toml` would.
+    /// Call before the simulation starts. No effect on a node with QUIC off.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn with_quic_max_paths(&mut self, limit: usize) -> &mut Self {
+        for label in self.pending_labels() {
+            let config = self.node_config_mut(&label);
+            Arc::make_mut(&mut config.config).network_api.quic_max_paths = Some(limit.to_string());
         }
         self
     }
@@ -2210,6 +2243,16 @@ impl SimNetwork {
     pub fn quic_endpoint_clock(&self, label: &NodeLabel) -> Option<&'static str> {
         let addr = *self.node_addresses.get(label)?;
         crate::transport::in_memory_socket::quic_endpoint_clock(&self.name, addr)
+    }
+
+    /// Whether the transport of the node `label` started its QUIC accept
+    /// loop, which it does only when it has an endpoint and the node passed
+    /// it a task registrar.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn quic_accept_loop_started(&self, label: &NodeLabel) -> bool {
+        self.node_addresses.get(label).is_some_and(|addr| {
+            crate::transport::in_memory_socket::quic_accept_loop_started(&self.name, *addr)
+        })
     }
 
     /// Panics if a QUIC endpoint probe is set: only `run_simulation_direct`
@@ -8133,6 +8176,11 @@ mod tests {
         let virtual_clock = std::any::type_name::<crate::simulation::VirtualTime>();
         assert_eq!(sim.quic_endpoint_clock(&labels[0]), Some(virtual_clock));
         assert_eq!(sim.quic_endpoint_clock(&labels[1]), None);
+        // The node passes its task registrar to the transport, which then
+        // starts the endpoint's accept loop; a node without an endpoint
+        // starts none.
+        assert!(sim.quic_accept_loop_started(&labels[0]));
+        assert!(!sim.quic_accept_loop_started(&labels[1]));
     }
 
     /// Watches the QUIC ingress outcomes of some addresses for a test, and
@@ -8193,15 +8241,20 @@ mod tests {
             })
             .collect();
         // Directly, or through the QUIC crash-loop breaker's `gate` (#5940),
-        // which takes these settings as its first argument.
+        // which takes these settings as its first argument and whose result
+        // the upgrade policy also reads.
         let flat: String = code.concat().split_whitespace().collect();
         let assigned = flat.matches("quic:config.quic_settings(),").count()
             + flat
-                .matches("quic:crate::transport::quic::breaker::gate(config.quic_settings(),")
+                .matches("letquic=crate::transport::quic::breaker::gate(config.quic_settings(),")
                 .count();
         assert_eq!(
             assigned, 1,
             "`build` sets `quic` from `config.quic_settings()`"
+        );
+        assert!(
+            flat.contains("quic,quic_policy,"),
+            "`build` keeps that value"
         );
         assert!(
             code.iter()

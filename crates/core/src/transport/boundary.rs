@@ -215,6 +215,10 @@ pub(crate) struct TransportHandle {
     /// Resolves when the transport's listener stops. The node treats that as
     /// fatal.
     pub(crate) listener: ListenerLiveness,
+    /// Whether the transport built a QUIC endpoint (`transport-quic` on and
+    /// the endpoint bound). Only then does the node give a connection's
+    /// transport its peer key, which only a QUIC upgrade reads.
+    pub(crate) quic_endpoint: bool,
 }
 
 /// Registers peers the node expects to connect in, so the transport accepts
@@ -423,16 +427,14 @@ impl futures::Stream for IncomingChunks {
 /// [`IncomingStream`]s that are the same stream (clones or forks) both match
 /// its identity; any other stream does not.
 ///
-/// The representation is private: today it is a weak reference to the UDP
-/// transport's reassembly buffer.
+/// The representation is private: today it is a weak reference to the
+/// reassembly buffer, which both paths fill.
 #[derive(Clone, Debug)]
 pub struct StreamIdentity(std::sync::Weak<LockFreeStreamBuffer>);
 
 impl StreamIdentity {
-    /// The identity of the UDP stream reassembled into `buffer`.
-    pub(in crate::transport) fn from_udp_buffer(
-        buffer: std::sync::Weak<LockFreeStreamBuffer>,
-    ) -> Self {
+    /// The identity of the stream reassembled into `buffer`.
+    pub(in crate::transport) fn from_buffer(buffer: std::sync::Weak<LockFreeStreamBuffer>) -> Self {
         Self(buffer)
     }
 }
@@ -487,31 +489,43 @@ pub(crate) trait InboundStreamRegistry: Send + Sync {
     );
 }
 
-/// When a connection last received an authenticated packet, readable from
-/// outside the task that owns the connection. Cheap to clone; every clone
-/// reads the same stamp.
+/// When a connection last received an authenticated packet, on its UDP session
+/// or on its active QUIC path, readable from outside the task that owns the
+/// connection. Cheap to clone; every clone reads the same stamp.
 #[derive(Clone)]
 pub(crate) struct ReceiptStamp {
     last_nanos: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    quic_last_nanos: std::sync::Arc<std::sync::atomic::AtomicU64>,
     now_nanos: std::sync::Arc<dyn Fn() -> u64 + Send + Sync>,
 }
 
 impl ReceiptStamp {
-    /// `last_nanos` is the time of the last authenticated receipt and
-    /// `now_nanos` reads the clock it was stamped with.
+    /// `last_nanos` and `quic_last_nanos` are the times of the last
+    /// authenticated receipt on each side, and `now_nanos` reads the clock
+    /// both were stamped with. `quic_last_nanos` is 0 until a path has been active; it then keeps its last
+    /// write when the path ends, and ages out against `now_nanos`.
     pub(crate) fn new(
         last_nanos: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        quic_last_nanos: std::sync::Arc<std::sync::atomic::AtomicU64>,
         now_nanos: std::sync::Arc<dyn Fn() -> u64 + Send + Sync>,
     ) -> Self {
         Self {
             last_nanos,
+            quic_last_nanos,
             now_nanos,
         }
     }
 
-    /// Time since the connection last received an authenticated packet.
+    /// Time since the connection last received an authenticated packet, on
+    /// either side.
     pub(crate) fn since_last_receipt(&self) -> std::time::Duration {
-        let last = self.last_nanos.load(std::sync::atomic::Ordering::Acquire);
+        let last = self
+            .last_nanos
+            .load(std::sync::atomic::Ordering::Acquire)
+            .max(
+                self.quic_last_nanos
+                    .load(std::sync::atomic::Ordering::Acquire),
+            );
         std::time::Duration::from_nanos((self.now_nanos)().saturating_sub(last))
     }
 }
@@ -542,7 +556,8 @@ pub(crate) trait PeerConnectionApi: Send {
     fn remote_version(&self) -> Option<(u8, u8, u16)>;
 
     /// When this connection last received an authenticated packet (any
-    /// packet that decrypted under the session key, keepalives included).
+    /// packet that decrypted under the session key, keepalives included, or
+    /// frames on its active QUIC path, within a tick of the path's watch).
     /// `None` when the connection does not track it, as for test doubles.
     fn receipt_stamp(&self) -> Option<ReceiptStamp> {
         None
@@ -591,6 +606,15 @@ pub(crate) trait PeerConnectionApi: Send {
     /// This should be called by the node layer after connection establishment,
     /// before any messages are processed.
     fn set_inbound_stream_registry(&mut self, registry: std::sync::Arc<dyn InboundStreamRegistry>);
+
+    /// Records the peer key the node promoted this connection into the ring
+    /// under. The node calls it at promotion, when the transport has a QUIC
+    /// endpoint, with the key the node bound to the connection
+    /// (`identity::bind`), never a key from an upgrade message. A transport
+    /// that already holds a different key (the one it dialled, or one given
+    /// earlier) keeps it, refuses this one and counts the refusal. A QUIC
+    /// upgrade of the connection authenticates the peer against the held key.
+    fn set_peer_identity(&mut self, key: TransportPublicKey);
 
     /// Sends raw stream data to the remote peer as the stream `stream_id`
     /// (from [`StreamId::next`]), which the transport delivers with the

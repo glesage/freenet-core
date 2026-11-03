@@ -424,6 +424,7 @@ fn stream_kinds_keep_the_connection_and_the_rest_end_it() {
         (stop_code::EVICTED, true),
         (stop_code::CANCELLED, true),
         (stop_code::FRAGMENT_REFUSED, false),
+        (stop_code::NOT_ACCEPTING_DATA, false),
         (reset_code::LENGTH_MISMATCH, true),
         (0x1f, true),
         (9, true),
@@ -436,6 +437,7 @@ fn stream_kinds_keep_the_connection_and_the_rest_end_it() {
         (stop_code::HEADER_REFUSED, true),
         (stop_code::OVERLONG, true),
         (stop_code::FRAGMENT_REFUSED, true),
+        (stop_code::NOT_ACCEPTING_DATA, true),
         (0x2f, true),
         (9, true),
     ];
@@ -446,7 +448,7 @@ fn stream_kinds_keep_the_connection_and_the_rest_end_it() {
     );
     assert_eq!(
         resets.len(),
-        reset_code::ALL.len() + 5,
+        reset_code::ALL.len() + 6,
         "every reset code has a row"
     );
     let scope = |retryable: bool| {
@@ -612,6 +614,7 @@ fn close_codes_have_fixed_distinct_wire_values() {
         (QuicCloseCode::IdentityMismatch, 2),
         (QuicCloseCode::SendAbortLimit, 3),
         (QuicCloseCode::PeerNotAcknowledging, 4),
+        (QuicCloseCode::ControlRefused, 5),
     ];
     assert_eq!(expected.len(), QuicCloseCode::COUNT);
     for (code, wire) in expected {
@@ -619,7 +622,7 @@ fn close_codes_have_fixed_distinct_wire_values() {
         assert_eq!(QuicCloseCode::from_code(u64::from(wire)), Some(code));
         assert!(!code.reason().is_empty());
     }
-    for unknown in [5_u64, 0x0f, 0x11, 0x21, u64::from(u32::MAX)] {
+    for unknown in [6_u64, 0x0f, 0x11, 0x21, u64::from(u32::MAX)] {
         assert_eq!(QuicCloseCode::from_code(unknown), None, "{unknown:#x}");
     }
 }

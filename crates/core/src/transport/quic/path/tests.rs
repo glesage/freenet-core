@@ -99,7 +99,14 @@ async fn paths_with(
     drop(permit);
     let (a, a_in) = QuicPath::new(client, pair.time.clone());
     let (b, b_in) = match b_budget {
-        Some(budget) => QuicPath::with_budget(server, pair.time.clone(), b_limits, budget),
+        Some(budget) => {
+            let (b, b_in) =
+                QuicPath::with_budget_and_own_channels(server, pair.time.clone(), b_limits, budget);
+            if b_limits.accept_data {
+                b.enable_data();
+            }
+            (b, b_in)
+        }
         None => QuicPath::with_limits(server, pair.time.clone(), b_limits),
     };
     Paths {
@@ -183,7 +190,8 @@ fn assert_stopped(result: Result<(), QuicSendError>, code: u32) {
 /// send as a transport stream) arrive intact and in full, and the same
 /// message sent twice arrives twice: dedup is not this layer's (e5 does it
 /// in `PeerConnection`, where both transports meet). Short messages are
-/// charged to the budget until their payload is taken.
+/// charged to the budget until their payload is taken, except those of one
+/// packet or less, as on UDP.
 #[test]
 fn short_messages_round_trip_and_are_not_deduplicated() {
     bounded(|| async move {
@@ -204,7 +212,11 @@ fn short_messages_round_trip_and_are_not_deduplicated() {
             received.push(message);
         }
         assert_eq!(received.len(), 4);
-        assert_eq!(p.b.charged().0, 4, "queued messages hold their charge");
+        assert_eq!(
+            p.b.charged().0,
+            1,
+            "only the 200 KiB message is charged; the others fit one packet"
+        );
         let received: Vec<Vec<u8>> = received
             .into_iter()
             .map(|m| m.into_payload().to_vec())
@@ -636,7 +648,7 @@ fn a_sender_that_gives_up_resets_the_stream() {
                     )
                     .await;
                 // Let the resets reach the receiver.
-                a.send_short(b"after").await.expect("still connected");
+                a.send_short(&payload(2000)).await.expect("still connected");
                 (short, long, failed)
             })
             .await;
@@ -794,12 +806,13 @@ fn an_uncharged_stream_is_evicted_at_its_age_limit() {
     })
 }
 
-/// A full channel never makes the receiver wait: a short message or control
-/// frame is dropped and counted, a stream is stopped with `CHANNEL_FULL`
-/// and its charge released. A second stream with an id the path already
-/// holds is stopped with `STREAM_ID_IN_USE`.
+/// A full control channel drops and counts the frame (nothing is waiting on a
+/// control frame). A full short or stream channel makes only that message's
+/// reader wait, holding the stream's credit: nothing is lost, and the message
+/// arrives once the consumer takes one. A second stream with an id the path
+/// already holds is stopped with `STREAM_ID_IN_USE`.
 #[test]
-fn full_channels_and_reused_ids_are_refused_without_waiting() {
+fn full_channels_hold_data_and_drop_control_and_reused_ids_are_refused() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
         let limits = QuicPathLimits {
@@ -811,7 +824,7 @@ fn full_channels_and_reused_ids_are_refused_without_waiting() {
         let mut p = paths("quic-path-full", 9, limits).await;
         let a = p.a.clone();
         let held = StreamId::next();
-        let (reused, overflow) = p
+        let reused = p
             .drive(async move {
                 a.send_short(b"one").await.unwrap();
                 a.send_short(b"two").await.unwrap();
@@ -820,22 +833,253 @@ fn full_channels_and_reused_ids_are_refused_without_waiting() {
                 a.send_stream(held, None, Bytes::from_static(b"held"))
                     .await
                     .unwrap();
-                let reused = a.send_stream(held, None, over_window()).await;
-                let overflow = a.send_stream(StreamId::next(), None, over_window()).await;
-                (reused, overflow)
+                a.send_stream(held, None, over_window()).await
             })
             .await;
         assert_stopped(reused, stop_code::STREAM_ID_IN_USE);
-        assert_stopped(overflow, stop_code::CHANNEL_FULL);
+        // A stream announced behind a full channel is not stopped: its sender
+        // is blocked on flow control until the consumer takes the first.
+        let a = p.a.clone();
+        let second_id = StreamId::next();
+        let second =
+            tokio::spawn(async move { a.send_stream(second_id, None, over_window()).await });
+        let time = p.time();
+        p.drive(async move { time.sleep(Duration::from_secs(1)).await })
+            .await;
+        assert!(!second.is_finished(), "the second stream waits for room");
         let stats = p.b.stats();
-        assert_eq!(stats.count(QuicInboundOutcome::ShortDroppedFull), 1);
+        assert_eq!(stats.count(QuicInboundOutcome::ShortDroppedFull), 0);
+        assert_eq!(stats.count(QuicInboundOutcome::StreamDroppedFull), 0);
         assert_eq!(stats.count(QuicInboundOutcome::ControlDroppedFull), 1);
         assert_eq!(stats.count(QuicInboundOutcome::StreamIdInUse), 1);
-        assert_eq!(stats.count(QuicInboundOutcome::StreamDroppedFull), 1);
         assert_eq!(&p.b_in.shorts.try_recv().unwrap().payload()[..], b"one");
         assert_eq!(&p.b_in.controls.try_recv().unwrap()[..], b"one");
         assert_eq!(p.b_in.streams.try_recv().unwrap().stream_id, held);
-        assert_eq!(p.b.charged(), (0, 0));
+        let time = p.time();
+        let second = p
+            .drive(async move {
+                let sent = second.await.unwrap();
+                time.sleep(Duration::from_secs(1)).await;
+                sent
+            })
+            .await;
+        second.expect("sent once there was room");
+        assert_eq!(&p.b_in.shorts.try_recv().unwrap().payload()[..], b"two");
+        assert_eq!(p.b_in.streams.try_recv().unwrap().stream_id, second_id);
+        assert_eq!(stats.count(QuicInboundOutcome::ShortDroppedFull), 0);
+        assert_eq!(stats.count(QuicInboundOutcome::StreamDroppedFull), 0);
+    })
+}
+
+/// A message held for room in a full channel is stopped at its age limit, so
+/// the wait is bounded and the charge is released.
+#[test]
+fn a_message_waiting_for_room_is_evicted_at_its_age_limit() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let limits = QuicPathLimits {
+            short_capacity: 1,
+            ..QuicPathLimits::DEFAULT
+        };
+        let mut p = paths("quic-path-full-age", 70, limits).await;
+        let a = p.a.clone();
+        p.drive(async move {
+            a.send_short(b"one").await.unwrap();
+            a.send_short(b"two").await.unwrap();
+        })
+        .await;
+        let time = p.time();
+        let age = max_inbound_stream_age(0);
+        p.drive(async move { time.sleep(age + Duration::from_secs(1)).await })
+            .await;
+        assert_eq!(&p.b_in.shorts.try_recv().unwrap().payload()[..], b"one");
+        let time = p.time();
+        p.drive(async move { time.sleep(Duration::from_secs(1)).await })
+            .await;
+        assert!(p.b_in.shorts.try_recv().is_err(), "the second was evicted");
+        assert_eq!(p.b.stats().count(QuicInboundOutcome::ShortDroppedFull), 0);
+    })
+}
+
+/// Waiters for room in a full channel are capped by quinn's stream limit:
+/// a Short waits BEFORE its end is read, so its stream stays open and its
+/// credit is held. With nothing draining, the sends that complete are those
+/// the channel holds plus the `MAX_UNI_STREAMS` readers waiting; the rest block
+/// in `open_uni`, and the memory held does not grow with the peer's upload.
+/// (Reading the end first frees the stream, so every send would complete and
+/// every one of the readers would be left waiting.) Once the consumer drains,
+/// all of them arrive.
+#[test]
+fn waiters_for_a_full_channel_are_capped_by_the_stream_limit() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let mut p = paths("quic-path-waiters", 80, QuicPathLimits::DEFAULT).await;
+        let limit = super::super::config::MAX_UNI_STREAMS as usize;
+        let count = SHORT_CHANNEL_CAPACITY + limit + 40;
+        let done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for i in 0..count {
+            let (a, done) = (p.a.clone(), done.clone());
+            tokio::spawn(async move {
+                a.send_short(&(i as u32).to_be_bytes()).await.unwrap();
+                done.fetch_add(1, Ordering::SeqCst);
+            });
+        }
+        let time = p.time();
+        p.drive(async move { time.sleep(Duration::from_secs(5)).await })
+            .await;
+        let sent = done.load(Ordering::SeqCst);
+        assert!(
+            sent <= SHORT_CHANNEL_CAPACITY + limit,
+            "{sent} sends completed with nothing draining"
+        );
+        assert!(sent >= SHORT_CHANNEL_CAPACITY, "only {sent} completed");
+        let stats = p.b.stats();
+        assert_eq!(p.b_in.shorts.len(), SHORT_CHANNEL_CAPACITY);
+        assert_eq!(
+            stats.count(QuicInboundOutcome::DeliveredShort) as usize,
+            SHORT_CHANNEL_CAPACITY
+        );
+        let mut got = std::collections::BTreeSet::new();
+        for _ in 0..200 {
+            while let Ok(message) = p.b_in.shorts.try_recv() {
+                let bytes: [u8; 4] = message.payload()[..].try_into().unwrap();
+                got.insert(u32::from_be_bytes(bytes));
+            }
+            if got.len() == count {
+                break;
+            }
+            let time = p.time();
+            p.drive(async move { time.sleep(Duration::from_millis(10)).await })
+                .await;
+        }
+        assert_eq!(got.len(), count, "every message arrived once drained");
+        assert_eq!(stats.count(QuicInboundOutcome::ShortDroppedFull), 0);
+    })
+}
+
+/// After a wait for room, idleness applies again: a stream that waits longer
+/// than the idle timeout, then stalls, is evicted idle, not at its age limit.
+#[test]
+fn a_stream_that_waited_for_room_is_evicted_idle_when_it_stalls() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let limits = QuicPathLimits {
+            stream_capacity: 1,
+            ..QuicPathLimits::DEFAULT
+        };
+        let mut p = paths("quic-path-wait-idle", 81, limits).await;
+        let idle = streaming_handle_idle_timeout();
+        let total = 10_000u64;
+        assert!(
+            max_inbound_stream_age(total) > idle * 5,
+            "the wait and the stall must fit inside the age limit"
+        );
+        let a = p.a.clone();
+        let held = StreamId::next();
+        p.drive(async move {
+            a.send_stream(held, None, Bytes::from_static(b"held"))
+                .await
+                .unwrap();
+        })
+        .await;
+        // Announced behind the full channel; half its payload, never finished.
+        let conn = p.a_raw();
+        let sender = tokio::spawn(async move {
+            let mut send = conn.open_uni().await.unwrap();
+            let mut bytes = header(1, 1, StreamId::next().0, total, 0);
+            bytes.extend_from_slice(&payload(5000));
+            send.write_all(&bytes).await.unwrap();
+            send.stopped().await.unwrap().map(|c| c.into_inner())
+        });
+        let time = p.time();
+        let sleeper = time.clone();
+        p.drive(async move { sleeper.sleep(idle * 3).await }).await;
+        assert!(!sender.is_finished(), "waiting for room is not idleness");
+        let stats = p.b.stats();
+        assert_eq!(stats.shared_count(InboundStreamOutcome::EvictedIdle), 0);
+        assert_eq!(p.b_in.streams.try_recv().unwrap().stream_id, held);
+        let released = time.now_nanos();
+        let code = p.drive(async move { sender.await.unwrap() }).await;
+        assert_eq!(code, Some(u64::from(stop_code::EVICTED)));
+        let stalled = Duration::from_nanos(time.now_nanos() - released);
+        assert!(
+            stalled >= idle && stalled < idle * 2,
+            "evicted {stalled:?} after the wait ended, idle timeout {idle:?}"
+        );
+        assert_eq!(stats.shared_count(InboundStreamOutcome::EvictedIdle), 1);
+        assert_eq!(stats.shared_count(InboundStreamOutcome::EvictedAge), 0);
+    })
+}
+
+/// A reader still waiting for room when its path ends is dropped with the
+/// receive task; each is counted, per kind.
+#[test]
+fn readers_waiting_for_room_when_the_path_ends_are_counted() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let limits = QuicPathLimits {
+            short_capacity: 1,
+            stream_capacity: 1,
+            ..QuicPathLimits::DEFAULT
+        };
+        let p = paths("quic-path-abandoned", 82, limits).await;
+        let a = p.a.clone();
+        let second_id = StreamId::next();
+        let sent = tokio::spawn(async move {
+            a.send_short(b"one").await.unwrap();
+            a.send_short(b"two").await.unwrap();
+            a.send_stream(StreamId::next(), None, Bytes::from_static(b"held"))
+                .await
+                .unwrap();
+            a.send_stream(second_id, None, over_window()).await
+        });
+        let time = p.time();
+        let sleeper = time.clone();
+        p.drive(async move { sleeper.sleep(Duration::from_secs(1)).await })
+            .await;
+        let stats = p.b.stats_handle();
+        assert_eq!(stats.count(QuicInboundOutcome::ShortAbandonedWaiting), 0);
+        assert_eq!(stats.count(QuicInboundOutcome::StreamAbandonedWaiting), 0);
+        let Paths { pair, b, .. } = p;
+        drop(b);
+        drive(&pair.time, LIMIT, async move {
+            time.sleep(Duration::from_secs(1)).await
+        })
+        .await;
+        sent.abort();
+        assert_eq!(stats.count(QuicInboundOutcome::ShortAbandonedWaiting), 1);
+        assert_eq!(stats.count(QuicInboundOutcome::StreamAbandonedWaiting), 1);
+    })
+}
+
+/// A full budget still delivers a short message of one packet or less: it is
+/// not charged, so no refusal can race its acknowledgement.
+#[test]
+fn a_full_budget_still_delivers_a_one_packet_short() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let limits = QuicPathLimits {
+            max_streams: 1,
+            max_bytes: ChargeOverhead::DEFAULT.cost(10_000),
+            ..QuicPathLimits::DEFAULT
+        };
+        let mut p = paths("quic-path-full-budget", 71, limits).await;
+        let a = p.a.clone();
+        p.drive(async move {
+            a.send_stream(StreamId::next(), None, Bytes::from_static(b"held"))
+                .await
+                .expect("fits");
+            a.send_short(b"small").await.expect("sent");
+        })
+        .await;
+        assert_eq!(p.b.charged().0, 1, "the held stream fills the budget");
+        assert_eq!(&p.b_in.shorts.try_recv().unwrap().payload()[..], b"small");
+        let stats = p.b.stats();
+        assert_eq!(stats.count(QuicInboundOutcome::DeliveredShort), 1);
+        assert_eq!(
+            stats.shared_count(InboundStreamOutcome::RefusedConnectionStreams),
+            0
+        );
     })
 }
 
@@ -896,14 +1140,14 @@ fn the_stream_limit_is_back_pressure() {
     })
 }
 
-/// A receiver that never drains its channel loses what does not fit and
-/// counts it, while every send reports success: the bytes were acknowledged
-/// (a successful send is not a delivery).
+/// A flood into a full channel loses nothing: the readers that find it full
+/// wait, and every message arrives as the consumer drains. Sends read as
+/// success once acknowledged, which they now are for what is delivered later.
 #[test]
-fn a_flood_into_an_undrained_receiver_is_dropped_and_counted() {
+fn a_flood_into_a_slow_receiver_is_held_and_all_delivered() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let p = paths("quic-path-flood", 12, QuicPathLimits::DEFAULT).await;
+        let mut p = paths("quic-path-flood", 12, QuicPathLimits::DEFAULT).await;
         let count = SHORT_CHANNEL_CAPACITY + 44;
         let a = p.a.clone();
         let results = p
@@ -915,16 +1159,27 @@ fn a_flood_into_an_undrained_receiver_is_dropped_and_counted() {
                 .await
             })
             .await;
-        assert!(
-            results.iter().all(Result::is_ok),
-            "every send reads as success"
-        );
+        assert!(results.iter().all(Result::is_ok), "every send is acked");
+        let mut got = std::collections::BTreeSet::new();
+        for _ in 0..100 {
+            while let Ok(message) = p.b_in.shorts.try_recv() {
+                let bytes: [u8; 4] = message.payload()[..].try_into().unwrap();
+                got.insert(u32::from_be_bytes(bytes));
+            }
+            if got.len() == count {
+                break;
+            }
+            let time = p.time();
+            p.drive(async move { time.sleep(Duration::from_millis(10)).await })
+                .await;
+        }
+        assert_eq!(got.len(), count, "every message arrived");
         let stats = p.b.stats();
         assert_eq!(
             stats.count(QuicInboundOutcome::DeliveredShort) as usize,
-            SHORT_CHANNEL_CAPACITY
+            count
         );
-        assert_eq!(stats.count(QuicInboundOutcome::ShortDroppedFull), 44);
+        assert_eq!(stats.count(QuicInboundOutcome::ShortDroppedFull), 0);
     })
 }
 
@@ -991,7 +1246,7 @@ fn a_stream_id_is_free_again_once_its_state_is_gone() {
         })
         .await;
         let a = p.a.clone();
-        p.drive(async move { a.send_short(b"sync").await.unwrap() })
+        p.drive(async move { a.send_short(&payload(2000)).await.unwrap() })
             .await;
         assert!(p.b_in.streams.try_recv().is_err(), "neither was announced");
         assert_eq!(p.b.stats().count(QuicInboundOutcome::Truncated), 2);
@@ -1022,7 +1277,7 @@ fn a_stalled_source_still_sees_the_stop() {
                     StreamId::next(),
                     1_000_000,
                     None,
-                    futures::stream::pending::<Result<Bytes, StreamError>>(),
+                    stalls_after_first_chunk(),
                 )
                 .await
             })
@@ -1251,7 +1506,7 @@ fn a_locally_cancelled_stream_is_stopped() {
                 let mut bytes = header(1, 1, id, total as u64, 0);
                 bytes.extend_from_slice(&payload(10));
                 send.write_all(&bytes).await.unwrap();
-                a.send_short(b"sync").await.unwrap();
+                a.send_short(&payload(2000)).await.unwrap();
                 send
             })
             .await;
@@ -1327,7 +1582,7 @@ fn dropping_the_path_cancels_streams_in_progress() {
             .await;
         // Let the header and metadata reach the receiver.
         let a = p.a.clone();
-        p.drive(async move { a.send_short(b"sync").await.unwrap() })
+        p.drive(async move { a.send_short(&payload(2000)).await.unwrap() })
             .await;
         let arrival = p.b_in.streams.try_recv().expect("announced");
         assert!(!arrival.handle.is_cancelled());
@@ -1475,7 +1730,7 @@ fn quic_keys_never_collide_with_udp_ids() {
             a.send_stream(id, None, Bytes::from_static(b"same id"))
                 .await
                 .expect("admitted beside the UDP charge");
-            a.send_short(b"short").await.expect("short");
+            a.send_short(&payload(2000)).await.expect("short");
         })
         .await;
         let arrival = p.b_in.streams.try_recv().expect("announced");
@@ -1539,7 +1794,7 @@ fn a_quic_guard_releases_only_its_own_charge() {
         let conn = p.a_raw();
         p.drive(raw_stream(conn, cut)).await;
         let a = p.a.clone();
-        p.drive(async move { a.send_short(b"sync").await.unwrap() })
+        p.drive(async move { a.send_short(&payload(2000)).await.unwrap() })
             .await;
         assert!(p.b_in.streams.try_recv().is_err(), "not announced");
         assert_eq!(p.b.stats().count(QuicInboundOutcome::Truncated), 1);
@@ -1601,8 +1856,8 @@ fn quic_admission_holds_one_budget_lock_from_check_to_charge() {
 
 // #5940 step M6: the path recycle guards (`super::recycle`).
 
-/// `count` sends from `path` whose chunk source fails at once, so each is
-/// reset on this side ([`reset_code::SENDER_ABORTED`]).
+/// `count` sends from `path` whose chunk source fails after its first chunk,
+/// so each is reset on this side ([`reset_code::SENDER_ABORTED`]).
 async fn abort_sends(path: Arc<QuicPath>, count: u64) {
     for _ in 0..count {
         let failed = path
@@ -1610,7 +1865,10 @@ async fn abort_sends(path: Arc<QuicPath>, count: u64) {
                 StreamId::next(),
                 20_000,
                 None,
-                futures::stream::iter(vec![Err(StreamError::InactivityTimeout)]),
+                futures::stream::iter(vec![
+                    Ok(Bytes::from_static(b"first")),
+                    Err(StreamError::InactivityTimeout),
+                ]),
             )
             .await;
         assert!(
@@ -1715,7 +1973,7 @@ fn a_dropped_send_counts_as_a_reset() {
                             StreamId::next(),
                             20_000,
                             None,
-                            futures::stream::pending(),
+                            stalls_after_first_chunk(),
                         ) => panic!("a send from a pending source ended: {sent:?}"),
                         () = time.sleep(Duration::from_secs(1)) => {}
                     }
@@ -1747,7 +2005,10 @@ fn a_stop_reported_by_the_write_is_not_counted() {
         let (written, aborts) = p
             .drive(async move {
                 let header = FrameHeader::short(10).expect("a short header");
-                let mut send = a.open(&header, &[]).await.expect("open");
+                let mut send = a
+                    .open(&header, &[], None, SendProgress::new())
+                    .await
+                    .expect("open");
                 let written = send.written(Err(quinn::WriteError::Stopped(
                     stop_code::BUDGET_REFUSED.into(),
                 )));
@@ -2443,5 +2704,1532 @@ fn an_idle_path_is_not_closed() {
         assert!(p.b.connection().inner().close_reason().is_none());
         assert!(recycle_closes_to(a_addr).is_empty());
         assert!(recycle_closes_to(b_addr).is_empty());
+    })
+}
+
+/// A chunk source that gives one chunk and then has nothing more: a send from
+/// it opens its stream, which then waits on the source.
+fn stalls_after_first_chunk()
+-> impl futures::Stream<Item = Result<Bytes, StreamError>> + Unpin + Send + 'static {
+    futures::stream::iter([Ok(Bytes::from_static(b"first"))]).chain(futures::stream::pending())
+}
+
+/// A future that never completes, standing in for a send blocked on the
+/// peer.
+async fn never() -> Result<(), QuicSendError> {
+    futures::future::pending().await
+}
+
+/// `bounded_send`'s classification, on virtual time with sends that block: a
+/// deadline before the stream is open is `NotOpened`, one after that
+/// `Failed(TimedOut)`, one after the end of the stream
+/// `MaybeDelivered(TimedOut)`; a connection lost before the stream is open is
+/// `NotOpened`, after it `Failed` and after the end
+/// `MaybeDelivered(ConnectionLost)`; a stop after the end is `Failed` (the peer
+/// refused it); success is `Sent`. The deadline is the one given, on the given
+/// clock.
+#[test]
+fn bounded_send_classifies_by_whether_the_stream_was_finished() {
+    bounded(|| async move {
+        let time = VirtualTime::new();
+        let clock = time.clone();
+        let (unopened, blocked, finished_then_blocked, timings) = drive(&time, LIMIT, async move {
+            let unopened = bounded_send(&clock, Duration::from_secs(1), |_| never()).await;
+            let start = clock.now();
+            let blocked = bounded_send(&clock, Duration::from_secs(5), |progress| async move {
+                progress.mark_opened();
+                never().await
+            })
+            .await;
+            let blocked_after = clock.now() - start;
+            let finished = bounded_send(&clock, Duration::from_secs(3), |progress| async move {
+                progress.mark_finished();
+                never().await
+            })
+            .await;
+            (
+                unopened,
+                blocked,
+                finished,
+                (blocked_after, clock.now() - start),
+            )
+        })
+        .await;
+        assert!(
+            matches!(
+                unopened,
+                BoundedSend::Failed(SendFailure::NotOpened(NotOpened::TimedOut))
+            ),
+            "{unopened:?}"
+        );
+        assert!(
+            matches!(blocked, BoundedSend::Failed(SendFailure::TimedOut)),
+            "{blocked:?}"
+        );
+        assert!(
+            matches!(
+                finished_then_blocked,
+                BoundedSend::MaybeDelivered(MaybeDelivered::TimedOut)
+            ),
+            "{finished_then_blocked:?}"
+        );
+        assert_eq!(timings, (Duration::from_secs(5), Duration::from_secs(8)));
+
+        let lost = || QuicSendError::ConnectionLost(quinn::ConnectionError::LocallyClosed);
+        let progress = SendProgress::new();
+        assert!(matches!(
+            bounded::outcome(Err(lost()), &progress),
+            BoundedSend::Failed(SendFailure::NotOpened(NotOpened::ConnectionLost(_)))
+        ));
+        progress.mark_opened();
+        assert!(matches!(
+            bounded::outcome(Err(lost()), &progress),
+            BoundedSend::Failed(SendFailure::Error(QuicSendError::ConnectionLost(_)))
+        ));
+        assert!(matches!(
+            bounded::outcome(Ok(()), &progress),
+            BoundedSend::Sent
+        ));
+        progress.mark_finished();
+        assert!(matches!(
+            bounded::outcome(Err(lost()), &progress),
+            BoundedSend::MaybeDelivered(MaybeDelivered::ConnectionLost)
+        ));
+        assert!(matches!(
+            bounded::outcome(Err(stopped(stop_code::CHANNEL_FULL)), &progress),
+            BoundedSend::Failed(SendFailure::Error(QuicSendError::Stopped(_)))
+        ));
+    })
+}
+
+/// A send that finishes before its deadline leaves no timer on the clock
+/// (`bounded_send` uses the cancelable sleep).
+#[test]
+fn bounded_send_that_finishes_early_leaves_no_wakeup() {
+    bounded(|| async move {
+        let time = VirtualTime::new();
+        let clock = time.clone();
+        let sent = drive(&time, LIMIT, async move {
+            bounded_send(&clock, Duration::from_secs(60), |_| async { Ok(()) }).await
+        })
+        .await;
+        assert!(matches!(sent, BoundedSend::Sent), "{sent:?}");
+        assert_eq!(time.pending_wakeup_count(), 0);
+    })
+}
+
+/// The outcomes on a real path. A `Ready` sent and acknowledged is `Sent`,
+/// and the receiver decodes it. With every acknowledgement from the peer
+/// dropped, the next frame is written whole and arrives, but the sender
+/// cannot know: `MaybeDelivered(TimedOut)`, not `Failed`. With every uni
+/// stream credit held, a send cannot open its stream: `Failed(TimedOut)`.
+/// A connection closed while waiting for the acknowledgement is
+/// `MaybeDelivered(ConnectionLost)`.
+#[test]
+fn bounded_sends_on_a_path_report_each_outcome() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let mut p = paths("quic-path-bounded", 60, QuicPathLimits::DEFAULT).await;
+        let (a, time) = (p.a.clone(), p.time());
+        let ready = QuicControl::Ready {
+            attempt: 7,
+            caps: 0,
+        };
+        let ack = QuicControl::ReadyAck {
+            attempt: 7,
+            caps: 0,
+        };
+        let timeout = Duration::from_secs(5);
+        let sent = p
+            .drive(async move { a.send_control_bounded(&time, timeout, ready).await })
+            .await;
+        assert!(matches!(sent, BoundedSend::Sent), "{sent:?}");
+        let payload = p.b_in.controls.try_recv().expect("delivered");
+        assert_eq!(p.b.decode_control(&payload), Ok(ready));
+
+        // Nothing from b reaches a: no acknowledgement.
+        let silenced = DropFrom::new("quic-path-bounded", &[p.pair.b_addr]);
+        let (a, time) = (p.a.clone(), p.time());
+        let unacked = p
+            .drive(async move { a.send_control_bounded(&time, timeout, ack).await })
+            .await;
+        assert!(
+            matches!(
+                unacked,
+                BoundedSend::MaybeDelivered(MaybeDelivered::TimedOut)
+            ),
+            "{unacked:?}"
+        );
+        let payload = p.b_in.controls.try_recv().expect("it did arrive");
+        assert_eq!(p.b.decode_control(&payload), Ok(ack));
+
+        // Still no acknowledgements; a closes its side while waiting.
+        let (a, time) = (p.a.clone(), p.time());
+        let lost = p
+            .drive(async move {
+                let send = a.send_control_bounded(&time, Duration::from_secs(60), ack);
+                tokio::pin!(send);
+                tokio::select! {
+                    outcome = &mut send => panic!("returned before the close: {outcome:?}"),
+                    () = time.sleep(Duration::from_secs(1)) => {}
+                }
+                a.connection().close(QuicCloseCode::Downgrade);
+                send.await
+            })
+            .await;
+        assert!(
+            matches!(
+                lost,
+                BoundedSend::MaybeDelivered(MaybeDelivered::ConnectionLost)
+            ),
+            "{lost:?}"
+        );
+        drop(silenced);
+
+        // A fresh pair, every credit held by streams b is still reading.
+        let p = paths("quic-path-bounded-open", 61, QuicPathLimits::DEFAULT).await;
+        let (conn, a, time) = (p.a_raw(), p.a.clone(), p.time());
+        let (blocked, held) = p
+            .drive(async move {
+                let mut held = Vec::new();
+                for _ in 0..super::super::config::MAX_UNI_STREAMS {
+                    let mut send = conn.open_uni().await.unwrap();
+                    let head = header(1, 1, StreamId::next().0, 1000, 0);
+                    send.write_all(&head).await.unwrap();
+                    held.push(send);
+                }
+                let blocked = a.send_control_bounded(&time, timeout, ready).await;
+                (blocked, held)
+            })
+            .await;
+        assert!(
+            matches!(
+                blocked,
+                BoundedSend::Failed(SendFailure::NotOpened(NotOpened::TimedOut))
+            ),
+            "{blocked:?}"
+        );
+        assert_eq!(p.b.stats().count(QuicInboundOutcome::DeliveredControl), 0);
+        assert_eq!(
+            p.b.stats().count(QuicInboundOutcome::AnnouncedStream),
+            u64::from(super::super::config::MAX_UNI_STREAMS),
+            "b holds every stream, so the send was blocked by the limit"
+        );
+        drop(held);
+    })
+}
+
+/// A control payload the receiving path cannot read is refused and counted
+/// by kind: an unknown version, an unknown type, a wrong length.
+#[test]
+fn refused_control_payloads_are_counted() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let p = paths("quic-path-control-refused", 62, QuicPathLimits::DEFAULT).await;
+        let mut ready = QuicControl::Ready {
+            attempt: 1,
+            caps: 0,
+        }
+        .encode();
+        assert!(p.b.decode_control(&ready).is_ok());
+        ready[0] = 2;
+        assert_eq!(
+            p.b.decode_control(&ready),
+            Err(ControlError::UnknownVersion(2))
+        );
+        ready[0] = 1;
+        ready[1] = 9;
+        assert_eq!(
+            p.b.decode_control(&ready),
+            Err(ControlError::UnknownType(9))
+        );
+        assert_eq!(
+            p.b.decode_control(&[1, 0, 0]),
+            Err(ControlError::WrongLength(3))
+        );
+        assert_eq!(p.b.decode_control(&[]), Err(ControlError::Empty));
+        let stats = p.b.stats();
+        assert_eq!(stats.count(QuicInboundOutcome::ControlUnknownVersion), 1);
+        assert_eq!(stats.count(QuicInboundOutcome::ControlUnknownType), 1);
+        assert_eq!(stats.count(QuicInboundOutcome::ControlMalformed), 2);
+    })
+}
+
+/// quinn-proto 0.11.19 announces new stream credit only past 64 / 8 freed
+/// streams (`queue_max_stream_id`). Written out, not derived from
+/// `UNANNOUNCED_CREDIT_SLACK`, so a wrong slack is not checked against itself.
+const QUINN_UNANNOUNCED_CREDIT: usize = 8;
+
+/// `count` streamed sends on a source that never delivers, for a test to race
+/// against: each holds a permit and a stream, or waits for a permit.
+fn blocked_streamed_sends(
+    a: &Arc<QuicPath>,
+    count: usize,
+) -> futures::stream::FuturesUnordered<
+    impl std::future::Future<Output = Result<(), QuicSendError>> + use<>,
+> {
+    (0..count)
+        .map(|_| {
+            let a = a.clone();
+            async move {
+                a.send_stream_chunks(StreamId::next(), 1000, None, stalls_after_first_chunk())
+                    .await
+            }
+        })
+        .collect()
+}
+
+/// The reserve is exactly what the division of the limit says, in the worst
+/// case for quinn's batched credit: with 8 freed slots not yet announced and
+/// every permit held by a send blocked on a source that never delivers, 8
+/// slots are left. Seven are held here and a short message takes the eighth;
+/// a control frame goes through after it. The streamed sends past the limit
+/// wait for a permit without opening a stream.
+#[test]
+fn a_short_still_sends_while_streamed_messages_are_blocked() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let mut p = paths("quic-path-reserved", 63, QuicPathLimits::DEFAULT).await;
+        let limit = super::super::config::STREAMED_SEND_LIMIT as usize;
+        assert_eq!(limit, 48);
+        let streamed = super::super::config::MAX_UNI_STREAMS as usize + 6;
+        let (a, conn, time) = (p.a.clone(), p.a_raw(), p.time());
+        let (short, control, still_blocked) = p
+            .drive(async move {
+                // Freed at the receiver, too few for quinn to announce.
+                for _ in 0..QUINN_UNANNOUNCED_CREDIT {
+                    a.send_short(b"earlier").await.expect("earlier short");
+                }
+                time.sleep(Duration::from_secs(1)).await;
+                let mut blocked = blocked_streamed_sends(&a, streamed);
+                let timeout = Duration::from_secs(5);
+                let sends = async {
+                    time.sleep(Duration::from_secs(2)).await;
+                    let mut held = Vec::new();
+                    for slot in 1..=7 {
+                        tokio::select! {
+                            send = conn.open_uni() => held.push(send.unwrap()),
+                            () = time.sleep(timeout) => panic!("reserved slot {slot} is missing"),
+                        }
+                    }
+                    let short = a.send_short_bounded(&time, timeout, b"through").await;
+                    let control = a
+                        .send_control_bounded(
+                            &time,
+                            timeout,
+                            QuicControl::Ready {
+                                attempt: 1,
+                                caps: 0,
+                            },
+                        )
+                        .await;
+                    (short, control)
+                };
+                tokio::select! {
+                    done = blocked.next() => panic!("a blocked send returned: {done:?}"),
+                    (short, control) = sends => (short, control, blocked.len()),
+                }
+            })
+            .await;
+        assert!(matches!(short, BoundedSend::Sent), "{short:?}");
+        assert!(matches!(control, BoundedSend::Sent), "{control:?}");
+        assert_eq!(still_blocked, streamed);
+        assert_eq!(
+            p.b.stats().count(QuicInboundOutcome::AnnouncedStream) as usize,
+            limit,
+            "streamed sends past the limit wait without opening a stream"
+        );
+        let mut shorts = Vec::new();
+        while let Ok(short) = p.b_in.shorts.try_recv() {
+            shorts.push(short.into_payload());
+        }
+        assert_eq!(shorts.len(), QUINN_UNANNOUNCED_CREDIT + 1);
+        assert_eq!(&shorts[QUINN_UNANNOUNCED_CREDIT][..], b"through");
+        assert!(p.b_in.controls.try_recv().is_ok());
+    })
+}
+
+/// A streamed send returns its permit however it ends: more sends than
+/// there are permits complete one after another, and after every permit was
+/// held by a send that timed out, the next streamed send still completes.
+#[test]
+fn streamed_sends_return_their_permits() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let p = paths("quic-path-permits", 66, QuicPathLimits::DEFAULT).await;
+        let limit = super::super::config::STREAMED_SEND_LIMIT as usize;
+        let (a, time) = (p.a.clone(), p.time());
+        let (completed, timed_out, later) = p
+            .drive(async move {
+                let timeout = Duration::from_secs(5);
+                let body = Bytes::from_static(b"body");
+                let mut completed = Vec::new();
+                for _ in 0..=limit {
+                    completed.push(
+                        a.send_stream_bounded(
+                            &time,
+                            timeout,
+                            StreamId::next(),
+                            None,
+                            body.clone(),
+                            None,
+                        )
+                        .await,
+                    );
+                }
+                let timed_out = futures::future::join_all((0..limit).map(|_| {
+                    a.send_stream_chunks_bounded(
+                        &time,
+                        Duration::from_secs(1),
+                        StreamId::next(),
+                        1000,
+                        None,
+                        stalls_after_first_chunk(),
+                        None,
+                    )
+                }))
+                .await;
+                let later = a
+                    .send_stream_bounded(&time, timeout, StreamId::next(), None, body, None)
+                    .await;
+                (completed, timed_out, later)
+            })
+            .await;
+        for outcome in &completed {
+            assert!(matches!(outcome, BoundedSend::Sent), "{outcome:?}");
+        }
+        for outcome in &timed_out {
+            assert!(
+                matches!(outcome, BoundedSend::Failed(SendFailure::TimedOut)),
+                "{outcome:?}"
+            );
+        }
+        assert!(matches!(later, BoundedSend::Sent), "{later:?}");
+    })
+}
+
+/// A bounded send whose deadline passes while it waits for a permit is
+/// `NotOpened`, and it opened no stream: the receiver announces only the
+/// streams holding permits, and nothing had to be reset.
+#[test]
+fn a_bounded_send_timing_out_on_a_permit_opens_no_stream() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let p = paths("quic-path-permit-wait", 67, QuicPathLimits::DEFAULT).await;
+        let limit = super::super::config::STREAMED_SEND_LIMIT as usize;
+        let (a, time) = (p.a.clone(), p.time());
+        let (outcome, aborts) = p
+            .drive(async move {
+                let mut blocked = blocked_streamed_sends(&a, limit);
+                let send = async {
+                    time.sleep(Duration::from_secs(2)).await;
+                    let outcome = a
+                        .send_stream_bounded(
+                            &time,
+                            Duration::from_secs(3),
+                            StreamId::next(),
+                            None,
+                            Bytes::from_static(b"body"),
+                            None,
+                        )
+                        .await;
+                    (outcome, a.send_aborts())
+                };
+                tokio::select! {
+                    done = blocked.next() => panic!("a blocked send returned: {done:?}"),
+                    result = send => result,
+                }
+            })
+            .await;
+        assert!(
+            matches!(
+                outcome,
+                BoundedSend::Failed(SendFailure::NotOpened(NotOpened::TimedOut))
+            ),
+            "{outcome:?}"
+        );
+        assert_eq!(aborts, 0, "no stream was opened, so none was reset");
+        assert_eq!(
+            p.b.stats().count(QuicInboundOutcome::AnnouncedStream) as usize,
+            limit
+        );
+    })
+}
+
+/// A shadow path never sends data. Only a debug build checks.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "a shadow QUIC path sends control frames only")]
+fn a_shadow_path_does_not_send_data() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let p = paths("quic-path-shadow-sends", 66, QuicPathLimits::SHADOW).await;
+        let time = p.time();
+        p.b.send_short_bounded(&time, Duration::from_secs(5), b"data")
+            .await;
+    });
+}
+
+/// A path in shadow mode refuses a Short or Stream frame with
+/// `NOT_ACCEPTING_DATA` before anything is charged, and counts it: the
+/// inbound budget it shares with the UDP session is untouched (no charge,
+/// no budget refusal), even when that budget is full. Control frames still
+/// arrive. The sender sees the stop as a failed send.
+#[test]
+fn a_shadow_path_refuses_data_before_charging_the_budget() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        for (subnet, budget) in [
+            (64, SharedInboundBudget::new(1024, 1 << 30)),
+            (65, SharedInboundBudget::new(0, 0)),
+        ] {
+            let mut p = paths_with(
+                &format!("quic-path-shadow-{subnet}"),
+                subnet,
+                QuicPathLimits::SHADOW,
+                Some(budget),
+            )
+            .await;
+            let (a, time) = (p.a.clone(), p.time());
+            let timeout = Duration::from_secs(5);
+            let (short, stream, control) = p
+                .drive(async move {
+                    let short = a.send_short_bounded(&time, timeout, &over_window()).await;
+                    let stream = a
+                        .send_stream_bounded(
+                            &time,
+                            timeout,
+                            StreamId::next(),
+                            Some(b"meta"),
+                            over_window(),
+                            None,
+                        )
+                        .await;
+                    let control = a
+                        .send_control_bounded(
+                            &time,
+                            timeout,
+                            QuicControl::Ready {
+                                attempt: 3,
+                                caps: 0,
+                            },
+                        )
+                        .await;
+                    (short, stream, control)
+                })
+                .await;
+            for (what, outcome) in [("short", short), ("stream", stream)] {
+                let BoundedSend::Failed(SendFailure::Error(QuicSendError::Stopped(code))) = outcome
+                else {
+                    panic!("{what}: expected a stop, got {outcome:?}");
+                };
+                assert_eq!(code, u64::from(stop_code::NOT_ACCEPTING_DATA), "{what}");
+            }
+            assert!(matches!(control, BoundedSend::Sent), "{control:?}");
+            let stats = p.b.stats();
+            assert_eq!(stats.count(QuicInboundOutcome::RefusedNotAcceptingData), 2);
+            assert_eq!(p.b.charged_streams_now(), 0, "nothing was charged");
+            assert_eq!(p.b.charged(), (0, 0));
+            for outcome in [
+                InboundStreamOutcome::RefusedConnectionBytes,
+                InboundStreamOutcome::RefusedConnectionStreams,
+            ] {
+                assert_eq!(stats.shared_count(outcome), 0, "{outcome:?}");
+            }
+            assert!(p.b_in.shorts.try_recv().is_err());
+            assert!(p.b_in.streams.try_recv().is_err());
+            let payload = p.b_in.controls.try_recv().expect("control arrives");
+            assert!(p.b.decode_control(&payload).is_ok());
+        }
+    })
+}
+
+/// Counts `on_fragment_sent` calls.
+#[derive(Default)]
+struct Fragments(std::sync::atomic::AtomicUsize);
+
+impl StreamProgressObserver for Fragments {
+    fn on_fragment_sent(&self) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+impl Fragments {
+    fn count(&self) -> usize {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
+/// The values the send table is written around.
+#[test]
+fn send_deadlines_have_these_values() {
+    let one_packet = SendDeadlines::short(100);
+    assert_eq!(one_packet.open, Duration::from_secs(1));
+    assert_eq!(one_packet.gap, None);
+    assert_eq!(one_packet.total, Duration::from_secs(5));
+
+    for len in [1, 2000, MIB as u64] {
+        let deadlines = SendDeadlines::stream(len);
+        assert!(deadlines.gap.is_none_or(|gap| gap >= deadlines.open));
+    }
+
+    let stream = SendDeadlines::stream(MIB as u64);
+    assert_eq!(stream.open, Duration::from_secs(2));
+    assert_eq!(stream.gap, Some(Duration::from_secs(5)));
+    assert_eq!(
+        stream.total,
+        crate::transport::peer_connection::inbound_stream_age_limit(MIB as u64)
+    );
+
+    assert_eq!(
+        SendDeadlines::short(MIB as u64),
+        stream,
+        "a Short that does not fit a packet holds a slot as a stream does"
+    );
+}
+
+/// The gap runs from the last step, each step moving it, and a send making
+/// steady progress still ends at `total`. Timers are not one per step.
+#[test]
+fn the_gap_runs_from_the_last_step_and_total_still_binds() {
+    bounded(|| async move {
+        let time = VirtualTime::new();
+        let clock = time.clone();
+        let deadlines = SendDeadlines {
+            open: Duration::from_secs(2),
+            gap: Some(Duration::from_secs(5)),
+            total: Duration::from_secs(60),
+        };
+        let (stalled, stalled_after, steady, steady_after) = drive(&time, LIMIT, async move {
+            let start = clock.now();
+            let stepping = clock.clone();
+            let stalled = bounded_send(&clock, deadlines, |progress| async move {
+                progress.mark_opened();
+                for _ in 0..3 {
+                    stepping.sleep(Duration::from_secs(3)).await;
+                    progress.step();
+                }
+                never().await
+            })
+            .await;
+            let stalled_after = clock.now() - start;
+            let start = clock.now();
+            let stepping = clock.clone();
+            let steady = bounded_send(&clock, deadlines, |progress| async move {
+                progress.mark_opened();
+                loop {
+                    stepping.sleep(Duration::from_secs(3)).await;
+                    progress.step();
+                }
+            })
+            .await;
+            (stalled, stalled_after, steady, clock.now() - start)
+        })
+        .await;
+        assert!(
+            matches!(stalled, BoundedSend::Failed(SendFailure::TimedOut)),
+            "{stalled:?}"
+        );
+        assert_eq!(stalled_after, Duration::from_secs(14));
+        assert!(
+            matches!(steady, BoundedSend::Failed(SendFailure::TimedOut)),
+            "{steady:?}"
+        );
+        assert_eq!(steady_after, Duration::from_secs(60));
+    })
+}
+
+/// The wait for the acknowledgement has no gap: it includes a send window of
+/// backlog, so only `total` ends it. The open deadline ends a send that has
+/// not opened, however long `total` is.
+#[test]
+fn the_gap_ends_at_the_end_of_the_stream_and_open_binds_first() {
+    bounded(|| async move {
+        let time = VirtualTime::new();
+        let clock = time.clone();
+        let deadlines = SendDeadlines {
+            open: Duration::from_secs(2),
+            gap: Some(Duration::from_secs(5)),
+            total: Duration::from_secs(60),
+        };
+        let (finished, finished_after, unopened, unopened_after) =
+            drive(&time, LIMIT, async move {
+                let start = clock.now();
+                let finished = bounded_send(&clock, deadlines, |progress| async move {
+                    progress.mark_opened();
+                    progress.mark_finished();
+                    never().await
+                })
+                .await;
+                let finished_after = clock.now() - start;
+                let start = clock.now();
+                let unopened = bounded_send(&clock, deadlines, |_| never()).await;
+                (finished, finished_after, unopened, clock.now() - start)
+            })
+            .await;
+        assert!(
+            matches!(
+                finished,
+                BoundedSend::MaybeDelivered(MaybeDelivered::TimedOut)
+            ),
+            "{finished:?}"
+        );
+        assert_eq!(finished_after, Duration::from_secs(60));
+        assert!(
+            matches!(
+                unopened,
+                BoundedSend::Failed(SendFailure::NotOpened(NotOpened::TimedOut))
+            ),
+            "{unopened:?}"
+        );
+        assert_eq!(unopened_after, Duration::from_secs(2));
+    })
+}
+
+/// A connection that has ended opens nothing: `NotOpened`, so the caller may
+/// send the message another way, with the error kept for attribution.
+#[test]
+fn a_send_on_a_lost_connection_is_not_opened() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let p = paths("quic-path-lost-open", 70, QuicPathLimits::DEFAULT).await;
+        let (a, time) = (p.a.clone(), p.time());
+        let (short, stream) = p
+            .drive(async move {
+                a.connection().close(QuicCloseCode::Downgrade);
+                let short = a
+                    .send_short_bounded(&time, SendDeadlines::short(4), b"data")
+                    .await;
+                let stream = a
+                    .send_stream_bounded(
+                        &time,
+                        SendDeadlines::stream(4),
+                        StreamId::next(),
+                        None,
+                        Bytes::from_static(b"data"),
+                        None,
+                    )
+                    .await;
+                (short, stream)
+            })
+            .await;
+        for outcome in [short, stream] {
+            assert!(
+                matches!(
+                    outcome,
+                    BoundedSend::Failed(SendFailure::NotOpened(NotOpened::ConnectionLost(_)))
+                ),
+                "{outcome:?}"
+            );
+        }
+    })
+}
+
+/// A send waiting for a permit ends when the connection does, with no wait for
+/// its deadline. The permits here are held outside any send: a send holding one
+/// would end on the close and free it, which would wake the waiter whether or
+/// not it races the close, and the semaphore itself never closes.
+#[test]
+fn a_close_wakes_a_send_waiting_for_a_permit_at_once() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let p = paths("quic-path-permit-close", 71, QuicPathLimits::DEFAULT).await;
+        let (a, time) = (p.a.clone(), p.time());
+        let (outcome, waited) = p
+            .drive(async move {
+                let limit = super::super::config::STREAMED_SEND_LIMIT;
+                let _held = Arc::clone(&a.stream_slots)
+                    .acquire_many_owned(limit)
+                    .await
+                    .expect("never closed");
+                let closes = a.clone();
+                let close_time = time.clone();
+                let close = async move {
+                    close_time.sleep(Duration::from_secs(1)).await;
+                    closes.connection().close(QuicCloseCode::Downgrade);
+                    futures::future::pending::<()>().await;
+                };
+                let send = async {
+                    let start = time.now();
+                    let outcome = a
+                        .send_stream_bounded(
+                            &time,
+                            Duration::from_secs(300),
+                            StreamId::next(),
+                            None,
+                            Bytes::from_static(b"body"),
+                            None,
+                        )
+                        .await;
+                    (outcome, time.now() - start)
+                };
+                tokio::select! {
+                    () = close => unreachable!("never returns"),
+                    result = send => result,
+                }
+            })
+            .await;
+        assert!(
+            matches!(
+                outcome,
+                BoundedSend::Failed(SendFailure::NotOpened(NotOpened::ConnectionLost(_)))
+            ),
+            "{outcome:?}"
+        );
+        assert!(
+            waited < Duration::from_secs(2),
+            "woken by the close at 1 s, not by a deadline, after {waited:?}"
+        );
+    })
+}
+
+/// A transfer slower than the gap but making progress is not a stall: each
+/// write on a real path moves the gap, so it ends `Sent` well past 5 s.
+#[test]
+fn a_slow_source_that_keeps_writing_outlives_the_gap() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let p = paths("quic-path-slow-source", 79, QuicPathLimits::DEFAULT).await;
+        let (a, time) = (p.a.clone(), p.time());
+        let (outcome, took) = p
+            .drive(async move {
+                let start = time.now();
+                let sleeps = time.clone();
+                let chunks = Box::pin(futures::stream::iter(0..4).then(move |_| {
+                    let sleeps = sleeps.clone();
+                    async move {
+                        sleeps.sleep(Duration::from_secs(3)).await;
+                        Ok(Bytes::from_static(b"body"))
+                    }
+                }));
+                let outcome = a
+                    .send_stream_chunks_bounded(
+                        &time,
+                        SendDeadlines::stream(16),
+                        StreamId::next(),
+                        16,
+                        None,
+                        chunks,
+                        None,
+                    )
+                    .await;
+                (outcome, time.now() - start)
+            })
+            .await;
+        assert!(matches!(outcome, BoundedSend::Sent), "{outcome:?}");
+        assert!(took >= Duration::from_secs(12), "{took:?}");
+    })
+}
+
+/// A source with nothing yet holds no permit and opens no stream, and past the
+/// gap the send is `NotOpened`. A source that ends or fails first opens nothing.
+#[test]
+fn a_source_with_no_first_chunk_holds_nothing() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let p = paths("quic-path-first-chunk", 72, QuicPathLimits::DEFAULT).await;
+        let limit = super::super::config::STREAMED_SEND_LIMIT as usize;
+        let (a, time) = (p.a.clone(), p.time());
+        let (waiting, free_while_waiting, waited, ended, failed) = p
+            .drive(async move {
+                let start = time.now();
+                let send = a.send_stream_chunks_bounded(
+                    &time,
+                    SendDeadlines::stream(1000),
+                    StreamId::next(),
+                    1000,
+                    None,
+                    futures::stream::pending::<Result<Bytes, StreamError>>(),
+                    None,
+                );
+                tokio::pin!(send);
+                tokio::select! {
+                    outcome = &mut send => panic!("ended early: {outcome:?}"),
+                    () = time.sleep(Duration::from_secs(1)) => {}
+                }
+                let free_while_waiting = a.free_stream_slots();
+                let waiting = send.await;
+                let waited = time.now() - start;
+                let ended = a
+                    .send_stream_chunks_bounded(
+                        &time,
+                        SendDeadlines::stream(1000),
+                        StreamId::next(),
+                        1000,
+                        None,
+                        futures::stream::empty::<Result<Bytes, StreamError>>(),
+                        None,
+                    )
+                    .await;
+                let failed = a
+                    .send_stream_chunks_bounded(
+                        &time,
+                        SendDeadlines::stream(1000),
+                        StreamId::next(),
+                        1000,
+                        None,
+                        futures::stream::iter([Err(StreamError::InactivityTimeout)]),
+                        None,
+                    )
+                    .await;
+                (waiting, free_while_waiting, waited, ended, failed)
+            })
+            .await;
+        assert_eq!(free_while_waiting, limit);
+        assert!(
+            matches!(
+                waiting,
+                BoundedSend::Failed(SendFailure::NotOpened(NotOpened::TimedOut))
+            ),
+            "{waiting:?}"
+        );
+        assert_eq!(waited, Duration::from_secs(5));
+        assert!(
+            matches!(
+                ended,
+                BoundedSend::Failed(SendFailure::Error(QuicSendError::LengthMismatch {
+                    declared: 1000,
+                    delivered: 0
+                }))
+            ),
+            "{ended:?}"
+        );
+        assert!(
+            matches!(
+                failed,
+                BoundedSend::Failed(SendFailure::Error(QuicSendError::Source(_)))
+            ),
+            "{failed:?}"
+        );
+        assert_eq!(p.a.send_aborts(), 0, "no stream existed to reset");
+        assert_eq!(p.b.stats().count(QuicInboundOutcome::AnnouncedStream), 0);
+    })
+}
+
+/// A source that stalls after its first chunk is reset at the gap and returns
+/// its permit, and the receiver discards the stream.
+#[test]
+fn a_source_stall_resets_at_the_gap_and_returns_the_permit() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let p = paths("quic-path-source-stall", 73, QuicPathLimits::DEFAULT).await;
+        let limit = super::super::config::STREAMED_SEND_LIMIT as usize;
+        let (a, time) = (p.a.clone(), p.time());
+        let (outcome, waited, held, free_after) = p
+            .drive(async move {
+                let start = time.now();
+                let send = a.send_stream_chunks_bounded(
+                    &time,
+                    SendDeadlines::stream(1000),
+                    StreamId::next(),
+                    1000,
+                    None,
+                    stalls_after_first_chunk(),
+                    None,
+                );
+                tokio::pin!(send);
+                tokio::select! {
+                    outcome = &mut send => panic!("ended early: {outcome:?}"),
+                    () = time.sleep(Duration::from_secs(1)) => {}
+                }
+                let held = a.free_stream_slots();
+                let outcome = send.await;
+                let waited = time.now() - start;
+                a.send_short(b"after").await.expect("still connected");
+                (outcome, waited, held, a.free_stream_slots())
+            })
+            .await;
+        assert!(
+            matches!(outcome, BoundedSend::Failed(SendFailure::TimedOut)),
+            "{outcome:?}"
+        );
+        assert_eq!(waited, Duration::from_secs(5));
+        assert_eq!(held, limit - 1);
+        assert_eq!(free_after, limit);
+        assert_eq!(p.a.send_aborts(), 1);
+        assert_eq!(p.b.stats().count(QuicInboundOutcome::ResetByPeer), 1);
+    })
+}
+
+/// A write that flow control holds up is a gap too: the stream is reset at the
+/// gap, with the connection still up.
+#[test]
+fn a_write_held_by_a_silent_peer_fails_at_the_gap() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let p = paths("quic-path-write-stall", 74, QuicPathLimits::DEFAULT).await;
+        let _silenced = DropFrom::new("quic-path-write-stall", &[p.pair.b_addr]);
+        let (a, time) = (p.a.clone(), p.time());
+        let body = over_window();
+        let fragments = body.len().div_ceil(FRAGMENT_PAYLOAD_SIZE);
+        let deadlines = SendDeadlines::stream(body.len() as u64);
+        let (outcome, ticks) = p
+            .drive(async move {
+                let ticks = Fragments::default();
+                let outcome = a
+                    .send_stream_bounded(
+                        &time,
+                        deadlines,
+                        StreamId::next(),
+                        None,
+                        body,
+                        Some(&ticks),
+                    )
+                    .await;
+                (outcome, ticks.count())
+            })
+            .await;
+        assert!(
+            matches!(outcome, BoundedSend::Failed(SendFailure::TimedOut)),
+            "{outcome:?}"
+        );
+        assert!(ticks > 0 && ticks < fragments, "{ticks} of {fragments}");
+        assert_eq!(p.a.send_aborts(), 1);
+        assert!(p.a.connection().inner().close_reason().is_none());
+    })
+}
+
+/// A permit stays held past `MaybeDelivered(TimedOut)`, because the stream
+/// still holds its slot, and comes back on the acknowledgement.
+#[test]
+fn a_permit_outlives_a_timed_out_send_until_the_ack() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let p = paths("quic-path-permit-ack", 75, QuicPathLimits::DEFAULT).await;
+        let limit = super::super::config::STREAMED_SEND_LIMIT as usize;
+        let silenced = DropFrom::new("quic-path-permit-ack", &[p.pair.b_addr]);
+        let (a, time) = (p.a.clone(), p.time());
+        let body = Bytes::from_static(b"body");
+        let (outcome, held) = p
+            .drive(async move {
+                let outcome = a
+                    .send_stream_bounded(
+                        &time,
+                        Duration::from_secs(1),
+                        StreamId::next(),
+                        None,
+                        body,
+                        None,
+                    )
+                    .await;
+                time.sleep(Duration::from_secs(2)).await;
+                (outcome, a.free_stream_slots())
+            })
+            .await;
+        assert!(
+            matches!(
+                outcome,
+                BoundedSend::MaybeDelivered(MaybeDelivered::TimedOut)
+            ),
+            "{outcome:?}"
+        );
+        assert_eq!(held, limit - 1, "the stream still holds its slot");
+
+        drop(silenced);
+        let (a, time) = (p.a.clone(), p.time());
+        let returned = p
+            .drive(async move {
+                for _ in 0..600 {
+                    if a.free_stream_slots() == limit {
+                        return true;
+                    }
+                    time.sleep(Duration::from_millis(100)).await;
+                }
+                false
+            })
+            .await;
+        assert!(returned, "the acknowledgement returns the permit");
+        assert_eq!(p.a.send_aborts(), 0, "nothing was reset");
+        assert!(
+            p.a.connection().inner().close_reason().is_none(),
+            "the permit came back from the ack, not from the connection ending"
+        );
+    })
+}
+
+/// With no acknowledgement ever, a close returns the held permit, so the task
+/// holding it ends with the connection.
+#[test]
+fn a_permit_held_past_a_timed_out_send_returns_on_close() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let p = paths("quic-path-permit-end", 76, QuicPathLimits::DEFAULT).await;
+        let limit = super::super::config::STREAMED_SEND_LIMIT as usize;
+        let _silenced = DropFrom::new("quic-path-permit-end", &[p.pair.b_addr]);
+        let (a, time) = (p.a.clone(), p.time());
+        let (held, after) = p
+            .drive(async move {
+                let outcome = a
+                    .send_short_bounded(&time, Duration::from_secs(1), &payload(5000))
+                    .await;
+                assert!(
+                    matches!(
+                        outcome,
+                        BoundedSend::MaybeDelivered(MaybeDelivered::TimedOut)
+                    ),
+                    "{outcome:?}"
+                );
+                let held = a.free_stream_slots();
+                a.connection().close(QuicCloseCode::Downgrade);
+                time.sleep(Duration::from_millis(10)).await;
+                (held, a.free_stream_slots())
+            })
+            .await;
+        assert_eq!(held, limit - 1, "a Short past one packet takes a permit");
+        assert_eq!(after, limit);
+    })
+}
+
+/// A Short past one packet waits for a permit as a stream does, and one that
+/// fits a packet does not.
+#[test]
+fn only_a_short_past_one_packet_takes_a_permit() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let p = paths("quic-path-short-permit", 77, QuicPathLimits::DEFAULT).await;
+        let limit = super::super::config::STREAMED_SEND_LIMIT as usize;
+        let (a, time) = (p.a.clone(), p.time());
+        let (large, small) = p
+            .drive(async move {
+                let mut blocked = blocked_streamed_sends(&a, limit);
+                let sends = async {
+                    time.sleep(Duration::from_secs(1)).await;
+                    let large = a
+                        .send_short_bounded(&time, SendDeadlines::short(5000), &payload(5000))
+                        .await;
+                    let small = a
+                        .send_short_bounded(&time, SendDeadlines::short(5), b"small")
+                        .await;
+                    (large, small)
+                };
+                tokio::select! {
+                    done = blocked.next() => panic!("a blocked send returned: {done:?}"),
+                    result = sends => result,
+                }
+            })
+            .await;
+        assert!(
+            matches!(
+                large,
+                BoundedSend::Failed(SendFailure::NotOpened(NotOpened::TimedOut))
+            ),
+            "{large:?}"
+        );
+        assert!(matches!(small, BoundedSend::Sent), "{small:?}");
+    })
+}
+
+/// The observer hears one tick per fragment, however the bytes were chunked,
+/// and the bytes arrive whole. Ticks are what keep a streaming PUT's retry
+/// loop from reading an upload as stalled.
+#[test]
+fn ticks_equal_the_fragment_count() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let mut p = paths("quic-path-ticks", 78, QuicPathLimits::DEFAULT).await;
+        let (a, time) = (p.a.clone(), p.time());
+        let body = Bytes::from(payload(3 * FRAGMENT_PAYLOAD_SIZE + 1));
+        let len = body.len() as u64;
+        let (from_bytes, from_chunks, bytes_ticks, chunk_ticks) = p
+            .drive({
+                let body = body.clone();
+                async move {
+                    let bytes_ticks = Fragments::default();
+                    let from_bytes = a
+                        .send_stream_bounded(
+                            &time,
+                            SendDeadlines::stream(len),
+                            StreamId::next(),
+                            None,
+                            body.clone(),
+                            Some(&bytes_ticks),
+                        )
+                        .await;
+                    let chunk_ticks = Fragments::default();
+                    let one_chunk = futures::stream::iter([Ok(body)]);
+                    let from_chunks = a
+                        .send_stream_chunks_bounded(
+                            &time,
+                            SendDeadlines::stream(len),
+                            StreamId::next(),
+                            len,
+                            None,
+                            one_chunk,
+                            Some(&chunk_ticks),
+                        )
+                        .await;
+                    (
+                        from_bytes,
+                        from_chunks,
+                        bytes_ticks.count(),
+                        chunk_ticks.count(),
+                    )
+                }
+            })
+            .await;
+        assert!(matches!(from_bytes, BoundedSend::Sent), "{from_bytes:?}");
+        assert!(matches!(from_chunks, BoundedSend::Sent), "{from_chunks:?}");
+        assert_eq!(bytes_ticks, 4);
+        assert_eq!(chunk_ticks, 4);
+        for _ in 0..2 {
+            let arrival = p.b_in.streams.try_recv().expect("announced");
+            let handle = IncomingStream::from(arrival.handle);
+            let assembled = p
+                .drive(async move { handle.assemble().await })
+                .await
+                .expect("whole");
+            assert_eq!(&assembled[..], &body[..]);
+        }
+    })
+}
+
+/// `total` counts the wait for the first chunk, so a plain `Duration` is one
+/// deadline for a whole send from a source.
+#[test]
+fn a_duration_bounds_a_send_from_a_source_including_the_first_chunk() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let p = paths("quic-path-source-total", 80, QuicPathLimits::DEFAULT).await;
+        let (a, time) = (p.a.clone(), p.time());
+        let (outcome, took) = p
+            .drive(async move {
+                let start = time.now();
+                let sleeps = time.clone();
+                let first = futures::stream::once(async move {
+                    sleeps.sleep(Duration::from_secs(3)).await;
+                    Ok(Bytes::from_static(b"first"))
+                });
+                let chunks = Box::pin(first.chain(futures::stream::pending()));
+                let outcome = a
+                    .send_stream_chunks_bounded(
+                        &time,
+                        Duration::from_secs(5),
+                        StreamId::next(),
+                        1000,
+                        None,
+                        chunks,
+                        None,
+                    )
+                    .await;
+                (outcome, time.now() - start)
+            })
+            .await;
+        assert!(
+            matches!(outcome, BoundedSend::Failed(SendFailure::TimedOut)),
+            "{outcome:?}"
+        );
+        assert_eq!(took, Duration::from_secs(5));
+    })
+}
+
+/// A close during the wait for the first chunk ends the send at once and says
+/// so, as a close during the wait for a permit does.
+#[test]
+fn a_close_ends_the_wait_for_the_first_chunk_at_once() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let p = paths("quic-path-first-close", 81, QuicPathLimits::DEFAULT).await;
+        let (a, time) = (p.a.clone(), p.time());
+        let (outcome, took) = p
+            .drive(async move {
+                let closes = a.clone();
+                let close_time = time.clone();
+                let close = async move {
+                    close_time.sleep(Duration::from_secs(1)).await;
+                    closes.connection().close(QuicCloseCode::Downgrade);
+                    futures::future::pending::<()>().await;
+                };
+                let send = async {
+                    let start = time.now();
+                    let outcome = a
+                        .send_stream_chunks_bounded(
+                            &time,
+                            SendDeadlines::stream(1000),
+                            StreamId::next(),
+                            1000,
+                            None,
+                            futures::stream::pending::<Result<Bytes, StreamError>>(),
+                            None,
+                        )
+                        .await;
+                    (outcome, time.now() - start)
+                };
+                tokio::select! {
+                    () = close => unreachable!("never returns"),
+                    result = send => result,
+                }
+            })
+            .await;
+        assert!(
+            matches!(
+                outcome,
+                BoundedSend::Failed(SendFailure::NotOpened(NotOpened::ConnectionLost(_)))
+            ),
+            "{outcome:?}"
+        );
+        assert!(took < Duration::from_secs(2), "{took:?}");
+    })
+}
+
+/// The permit rule turns on one length: the largest Short that fits a packet
+/// takes no permit, and one byte more does.
+#[test]
+fn the_permit_for_a_short_starts_just_past_one_packet() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let fits = (1..=FRAGMENT_PAYLOAD_SIZE as u64 * 2)
+            .take_while(|len| fits_one_packet(*len))
+            .last()
+            .expect("something fits a packet") as usize;
+        let p = paths("quic-path-short-boundary", 82, QuicPathLimits::DEFAULT).await;
+        let (a, time) = (p.a.clone(), p.time());
+        let (at, past) = p
+            .drive(async move {
+                let limit = super::super::config::STREAMED_SEND_LIMIT;
+                let _held = Arc::clone(&a.stream_slots)
+                    .acquire_many_owned(limit)
+                    .await
+                    .expect("never closed");
+                let at = a
+                    .send_short_bounded(&time, SendDeadlines::short(fits as u64), &payload(fits))
+                    .await;
+                let past = a
+                    .send_short_bounded(
+                        &time,
+                        SendDeadlines::short(fits as u64 + 1),
+                        &payload(fits + 1),
+                    )
+                    .await;
+                (at, past)
+            })
+            .await;
+        assert!(matches!(at, BoundedSend::Sent), "{at:?}");
+        assert!(
+            matches!(
+                past,
+                BoundedSend::Failed(SendFailure::NotOpened(NotOpened::TimedOut))
+            ),
+            "{past:?}"
+        );
+    })
+}
+
+/// Records which stream each fragment belonged to.
+struct Turns(u8, Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl StreamProgressObserver for Turns {
+    fn on_fragment_sent(&self) {
+        self.1.lock().unwrap().push(self.0);
+    }
+}
+
+/// How far apart two fragments of one send may be, on one thread. Round robin
+/// among `sends` writers is about `sends`; the margin is for the writers that
+/// wait on credit and rejoin in another order. Without the yield it is 3503.
+fn assert_writers_took_turns(log: &[u8], sends: u8, fragments: usize) {
+    assert_eq!(log.len(), usize::from(sends) * fragments);
+    for send in 0..sends {
+        let seen: Vec<usize> = log
+            .iter()
+            .enumerate()
+            .filter_map(|(at, of)| (*of == send).then_some(at))
+            .collect();
+        let widest = seen.windows(2).map(|at| at[1] - at[0]).max().unwrap_or(0);
+        assert!(
+            widest <= 4 * usize::from(sends),
+            "send {send} waited {widest} fragments between two of its own"
+        );
+    }
+}
+
+/// Concurrent streams on one path share its send window fragment by fragment.
+/// quinn gives a write all the free credit without yielding, so without the
+/// yield in `take_turns` the streams run one after another: 3503 fragments
+/// between two of one stream's in this shape, which at 1 Mbit/s would be about
+/// 30 s against the 5 s gap the sender and the receiver allow.
+///
+/// On one thread only, because `drive` is. A multi-thread runtime wakes in
+/// another order, so this does not speak for it.
+#[test]
+fn streams_on_a_path_take_turns_with_their_fragments() {
+    bounded(|| async move {
+        for (streams, subnet, network) in
+            [(2u8, 88, "quic-path-turns-2"), (4, 83, "quic-path-turns-4")]
+        {
+            let _seed = GlobalRng::seed_guard(SEED);
+            let mut p = paths(network, subnet, QuicPathLimits::DEFAULT).await;
+            let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let body = Bytes::from(payload(4 * MIB));
+            let mut sends = Vec::new();
+            for stream in 0..streams {
+                let (a, time, body, log) = (p.a.clone(), p.time(), body.clone(), log.clone());
+                sends.push(tokio::spawn(async move {
+                    let turns = Turns(stream, log);
+                    a.send_stream_bounded(
+                        &time,
+                        Duration::from_secs(300),
+                        StreamId::next(),
+                        None,
+                        body,
+                        Some(&turns),
+                    )
+                    .await
+                }));
+            }
+            let mut arrivals =
+                std::mem::replace(&mut p.b_in.streams, tokio::sync::mpsc::channel(1).1);
+            let reader = tokio::spawn(async move {
+                let mut held = Vec::new();
+                while let Some(arrival) = arrivals.recv().await {
+                    held.push(arrival);
+                }
+            });
+            p.drive(async move {
+                for send in sends {
+                    let sent = send.await.expect("the send ran");
+                    assert!(matches!(sent, BoundedSend::Sent), "{sent:?}");
+                }
+            })
+            .await;
+            reader.abort();
+            let log = log.lock().unwrap();
+            assert_writers_took_turns(&log, streams, (4 * MIB).div_ceil(FRAGMENT_PAYLOAD_SIZE));
+        }
+    })
+}
+
+/// The same for Shorts past one packet, which write through their own loop.
+#[test]
+fn shorts_past_one_packet_take_turns_with_their_fragments() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let shorts: u8 = 4;
+        let p = paths("quic-path-short-turns", 84, QuicPathLimits::DEFAULT).await;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let body = Arc::new(payload(4 * MIB));
+        let mut sends = Vec::new();
+        for short in 0..shorts {
+            let (a, body, log) = (p.a.clone(), body.clone(), log.clone());
+            sends.push(tokio::spawn(async move {
+                let turns = Turns(short, log);
+                a.send_short_with(&body, Some(&turns), SendProgress::new())
+                    .await
+            }));
+        }
+        p.drive(async move {
+            for send in sends {
+                send.await.expect("the send ran").expect("sent");
+            }
+        })
+        .await;
+        let log = log.lock().unwrap();
+        assert_writers_took_turns(&log, shorts, (4 * MIB).div_ceil(FRAGMENT_PAYLOAD_SIZE));
+    })
+}
+
+/// The end of a one-packet message leaves with its data, in one STREAM frame.
+/// A yield after the last piece would send them apart, two ack-eliciting
+/// datagrams for the commonest message on a path.
+#[test]
+fn a_one_packet_message_is_one_stream_frame() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let p = paths("quic-path-one-frame", 85, QuicPathLimits::DEFAULT).await;
+        let (a, time) = (p.a.clone(), p.time());
+        let frames = p
+            .drive(async move {
+                let before = a.connection().inner().stats().frame_tx.stream;
+                let sent = a
+                    .send_short_bounded(&time, SendDeadlines::short(5), b"small")
+                    .await;
+                assert!(matches!(sent, BoundedSend::Sent), "{sent:?}");
+                a.connection().inner().stats().frame_tx.stream - before
+            })
+            .await;
+        assert_eq!(frames, 1);
+    })
+}
+
+/// So does the last fragment of a stream of two pieces while another send holds
+/// a permit, which is when pieces yield: the first piece goes in one STREAM
+/// frame, and the second leaves with the end of the stream, in another.
+#[test]
+fn the_end_of_a_stream_leaves_with_its_last_fragment() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let p = paths("quic-path-last-frame", 86, QuicPathLimits::DEFAULT).await;
+        let (a, time) = (p.a.clone(), p.time());
+        let body = Bytes::from(payload(FRAGMENT_PAYLOAD_SIZE + 100));
+        let frames = p
+            .drive(async move {
+                let held = Arc::clone(&a.stream_slots)
+                    .acquire_owned()
+                    .await
+                    .expect("never closed");
+                let before = a.connection().inner().stats().frame_tx.stream;
+                let sent = a
+                    .send_stream_bounded(
+                        &time,
+                        SendDeadlines::stream(body.len() as u64),
+                        StreamId::next(),
+                        None,
+                        body,
+                        None,
+                    )
+                    .await;
+                assert!(matches!(sent, BoundedSend::Sent), "{sent:?}");
+                drop(held);
+                a.connection().inner().stats().frame_tx.stream - before
+            })
+            .await;
+        assert_eq!(frames, 2);
+    })
+}
+
+/// A first chunk that arrives with no time left opens nothing, whichever of
+/// the chunk and the timer the select took. Repeated, because the two land on
+/// the same instant and the select draws which to poll first.
+#[test]
+fn a_first_chunk_at_the_deadline_opens_no_stream() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let p = paths("quic-path-first-late", 87, QuicPathLimits::DEFAULT).await;
+        let (a, time) = (p.a.clone(), p.time());
+        let outcomes = p
+            .drive(async move {
+                let mut outcomes = Vec::new();
+                for _ in 0..32 {
+                    let sleeps = time.clone();
+                    let first = futures::stream::once(async move {
+                        sleeps.sleep(Duration::from_secs(5)).await;
+                        Ok(Bytes::from_static(b"late"))
+                    });
+                    outcomes.push(
+                        a.send_stream_chunks_bounded(
+                            &time,
+                            Duration::from_secs(5),
+                            StreamId::next(),
+                            4,
+                            None,
+                            Box::pin(first),
+                            None,
+                        )
+                        .await,
+                    );
+                }
+                outcomes
+            })
+            .await;
+        for outcome in &outcomes {
+            assert!(
+                matches!(
+                    outcome,
+                    BoundedSend::Failed(SendFailure::NotOpened(NotOpened::TimedOut))
+                ),
+                "{outcome:?}"
+            );
+        }
+        assert_eq!(p.a.send_aborts(), 0);
+        assert_eq!(p.b.stats().count(QuicInboundOutcome::AnnouncedStream), 0);
     })
 }

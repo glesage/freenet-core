@@ -457,8 +457,8 @@ Current wire-gated floors:
   message `SymmetricMessagePayload::Upgrade`, #5940 step e1).
 
   Set to **`(0, 2, 149)`**, the release intended to first ship the decoder.
-  Nothing sends the message yet; a later step sends it only to peers that pass
-  `may_send_upgrade`, which reads this floor. Guarded by
+  The negotiation (e5a-5b) sends it only to peers that pass `may_send_upgrade`,
+  which reads this floor, or in reply to one they sent. Guarded by
   `QUIC_UPGRADE_SHIPPED_IN`, checked by
   `symmetric_message.rs::upgrade_floor_tracks_the_shipping_release`. It is set
   to `Some((0, 2, 149))` ahead of the 0.2.149 cut, because the decoder (#5970)
@@ -470,6 +470,26 @@ Current wire-gated floors:
   release before any release that sends the message.
   `upgrade_floor_stays_above_every_release_without_the_decoder` catches the
   floor being lowered.
+
+- `QUIC_UPGRADE_NEGOTIATES_IN` in the same file (the first release that answers
+  a QUIC upgrade `Offer`, #5940 step e5a).
+
+  Frozen at **`(0, 2, 154)`**, the release that first ships the negotiation
+  (e5a-5b), recorded in `QUIC_UPGRADE_NEGOTIATES_SHIPPED_IN`, checked by
+  `symmetric_message.rs::negotiation_floor_tracks_the_shipping_release`. Too high
+  only delays upgrades; too low makes offers to peers that ignore them, which
+  time out and count against the upgrade success rate.
+  `negotiation_floor_stays_above_every_release_that_ignores_an_offer` catches the
+  floor being lowered. The simulation test
+  `test_quic_shadow_real_version_offers_only_from_the_first_negotiating_release`
+  requires real upgrades once the crate reaches 0.2.154, so raising the floor also
+  means moving `QUIC_FIRST_NEGOTIATING_RELEASE` beside it.
+
+- `QUIC_DATA_PERCENT` in `crates/core/src/transport/quic/upgrade/policy.rs` (the
+  share of pairs that carry data on QUIC, #5940). It stays at its value unless
+  this release is a rollout step (0, 5, 25, 100), changed in its own PR. That PR also edits the expectations that pin 0:
+  `assert_eq!(QUIC_DATA_PERCENT, 0, ...)` in `policy.rs` and the
+  `quic-data-release-share` case in `simulation_integration.rs`.
 
 When a NEW wire-gated feature first ships (not this one), set its floor to
 **exactly that release version** and freeze it, as described above.
@@ -579,6 +599,27 @@ gh run rerun --failed <RUN_ID> --repo freenet/freenet-core
 
 The re-run picks up where it left off — `wait_for_pr` will see the merged
 state and proceed to `verify_publishable`.
+
+### `Check sampled C code for instructions above baseline x86-64` failed
+
+Do not publish that build. It fails in one of two ways, and
+`scripts/check-x86-64-baseline.sh` explains both in its header:
+
+- **`uses instructions above baseline`:** the C compiler built for a newer CPU
+  than we support, as happened in 0.2.152, whose binaries crashed on every CPU
+  without AVX2. Check the job's `runs-on`, its `CFLAGS_*` variables and the
+  compiler in the log.
+- **`no symbol matches`:** a dependency update renamed or removed a sampled
+  function, or the release profile now strips symbols. Replace the name in
+  `DEFAULT_SENTINELS`.
+
+To stop a bad build that has already been published from reaching more nodes,
+mark the previous release as latest with `gh release edit <tag> --latest`.
+Without `--force`, nodes and gateways only move to a strictly newer version, so
+this does not downgrade anyone. It does not change the Docker `latest` tag. The
+next release takes the marker back automatically. While a bad build is demoted
+this way, do not re-run its `attach-to-release` job: that marks the highest
+version latest again.
 
 ### `verify_publishable` failed
 

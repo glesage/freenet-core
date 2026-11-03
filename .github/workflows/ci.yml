@@ -248,6 +248,12 @@ jobs:
       - name: Self-test release wait_for_binaries gh resilience
         run: bash scripts/release_wait_for_binaries_test.sh
 
+      # Regression gate for 0.2.152, whose C dependencies were built for
+      # x86-64-v3 and died with SIGILL on CPUs without AVX2. The check itself
+      # runs on the real binaries in cross-compile.yml; this tests the check.
+      - name: Self-test x86-64 baseline check
+        run: bash scripts/check-x86-64-baseline_test.sh
+
       # Release-driver RESUME state. Two regressions, both of the shape where a
       # resumed release is wrong in a way the operator cannot see: the v0.2.42
       # FDEV_VERSION double-bump, and the CRATES_PUBLISHED flag being set on
@@ -346,7 +352,7 @@ jobs:
       # clean when they landed but were not actually in this list, so nothing
       # held them to it. `-x` because the two test scripts `source` the canary.
       - name: Lint install/uninstall scripts (shellcheck)
-        run: shellcheck -x scripts/install.sh scripts/uninstall.sh scripts/test-install-sh.sh scripts/test-uninstall-sh.sh scripts/macos-url-scheme-e2e.sh scripts/auto-update-canary.sh scripts/auto-update-canary_test.sh scripts/auto-update-canary_lifecycle_test.sh scripts/release_wait_for_binaries_test.sh scripts/release_canary_wiring_test.sh scripts/rule_lint_shell_assertion_counter_test.sh scripts/release.sh scripts/pr-backlog-sweep.sh scripts/pr-backlog-sweep_test.sh scripts/release-rollback.sh scripts/release_rollback_test.sh scripts/resolve_release_mode.sh scripts/release_dry_run_test.sh nix/freenet-node.sh scripts/nix-node-wrapper_test.sh scripts/wan-bench-classify.sh scripts/wan-bench-classify_test.sh
+        run: shellcheck -x scripts/check-x86-64-baseline.sh scripts/check-x86-64-baseline_test.sh scripts/install.sh scripts/uninstall.sh scripts/test-install-sh.sh scripts/test-uninstall-sh.sh scripts/macos-url-scheme-e2e.sh scripts/auto-update-canary.sh scripts/auto-update-canary_test.sh scripts/auto-update-canary_lifecycle_test.sh scripts/release_wait_for_binaries_test.sh scripts/release_canary_wiring_test.sh scripts/rule_lint_shell_assertion_counter_test.sh scripts/release.sh scripts/pr-backlog-sweep.sh scripts/pr-backlog-sweep_test.sh scripts/release-rollback.sh scripts/release_rollback_test.sh scripts/resolve_release_mode.sh scripts/release_dry_run_test.sh nix/freenet-node.sh scripts/nix-node-wrapper_test.sh scripts/wan-bench-classify.sh scripts/wan-bench-classify_test.sh
       # The PR-backlog sweep reports stalled PRs (see
       # .github/workflows/pr-backlog-sweep.yml). Its self-test drives the ABORT
       # paths -- failed query, empty listing the REST probe contradicts,
@@ -1113,7 +1119,10 @@ jobs:
       # And through LaunchServices: build an unsigned Freenet.app with the real
       # package-macos.sh, register it, click links with `open`, and check the
       # menu-bar wrapper handled them, including the instance launchd starts at
-      # login. The app starts a real node, so this rebuilds the binary with
+      # login. It also checks that the menu bar icon is really on screen, which
+      # needs macOS 26 or later to mean anything (#6093), and that Launch at
+      # Login registers and repairs old agents. The app starts a real node, so
+      # this rebuilds the binary with
       # FREENET_GIT_IS_DIRTY=1 (auto-update off; only the freenet crate
       # recompiles): otherwise a release newer than this branch would make
       # the node exit 42 and the DMG-swap updater replace the test bundle
@@ -1189,6 +1198,12 @@ jobs:
       # splits it.
       - name: Test freenet:// handler binary
         run: cargo nextest run -p freenet --profile ci --test url_scheme_handler
+
+      # The QUIC crash-loop breaker through the real process (#6031). Its
+      # decision is tested on every platform; only this reaches the Windows
+      # branch in the binary.
+      - name: Test QUIC breaker on Windows
+        run: cargo nextest run -p freenet --profile ci --test quic_breaker_windows
 
       # And through real protocol activation: Start-Process hands the link to
       # Windows, which looks up HKCU\Software\Classes\freenet and runs the

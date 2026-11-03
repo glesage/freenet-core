@@ -299,6 +299,10 @@ where
     op_manager.set_request_router(request_router.clone());
     let request_router = Some(request_router);
     let mut results = FuturesUnordered::new();
+    // Cleared when every response sender is gone: a closed channel is always
+    // ready, so polling it again would spin this task and starve the runtime
+    // (under paused time, stop the clock).
+    let mut responses_open = true;
     loop {
         // Uses deterministic_select! for DST - guards are evaluated BEFORE futures are created
         crate::deterministic_select! {
@@ -372,7 +376,10 @@ where
                     }
                 });
             },
-            res = client_responses.recv() => {
+            res = client_responses.recv(), if responses_open => {
+                if res.is_none() {
+                    responses_open = false;
+                }
                 if let Some((cli_id, request_id, res)) = res {
                     if let Ok(result) = &res {
                         tracing::debug!(
@@ -1855,10 +1862,10 @@ async fn process_open_request(
                                         "ContractNotification"
                                     }
                                     InboundDelegateMsg::DelegateMessage(_) => "DelegateMessage",
-                                    // Appended in stdlib 0.10.0. Core does not
-                                    // yet produce either (#5600 unsubscribe,
-                                    // #5565 wakeup), but an app may send one,
-                                    // and it should not read as "Unknown".
+                                    // Appended in stdlib 0.10.0. An app may
+                                    // still send one, which the node refuses
+                                    // (`contract::node_only_inbound`); the log
+                                    // should name it, not say "Unknown".
                                     InboundDelegateMsg::UnsubscribeContractResponse(_) => {
                                         "UnsubscribeContractResponse"
                                     }

@@ -3028,6 +3028,10 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 serde_json::json!(snapshot.upgrade_control_received),
             );
             m.insert(
+                "upgrade_decline_suppressed".into(),
+                serde_json::json!(snapshot.upgrade_decline_suppressed),
+            );
+            m.insert(
                 "handshake_unauthenticated_dropped".into(),
                 serde_json::json!(snapshot.handshake_unauthenticated_dropped),
             );
@@ -3042,6 +3046,10 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
             m.insert(
                 "quic_breaker_trips".into(),
                 serde_json::json!(snapshot.quic_breaker_trips),
+            );
+            m.insert(
+                "quic_send_refused".into(),
+                serde_json::json!(snapshot.quic_send_refused),
             );
             m.insert(
                 "quic_breaker_suppressed".into(),
@@ -3066,6 +3074,53 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
             m.insert(
                 "quic_close_sent_peer_not_acknowledging".into(),
                 serde_json::json!(snapshot.quic_close_sent_peer_not_acknowledging),
+            );
+            m.insert(
+                "quic_close_sent_control_refused".into(),
+                serde_json::json!(snapshot.quic_close_sent_control_refused),
+            );
+            {
+                use crate::transport::metrics::{
+                    QuicCloseCode, QuicFallback, QuicPathAge, QuicUpgradeOutcome,
+                };
+                for (i, count) in snapshot.quic_close_received.iter().enumerate() {
+                    let label = QuicCloseCode::ALL
+                        .get(i)
+                        .map_or("unknown_code", |code| code.label());
+                    m.insert(format!("quic_close_received_{label}"), (*count).into());
+                }
+                for (outcome, count) in QuicUpgradeOutcome::ALL.iter().zip(snapshot.quic_upgrade) {
+                    m.insert(format!("quic_upgrade_{}", outcome.label()), count.into());
+                }
+                for (cause, count) in QuicFallback::ALL.iter().zip(snapshot.quic_fallback) {
+                    m.insert(format!("quic_fallback_{}", cause.label()), count.into());
+                }
+                for (age, count) in QuicPathAge::ALL.iter().zip(snapshot.quic_path_age_at_close) {
+                    m.insert(
+                        format!("quic_path_age_at_close_{}", age.label()),
+                        count.into(),
+                    );
+                }
+            }
+            m.insert(
+                "quic_establish_ms_p50".into(),
+                serde_json::json!(snapshot.quic_establish_ms_p50),
+            );
+            m.insert(
+                "quic_establish_ms_p90".into(),
+                serde_json::json!(snapshot.quic_establish_ms_p90),
+            );
+            m.insert(
+                "quic_establish_samples".into(),
+                serde_json::json!(snapshot.quic_establish_samples),
+            );
+            m.insert(
+                "quic_paths_offered_or_dialing".into(),
+                serde_json::json!(snapshot.quic_paths_offered_or_dialing),
+            );
+            m.insert(
+                "quic_paths_active".into(),
+                serde_json::json!(snapshot.quic_paths_active),
             );
             m.insert(
                 "nat_fail_samples".into(),
@@ -3098,6 +3153,14 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
             m.insert(
                 "inbound_stream_evicted_age".into(),
                 serde_json::json!(snapshot.inbound_stream_evicted_age),
+            );
+            m.insert(
+                "inbound_stream_stream_id_on_both_paths".into(),
+                serde_json::json!(snapshot.inbound_stream_stream_id_on_both_paths),
+            );
+            m.insert(
+                "inbound_stream_complete_charge_past_age".into(),
+                serde_json::json!(snapshot.inbound_stream_complete_charge_past_age),
             );
             m.insert(
                 "nat_attempts_connect_joiner".into(),
@@ -5854,6 +5917,7 @@ mod tests {
             "cpu_time_seconds",
             "cumulative_bytes_sent",
             "cumulative_bytes_received",
+            "quic_paths_active",
         ] {
             assert!(obj.contains_key(key), "event_data missing key `{key}`");
         }
@@ -7534,6 +7598,41 @@ mod tests {
             .cloned()
             .collect();
         expected.insert("type".to_string());
+        // The QUIC families are arrays in the snapshot and one key per label in
+        // the event.
+        use crate::transport::metrics::{
+            QuicCloseCode, QuicFallback, QuicPathAge, QuicUpgradeOutcome,
+        };
+        for family in [
+            "quic_close_received",
+            "quic_upgrade",
+            "quic_fallback",
+            "quic_path_age_at_close",
+        ] {
+            assert!(expected.remove(family), "{family} is in the snapshot");
+        }
+        expected.extend(
+            QuicCloseCode::ALL
+                .iter()
+                .map(|code| code.label())
+                .chain(["unknown_code"])
+                .map(|label| format!("quic_close_received_{label}")),
+        );
+        expected.extend(
+            QuicUpgradeOutcome::ALL
+                .iter()
+                .map(|outcome| format!("quic_upgrade_{}", outcome.label())),
+        );
+        expected.extend(
+            QuicFallback::ALL
+                .iter()
+                .map(|cause| format!("quic_fallback_{}", cause.label())),
+        );
+        expected.extend(
+            QuicPathAge::ALL
+                .iter()
+                .map(|age| format!("quic_path_age_at_close_{}", age.label())),
+        );
         let actual: std::collections::BTreeSet<String> = event_kind_to_json(
             &super::super::EventKind::TransportSnapshot(Box::new(snapshot)),
         )
@@ -7659,6 +7758,8 @@ mod tests {
             inbound_stream_closed_too_many_refusals: 4,
             inbound_stream_evicted_idle: 5,
             inbound_stream_evicted_age: 6,
+            inbound_stream_stream_id_on_both_paths: 61,
+            inbound_stream_complete_charge_past_age: 62,
             ..Default::default()
         };
         let reference = serde_json::to_value(&snapshot).unwrap();
@@ -7672,6 +7773,8 @@ mod tests {
             ("inbound_stream_closed_too_many_refusals", 4),
             ("inbound_stream_evicted_idle", 5),
             ("inbound_stream_evicted_age", 6),
+            ("inbound_stream_stream_id_on_both_paths", 61),
+            ("inbound_stream_complete_charge_past_age", 62),
         ] {
             assert_eq!(json[key], expected, "event-log value for {key}");
             assert_eq!(json[key], reference[key], "serde value for {key}");
@@ -7716,6 +7819,12 @@ mod tests {
             conn_identity_teardown_key_elsewhere: 73,
             conn_identity_teardown_unidentified: 74,
             conn_identity_teardown_key_unmapped: 79,
+            conn_identity_promotion_key_mismatch: 181,
+            conn_identity_transport_key_set: 182,
+            conn_identity_transport_key_same: 183,
+            conn_identity_transport_key_refused: 184,
+            conn_identity_transport_key_sent: 185,
+            conn_identity_transport_key_undelivered: 186,
             ..Default::default()
         };
         let reference = serde_json::to_value(&snapshot).unwrap();
@@ -7743,6 +7852,12 @@ mod tests {
             ("conn_identity_teardown_key_elsewhere", 73),
             ("conn_identity_teardown_unidentified", 74),
             ("conn_identity_teardown_key_unmapped", 79),
+            ("conn_identity_promotion_key_mismatch", 181),
+            ("conn_identity_transport_key_set", 182),
+            ("conn_identity_transport_key_same", 183),
+            ("conn_identity_transport_key_refused", 184),
+            ("conn_identity_transport_key_sent", 185),
+            ("conn_identity_transport_key_undelivered", 186),
         ] {
             assert_eq!(json[key], expected, "event-log value for {key}");
             assert_eq!(json[key], reference[key], "serde value for {key}");
@@ -7761,7 +7876,9 @@ mod tests {
             quic_close_sent_identity_mismatch: 4,
             quic_close_sent_send_abort_limit: 5,
             quic_close_sent_peer_not_acknowledging: 6,
+            quic_close_sent_control_refused: 8,
             quic_breaker_trips: 7,
+            quic_send_refused: 9,
             quic_breaker_suppressed: true,
             ..Default::default()
         };
@@ -7777,7 +7894,9 @@ mod tests {
             ("quic_close_sent_identity_mismatch", 4),
             ("quic_close_sent_send_abort_limit", 5),
             ("quic_close_sent_peer_not_acknowledging", 6),
+            ("quic_close_sent_control_refused", 8),
             ("quic_breaker_trips", 7),
+            ("quic_send_refused", 9),
         ] {
             assert_eq!(json[key], expected, "event-log value for {key}");
             assert_eq!(json[key], reference[key], "serde value for {key}");
@@ -7787,6 +7906,72 @@ mod tests {
             json["quic_breaker_suppressed"],
             reference["quic_breaker_suppressed"]
         );
+    }
+
+    /// Every QUIC upgrade family reaches the event-log JSON under its flat
+    /// `<prefix>_<label>` key with the value the snapshot holds.
+    #[test]
+    fn transport_snapshot_json_carries_quic_upgrade_telemetry() {
+        use crate::transport::metrics::{
+            QuicCloseCode, QuicFallback, QuicPathAge, QuicUpgradeOutcome,
+        };
+        let mut snapshot = crate::transport::metrics::TransportSnapshot::default();
+        let mut next = 0u64;
+        let mut fill = |slots: &mut [u64]| {
+            for slot in slots {
+                next += 1;
+                *slot = next;
+            }
+        };
+        fill(&mut snapshot.quic_close_received);
+        fill(&mut snapshot.quic_upgrade);
+        fill(&mut snapshot.quic_fallback);
+        fill(&mut snapshot.quic_path_age_at_close);
+        snapshot.quic_establish_ms_p50 = Some(901);
+        snapshot.quic_establish_ms_p90 = Some(902);
+        snapshot.quic_establish_samples = 903;
+        snapshot.quic_paths_offered_or_dialing = 904;
+        snapshot.quic_paths_active = 905;
+        let json = event_kind_to_json(&super::super::EventKind::TransportSnapshot(Box::new(
+            snapshot.clone(),
+        )));
+        let mut expected = Vec::new();
+        for (i, count) in snapshot.quic_close_received.iter().enumerate() {
+            let label = QuicCloseCode::ALL
+                .get(i)
+                .map_or("unknown_code", |code| code.label());
+            expected.push((format!("quic_close_received_{label}"), *count));
+        }
+        for (outcome, count) in QuicUpgradeOutcome::ALL.iter().zip(snapshot.quic_upgrade) {
+            expected.push((format!("quic_upgrade_{}", outcome.label()), count));
+        }
+        for (cause, count) in QuicFallback::ALL.iter().zip(snapshot.quic_fallback) {
+            expected.push((format!("quic_fallback_{}", cause.label()), count));
+        }
+        for (age, count) in QuicPathAge::ALL.iter().zip(snapshot.quic_path_age_at_close) {
+            expected.push((format!("quic_path_age_at_close_{}", age.label()), count));
+        }
+        for (key, value) in [
+            ("quic_establish_ms_p50", 901),
+            ("quic_establish_ms_p90", 902),
+            ("quic_establish_samples", 903),
+            ("quic_paths_offered_or_dialing", 904),
+            ("quic_paths_active", 905),
+        ] {
+            expected.push((key.to_string(), value));
+        }
+        assert_eq!(
+            expected.len(),
+            QuicCloseCode::COUNT
+                + 1
+                + QuicUpgradeOutcome::COUNT
+                + QuicFallback::COUNT
+                + QuicPathAge::COUNT
+                + 5
+        );
+        for (key, value) in expected {
+            assert_eq!(json[&key], value, "event-log value for {key}");
+        }
     }
 
     /// Each connection identity key is in the event-log JSON exactly when its

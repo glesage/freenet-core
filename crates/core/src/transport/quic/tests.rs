@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use super::config::{
     self, ALPN, INCOMING_BUFFER_BYTES, INCOMING_BUFFER_TOTAL_BYTES, KEEPALIVE_INTERVAL,
-    MAX_BIDI_STREAMS, MAX_INCOMING, MAX_UDP_PAYLOAD, MAX_WINDOW_BYTES, MIN_WINDOW_BYTES,
+    MAX_INCOMING, MAX_UDP_PAYLOAD, MAX_WINDOW_BYTES, MIN_WINDOW_BYTES,
 };
 use super::identity::{PeerKey, PinnedClientKey, PinnedServerKey, QuicIdentity};
 use super::test_tls::TestIdentity;
@@ -31,7 +31,7 @@ use crate::transport::in_memory_socket::{
 use crate::transport::metrics::DemuxClass;
 use crate::transport::packet_data::MAX_RECV_PACKET_SIZE;
 
-pub(super) const SEED: u64 = 0x0059_40C2;
+pub(in crate::transport) const SEED: u64 = 0x0059_40C2;
 
 /// One datagram as a test socket saw it leave.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,7 +104,11 @@ fn pump<S: Socket>(socket: Arc<DemuxSocket<S>>) -> tokio::task::JoinHandle<()> {
 /// Run `fut` on the test runtime, letting every task run until nothing is
 /// ready and then moving `time` to its next wakeup. Fails if virtual time
 /// passes `limit` first.
-pub(super) async fn drive<F>(time: &VirtualTime, limit: Duration, fut: F) -> F::Output
+pub(in crate::transport::quic) async fn drive<F>(
+    time: &VirtualTime,
+    limit: Duration,
+    fut: F,
+) -> F::Output
 where
     F: std::future::Future + Send + 'static,
     F::Output: Send + 'static,
@@ -143,7 +147,7 @@ const WATCHDOG: Duration = Duration::from_secs(120);
 /// so a test on the test's own runtime would hang `cargo test` forever
 /// instead of failing; the spinning thread is left behind and dies with the
 /// test process.
-pub(super) fn bounded<F, Fut>(test: F)
+pub(in crate::transport::quic) fn bounded<F, Fut>(test: F)
 where
     F: FnOnce() -> Fut + Send + 'static,
     Fut: std::future::Future<Output = ()>,
@@ -204,7 +208,7 @@ fn settings() -> QuicSettings {
 }
 
 /// Two endpoints, `a` (client) and `b` (server), on one simulated network.
-pub(super) struct Pair {
+pub(in crate::transport::quic) struct Pair {
     pub(super) time: VirtualTime,
     network: String,
     pub(super) a: QuicEndpoint,
@@ -232,7 +236,7 @@ impl Drop for Pair {
 /// the simulated network registry is keyed by address), with an egress cap
 /// of `a_cap` bytes per second on `a`'s socket, on the same `VirtualTime`
 /// as the endpoints. `b` accepts connections from `a`.
-pub(super) async fn pair(
+pub(in crate::transport::quic) async fn pair(
     network: &str,
     a_addr: SocketAddr,
     b_addr: SocketAddr,
@@ -1499,9 +1503,9 @@ fn endpoint_config_pins_every_value() {
 /// each must render as, for a window of `window` bytes.
 fn pinned_transport_fields(window: u64) -> Vec<(&'static str, String)> {
     vec![
-        ("max_concurrent_bidi_streams", MAX_BIDI_STREAMS.to_string()),
-        // A literal, not `MAX_UNI_STREAMS`, so a change to the limit fails
-        // here; the value is set from field data (see its doc).
+        // Literals, not the constants, so a change to a limit fails here.
+        ("max_concurrent_bidi_streams", "0".into()),
+        // The uni value is set from field data (see its doc).
         ("max_concurrent_uni_streams", "64".into()),
         ("stream_receive_window", window.to_string()),
         ("receive_window", window.to_string()),
@@ -2184,6 +2188,7 @@ fn a_cap_short_of_the_datagram_is_would_block() {
     assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
     assert!(demux.inner_for_test().sent.lock().unwrap().is_empty());
     assert_eq!(cap.level_bytes(), level, "nothing was charged");
+    assert_eq!(socket.send_refused(), 1, "a cap refusal is counted");
 
     let mut poller = socket.clone().create_io_poller();
     let waker = futures::task::noop_waker();
@@ -2218,6 +2223,7 @@ fn a_full_socket_buffer_is_would_block_and_returns_the_take() {
     assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
     assert_eq!(cap.level_bytes(), level, "the take came back");
     assert_eq!(cap.stats().bytes, 0);
+    assert_eq!(socket.send_refused(), 1, "a full buffer is counted");
 }
 
 /// A send that fails with any other error is reported to quinn as sent
@@ -2569,8 +2575,8 @@ fn the_cap_wakes_waiters_per_quic_datagram() {
 }
 
 /// Each close code reaches the peer as that code, and the peer maps it to
-/// the kind its handling depends on: `Downgrade` (and the two recycle
-/// codes, which also ask the peer to fall back to UDP) and
+/// the kind its handling depends on: `Downgrade` (and the recycle codes and
+/// `ControlRefused`, which also ask the peer to fall back to UDP) and
 /// `IdentityMismatch` are refusals, `NodeDroppedPeer` (also what dropping a connection sends) is a
 /// lost connection. Either side can close. Each close is counted once, by
 /// code; a second close of an ended connection sends and counts nothing.
@@ -2591,7 +2597,8 @@ fn close_codes_reach_the_peer() {
             QuicCloseCode::NodeDroppedPeer => QuicErrorKind::ConnectionLost,
             QuicCloseCode::Downgrade
             | QuicCloseCode::SendAbortLimit
-            | QuicCloseCode::PeerNotAcknowledging => QuicErrorKind::Refused {
+            | QuicCloseCode::PeerNotAcknowledging
+            | QuicCloseCode::ControlRefused => QuicErrorKind::Refused {
                 reason: QuicRefusal::Downgrade,
             },
             QuicCloseCode::IdentityMismatch => QuicErrorKind::Refused {
@@ -2632,6 +2639,29 @@ fn close_codes_reach_the_peer() {
                 drop((closer, peer));
             }
         }
+        // The side that did not close counts the raw code it received, once
+        // per connection (`quic_close_received_*`). The closer's own watcher
+        // sees a local close and counts nothing.
+        let time = pair.time.clone();
+        drive(&pair.time, Duration::from_secs(5), async move {
+            time.sleep(Duration::from_secs(1)).await
+        })
+        .await;
+        let received = |remote| -> Vec<String> {
+            TRANSPORT_METRICS
+                .quic_events_of(remote)
+                .into_iter()
+                .filter(|event| event.starts_with("(\"close_received\""))
+                .collect()
+        };
+        let want = |codes: &[QuicCloseCode]| -> Vec<String> {
+            codes
+                .iter()
+                .map(|code| format!("(\"close_received\", Some({code:?}), {})", code.code()))
+                .collect()
+        };
+        assert_eq!(received(pair.a_addr), want(&sent_by_a));
+        assert_eq!(received(pair.b_addr), want(&sent_by_b));
         assert_eq!(TRANSPORT_METRICS.quic_close_sent_to(pair.b_addr), sent_by_a);
         assert_eq!(TRANSPORT_METRICS.quic_close_sent_to(pair.a_addr), sent_by_b);
 
@@ -2687,7 +2717,10 @@ fn endpoint_death_turns_quic_off_without_stopping_the_node() {
 
         let monitor = BackgroundTaskMonitor::new();
         let (attempts, _attempts_rx) = tokio::sync::mpsc::channel(4);
-        assert!(pair.a.spawn_accept_loop(&monitor, attempts));
+        assert!(
+            pair.a
+                .spawn_accept_loop(&monitor.late_registrar(), attempts)
+        );
         let monitor_fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let wait = {
             let fired = monitor_fired.clone();
@@ -2808,10 +2841,10 @@ fn dropping_the_endpoint_is_not_a_death() {
         .unwrap();
         let monitor = BackgroundTaskMonitor::new();
         let (attempts, mut attempts_rx) = tokio::sync::mpsc::channel(4);
-        assert!(endpoint.spawn_accept_loop(&monitor, attempts));
+        assert!(endpoint.spawn_accept_loop(&monitor.late_registrar(), attempts));
         let (second, _second_rx) = tokio::sync::mpsc::channel(4);
         assert!(
-            !endpoint.spawn_accept_loop(&monitor, second),
+            !endpoint.spawn_accept_loop(&monitor.late_registrar(), second),
             "one accept loop per endpoint"
         );
         let mut availability = endpoint.availability();
@@ -2870,7 +2903,10 @@ fn a_full_accept_queue_ignores_and_counts_the_attempt() {
         let monitor = BackgroundTaskMonitor::new();
         // Room for one attempt, never taken.
         let (attempts, _attempts_rx) = tokio::sync::mpsc::channel(1);
-        assert!(pair.b.spawn_accept_loop(&monitor, attempts));
+        assert!(
+            pair.b
+                .spawn_accept_loop(&monitor.late_registrar(), attempts)
+        );
         let clients: Vec<_> = (0..2)
             .map(|_| {
                 let (a, b_addr, b_key) = (pair.a.clone(), pair.b_addr, pair.b_key());
@@ -2951,6 +2987,82 @@ fn the_transport_reports_quic_availability() {
             );
         }
         unregister_network_time_source(network);
+    })
+}
+
+/// When the node opens the transport with an endpoint, the endpoint's
+/// accept loop is started and registered through the node's late
+/// registrar, so the monitor, already waiting by then, watches it. Without
+/// a registrar (tools and tests) no loop is started, and without an
+/// endpoint (QUIC off) there is no loop to start. On simulation sockets.
+#[test]
+fn the_transport_starts_the_accept_loop_through_the_late_registrar() {
+    bounded(|| async move {
+        use crate::node::background_task_monitor::BackgroundTaskMonitor;
+        use crate::transport::connection_handler::{UdpTransportConfig, bind_udp_listener};
+        let network = "quic-transport-accept-loop";
+        let _clock = Registration::time_source(network, VirtualTime::new());
+        for (port, quic, with_registrar) in [
+            (5000, Some(settings()), true),
+            (5001, Some(settings()), false),
+            (5002, None, true),
+        ] {
+            let local = SocketAddr::from(([10, 201, 35, 1], port));
+            let _registered = Registration::address(local, network);
+            let monitor = BackgroundTaskMonitor::new();
+            // The node's order: the monitor waits before the transport opens.
+            let registrar = monitor.late_registrar();
+            let wait = tokio::spawn(monitor.wait_for_any_exit());
+            let has_endpoint = quic.is_some();
+            let (outbound, _inbound, listener) = bind_udp_listener::<SimulationSocket>(
+                crate::transport::TransportKeypair::new(),
+                local.ip(),
+                port,
+                false,
+                UdpTransportConfig {
+                    quic,
+                    task_registrar: with_registrar.then(|| registrar.clone()),
+                    ..UdpTransportConfig::default()
+                },
+            )
+            .await
+            .unwrap();
+            let expected: &[&str] = if with_registrar && has_endpoint {
+                &["quic_accept_loop"]
+            } else {
+                &[]
+            };
+            assert_eq!(registrar.registered(), expected, "port {port}");
+            assert_eq!(
+                crate::transport::in_memory_socket::quic_accept_loop_started(network, local),
+                !expected.is_empty(),
+                "port {port}"
+            );
+            match outbound.quic_endpoint() {
+                Some(endpoint) => {
+                    let (attempts, _attempts_rx) = tokio::sync::mpsc::channel(1);
+                    assert_eq!(
+                        endpoint.spawn_accept_loop(
+                            &BackgroundTaskMonitor::new().late_registrar(),
+                            attempts
+                        ),
+                        !with_registrar,
+                        "with a registrar the transport already started the endpoint's one loop"
+                    );
+                }
+                None => assert!(!has_endpoint, "an endpoint is built with QUIC on"),
+            }
+            for _ in 0..64 {
+                tokio::task::yield_now().await;
+            }
+            assert!(
+                !wait.is_finished(),
+                "the running loop does not end the wait"
+            );
+            wait.abort();
+            listener.abort();
+        }
+        crate::transport::in_memory_socket::clear_quic_endpoint_clocks(network);
     })
 }
 
@@ -3360,7 +3472,10 @@ fn a_panic_in_the_socket_adapter_turns_quic_off_and_the_node_keeps_running() {
 
                 let monitor = BackgroundTaskMonitor::new();
                 let (attempts, _attempts_rx) = tokio::sync::mpsc::channel(4);
-                assert!(pair.a.spawn_accept_loop(&monitor, attempts));
+                assert!(
+                    pair.a
+                        .spawn_accept_loop(&monitor.late_registrar(), attempts)
+                );
                 let monitor_fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let wait = {
                     let fired = monitor_fired.clone();
@@ -4274,4 +4389,102 @@ fn a_release_without_a_panic_closes_nothing() {
         assert!(TRANSPORT_METRICS.quic_close_sent_to(pair.b_addr).is_empty());
         drop((client, server));
     });
+}
+
+/// A Retry token comes back validated up to its lifetime, on the endpoint's clock,
+/// and past it the attempt is refused with a close and does not reach `accept`.
+#[test]
+fn a_retry_token_is_honoured_for_its_lifetime_on_the_endpoint_clock() {
+    use bytes::BytesMut;
+    use quinn_proto::{DatagramEvent, Endpoint};
+    let _seed = GlobalRng::seed_guard(SEED);
+    let time = VirtualTime::new();
+    let client_keys = TransportKeypair::new();
+    let server_keys = TransportKeypair::new();
+    let server_tls = QuicIdentity::new(&server_keys)
+        .unwrap()
+        .server_tls(&PeerKey::of(client_keys.public()).unwrap())
+        .unwrap();
+    let client_tls = QuicIdentity::new(&client_keys)
+        .unwrap()
+        .client_tls(&PeerKey::of(server_keys.public()).unwrap())
+        .unwrap();
+    let transport = Arc::new(config::transport_config(&settings(), &time));
+    let server_config = config::server_config(
+        Arc::new(server_tls),
+        transport.clone(),
+        config::system_clock(time.clone()),
+    )
+    .unwrap();
+    let endpoint_config = || Arc::new(config::endpoint_config().unwrap());
+    let mut server = Endpoint::new(endpoint_config(), Some(Arc::new(server_config)), true, None);
+    let mut client = Endpoint::new(endpoint_config(), None, true, None);
+    let client_addr: SocketAddr = "10.205.0.1:5000".parse().unwrap();
+    let server_addr: SocketAddr = "10.205.0.2:5000".parse().unwrap();
+    let now = tokio::time::Instant::now().into_std();
+
+    let (_, mut connection) = client
+        .connect(
+            now,
+            config::client_config(Arc::new(client_tls), transport),
+            server_addr,
+            config::SERVER_NAME,
+        )
+        .unwrap();
+    let mut first = Vec::new();
+    let sent = connection.poll_transmit(now, 1, &mut first).unwrap();
+    first.truncate(sent.size);
+    let mut scratch = Vec::new();
+    let Some(DatagramEvent::NewConnection(incoming)) = server.handle(
+        now,
+        client_addr,
+        None,
+        None,
+        BytesMut::from(&first[..]),
+        &mut scratch,
+    ) else {
+        panic!("the first Initial is a new attempt");
+    };
+    assert!(!incoming.remote_address_validated());
+    let mut retry = Vec::new();
+    let sent = server.retry(incoming, &mut retry).unwrap();
+    retry.truncate(sent.size);
+    let Some(DatagramEvent::ConnectionEvent(_, event)) = client.handle(
+        now,
+        server_addr,
+        None,
+        None,
+        BytesMut::from(&retry[..]),
+        &mut scratch,
+    ) else {
+        panic!("the Retry reaches the client's connection");
+    };
+    connection.handle_event(event);
+    let mut with_token = Vec::new();
+    let sent = connection.poll_transmit(now, 1, &mut with_token).unwrap();
+    with_token.truncate(sent.size);
+
+    let mut arrive = |server: &mut Endpoint| {
+        server.handle(
+            now,
+            client_addr,
+            None,
+            None,
+            BytesMut::from(&with_token[..]),
+            &mut scratch,
+        )
+    };
+    time.advance(config::RETRY_TOKEN_LIFETIME);
+    let Some(DatagramEvent::NewConnection(validated)) = arrive(&mut server) else {
+        panic!("the token holds for its whole lifetime");
+    };
+    assert!(validated.remote_address_validated());
+    assert!(!validated.may_retry());
+    server.ignore(validated);
+
+    time.advance(Duration::from_millis(1));
+    assert!(
+        matches!(arrive(&mut server), Some(DatagramEvent::Response(_))),
+        "past its lifetime the token is answered with a close"
+    );
 }
