@@ -20,14 +20,19 @@ type Version = (u8, u8, u16);
 /// One thing a node's upgrades did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuicUpgradeRecord {
-    /// On the runtime's clock, which every node shares.
+    /// Since the first record, on the clock of the runtime that recorded it. The
+    /// direct runner has one runtime, so times compare across nodes. Under turmoil
+    /// each host's clock starts when its runtime is built, so compare times only
+    /// within one node.
     pub at: Duration,
     pub node: SocketAddr,
     pub peer: SocketAddr,
-    /// The session's number in its node; 0 for a node with QUIC off.
+    /// The session's number in its node; 0 for a node with QUIC off, and for a
+    /// record about no session (an injected fault, with the node as `peer`).
     pub session: u64,
     /// An `Outcome` in its `Debug` form, or `received ...`, `sent ...`,
-    /// `closed path with ...`, `stale connection ...`, `session ended`.
+    /// `closed path with ...`, `stale connection ...`, `session ended`,
+    /// `injected an Initial`, `failed the endpoint at <ms> ms`.
     pub what: String,
     /// The path permits the node held just after this.
     pub permits: usize,
@@ -42,8 +47,8 @@ struct TraceData {
     connections: Mutex<BTreeMap<SocketAddr, usize>>,
     /// Nodes that receive an extra Initial each time they allow a peer.
     initial_on_attempt: Mutex<BTreeSet<SocketAddr>>,
-    /// Nodes that send each short message on a path that may carry data.
-    shorts_on_paths: Mutex<BTreeSet<SocketAddr>>,
+    /// Nodes that build their paths to refuse data while they advertise the bit.
+    refuse_data: Mutex<BTreeSet<SocketAddr>>,
     /// The version a peer reports, and the release it then reads as.
     release: Mutex<Option<(Version, Version)>>,
 }
@@ -117,12 +122,11 @@ impl QuicUpgradeTrace {
         self.data.initial_on_attempt.lock().insert(node);
     }
 
-    /// `node` sends each message that fits a packet as a Short on the connection's
-    /// path, when that path may carry data. Nothing else calls a path's data sends
-    /// yet, so this is how a simulation gets real messages onto one. If the send
-    /// fails the message is lost, since there is no fallback to UDP here.
-    pub fn send_shorts_on_paths(&self, node: SocketAddr) {
-        self.data.shorts_on_paths.lock().insert(node);
+    /// `node` advertises its data bit but builds every path to refuse data, as a
+    /// node with a gating bug would. Its peer sends data, the node refuses it and
+    /// closes the path, and the pair's data goes on UDP.
+    pub fn refuse_data_while_advertising(&self, node: SocketAddr) {
+        self.data.refuse_data.lock().insert(node);
     }
 
     /// A peer that reports `real` is treated as running `release` when the machine
@@ -134,7 +138,9 @@ impl QuicUpgradeTrace {
         *self.data.release.lock() = Some((real, release));
     }
 
-    /// `node`'s QUIC endpoint driver fails `at` after its transport opens.
+    /// `node`'s QUIC endpoint driver fails `at` after its transport opens, on the
+    /// path clock (the network's VirtualTime in simulation). The node records
+    /// `failed the endpoint at <ms> ms` with that clock's time.
     pub fn fail_endpoint_at(&self, node: SocketAddr, at: Duration) {
         self.data.down_at.lock().insert(node, at);
     }
@@ -214,8 +220,8 @@ impl NodeTrace {
         }
     }
 
-    pub(crate) fn sends_shorts_on_paths(&self) -> bool {
-        self.trace.data.shorts_on_paths.lock().contains(&self.addr)
+    pub(crate) fn refuses_data_while_advertising(&self) -> bool {
+        self.trace.data.refuse_data.lock().contains(&self.addr)
     }
 
     pub(crate) fn wrong_record(&self) -> bool {

@@ -102,7 +102,7 @@ const TOKEN_BUCKET_WINDOW: Duration = Duration::from_millis(100);
 /// (~1200 bytes) cannot be admitted, stalling connections at very low rates.
 /// 8 KiB (~6–7 max-size packets) provides enough headroom for burst handling
 /// without allowing large uncontrolled bursts.
-const MIN_BUCKET_CAPACITY_BYTES: usize = 8192;
+pub(in crate::transport) const MIN_BUCKET_CAPACITY_BYTES: usize = 8192;
 
 pub type SerializedMessage = Vec<u8>;
 
@@ -249,8 +249,9 @@ pub(super) async fn bind_udp_listener<S: Socket>(
         .as_ref()
         .and_then(|_| get_socket_virtual_time(&bind_addr));
     // The node-wide egress cap exists only when `total-bandwidth-limit` is
-    // set and not 0 (`global_bandwidth` is set, and `from_total_limit`
-    // builds no cap for 0), so a node without it pays nothing. The cap runs
+    // set and not 0 (`global_bandwidth` is set; the node builds no pool for a
+    // total of 0, `NetworkApiConfig::global_bandwidth_manager`), so a node
+    // without it pays nothing. The cap runs
     // on `RealTime`, as the listener built below does, in production and in
     // simulation alike; waiters sleep on their own connection's time
     // source. A cap on the network's `VirtualTime` would compute deficits on
@@ -281,7 +282,19 @@ pub(super) async fn bind_udp_listener<S: Socket>(
     // above; the simulation's `VirtualTime` in a simulation, which has no
     // cap), authenticates with this node's transport key, and has an empty
     // allow-set: nothing reaches it until an upgrade path allows a peer.
-    let quic_endpoint = config.quic.as_ref().and_then(|settings| {
+    // Each QUIC connection's window is capped at the rate the UDP token
+    // bucket paces a connection at (`quic::recycle::CappedCubic`).
+    let quic_settings = config
+        .quic
+        .clone()
+        .map(|settings| super::quic::QuicSettings {
+            rate_limit: super::quic::config::QuicRateLimit::new(
+                config.bandwidth_limit,
+                config.global_bandwidth.clone(),
+            ),
+            ..settings
+        });
+    let quic_endpoint = quic_settings.as_ref().and_then(|settings| {
         let socket = socket.clone();
         match quic_virtual_time {
             // Building the endpoint draws quinn's RNG seed from `GlobalRng`.
@@ -304,6 +317,9 @@ pub(super) async fn bind_udp_listener<S: Socket>(
         }
     });
 
+    if let (Some(_), Some(settings)) = (&quic_endpoint, &quic_settings) {
+        super::TRANSPORT_METRICS.set_quic_flow_control_window_bytes(settings.window_bytes());
+    }
     #[cfg(any(test, feature = "testing"))]
     if let Some(endpoint) = &quic_endpoint {
         super::in_memory_socket::record_quic_endpoint_clock(bind_addr, endpoint.clock_type());
@@ -354,10 +370,18 @@ fn build_quic_upgrades(
     if let Some(at) = trace.as_ref().and_then(|trace| trace.down_at()) {
         let failing = endpoint.clone();
         let clock = path_clock.clone();
+        let noted = trace.clone();
         // Bounded by `at`, and holds an endpoint share only until then.
         drop(GlobalExecutor::spawn(async move {
             clock.sleep(at).await;
             failing.fail_driver();
+            // Recorded so a test can check the fault ran rather than infer it,
+            // with the time on the clock the fault was set on: a record's `at`
+            // is on the recording host's own clock.
+            if let Some(trace) = noted {
+                let ms = clock.now_nanos() / 1_000_000;
+                trace.record(trace.addr(), 0, format!("failed the endpoint at {ms} ms"));
+            }
         }));
     }
     Some(QuicUpgrades::new(

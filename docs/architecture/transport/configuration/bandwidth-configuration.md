@@ -35,7 +35,7 @@ freenet --total-bandwidth-limit 50000000 --min-bandwidth-per-connection 1000000
 
 | Argument | Description | Default |
 |----------|-------------|---------|
-| `--bandwidth-limit <bytes/sec>` | Per-connection cap on the congestion controller's rate for streamed transfers (0 = unset; values below 64 KiB/s are raised to it; ignored when `--total-bandwidth-limit` is set) | None (the congestion controller's rate: 1,250,000 (1.25 MB/s) for `fixedrate`) |
+| `--bandwidth-limit <bytes/sec>` | Per-connection cap on the congestion controller's rate for streamed transfers (0 = unset; values below 64 KiB/s are raised to it; ignored when `--total-bandwidth-limit` is set and not 0) | None (the congestion controller's rate: 1,250,000 (1.25 MB/s) for `fixedrate`) |
 | `--total-bandwidth-limit <bytes/sec>` | Cap on everything the node sends over UDP, across ALL connections | None (disabled) |
 | `--min-bandwidth-per-connection <bytes/sec>` | Minimum per-connection pacing rate inside the total (clamped to the total) | 1,000,000 (1 MB/s) |
 | `--congestion-control <algorithm>` | Congestion control algorithm (`fixedrate`, `ledbat`, `bbr`) | `fixedrate` |
@@ -191,7 +191,7 @@ Only one kind of send waits for the bucket:
 
 | Send | Behaviour when the bucket is empty |
 |------|------------------------------------|
-| Stream fragments (`send_stream`, `pipe_stream`) | First reserve the datagram on the per-connection bucket and sleep until it is due, so a connection serves its streams in order; a reservation whose wait would reach the stream's 5 s deadline is not made, so it takes no place in the connection's order, and the stream fails at once (counted as refused, `egress_streams_refused_*`). A reservation that was made and is later given back (the stream is cancelled or fails on a later wait) does not move the fragments behind it up; their waits are not recomputed. An admitted new stream can still delay streams already in progress on the connection, as without a cap; a per-connection scheduler is future work. This looks only at the connection's wait, so a fragment can still fail on the node-wide bucket at the deadline. The fragment keeps that reservation through later waits. Then, right after a cwnd check, take the datagram from the node-wide bucket and send at once. If it is short, take nothing from it, sleep for the deficit times 1.0 to 1.4 plus 0 to 2 ms (random), and start again from the cwnd check. Nothing is held on the node-wide bucket while waiting, and the order among streams waiting for it is random. A stream whose next fragment has not been sent 5 s after its previous one (or after the stream started; the gap the receiver times, whatever the wait was for) fails. |
+| Stream fragments (`send_stream`, `pipe_stream`) | First reserve the datagram on the per-connection bucket and sleep until it is due, so a connection serves its streams in order; a reservation whose wait would reach the stream's 5 s deadline is not made, so it takes no place in the connection's order, and the stream fails at once (counted as refused, `egress_streams_refused_*`). A reservation that was made and is later given back (the stream is cancelled or fails on a later wait) does not move the fragments behind it up; their waits are not recomputed. An admitted new stream can still delay streams already in progress on the connection, as without a cap; a per-connection scheduler is future work. This looks only at the connection's wait, so a fragment can still fail on the node-wide bucket at the deadline. The fragment keeps that reservation through later waits. Then wait in the node-wide bucket's admission queue, the same queue the QUIC endpoint waits in, until the bucket holds the datagram; after any wait, check cwnd again; then take the datagram from the node-wide bucket and send at once. Nothing is held on the node-wide bucket while waiting: the queue holds the stream's place, not bytes. Once admitted, the stream holds one datagram until it takes it, for at most 1 ms. If its take fails (an ACK or another unpaced send took the datagram first), or its congestion window holds it longer than that, it waits again at the same place in the queue, not at the back. A stream whose next fragment has not been sent 5 s after its previous one (or after the stream started; the gap the receiver times, whatever the wait was for) fails. |
 | Everything else (handshakes, short messages, ACKs, receipts, keepalives, Pongs, retransmissions) | Sent at once and charged once sent. The bucket goes into debt, and the next stream fragments wait longer to pay it. |
 
 The sends that never wait are sent from places that must not block: the receive path
@@ -210,16 +210,20 @@ What this guarantees:
   it is still sent but not charged ("forgiven", counted as
   `egress_debt_forgiven_bytes`). So the cap holds on average, and forgiven bytes mean
   control traffic alone exceeded the cap for over a second.
-- The order among waiting streams is random: a stream that wakes when the bucket has
-  room takes it. Each of `N` concurrent streams gets a fragment about every
-  `N * 1200 / C` seconds on average at a cap of `C` bytes/s, and the gaps have a
-  geometric tail (see the troubleshooting section). Connections share the cap in
+- Waiting streams and QUIC connections are served approximately in the order they
+  queued, each with a turn (a QUIC transmit delayed by the operating system between
+  its admission and its send can take another QUIC connection's turn), so each of `N` waiting senders gets a datagram about every
+  `N * 1200 / C` seconds at a cap of `C` bytes/s. Until #6112 the order was random
+  and the gaps had a geometric tail, and a QUIC path, which already queued, won most
+  refills. Connections share the cap in
   proportion to their number of waiting streams.
 - Known limitation: there is no isolation between connections inside the cap. A peer
   that drives many streams through this node gets a proportional share of it.
 
 Without `total-bandwidth-limit` no bucket exists and nothing changes. A
-`total-bandwidth-limit` of 0 is ignored with a warning.
+`total-bandwidth-limit` of 0 is ignored with a warning: no cap and no per-connection
+share for UDP or QUIC (UDP no longer paces at the 1 MB/s per-connection minimum), and
+`bandwidth-limit` applies to both transports if set.
 
 At startup the node logs the cap, warns if `min-bandwidth-per-connection` was above
 the total (it is clamped), and warns if the total is below 4,800 bytes/s (four
@@ -549,8 +553,10 @@ megabytes. These are estimates from the slot-lottery model, not guarantees. The 
 is a higher limit; there is no per-stream admission control.
 
 A slow stream also holds broadcast capacity: the broadcast queue keeps a send's slot
-until its stream completes, up to `STREAM_COMPLETION_TIMEOUT` (120 s), so a cap that
-makes streams slow also slows contract update fan-out.
+until its stream completes, up to `STREAM_PERMIT_HOLD` (120 s), so a cap that makes
+streams slow also slows contract update fan-out. The send goes on waiting for the
+stream after that, without the slot, up to a size-scaled limit just under the
+receiver's age limit (`stream_completion_timeout`).
 
 ## Source Code
 

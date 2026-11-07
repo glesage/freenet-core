@@ -173,6 +173,7 @@ pub(crate) use hosting::{GENUINE_ACCESS_RECENCY_BUCKETS, READ_COUNT_HIST_BUCKETS
 /// can bound itself by real disk headroom, not just RAM, without duplicating
 /// the `statvfs` FFI call or the walk.
 pub(crate) use hosting::{disk_available_bytes, disk_directory_size_bytes};
+pub(crate) mod applied_payloads;
 pub mod interest;
 mod live_tx;
 mod location;
@@ -387,6 +388,11 @@ pub(crate) struct Ring {
     /// inbound broadcast instead of O(WASM merge). Cleared the instant a merge
     /// succeeds. See `crate::ring::merge_backoff`.
     pub(crate) merge_backoff: Arc<merge_backoff::MergeBackoff>,
+    /// Per-contract hashes of payloads already merged into this node's
+    /// current state. The UPDATE receive paths skip a payload found here;
+    /// the executor records a payload only after its merge commits. See
+    /// `crate::ring::applied_payloads`.
+    pub(crate) applied_payloads: Arc<applied_payloads::AppliedPayloads>,
     /// SENDER-side memo of contracts whose deltas are known-doomed (the HQk7
     /// resync loop). Armed by repeated resync-after-our-delta signals or local
     /// `Invalid`-class delta-apply failures; while armed, the broadcast path
@@ -864,6 +870,15 @@ impl Ring {
                 max_connections,
             )),
             merge_backoff: Arc::new(merge_backoff::MergeBackoff::new(time_source.clone())),
+            // Same injectable clock as the hosting manager and the interest
+            // manager (whose clock the 60 s broadcast dedup cache reads), so
+            // the age bound is deterministic in simulations and tests.
+            applied_payloads: Arc::new(applied_payloads::AppliedPayloads::new(
+                config
+                    .hosting_time_source_override
+                    .clone()
+                    .unwrap_or_else(|| time_source.clone()),
+            )),
             delta_incompat: Arc::new(delta_incompat::DeltaIncompat::new(time_source.clone())),
             resync_emit_limiter: Arc::new(resync_rate_limit::new_emit_limiter(time_source.clone())),
             resync_response_limiter: Arc::new(resync_rate_limit::new_response_limiter(
@@ -1609,6 +1624,13 @@ impl Ring {
             // haven't failed a merge recently; a poison contract still in
             // cooldown is preserved.
             ring.merge_backoff.cleanup_expired();
+
+            // Drop applied-payload records for contracts this node no longer
+            // hosts or serves. Eviction already resets them at the decision;
+            // this is the level-triggered backstop that keeps the map bounded
+            // by the hosted set whatever path ended hosting. Dropping a record
+            // only loses skips, so a race with a concurrent re-host is safe.
+            ring.reap_applied_payloads();
 
             // Sweep stale delta-send attributions and idle unarmed entries in
             // the delta-incompatibility memo (HQk7 resync loop); an armed
@@ -2708,6 +2730,7 @@ impl Ring {
                     recv_n: receiver.counts,
                     recv_tn: receiver.terminal_counts,
                     recv_tb: receiver.terminal_bytes,
+                    recv_ap: receiver.already_applied,
                     state_n: disk.state_size_bucket_counts,
                     state_b: disk.state_size_bucket_bytes,
                     state: [
@@ -3591,6 +3614,21 @@ impl Ring {
     /// When contracts are evicted (past max entries and beyond TTL), this task
     /// cleans up the local subscription state. The upstream peer will eventually
     /// prune us when updates fail to deliver.
+    /// The free-space figure the hosting sweep budgets disk against.
+    ///
+    /// `read_real` is the data-dir mount's free space (`statvfs`); a failed
+    /// read falls back to `u64::MAX`, so the disk budget clamps to its cap. In
+    /// a simulation (`SimNetwork` sets the network name on the thread its
+    /// nodes run on) the real read is skipped and the fallback used, so free
+    /// space on the machine running the tests cannot change eviction between
+    /// runs of one seed (#6123).
+    fn sweep_free_space_bytes(read_real: impl FnOnce() -> Option<u64>) -> u64 {
+        if topology_registry::get_current_network_name().is_some() {
+            return u64::MAX;
+        }
+        read_real().unwrap_or(u64::MAX)
+    }
+
     async fn sweep_get_subscription_cache(ring: Arc<Self>, interval_duration: Duration) {
         let shutdown = ring.shutdown_token();
         // Add random initial delay to prevent synchronized sweeps across peers
@@ -3830,8 +3868,14 @@ impl Ring {
             // no `.await` point. Push it onto a blocking thread so it can never
             // stall other tasks on the async reactor — the same discipline
             // `secrets_store/sweep.rs` uses for its "disk walk + ReDb reads".
+            //
+            // `offload_blocking`, not a bare `spawn_blocking`: on a simulation
+            // host (`current_thread`) it runs the walk inline. A pool thread
+            // finishes in wall-clock time, so the step at which this loop
+            // resumed depended on OS scheduling and one seed gave different
+            // results from run to run (#6123).
             let ring_for_disk = ring.clone();
-            if let Err(err) = tokio::task::spawn_blocking(move || {
+            if let Err(err) = crate::util::blocking::offload_blocking(move || {
                 #[cfg(feature = "redb")]
                 ring_for_disk.hosting_manager.seed_disk_tracker_if_absent();
                 ring_for_disk.hosting_manager.refresh_disk_usage();
@@ -3853,10 +3897,8 @@ impl Ring {
             // du-walks above already ran OUTSIDE any cache lock (in the blocking
             // task); only the O(1) `set_budget_bytes` inside
             // `recompute_effective_budget` takes the cache write lock.
-            let available = ring
-                .hosting_manager
-                .disk_available_bytes()
-                .unwrap_or(u64::MAX);
+            let available =
+                Self::sweep_free_space_bytes(|| ring.hosting_manager.disk_available_bytes());
             ring.hosting_manager.recompute_effective_budget(available);
         }
     }
@@ -5511,6 +5553,14 @@ impl Ring {
     /// No-op if the contract is not currently subscribed.
     pub fn record_contract_update(&self, contract: &ContractKey) {
         self.hosting_manager.record_contract_update(contract)
+    }
+
+    /// Drop applied-payload records (`crate::ring::applied_payloads`) for
+    /// contracts this node neither hosts nor serves. Called by the ring
+    /// reaper. Returns how many contracts were dropped.
+    pub(crate) fn reap_applied_payloads(&self) -> usize {
+        self.applied_payloads
+            .retain_contracts(|key| self.is_hosting_contract(key) || self.contract_in_use(key))
     }
 
     /// True if `contract` has been flagged as violating a CRDT invariant
@@ -8169,6 +8219,75 @@ mod k_closest_source_tests {
              is_peer_ready in the routability mapping): k_closest falls back to \
              not-ready peers, so a not-ready closer neighbor is still a valid route \
              target and must keep this node from short-circuiting its renewal (#4440)."
+        );
+    }
+
+    /// #6123: the hosting sweep's disk-usage walk goes through
+    /// `offload_blocking`, so a simulation host runs it inline. Through a bare
+    /// `spawn_blocking` it finished on a real OS thread in wall-clock time, the
+    /// step at which the sweep resumed followed OS scheduling, and one seed gave
+    /// different results from run to run. In a simulation the free-space read
+    /// is replaced by a fixed figure for the same reason. Comment lines are
+    /// dropped, so a commented-out call fails this pin too.
+    #[test]
+    fn sweep_disk_walk_runs_inline_in_simulations() {
+        let src = production_source();
+        let body = extract_fn_body(
+            src,
+            "async fn sweep_get_subscription_cache(ring: Arc<Self>, interval_duration: Duration) {",
+        );
+        let code: String = body
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .flat_map(|line| line.chars())
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            !code.contains("spawn_blocking("),
+            "the sweep awaits a bare spawn_blocking; use offload_blocking (#6123)"
+        );
+        let walk = code
+            .split_once("crate::util::blocking::offload_blocking(move||{")
+            .map(|(_, after)| after)
+            .and_then(|after| after.split_once("}).await"))
+            .map(|(walk, _)| walk)
+            .expect("the sweep runs a closure through offload_blocking");
+        assert!(
+            walk.contains("ring_for_disk.hosting_manager.refresh_disk_usage();"),
+            "offload_blocking must wrap the disk-usage walk"
+        );
+        assert!(
+            code.contains(
+                "letavailable=Self::sweep_free_space_bytes(||ring.hosting_manager.disk_available_bytes());"
+            ),
+            "the sweep's free space goes through the simulation gate (#6123)"
+        );
+    }
+
+    /// In a simulation the sweep's free-space figure is the fixed fallback and
+    /// the real read is never made; outside one it is the real read.
+    #[test]
+    fn sweep_free_space_ignores_the_real_read_in_a_simulation() {
+        use std::cell::Cell;
+        let reads = Cell::new(0);
+        let read = || {
+            reads.set(reads.get() + 1);
+            Some(1024)
+        };
+
+        super::topology_registry::clear_current_network_name();
+        assert_eq!(super::Ring::sweep_free_space_bytes(read), 1024);
+        assert_eq!(super::Ring::sweep_free_space_bytes(|| None), u64::MAX);
+        assert_eq!(reads.get(), 1);
+
+        super::topology_registry::set_current_network_name("free-space-gate");
+        let in_simulation = super::Ring::sweep_free_space_bytes(read);
+        super::topology_registry::clear_current_network_name();
+        assert_eq!(in_simulation, u64::MAX);
+        assert_eq!(
+            reads.get(),
+            1,
+            "a simulation must not read the real free space"
         );
     }
 

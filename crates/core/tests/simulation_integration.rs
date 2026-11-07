@@ -848,6 +848,198 @@ impl TraceFingerprint {
     }
 }
 
+/// Thread ids of the tokio blocking-pool threads alive now (Linux).
+#[cfg(target_os = "linux")]
+fn blocking_pool_threads() -> std::collections::BTreeSet<u64> {
+    let Ok(tasks) = std::fs::read_dir("/proc/self/task") else {
+        return Default::default();
+    };
+    tasks
+        .flatten()
+        .filter_map(|task| {
+            let tid = task.file_name().to_str()?.parse::<u64>().ok()?;
+            let name = std::fs::read_to_string(task.path().join("comm")).ok()?;
+            (name.trim_end() == "tokio-rt-worker").then_some(tid)
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+const NO_BLOCKING_POOL_CHILD_ENV: &str = "FREENET_NO_BLOCKING_POOL_CHILD";
+#[cfg(target_os = "linux")]
+const NO_BLOCKING_POOL_TEST: &str = "test_simulation_uses_no_blocking_pool_thread";
+
+/// No simulated node may hand work to tokio's blocking pool.
+///
+/// A blocking-pool thread finishes in wall-clock time, so the simulation step
+/// at which the awaiting task resumes follows OS scheduling, and one seed gives
+/// different results from run to run. That was #6123: Ring's disk-usage sweep
+/// awaited `spawn_blocking` (now `offload_blocking`, inline on a simulation
+/// host). The sweep first walks 70-90 s of virtual time into a run, so this run
+/// keeps operations going to about 140 s and watches, every 20 ms, for a
+/// `tokio-rt-worker` thread (tokio's name for its blocking-pool threads) that
+/// was not there before the simulation started. It catches any awaited
+/// `spawn_blocking` or `tokio::fs` call on a simulation path, not only the
+/// sweep's. The polling matters: an idle blocking thread exits after 10 s, so
+/// a check at the end alone could miss one used early.
+///
+/// Runs in a child process (a re-exec of this binary filtered to this test), so
+/// no other test in the same `cargo test` process can create a blocking thread
+/// during the watch.
+#[cfg(target_os = "linux")]
+#[test]
+fn test_simulation_uses_no_blocking_pool_thread() {
+    if std::env::var_os(NO_BLOCKING_POOL_CHILD_ENV).is_none() {
+        let output = std::process::Command::new("/proc/self/exe")
+            .args([
+                "--exact",
+                "--test-threads=1",
+                "--nocapture",
+                NO_BLOCKING_POOL_TEST,
+            ])
+            .env(NO_BLOCKING_POOL_CHILD_ENV, "1")
+            .output()
+            .expect("re-exec the test binary");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "child run of {NO_BLOCKING_POOL_TEST} failed.\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        );
+        // libtest exits 0 when its filter matches nothing; fail closed on a
+        // rename instead of passing vacuously.
+        assert!(
+            stdout.contains("1 passed"),
+            "the child must actually have run {NO_BLOCKING_POOL_TEST}; if it was \
+             renamed, update NO_BLOCKING_POOL_TEST.\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        );
+        return;
+    }
+
+    const SEED: u64 = 0xD15C_6123;
+    const NAME: &str = "no-blocking-pool";
+    const NODES: usize = 9;
+    const CONTRACTS: u8 = 4;
+    const ROUNDS: usize = 30;
+
+    // Positive control: a deliberate `spawn_blocking` on a runtime of its own
+    // must show up, or the detector is blind (tokio renamed its blocking
+    // threads, or something set a thread name) and an empty result below
+    // would mean nothing.
+    {
+        let control_before = blocking_pool_threads();
+        let control = create_runtime();
+        control
+            .block_on(async {
+                tokio::task::spawn_blocking(|| {
+                    std::thread::sleep(Duration::from_millis(50));
+                })
+                .await
+            })
+            .expect("control blocking task");
+        let seen = blocking_pool_threads();
+        assert!(
+            seen.difference(&control_before).next().is_some(),
+            "the detector did not see a deliberate spawn_blocking; tokio's \
+             blocking-pool thread name is no longer \"tokio-rt-worker\", so this \
+             test would pass without detecting anything"
+        );
+        drop(control);
+    }
+
+    // Taken before the network is built, so a blocking thread created while
+    // building it counts too.
+    let before = blocking_pool_threads();
+    setup_deterministic_state(SEED);
+    let rt = create_runtime();
+    let mut sim = rt.block_on(SimNetwork::new(NAME, 1, NODES, 10, 3, 8, 3, SEED));
+
+    let contracts: Vec<_> = (0..CONTRACTS)
+        .map(|i| SimOperation::create_test_contract(0x60 + i))
+        .collect();
+    let mut operations = Vec::new();
+    for (i, contract) in contracts.iter().enumerate() {
+        operations.push(ScheduledOperation::new(
+            NodeLabel::gateway(NAME, 0),
+            SimOperation::Put {
+                contract: contract.clone(),
+                state: SimOperation::create_test_state(i as u8),
+                subscribe: true,
+            },
+        ));
+    }
+    for node in 1..=NODES {
+        operations.push(ScheduledOperation::new(
+            NodeLabel::node(NAME, node),
+            SimOperation::Subscribe {
+                contract_id: *contracts[node % contracts.len()].key().id(),
+            },
+        ));
+    }
+    for round in 0..ROUNDS {
+        let contract = &contracts[round % contracts.len()];
+        operations.push(ScheduledOperation::new(
+            NodeLabel::node(NAME, 1 + round % NODES),
+            SimOperation::Update {
+                key: contract.key(),
+                data: SimOperation::create_test_state(16 + round as u8),
+            },
+        ));
+        operations.push(ScheduledOperation::new(
+            NodeLabel::node(NAME, 1 + (round * 5 + 3) % NODES),
+            SimOperation::Get {
+                contract_id: *contracts[(round + 1) % contracts.len()].key().id(),
+                return_contract_code: false,
+                subscribe: false,
+            },
+        ));
+    }
+    let op_interval = Duration::from_secs(2);
+    let op_seconds = operations.len() as u64 * op_interval.as_secs();
+    assert!(
+        op_seconds > 120,
+        "operations must run past the sweep's first disk walk (70-90 s)"
+    );
+    sim.with_controlled_op_interval(op_interval);
+
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let watcher = {
+        let stop = stop.clone();
+        let before = before.clone();
+        std::thread::spawn(move || {
+            let mut seen = std::collections::BTreeSet::new();
+            while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                seen.extend(blocking_pool_threads().difference(&before).copied());
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            seen.extend(blocking_pool_threads().difference(&before).copied());
+            seen
+        })
+    };
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(op_seconds + 30),
+        Duration::from_secs(20),
+    );
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    let new_threads = watcher.join().expect("watcher thread");
+    assert!(
+        result.turmoil_result.is_ok(),
+        "simulation failed: {:?}",
+        result.turmoil_result.err()
+    );
+    assert!(
+        new_threads.is_empty(),
+        "a simulated node handed work to tokio's blocking pool ({} new \
+         tokio-rt-worker threads: {new_threads:?}). Its result then arrives in \
+         wall-clock time and the run stops being a function of its seed \
+         (#6123). Run blocking work inline on a simulation host, e.g. through \
+         crate::util::blocking::offload_blocking.",
+        new_threads.len()
+    );
+}
+
 /// **STRICT** determinism test: verifies that same seed produces EXACTLY identical events.
 ///
 /// This test uses Turmoil's deterministic scheduler to ensure reproducible execution.
@@ -1688,6 +1880,8 @@ fn test_high_latency_timeout_regression() {
 
 /// Test: Use actual SimulationSocket inside Turmoil.
 /// This verifies that the real in-memory socket works with Turmoil's deterministic scheduler.
+/// It drives turmoil itself with `sim.run()`, so the VirtualTime it registers stays
+/// at 0: nothing here (no QUIC endpoint, no time-based fault rule) runs on it.
 #[test]
 fn test_turmoil_with_real_simulation_socket() -> turmoil::Result {
     let network_name = "turmoil-test";
@@ -20759,6 +20953,24 @@ impl QuicShadowRun {
     fn dump(&self) -> String {
         format!("{:#?}", self.trace.records())
     }
+
+    /// Data each node received on UDP after its peer's path took the peer's data,
+    /// by at least a second, so a packet already on the wire is not counted. The
+    /// count is made where UDP data arrives, whichever code sent it.
+    fn udp_data_once_on_the_path(&self) -> usize {
+        let &[first, second] = &self.nodes[..] else {
+            panic!("two nodes: {:?}", self.nodes);
+        };
+        let late = |receiver, sender| {
+            let enabled = self.trace.matching(sender, "DataEnabled")[0].at;
+            self.trace
+                .matching(receiver, "data arrived on UDP")
+                .iter()
+                .filter(|record| record.at > enabled + Duration::from_secs(1))
+                .count()
+        };
+        late(first, second) + late(second, first)
+    }
 }
 
 /// One direct-runner simulation of `gateways` plus `nodes`, in `QUIC_EVENT_WAIT`
@@ -20823,9 +21035,9 @@ fn run_as_first_negotiating_release(trace: &freenet::dev_tool::QuicUpgradeTrace)
 
 /// Each node's data bit, end to end over a real QUIC connection: a pair negotiates
 /// data only with both bits, a mismatch stays in shadow, and shadow or a share of 0
-/// sets no bit. Whatever the bits, nothing is sent on the path.
+/// sets no bit. A pair without both bits sends nothing on its path.
 #[test_log::test]
-fn test_quic_data_needs_both_bits_and_carries_nothing_yet() {
+fn test_quic_data_needs_both_bits() {
     for (name, seed, modes, percents, carries) in [
         (
             "quic-data-both",
@@ -20881,21 +21093,27 @@ fn test_quic_data_needs_both_bits_and_carries_nothing_yet() {
                 run.dump()
             );
         }
-        assert_eq!(
-            run.total("path carried data: refused 0, delivered 0"),
-            2,
-            "{name}: both paths end carrying no data: {}",
-            run.dump()
-        );
+        if !carries {
+            assert_eq!(
+                run.total("path carried data: refused 0, delivered 0"),
+                2,
+                "{name}: both paths end carrying no data: {}",
+                run.dump()
+            );
+            assert_eq!(
+                run.total("path sent data: sent 0, maybe 0, on udp 0, dropped 0"),
+                2,
+                "{name}: {}",
+                run.dump()
+            );
+        }
     }
 }
 
-/// Data on a test percentage, end to end: both nodes negotiate it and send their
-/// messages as Shorts on the path, and those messages come out of `recv` and decode
-/// as real network messages. No node code sends on a path yet, so the run asks for
-/// it (`send_shorts_on_paths`). Only Shorts are covered here: a Stream through
-/// `recv` is tested at the connection (`ack_policy_tests/quic_data.rs`) and goes
-/// end to end in e5b-5/6.
+/// Data on a test percentage, end to end: both nodes negotiate it and their
+/// messages go on the path, come out of `recv` and decode as real network messages.
+/// The counts come from each end: what the receiver took off the path, what the
+/// sender heard, and what arrived on UDP once the peer had data on.
 #[test_log::test]
 fn test_quic_data_delivers_a_real_message_through_recv() {
     let run = run_quic_shadow_sim(
@@ -20904,14 +21122,9 @@ fn test_quic_data_delivers_a_real_message_through_recv() {
         (1, 1),
         30,
         |sim, trace, labels| {
-            let addresses: Vec<_> = labels
-                .iter()
-                .map(|label| sim.all_node_addresses()[label])
-                .collect();
-            for (label, address) in labels.iter().zip(addresses) {
+            for label in labels {
                 sim.with_node_transport_quic(label, "prefer");
                 sim.with_node_quic_data_percent(label, 100);
-                trace.send_shorts_on_paths(address);
             }
             run_as_first_negotiating_release(trace);
         },
@@ -20919,6 +21132,12 @@ fn test_quic_data_delivers_a_real_message_through_recv() {
     for node in &run.nodes {
         assert_eq!(run.whats(*node, "DataEnabled"), 1, "{}", run.dump());
     }
+    assert_eq!(run.udp_data_once_on_the_path(), 0, "{}", run.dump());
+    assert!(
+        run.total("data arrived on UDP") > 0,
+        "data seen on UDP before the path carried it, so the count works: {}",
+        run.dump()
+    );
     let received = run.total("received a short on the path");
     assert!(received > 0, "{}", run.dump());
     assert_eq!(
@@ -20943,6 +21162,394 @@ fn test_quic_data_delivers_a_real_message_through_recv() {
         "{}",
         run.dump()
     );
+    assert_eq!(run.total("sent a short on UDP"), 0, "{}", run.dump());
+}
+
+/// A stream end to end: a state too large for a message goes on the path as a
+/// Stream, the receiver assembles it through `recv` and the registry, and stores
+/// it. UDP carries no data once the path does.
+#[test_log::test]
+fn test_quic_data_carries_a_stream_end_to_end() {
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation};
+    const NETWORK: &str = "quic-data-stream";
+    const SEED: u64 = 0x5940_E5B6_0001;
+    const STATE_LEN: usize = 512 * 1024;
+    setup_deterministic_state(SEED);
+    let contract = SimOperation::create_test_contract(0x61);
+    let key = contract.key();
+    let warm_up = SimOperation::create_test_contract(0x62);
+    let state: Vec<u8> = (0..STATE_LEN).map(|i| (i % 251) as u8).collect();
+
+    let rt = create_runtime();
+    let (sim, trace, nodes) = rt.block_on(async {
+        let mut sim = SimNetwork::new(NETWORK, 1, 1, 7, 3, 10, 2, SEED).await;
+        sim.enable_gateway_ack_version();
+        sim.with_streaming_threshold(64 * 1024);
+        sim.with_controlled_op_interval(Duration::from_secs(40));
+        sim.wait_for_join_convergence_before_ops(1.0, Duration::from_secs(60));
+        let trace = sim.quic_upgrade_trace();
+        let labels: Vec<_> = sim.all_node_addresses().keys().cloned().collect();
+        for label in &labels {
+            sim.with_node_transport_quic(label, "prefer");
+            sim.with_node_quic_data_percent(label, 100);
+        }
+        run_as_first_negotiating_release(&trace);
+        let nodes: Vec<_> = sim.all_node_addresses().values().copied().collect();
+        (sim, trace, nodes)
+    });
+    drop(rt);
+    let node = NodeLabel::node(NETWORK, 1);
+    let gateway = NodeLabel::gateway(NETWORK, 0);
+    let operations = vec![
+        // Gives the path the time to come up: the first offer waits 2-10 s.
+        ScheduledOperation::new(
+            node.clone(),
+            SimOperation::Put {
+                contract: warm_up,
+                state: vec![1; 64],
+                subscribe: false,
+            },
+        ),
+        ScheduledOperation::new(
+            node,
+            SimOperation::Put {
+                contract,
+                state: state.clone(),
+                subscribe: false,
+            },
+        ),
+    ];
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(300),
+        Duration::from_secs(60),
+    );
+    assert!(
+        result.turmoil_result.is_ok(),
+        "simulation failed: {:?}",
+        result.turmoil_result.err()
+    );
+    let run = QuicShadowRun {
+        trace,
+        nodes,
+        logs_events: 0,
+        mesh: Default::default(),
+    };
+    for address in &run.nodes {
+        assert_eq!(run.whats(*address, "DataEnabled"), 1, "{}", run.dump());
+    }
+    assert!(
+        run.total("sent a stream on the path: Sent") >= 1,
+        "{}",
+        run.dump()
+    );
+    assert!(
+        run.total("received a stream on the path") >= 1,
+        "{}",
+        run.dump()
+    );
+    assert_eq!(run.udp_data_once_on_the_path(), 0, "{}", run.dump());
+    assert!(
+        run.total("data arrived on UDP") > 0,
+        "data seen on UDP before the path carried it, so the count works: {}",
+        run.dump()
+    );
+    assert_eq!(
+        run.total("path carried data: refused 0"),
+        run.total("path carried data"),
+        "{}",
+        run.dump()
+    );
+    assert_eq!(
+        run.total("sent a stream on the path: Failed"),
+        0,
+        "{}",
+        run.dump()
+    );
+    let stored = result
+        .node_storages
+        .get(&gateway)
+        .and_then(|storage| storage.get_stored_state(&key))
+        .expect("the gateway stored the state");
+    assert_eq!(stored.as_ref(), state.as_slice());
+}
+
+/// The path goes dark in the middle of a transfer: after 384 KiB of QUIC
+/// datagrams have moved between the node and the gateway, every later one is
+/// lost, while their UDP session carries on. Both ends stop putting new data on
+/// the path once its sends time out with nothing acknowledged (it is suspect),
+/// so data reaches the peer on UDP while the path is still up; the path falls
+/// back on its idle timeout with the UDP session up, the pair is offered a path
+/// again, and the gateway ends with the whole state.
+#[test_log::test]
+fn test_quic_data_path_cut_mid_transfer_falls_back_to_udp() {
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation};
+    const NETWORK: &str = "quic-data-cut";
+    const SEED: u64 = 0x5940_E5B6_0004;
+    const STATE_LEN: usize = 1024 * 1024;
+    const CUT_AFTER_BYTES: u64 = 384 * 1024;
+    setup_deterministic_state(SEED);
+    let contract = SimOperation::create_test_contract(0x63);
+    let key = contract.key();
+    let warm_up = SimOperation::create_test_contract(0x64);
+    let state: Vec<u8> = (0..STATE_LEN).map(|i| (i % 251) as u8).collect();
+
+    let node = NodeLabel::node(NETWORK, 1);
+    let gateway = NodeLabel::gateway(NETWORK, 0);
+    let rt = create_runtime();
+    let (sim, trace, nodes) = rt.block_on(async {
+        let mut sim = SimNetwork::new(NETWORK, 1, 1, 7, 3, 10, 2, SEED).await;
+        sim.enable_gateway_ack_version();
+        sim.with_streaming_threshold(64 * 1024);
+        sim.with_controlled_op_interval(Duration::from_secs(40));
+        sim.wait_for_join_convergence_before_ops(1.0, Duration::from_secs(60));
+        let trace = sim.quic_upgrade_trace();
+        let labels: Vec<_> = sim.all_node_addresses().keys().cloned().collect();
+        for label in &labels {
+            sim.with_node_transport_quic(label, "prefer");
+            sim.with_node_quic_data_percent(label, 100);
+        }
+        run_as_first_negotiating_release(&trace);
+        // A simulation has no keepalive and a QUIC idle timeout of a day; a
+        // production path that goes dark ends on its 120 s idle timeout.
+        sim.with_quic_idle_timeout(Duration::from_secs(60));
+        sim.drop_quic_datagrams_between_after(&node, &gateway, Duration::ZERO, CUT_AFTER_BYTES);
+        let nodes: Vec<_> = sim.all_node_addresses().values().copied().collect();
+        (sim, trace, nodes)
+    });
+    drop(rt);
+    let operations = vec![
+        // Gives the path the time to come up: the first offer waits 2-10 s.
+        ScheduledOperation::new(
+            node.clone(),
+            SimOperation::Put {
+                contract: warm_up,
+                state: vec![1; 64],
+                subscribe: false,
+            },
+        ),
+        ScheduledOperation::new(
+            node,
+            SimOperation::Put {
+                contract,
+                state: state.clone(),
+                subscribe: false,
+            },
+        ),
+    ];
+    // Long enough for the PUT's retry and the idle timeout.
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(600),
+        Duration::from_secs(300),
+    );
+    assert!(
+        result.turmoil_result.is_ok(),
+        "simulation failed: {:?}",
+        result.turmoil_result.err()
+    );
+    let run = QuicShadowRun {
+        trace,
+        nodes,
+        logs_events: 0,
+        mesh: Default::default(),
+    };
+    // Premise: the path carried data before the cut.
+    for address in &run.nodes {
+        assert!(run.whats(*address, "DataEnabled") >= 1, "{}", run.dump());
+    }
+    let records = run.trace.records();
+    let mut on_udp_while_dark = false;
+    // Each end: its path went suspect before it closed, and fell back on the
+    // idle timeout. Times are compared per node: each host's trace clock starts
+    // on its own.
+    for address in &run.nodes {
+        let of_node = |what: &str| {
+            records
+                .iter()
+                .filter(|r| r.node == *address && r.what.starts_with(what))
+                .collect::<Vec<_>>()
+        };
+        let fell_back = of_node("Fallback(");
+        assert_eq!(
+            fell_back
+                .iter()
+                .map(|r| r.what.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Fallback(Idle)"],
+            "{address} fell back on the idle timeout: {}",
+            run.dump()
+        );
+        let fell_back_at = fell_back[0].at;
+        assert!(
+            of_node("path was suspect: entered ")
+                .iter()
+                .any(|r| !r.what.starts_with("path was suspect: entered 0")),
+            "{address}'s path went suspect: {}",
+            run.dump()
+        );
+        // Suspect: after the last data its path delivered here, and before it
+        // fell back, data arrived here on UDP.
+        let last_on_path = of_node("received a short on the path")
+            .iter()
+            .chain(of_node("received a stream on the path").iter())
+            .map(|r| r.at)
+            .max();
+        if let Some(last_on_path) = last_on_path {
+            on_udp_while_dark |= of_node("data arrived on UDP")
+                .iter()
+                .any(|r| r.at > last_on_path && r.at < fell_back_at);
+        }
+    }
+    // At least one end had data for the other while the path was dark, and it
+    // went on UDP: without suspect routing it went on the dark path and was lost.
+    assert!(
+        on_udp_while_dark,
+        "data came on UDP while the dark path was up: {}",
+        run.dump()
+    );
+    let fell_back = records
+        .iter()
+        .find(|r| r.what.starts_with("Fallback("))
+        .unwrap_or_else(|| panic!("the dark path fell back: {}", run.dump()));
+    let offered_again = records
+        .iter()
+        .find(|r| r.what == "Offered" && r.at > fell_back.at)
+        .unwrap_or_else(|| {
+            panic!(
+                "the pair was offered again after the fallback: {}",
+                run.dump()
+            )
+        });
+    assert!(
+        records
+            .iter()
+            .all(|r| !(r.what == "session ended" && r.at <= offered_again.at)),
+        "the UDP session stayed up through the fallback: {}",
+        run.dump()
+    );
+    let stored = result
+        .node_storages
+        .get(&gateway)
+        .and_then(|storage| storage.get_stored_state(&key))
+        .expect("the gateway stored the state");
+    assert_eq!(stored.as_ref(), state.as_slice());
+}
+
+/// A gateway with a gating bug: it advertises its data bit but refuses data. The
+/// first data the node sends on the path is refused, the gateway closes the path
+/// with DOWNGRADE, the node falls back to UDP, and the operations still succeed:
+/// the large state reaches the gateway and is stored.
+#[test_log::test]
+fn test_quic_data_refused_by_the_peer_closes_the_path_and_falls_back_to_udp() {
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation};
+    const NETWORK: &str = "quic-data-refused";
+    const SEED: u64 = 0x5940_E5B6_0002;
+    const STATE_LEN: usize = 512 * 1024;
+    setup_deterministic_state(SEED);
+    let contract = SimOperation::create_test_contract(0x61);
+    let key = contract.key();
+    let warm_up = SimOperation::create_test_contract(0x62);
+    let state: Vec<u8> = (0..STATE_LEN).map(|i| (i % 251) as u8).collect();
+
+    let rt = create_runtime();
+    let (sim, trace, nodes) = rt.block_on(async {
+        let mut sim = SimNetwork::new(NETWORK, 1, 1, 7, 3, 10, 2, SEED).await;
+        sim.enable_gateway_ack_version();
+        sim.with_streaming_threshold(64 * 1024);
+        sim.with_controlled_op_interval(Duration::from_secs(40));
+        sim.wait_for_join_convergence_before_ops(1.0, Duration::from_secs(60));
+        let trace = sim.quic_upgrade_trace();
+        let labels: Vec<_> = sim.all_node_addresses().keys().cloned().collect();
+        for label in &labels {
+            sim.with_node_transport_quic(label, "prefer");
+            sim.with_node_quic_data_percent(label, 100);
+        }
+        run_as_first_negotiating_release(&trace);
+        let gateway_addr = sim.all_node_addresses()[&NodeLabel::gateway(NETWORK, 0)];
+        trace.refuse_data_while_advertising(gateway_addr);
+        let nodes: Vec<_> = sim.all_node_addresses().values().copied().collect();
+        (sim, trace, nodes)
+    });
+    drop(rt);
+    let node = NodeLabel::node(NETWORK, 1);
+    let gateway = NodeLabel::gateway(NETWORK, 0);
+    let operations = vec![
+        // Gives the path the time to come up: the first offer waits 2-10 s.
+        ScheduledOperation::new(
+            node.clone(),
+            SimOperation::Put {
+                contract: warm_up,
+                state: vec![1; 64],
+                subscribe: false,
+            },
+        ),
+        ScheduledOperation::new(
+            node,
+            SimOperation::Put {
+                contract,
+                state: state.clone(),
+                subscribe: false,
+            },
+        ),
+    ];
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(300),
+        Duration::from_secs(60),
+    );
+    assert!(
+        result.turmoil_result.is_ok(),
+        "simulation failed: {:?}",
+        result.turmoil_result.err()
+    );
+    let run = QuicShadowRun {
+        trace,
+        nodes,
+        logs_events: 0,
+        mesh: Default::default(),
+    };
+    // Both set the bit, so the node sent data; the gateway refused it and closed.
+    for address in &run.nodes {
+        assert!(run.whats(*address, "DataEnabled") >= 1, "{}", run.dump());
+    }
+    let refused = run
+        .trace
+        .records()
+        .iter()
+        .filter(|record| {
+            record.what.starts_with("path carried data: refused ")
+                && !record.what.starts_with("path carried data: refused 0")
+        })
+        .count();
+    assert!(refused >= 1, "the gateway refused data: {}", run.dump());
+    assert!(
+        run.total("Fallback(DowngradeReceived)") >= 1,
+        "the node fell back on the gateway's close: {}",
+        run.dump()
+    );
+    assert!(
+        run.total("path closed refusing data: 1") >= 1,
+        "the gateway closed the path on its refusal: {}",
+        run.dump()
+    );
+    // The backoff after each DOWNGRADE (60 s, doubling) bounds the renegotiation
+    // over the run's ~6 minutes: a tight loop of offers and closes fails here.
+    assert!(run.total("Offered") <= 5, "offers: {}", run.dump());
+    assert!(
+        run.total("Fallback(DowngradeReceived)") <= 4,
+        "fallbacks: {}",
+        run.dump()
+    );
+    let stored = result
+        .node_storages
+        .get(&gateway)
+        .and_then(|storage| storage.get_stored_state(&key))
+        .expect("the gateway stored the state");
+    assert_eq!(stored.as_ref(), state.as_slice());
 }
 
 /// Shadow on both ends: the whole negotiation runs over a real QUIC connection,
@@ -21336,6 +21943,68 @@ fn test_quic_endpoint_down_closes_every_path() {
     );
 }
 
+/// The controlled (turmoil) runner moves the network's VirtualTime with its own
+/// clock, so a timer on that clock fires: the gateway's endpoint failure, set for
+/// 5 s on the path clock, happens at 5 s, and VirtualTime ends near the run's
+/// length. Before the runner moved it, VirtualTime read 0 for the whole run and
+/// the failure never happened.
+#[test_log::test]
+fn test_controlled_simulation_advances_virtual_time() {
+    use freenet::dev_tool::NodeLabel;
+    const NETWORK: &str = "controlled-virtual-time";
+    const SEED: u64 = 0x5940_7117_0001;
+    const FAIL_AT: Duration = Duration::from_secs(5);
+    const WAIT: Duration = Duration::from_secs(20);
+    setup_deterministic_state(SEED);
+    let rt = create_runtime();
+    let gateway = NodeLabel::gateway(NETWORK, 0);
+    let (sim, trace, time, gateway_addr) = rt.block_on(async {
+        let mut sim = SimNetwork::new(NETWORK, 1, 1, 7, 3, 10, 2, SEED).await;
+        sim.with_transport_quic("shadow");
+        let trace = sim.quic_upgrade_trace();
+        let gateway_addr = sim.all_node_addresses()[&gateway];
+        trace.fail_endpoint_at(gateway_addr, FAIL_AT);
+        let time = sim.virtual_time().clone();
+        (sim, trace, time, gateway_addr)
+    });
+    drop(rt);
+    let (no_operations, max_duration) = (Vec::new(), Duration::from_secs(60));
+    let result = sim.run_controlled_simulation(SEED, no_operations, max_duration, WAIT);
+    assert!(
+        result.turmoil_result.is_ok(),
+        "simulation failed: {:?}",
+        result.turmoil_result.err()
+    );
+    // The client sleeps 3 s, fires no operation and waits `WAIT`, so the run
+    // lasts at least that long, and VirtualTime with it.
+    let now = Duration::from_nanos(time.now_nanos());
+    assert!(
+        now >= WAIT + Duration::from_secs(3),
+        "VirtualTime followed the run: {now:?}"
+    );
+    let failed = trace.matching(gateway_addr, "failed the endpoint at ");
+    assert_eq!(
+        failed.len(),
+        1,
+        "the 5 s timer fired once: {:#?}",
+        trace.records()
+    );
+    // The time the record carries is on the path clock, VirtualTime itself; a
+    // record's `at` is on its host's own clock, which under turmoil does not
+    // start at the run's start.
+    let fired_ms: u64 = failed[0]
+        .what
+        .trim_start_matches("failed the endpoint at ")
+        .trim_end_matches(" ms")
+        .parse()
+        .expect("the record carries its time");
+    let fired = Duration::from_millis(fired_ms);
+    assert!(
+        fired >= FAIL_AT && fired <= FAIL_AT + Duration::from_secs(1),
+        "it fired at 5 s on VirtualTime: {fired:?}"
+    );
+}
+
 /// The same run with the same seed gives the same upgrades at the same times.
 #[test_log::test]
 fn test_quic_shadow_upgrade_is_deterministic() {
@@ -21353,7 +22022,8 @@ fn test_quic_shadow_upgrade_is_deterministic() {
 
 /// The client or server of an established path restarts, with its identity, and
 /// its old path's datagrams no longer arrive. The survivor's session is replaced,
-/// so its live path closes by that alone, and the backoff of the session that ended
+/// so its live path closes by that alone, with SESSION_ENDED, and the backoff of the
+/// session that ended
 /// carries over to the new one: a survivor that is the server waits for it before
 /// it offers, and one that is the client declines with `Backoff`.
 #[test_log::test]
@@ -21378,10 +22048,10 @@ fn test_quic_replaced_connection_closes_its_path_and_keeps_the_backoff() {
         assert!(ended.at >= replaced_at, "{dump}");
         assert_eq!(ended.permits, 0, "{dump}");
         assert!(
-            of("closed path with Downgrade")
+            of("closed path with SessionEnded")
                 .iter()
                 .any(|c| c.session == old && c.at >= replaced_at),
-            "the session's end closed the live path: {dump}"
+            "the session's end closed the live path with SESSION_ENDED: {dump}"
         );
         assert!(
             of("Fallback").iter().all(|f| f.session != old),

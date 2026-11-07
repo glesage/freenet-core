@@ -111,13 +111,75 @@ refill also covered: capacity moves between connections, the node cap
 holds; so no timer-slack margin is needed), and a send error after the
 take does not refund it (as uncapped). Rate updates every RTT can
 reorder waiters slightly, as on the uncapped reserve path; order is not
-a correctness property of the cap. Then each attempt is:
-cwnd check, node-wide egress_cap::try_take, back to back with no await
-before the send; if the cap is short, sleep through StreamPacing (deficit x
-U[1.0, 1.4) + U[0, 2 ms)) and start again from the cwnd check. NODE-CAP
-ADMISSION IS A RACE: nothing is held on the cap while waiting, the order
-among waiters is random, so connections share the cap by their number of
-waiting streams (no isolation between connections). The kept connection
+a correctness property of the cap. Then each attempt is: wait in the
+node-wide cap's admission queue (StreamPacing::wait_for_admission over
+EgressCap::poll_admit, the SAME queue the QUIC endpoint waits in); if it had
+to wait, start again from the cwnd check, which the queue then admits at
+once; then cwnd check and egress_cap::try_take back to back with no await
+before the send (a take that still fails, because another sender took the
+refill first, queues again). NODE-CAP ADMISSION IS IN ORDER: each waiting
+stream and each waiting QUIC connection is one entry, and poll_admit admits
+a waiter only when the bucket holds its datagram PLUS one for every waiter
+queued ahead of it (counted up to MAX_ADMISSION_WAKERS), so a waiter that
+polls first cannot take another's turn. Nothing is set aside: a waiter
+ahead that has not polled yet takes its datagram from the same level when
+it does. Timers (staggered by place) decide only when a waiter looks; a late
+timer delays that waiter, never reorders. Without the level check, waiters
+due on one tick were admitted in poll order and a re-armed waiter lost every
+tie (one stream in three sent nothing in 2 s at 1524 streams). After
+Admission::Waited the stream re-checks cwnd and calls again; that call
+takes its turn without queueing within ADMISSION_PASS (1 ms). Without the
+pass it re-queued at the back on every turn and never sent. A stream held
+by cwnd past the pass, or whose take failed (an unpaced send took the
+datagram first), queues again AT ITS PLACE (AdmissionWaiter::held_place, the
+ticket it was admitted from, kept until a take succeeds), so neither costs
+it a turn of the queue (streams_sharing_a_window_keep_their_turn_under_a_binding_cap:
+worst gap one turn, 0.86 s, against two turns, 1.61 s, when it went to the
+back). At most MAX_ADMISSION_WAKERS admissions are live at once; the next
+waiter waits, and no live one is dropped. Every admission has a number its
+waiter keeps; a waiter that polls again (a QUIC poller whose take failed, a
+stream past the pass) withdraws its own, and a take never withdraws one it
+did not use, so a failed send on quinn's respond path (no poll_writable)
+leaves every live admission alone. A named waiter admitted on its first poll
+keeps a place too (its admission's number). A withdrawn admission wakes the
+next held waker, and a waiter's timer is set no later than the oldest
+outstanding admission lapses, so a datagram counted for an admission that
+goes unused does not leave the bucket idle. An admission stays on the queue
+(QueuedWaiters::admitted) until its take or for ADMISSION_PASS, whichever
+comes first: it counts ahead of every waiter that polls, and every take
+leaves one datagram per outstanding admission but its own, so on a
+multi-thread runtime nobody can use a datagram admitted to another sender
+between its Ready and its take. Admission times are read under the queue
+lock. A stream's admission is NAMED (AdmissionWaiter::named, taken with
+try_take_admitted through StreamPacing::take): its take finds its own
+admission or, once that lapsed, takes as a newcomer that leaves the
+datagrams owed to the rest. Without names, a stream descheduled past the
+pass took the datagram of a newer admission and cleared that admission as
+its own (2 to 37 of 3200 takes lost in
+an_admitted_take_is_not_lost_to_another_thread). A QUIC take is named too:
+QuicPoller::poll_ready hands its admission number to QuicSocket::try_send
+through a thread-local (quic/socket.rs HANDED_ADMISSION), relying on quinn
+0.11.12 calling poll_writable then try_send back to back on one thread
+(connection.rs:1048-1057; a quinn bump must re-check it,
+a_poller_hands_its_admission_to_the_transmit_that_follows). quinn's
+endpoint respond (endpoint.rs:584) sends with no poll, finds no handoff and
+leaves every admission alone. No take ever uses an admission it does not
+name. The queue holds a waker
+and a place, never bytes. So connections share the cap by their number of
+waiting senders (no isolation between connections). The wait races the
+stream's deadline (cut at LONG_WAIT and at PACED_WAIT_DEADLINE, check()
+after each cut), so abandonment and its counters mean what they did. Past
+MAX_ADMISSION_WAKERS (1024) queued waiters, newer ones hold no waker but
+keep their place and their staggered timer; no waiter is evicted (evicting
+the oldest sent the longest waiters to the back, and 500 of 1524 streams
+sent once in 2 s). A waiter's place is counted under the queue lock up to
+MAX_ADMISSION_WAKERS + 1 (so at most 1025 steps per poll, however long the
+queue), and its timer's stagger is clamped to MAX_ADMISSION_WAKERS so
+quic::socket::cap_hold_validity still bounds a QUIC transmit's next poll; a
+waiter further back wakes early and waits again: it is never admitted while
+more than MAX_ADMISSION_WAKERS are ahead of it, whatever the level (the
+clamp is for the timer only, pinned by
+a_waiter_past_the_count_bound_is_not_admitted_by_a_large_burst). The kept connection
 payment can be stale after a cwnd or cap wait (the bucket refills under
 it): a connection may then exceed its bucket by one datagram per waiting
 stream. That moves capacity between connections only; the node cap is
@@ -126,7 +188,14 @@ NEVER put a reservation on the NODE cap (earlier reservation/hold models
 there leaked capacity). 0.2.148 used try_take + jittered retry on
 the per-connection bucket too; the race starved streams on busy connections
 past 5 s (every abandonment on capped peers was `connection`, failures
-doubled on the busiest capped peer). StreamPacing (one per stream, only with
+doubled on the busiest capped peer). The node cap kept that race (try_take
++ jittered retry) until #6112, on the reasoning that its waiters were all
+streams, equally unordered. It stopped being neutral once QUIC shared the
+cap: QUIC waits in the queue, so it won contended refills, and with the
+default minimum (below) a QUIC path took about 462 kB/s and a UDP stream
+38 kB/s of a 500 kB/s cap (40 seeds). The 0.2.148 lesson applies: a random
+race among waiters starves the unlucky ones, so stream waiters now queue
+too (249 and 251 kB/s measured the same way). StreamPacing (one per stream, only with
 a cap) measures the gap since the stream's previous fragment was sent, the
 gap the receiver's STREAM_INACTIVITY_TIMEOUT times, and is checked BEFORE
 every take and after every sleep, and on every poll of the cwnd wait: at
@@ -159,9 +228,11 @@ before it sends (answered_connection_ack, receipts taken before the NoOp).
 Unpaced debt is capped at DEBT_LIMIT (1 s at the cap); the rest is forgiven
 (sent uncharged) and counted. Over any interval ending at a paced send the
 node sends at most burst + rate x interval + bytes forgiven in the
-interval. Invariant: nothing is reserved on the NODE cap; a paced sender
-holds no node-wide capacity while it waits, and is charged there only at
-its send (it does hold its per-connection reservation, see above). Gaps
+interval. Invariant: nothing is reserved on the NODE cap while a sender
+waits; it holds no node-wide capacity in the queue, and is charged there only
+at its send (it does hold its per-connection reservation, see above). Between
+its admission and its take an admitted sender holds one datagram, for at most
+ADMISSION_PASS (1 ms): every other take leaves it in the bucket. Gaps
 that reach LONG_WAIT
 (2.5 s) and abandoned streams are counted by what took most of the gap
 (WaitCause: cap, connection = the connection's own bucket, other = cwnd, the
@@ -177,20 +248,25 @@ the cap's TimeSource, kept in the caller's AdmissionWaiter. The timer is
 STAGGERED: deficit plus one WAKE_DATAGRAM_BYTES of refill per waiter queued
 ahead, so N waiters with one deficit wake one per datagram of refill, oldest
 first, not all N at once. While Pending the cap also holds the caller's
-waker (at most MAX_ADMISSION_WAKERS; past it an entry is dropped WITHOUT
-waking, its waiter keeps its timer); a waiter keeps its queue place across
+waker (at most MAX_ADMISSION_WAKERS; past it a newer waiter is queued with
+no waker and relies on its timer, and no entry is dropped); a waiter keeps its queue place across
 polls, and dropping an AdmissionWaiter removes its entry, so a closed
 connection cannot absorb a wake. Bytes given back (a take that sent less, or a failed send)
 wake one held waker per WAKE_DATAGRAM_BYTES (1200, the QUIC datagram) the
 bucket then holds, and none if it holds less, so legacy give-backs cost N
 waiting QUIC connections nothing until a datagram fits; wakers are woken
-after the lock is released, oldest registration first (a FIFO; overflow
-drops the oldest). An admitted waiter took the slot reserved for it, so
+after the lock is released, oldest holder first; the woken keep their
+places. An admission wakes the oldest waiter still holding a waker (the
+next in line, AdmissionQueue::try_admit), one wake per admission: a waiter's
+timer is set from its place when it last polled, and waiters that left
+ahead of it since (streams failing at their deadline) make it late. Without
+that wake, 300 streams on a 64 KiB/s cap, failing at their deadline and
+retrying, used 18% of the refill; with it, 100%. An admitted waiter took the slot reserved for it, so
 nobody behind it moves; a waiter dropped while queued wakes the next
 MAX_FOLLOWERS_WOKEN_PER_LEAVE (8) behind it so each re-polls to its new
 place (AdmissionQueue::leave), so N closes cost at most 8 N wakes. Waiters
 further back stay up to one datagram late per such drop until they next
-poll. An entry evicted at MAX_ADMISSION_WAKERS wakes nobody. No waiter wakes before
+poll. No waiter wakes before
 the bucket can admit it. It takes
 nothing; the QUIC socket takes with
 try_take and sends with DemuxSocket::try_send_to_paced, so its datagram is
@@ -730,7 +806,7 @@ Rate calculation on every rate update (peer_connection::paced_rate; #6047):
   A configured limit only lowers the rate, never raises it above cc_rate.
   bandwidth_limit is the config after NetworkApiConfig::transport_bandwidth_limit
   (effective_bandwidth_limit, called once in p2p_protoc and pinned there by a
-  config.rs test): 0 = unset, ignored under any total-bandwidth-limit, and
+  config.rs test): 0 = unset, ignored under any non-zero total-bandwidth-limit (a total of 0 is unset), and
   raised to MIN_BANDWIDTH_LIMIT (2 x MIN_INBOUND_STREAM_RATE_BYTES_PER_SEC,
   64 KiB/s) if lower: near the receiver's age-limit rate, long streams fail.
   The bucket's INITIAL rate comes from peer_connection::initial_paced_rate at
@@ -740,6 +816,108 @@ Rate calculation on every rate update (peer_connection::paced_rate; #6047):
   (#3702 burst). The global share is still taken as is, as before #6047.
   Only stream fragments draw on the bucket; short messages, ACKs and
   retransmits are unpaced.
+  QUIC has no share of this bucket. With a limit set its data is paced by a
+  bucket of its own at the limit (the path pacer, below), and the same rate
+  (QuicRateLimit::rate, which calls paced_rate) caps each QUIC connection's
+  congestion window:
+  recycle::CappedCubic::window = min(Cubic's window, max(rate x RTT,
+  window_floor)): the cap never goes below window_floor (two full datagrams
+  and one byte, 2401 B: quinn refuses
+  a send at in_flight + bytes >= window, so 2400 would admit one datagram, and
+  a lone packet waits for the peer's 25 ms delayed ack). With no limit, or
+  before the first acknowledgement, it is Cubic's window; for the first batch
+  of acknowledgements the RTT is still quinn's 333 ms initial estimate, so the
+  cap is loose for that batch. quinn's in-flight limit reads the window, which
+  holds a path to about the rate (a_path_under_a_bandwidth_limit_keeps_to_it:
+  within 10% at 400 kB/s over a 40 ms round trip); the pacer only spreads the
+  sends. While the cap is below Cubic's window, on_ack reports the path as
+  app-limited to Cubic, so Cubic does not grow behind the cap and still backs
+  off on loss once the cap rises above the capacity (RFC 7661 idea). It
+  covers everything the path sends, shorts and control frames included. It
+  does not hold where rate x RTT is under the floor: there a path keeps two
+  datagrams in flight, about 2400 B per round trip (at the 64 KiB/s minimum,
+  any round trip under about 37 ms; pinned by
+  the_floor_keeps_two_datagrams_in_flight_both_ways). On loopback a path ran
+  at 3.4 to 34 MB/s with 500 kB/s set.
+  Path pacer (quic/path/pacer.rs): with bandwidth-limit or
+  total-bandwidth-limit set (PeerConnection::path_rate_limit), the session
+  builds a LimitPacer on the path's clock (the one the send deadlines run
+  on), and every path of the connection draws its data writes from it: a
+  token bucket of the connection's QUIC side at QuicRateLimit::rate (the
+  limit, or the share, read again at every reservation; capacity rate / 10,
+  at least MIN_BUCKET_CAPACITY_BYTES, recomputed when the rate changes), so
+  the limit holds at any round trip. NOT the UDP stream bucket: that runs at
+  min(UDP controller rate, limit), and FixedRate's 1.25 MB/s would pace QUIC
+  below a higher limit, slower than no limit at all. Charged: each write of
+  a Stream or pipe (header, metadata, payload) and of a Short past one
+  packet. Not charged, as on UDP: one-packet Shorts and control frames,
+  which never wait behind data. With no limit nothing is paced. A write
+  reserves with reserve_within, limited to what the send's current deadline
+  leaves, and waits in the send's own task; a refused reservation takes
+  nothing and ends the send NotOpened(Paced) before the stream opened
+  (header and metadata are taken before open_uni) or Failed(Paced) after
+  (the stream is reset). A message the pacer refused that UDP then sent is
+  charged to the pacer in full as debt (QuicPath::charge_fallback, after the
+  UDP send succeeds), up to FALLBACK_DEBT (half a second at the rate): an
+  unbounded debt refused the next fragment of every stream already open, and
+  a refused open stream is dropped. Each refusal counts
+  quic_data_event_pacer_refused. A total-bandwidth-limit of 0 is unset for
+  both transports (NetworkApiConfig::effective_total_bandwidth_limit: no
+  global pool, so no UDP share, no QUIC pacer, no window cap, and a
+  bandwidth-limit beside it applies to both). Bytes taken for a write not
+  made go back. A refusal is never a timeout for the stall count (route.rs
+  timed_out); a pacer wait is NOT progress, so a dark paced path still goes
+  suspect and closes. Residual, accepted (lead, 2026-11-06; the design-B
+  residual): a peer whose data is on both transports at once can get up to
+  twice its share, for as long as that lasts. That includes a message the
+  pacer refused: the charge is booked when its UDP transfer ends and is
+  capped at half a second, so for the whole transfer QUIC keeps sending at
+  the pacer's rate beside it (a 10 MB fallback at a 100 kB/s bandwidth-limit
+  runs about 100 s on the UDP bucket, then 50 kB is charged). Data that falls
+  back for any other reason (no stream credit, a deadline) is paced by the
+  UDP bucket only. Only a budget shared by both transports would close it;
+  the egress cap still bounds the node under total-bandwidth-limit. Pinned by quic::path::tests::pacer,
+  pacer_refusals_never_count_and_a_dark_paced_path_still_closes,
+  a_paced_send_to_a_dark_peer_times_out_and_the_path_goes_suspect,
+  messages_the_pacer_refuses_go_on_udp_and_are_charged_to_it,
+  a_session_paces_its_data_only_under_a_limit,
+  a_sessions_pacer_runs_on_the_path_clock,
+  config::tests::a_total_of_zero_paces_neither_transport,
+  a_data_route_is_paced_only_when_the_session_has_a_pacer and
+  quic_data_is_paced_only_under_a_limit_and_at_that_limit.
+  Under a saturated egress cap, the window cap apportions it only when the
+  per-connection share is below the cap. With the minimum per connection set
+  below the share (two connections, one flow each, equal RTT),
+  a_quic_path_and_udp_streams_each_get_their_fair_share_under_a_saturated_
+  egress_cap measured QUIC about 239 kB/s and a UDP stream sender about
+  250 kB/s of a 250 kB/s share, over 40 seeds (491 and 12 kB/s with the
+  window cap removed). With the DEFAULT minimum (DEFAULT_MIN_PER_CONNECTION,
+  1 MB/s, which GlobalBandwidthManager clamps to the total), a total below
+  n x 1 MB/s, so nearly every residential cap, gives every connection a share
+  of min(1 MB/s, total): each QUIC window cap is total x RTT and apportions
+  nothing. The egress cap's admission queue apportions it instead: QUIC and
+  UDP stream senders wait in the same FIFO (see "Node-wide egress cap"), so
+  each waiting sender gets a turn. Measured the same way with the default
+  minimum: QUIC 249362 to 249363 B/s, one UDP stream 250568 B/s (40 seeds;
+  before #6112 QUIC 461 to 463 kB/s, UDP 37 to 39 kB/s). With four UDP
+  streams on the other connection: QUIC about 100 kB/s, the streams about
+  400 kB/s, since the queue serves senders, not connections (with no QUIC
+  path, one stream against four on another connection: 100 and 400 kB/s).
+  With the minimum below the share the connection buckets bound each side:
+  QUIC 239332 to 240057 B/s, UDP 249943 to 250106 B/s, with one or four
+  streams. No fragment reached the stream deadline in any case.
+  KNOWN LIMITATION on capped nodes: a QUIC connection is one sender in that
+  queue, so its ACKs wait their turn behind queued UDP stream fragments. With
+  100 UDP streams queued on a 500 kB/s cap, the peer sending to this node over
+  QUIC measured srtt 123 ms (41 ms on main, where QUIC won nearly every refill)
+  and a 300 kB transfer took 0.74 s (0.21 s); no losses or congestion events.
+  No ACK priority: quinn does not mark ACK-only transmits and the poller does
+  not know a transmit's size when it polls, so a size rule would be a guess.
+  Only nodes with total-bandwidth-limit are affected.
+  CappedCubic::metrics reports the capped window as congestion_window.
+  The transport sets the rate when it binds (bind_udp_listener, pinned by
+  the_transport_gives_the_endpoint_its_bandwidth_settings); QuicSettings
+  from the config carries none.
 
 Token reservation:
   → Reserve BEFORE sending
@@ -888,10 +1066,11 @@ it must not wait unless it is a pacing point.
 `QuicMode::default_mode`, shadow on Linux and macOS and off elsewhere, since
 the breaker cannot trip without a boot identity) decides whether `bind_udp_listener` builds a quinn endpoint over the DemuxSocket.
 `prefer` negotiates data with the release's share of pairs ("Data slice" below;
-`upgrade::policy::log_startup` reports the share at INFO once per node). No code
-sends data on a path yet, so `prefer` differs from `shadow` only by that bit. The
-release that makes `prefer` carry data must say in its notes that existing
-`prefer` configs start carrying data. Off: no endpoint, no QUIC ingress, nothing
+`upgrade::policy::log_startup` reports the share at INFO once per node), and a pair
+with both bits sends its data on the path ("QUIC send route" below). At a share of
+0, with no `quic-data-percent`, `prefer` differs from `shadow` only by the bit, which
+stays 0. The release that raises the share above 0 must say in its notes that
+existing `prefer` configs start carrying data. Off: no endpoint, no QUIC ingress, nothing
 changes. QUIC must stay off by default on Windows until the crash-loop
 breaker has been confirmed on a real Windows machine (#6031). The default is
 read, never written to config.toml: a node that did not set the key follows the
@@ -935,7 +1114,8 @@ doc has the transition table.
   restarted peer is replaced before its old QUIC connection reports anything.
   A failure that already charged left the machine in Idle, so it is not
   charged twice. An endpoint ending, or a SessionEnded with the endpoint read
-  as Down, charges nothing.
+  as Down, charges nothing. A machine shut off by a session end closes its
+  path with SESSION_ENDED (code 6); every other shut-off closes with DOWNGRADE.
   Uncharged: a Decline of Busy, NotReady or Backoff and a full allow-set retry
   after 60 s (jittered) and leave the failure count. So a peer that stays
   NotReady or in its own backoff is offered to once per 60 s while that lasts.
@@ -950,7 +1130,7 @@ doc has the transition table.
   seed may come off a clock with another epoch. A promotion's first offer waits
   for the later of the seed and its own delay. e5a-5b must carry it per peer key
   across a replaced session, or a session that flaps retries at session rate.
-  Failures: close codes 1, 3, 4 and 5, a lost connection, an idle timeout and a
+  Failures: close codes 1, 3, 4, 5 and 6, a lost connection, an idle timeout and a
   deadline each mean fallback plus normal backoff, then a new offer. Never a
   permanent downgrade. Identity: close code 2 received, or Event::IdentityMismatch
   (closes with IDENTITY_MISMATCH). A TLS failure during the handshake
@@ -1030,8 +1210,11 @@ pair is in the slice when its bucket is below the percentage, so 0 holds none,
   overtake the frame carrying its bit. Sending is `QuicPath::send_data`, which
   `debug_assert_carries_data` reads. The Offer's caps stay 0. A release before the
   bit clears it on decode and sends 0, so its pairs stay in shadow.
-  No node code sends data on a path yet. Frames a peer sends to a node with its own
-  bit set reach `recv` ("QUIC receive flow" below).
+  With both bits the connection sends on the path ("QUIC send route" below). Frames
+  a peer sends to a node with its own bit set reach `recv` ("QUIC receive flow"
+  below). A sender needs no version check: 0.2.154 is the first release that can
+  set the bit and the first that reads, every earlier one clears the bit on decode
+  and sends 0, and a node rolled back has restarted and negotiates again.
 
 Receipt stamp (#6028, e5b-3): `ReceiptStamp` reads the later of two values,
 `last_inbound_nanos` (UDP) and `quic_receipt_nanos`, on the connection's clock. The
@@ -1074,15 +1257,50 @@ snapshot except the two gauges.
   offered and declined_uncharged. Both sides count `established`; only the
   offerer's is the numerator. Counts are node-wide; there is no per-pair series.
   `quic_fallback_<label>` (`QuicFallback`): idle, reset, protocol, downgrade_rx,
-  endpoint_down. Paths that had been active only; an attempt that ends in setup
-  is counted in `quic_upgrade_*`. A close this node sent for send_abort_limit or
-  peer_not_acknowledging reaches the machine as a lost connection, so it counts
-  as `reset`; its count is `quic_close_sent_*`. A key mismatch is
-  `quic_upgrade_identity_mismatch`.
+  endpoint_down, session_ended_rx. Paths that had been active only; an attempt
+  that ends in setup is counted in `quic_upgrade_*`. A close this node sent for
+  send_abort_limit or peer_not_acknowledging reaches the machine as a lost
+  connection, so it counts as `reset`; its count is `quic_close_sent_*`. A key
+  mismatch is `quic_upgrade_identity_mismatch`.
+  session_ended_rx is the peer closing with SESSION_ENDED (6): its UDP session
+  to this node ended (a prune or a restart). It is charged like downgrade_rx.
+  In setup this node counts the same close as `setup_downgrade_rx`, since
+  `QuicUpgradeOutcome` is full. A peer on a release before the code closes
+  with DOWNGRADE in that case (downgrade_rx). A node on a release before the
+  code reads 6 as an unknown code, a lost connection: `reset` for an active
+  path and `quic_upgrade_handshake_failed` in setup. So during a mixed
+  rollout, old nodes show more `reset` and `unknown_code` and fewer
+  `downgrade_rx` for the same closes, with nothing broken.
+  `quic_churned_fallback_<label>`, the same labels: fallbacks the UDP session's
+  end followed within FALLBACK_CHURN_WINDOW (150 s). The window is longer than
+  a UDP session takes to end once its peer goes silent (120 s idle timeout,
+  plus a keepalive interval, plus a timeout check), pinned by
+  the_churn_window_outlasts_a_udp_idle_timeout. The machine remembers each
+  fallback's time and cause (at most RECENT_FALLBACKS_MAX, 8; each is followed
+  by a backoff of at least 48 s, so at most 4 fit the window) and at
+  SessionEnded records Outcome::ChurnedFallback once for each within the
+  window, boundary included; the list is then empty, so a later SessionEnded
+  counts none again. It is a separate prefix so a sum over `quic_fallback_*`
+  does not add it in.
+  Reading them: a churned fallback is counted at the session's end, which can
+  come up to 150 s after the fallback, so with the default 30 s snapshot a
+  per-snapshot `quic_fallback_<c>` minus `quic_churned_fallback_<c>` can be
+  negative. Subtract only over windows much longer than 150 s (an hour or a
+  day). The Step 2 gate, fallbacks per path-day excluding endpoint and
+  restart causes, is then
+    (sum over c in idle, reset, protocol, downgrade_rx of
+       quic_fallback_<c> - quic_churned_fallback_<c>) / path-days,
+  with endpoint_down and session_ended_rx left out entirely (session_ended_rx
+  is churn by definition). It is a lower bound on fallbacks where QUIC failed
+  while UDP kept working: any session end within the window counts, including
+  one that the QUIC failure itself caused.
   `quic_close_received_<label>`: one per QUIC connection quinn reports as closed
   by a peer application close, by raw code (counted in `QuicConnection::new`'s
   watcher, because `QuicErrorKind` merges codes 1, 3, 4 and 5); a code with no
-  name is `unknown_code`. A local close is not counted.
+  name is `unknown_code`, always the last slot. A new code goes in before it,
+  so a reader must take the last slot as unknown and not use a fixed index
+  (SESSION_ENDED moved `unknown_code` from index 6 to 7). A local close is not
+  counted.
   `quic_path_age_at_close_<lt_1m|lt_10m|lt_1h|lt_1d|ge_1d>`: age of an active
   path at the teardown that ends it. `quic_establish_ms_p50`/`_p90`/`_samples`:
   from this node's Offer or Accept to active, on the session clock, first 256
@@ -1092,10 +1310,75 @@ snapshot except the two gauges.
   `PathGauge` guard inside the attempt, so dropping the attempt leaves the gauge.
   `quic_paths_active` is also in `resource_utilization` beside
   `memory_rss_bytes`.
-  Not built: stream-concurrency instruments on real QUIC (`quic_open_uni_waited`,
-  permit waits, ge_8..ge_48, control_* refusals) have no source until e5b and
-  read zero in shadow; the `transport=legacy|quic` connection attribute; a
-  per-path memory estimate.
+  `quic_flow_control_window_bytes`: the flow-control window of this node's QUIC
+  connections (per connection and direction), set when the endpoint is built,
+  0 without one; a state, not reset and not activity. Throughput by window
+  size shows whether nodes at the 128 KiB floor are slower on QUIC than on UDP.
+  Not built: the `transport=legacy|quic` attribute on connection, transfer and
+  disconnect events; quinn's RTT, min RTT and lost bytes on a QUIC transfer's
+  events (those fields are None today); the per-peer byte counters and the
+  dashboard for QUIC traffic; a per-path memory estimate.
+
+QUIC data telemetry (#5940 e5b-8, `transport/metrics/quic_data.rs`): node-wide
+counts of what paths' data sends and receives did, in one nested
+`TransportSnapshot::quic_data` and uploaded flat, a key per non-zero count and the
+gauge every period, 0 included (`QuicDataSnapshot::upload_keys`). Each is
+recorded where the path decides it, into the path's `QuicPathStats` and the node's
+`QuicDataCounters` together (`QuicPathLimits::counters`, `TRANSPORT_METRICS` unless
+a test passes its own; tests read their own, never the global).
+  quic_data_send_<short|large_short|stream|pipe>_<sent|maybe_delivered|
+  not_opened_udp|failed_udp|dropped>; quic_data_event_<short_overflow_udp|
+  data_refused|stalled_closed|udp_send_failed|suspect_entered|suspect_left|
+  pacer_refused>; quic_data_stop_<code> (stops a
+  peer sent to data sends); quic_inbound_<QuicInboundOutcome> (every receive
+  outcome, refusals by frame kind as short_refused_budget and
+  stream_refused_budget); quic_enabled_data_paths; quic_live_data_paths (a gauge of
+  paths with a route the peer has not refused data on, not reset, not activity;
+  lowered once, at the refusal or when the attempt goes); quic_sends and quic_open_uni_waited (opens a
+  path tried, data and control, and those that waited for stream credit);
+  quic_streamed_sends and quic_stream_permit_waited; quic_bytes_sent and
+  quic_bytes_received (quinn's UDP payload counts, reported by change at each 2 s
+  tick of the acknowledgement watch and once more when the path's task ends);
+  quic_sent_packets, quic_lost_packets, quic_lost_bytes and
+  quic_congestion_events (quinn's PathStats, every path including shadow ones, by
+  the same tick and once more when the path's task ends, so a path's last tick
+  before it closes is counted, sums of the period). A CONNECTION_CLOSE quinn sends
+  again after that report is in neither the byte nor the packet counts. A panic
+  in the watch, which the path survives, ends nothing: the report is the
+  receive supervisor's (recycle::PathReport); quic_loss_rate_<zero|lt_0_5pct|lt_1pct|
+  lt_2pct|lt_5pct|lt_10pct|lt_20pct|ge_20pct> (a gauge of live paths that have sent
+  at least 200 packets since they started, each in the one bucket of its own
+  lost/sent over its life, moved as it changes, out when the path ends; every
+  bucket uploaded every period, 0 included; no per-path values) and
+  quic_ended_loss_rate_<bucket> (paths that ended in the period, by their final
+  bucket, so paths that fail lossy still show) and quic_ended_paths_below_floor
+  (paths that ended in the period before 200 packets). Packets in flight at close
+  are dropped by quinn, not declared lost, so a final bucket can understate the
+  loss at the end. The rate is quinn's lost over
+  sent (quinn-proto 0.11.19), not a measurement of the link: sent counts every
+  packet quinn built, acknowledgement-only ones included; lost counts quinn's
+  loss declarations, and a packet declared lost and later acknowledged is not
+  taken back; lost PLPMTUD probes are left out of lost while sent ones are in
+  sent, and MTU discovery is off, so no path sends any. A shadow path's packets
+  are mostly keepalives and acknowledgements, so its rate may not hold for
+  data-sized packets. The sums and the buckets are updated and reset under one
+  lock;
+  quic_session_ended_with_data_path_<age> (sessions that ended while their
+  path's route still carried data); quic_streams_sampled_paths,
+  quic_streams_open_ge_<8|16|32|48> and quic_streams_peak_max (per path and period,
+  the peak of inbound streams read at once, counted as inbound_concurrency counts
+  connections).
+  A family is the keys of one label list under one prefix
+  (`QuicDataSnapshot::keys_by_family`). No other key starts with a family's
+  prefix or with the prefix sibling families share (`quic_data_` for the send,
+  event and stop families, `quic_streams_open_` for the levels), and no key starts
+  with a prefix two of the snapshot's other keys share (`quic_send_`,
+  `quic_paths_` and the rest), so a prefix sum never adds two kinds of count. The
+  tests read the families from the keys and the other keys from the snapshot's
+  serde fields, not from a list (`no_key_is_under_another_family`). The step-3
+  stream-limit bars read quic_open_uni_waited over quic_sends,
+  quic_stream_permit_waited over quic_streamed_sends (both counts of attempts),
+  and quic_streams_open_ge_48 over quic_streams_sampled_paths.
 
 Upgrade driver (`quic/upgrade/driver.rs`, #5940 step e5a-5b): QuicUpgrades is
 per node (endpoint, policy, routes by address, live sessions by peer key, backoff
@@ -1105,10 +1388,10 @@ task, no select arm and no GlobalRng draw. It owns one task per connection, whic
 runs the machine, so nothing of a negotiation runs inside `recv`, which only
 `try_send`s a received Upgrade to it.
   Sends: UDP Upgrade messages are tracked packets, sent by the driver through
-  UpgradeSender, which holds only what a send needs. It charges flight size and
+  UdpSender, which holds only what a send needs. It charges flight size and
   tracks the packet only after the socket took it, with no await between, so a
   send that fails or is dropped leaves nothing in flight. Control frames go through
-  send_control_bounded in a task per send, and nothing else is sent on a path.
+  send_control_bounded in a task per send. Data goes by "QUIC send route" below.
   Paths: QuicPath::with_budget(.., SHADOW or DEFAULT by this node's data bit, the
   connection's inbound budget, the session's data channels), on the clock quinn runs on (PathClock: RealTime, or
   the network's VirtualTime in simulation). The machine reads the connection's
@@ -1208,7 +1491,8 @@ exposes (its module doc lists the few it does not):
   grease_quic_bit(false) (the demux rule depends on it), versions [1],
   max_udp_payload / initial and min MTU 1200, no MTU discovery, no GSO,
   keepalive 15 s (None when the TimeSource disables keepalive), idle = the
-  TimeSource's connection idle timeout, Cubic, 64 uni / 0 bidi streams,
+  TimeSource's connection idle timeout, Cubic with its window capped to the
+  configured bandwidth (recycle::CappedCubic), 64 uni / 0 bidi streams,
   stream / receive / send window = clamp(5% of memory / (2 x
   max-number-of-connections), 128 KiB, 2 MiB), no unreliable datagrams, no
   spin bit, migration off, max_incoming 64, incoming buffers 64 KiB / 1 MiB,
@@ -1297,19 +1581,24 @@ once connections open, quinn's connection-ID draws
 inside quinn's tasks. With endpoints idle, the one difference from QUIC off
 is scheduling (one endpoint driver task per node), which changes some
 connection choices, so a QUIC-on run is compared with QUIC off by the peers
-that join, not by the exact edge set. `probe_quic_endpoints_at` sends each
+that join, not by the exact edge set. Every runner moves that VirtualTime: the
+direct runner from tokio's clock, the turmoil runners after each step
+(`run_turmoil_on_virtual_time`); before that the turmoil runners left it at 0, so
+no QUIC timer fired there. A record's `at` is on its host's own clock; under
+turmoil each host's starts when its runtime is built. `probe_quic_endpoints_at` sends each
 node a stranger's QUIC datagram during a direct-runner run, so a test can
 check every endpoint was live (`not_allowed`) rather than failed to bind.
 `SimNetwork::quic_upgrade_trace` returns a handle (`quic/upgrade/sim_trace.rs`,
-tests only) with what each node's upgrades did, readable after the run. It also
-injects: `send_shorts_on_paths` (the node sends each message that fits a packet as
-a Short on the connection's path, when that path may carry data, with no fallback
-to UDP; nothing else sends data on a path yet), `send_initial_on_each_attempt` (the node receives an Initial with the
+tests only) with what each node's upgrades did, readable after the run,
+including what arrived on the path and on UDP (`received a short on the path`,
+`data arrived on UDP`, noted at the receiver whichever code sent it) and what each
+send ended as (`sent a short on the path: ...`). It also
+injects: `send_initial_on_each_attempt` (the node receives an Initial with the
 peer's address as its source each time it allows that address, and records
 `injected an Initial`), `make_record_wrong` (the key compared after the
 handshake disagrees, so the path closes with IDENTITY_MISMATCH),
 `fail_endpoint_at` (the endpoint
-driver dies) and `run_as_release` (a peer reporting the crate's version reads
+driver dies, recorded as `failed the endpoint at <ms> ms` on VirtualTime) and `run_as_release` (a peer reporting the crate's version reads
 as a given release, since this tree reports a version below the negotiation
 floor until the release bump). The first offer is 2-10 s after promotion, so give a run tens of
 virtual seconds.
@@ -1365,9 +1654,10 @@ every rate), endpoint-down, panics and breaker trips, RSS against
 
 Simulation scenarios (`tests/simulation_integration.rs`, `test_quic_*`): two
 nodes established with traffic on UDP; data bits on each side, where only both
-enable data and nothing is sent; data at a test percentage with messages sent on
-the path, which come out of `recv` and decode as real messages (Shorts only; a Stream
-end to end is for e5b-5/6); QUIC-off peers decline `Disabled`; peers
+enable data; data at a test percentage, where messages go on the path, come out of
+`recv` and decode as real messages, with no data on UDP once the path carries it; a
+state past the streaming threshold as a Stream end to end, stored by the receiver;
+QUIC-off peers decline `Disabled`; peers
 below the version floor are never offered; blackholed and idle paths fall back
 and are re-offered; a wrong key closes with IDENTITY_MISMATCH; endpoint-down
 closes every path; an Initial the peer did not send is retried and the real dial
@@ -1444,8 +1734,8 @@ either side, and a man in the middle with its own key on either leg.
 
 #### QUIC framing and path (`quic/framing.rs`, `quic/path.rs`, #5940 step e3)
 
-The upgrade driver builds a `QuicPath` and sends only control frames on it; data
-sends are for e5b.
+The upgrade driver builds a `QuicPath` and sends control frames on it. Data goes on
+it by "QUIC send route" below.
 
 ```
 One message per QUIC uni stream: an 18-byte header, then metadata, then
@@ -1493,7 +1783,8 @@ Sending (QuicPath::send_short_bounded / send_stream_bounded /
   queued or in flight, and short and
   control messages hold no more than the reserve (pinned by
   a_short_still_sends_while_streamed_messages_are_blocked).
-  e5b constraints (none arises in shadow, which sends only control frames):
+  Constraints on a path that carries data (none arises in shadow, which sends only
+  control frames):
   → A permit can return before the slot does: on a reset or a stop from the
     peer (about one round trip), and on an ack, which is about receipt and can
     come before the receiver has read the stream to its end. That is short
@@ -1707,7 +1998,7 @@ Path recycling (quic/recycle.rs, #5940 step M6): besides the send-reset
   the peer acknowledged none of them, and the peer kept sending (no two
   samples in a row without anything from it). A peer that keeps sending but
   acknowledges none of our packets is not a conforming QUIC peer (RFC 9000 13.2.1). Newly acknowledged packets
-  are counted by AckCounting, which wraps Cubic in transport_config;
+  are counted by CappedCubic, which wraps Cubic in transport_config;
   ConnectionStats has no such counter. Two samples in a row with nothing
   from the peer end the window, and so does a sample with nothing
   outstanding (in flight after the latest acknowledgements, minus losses,
@@ -1745,7 +2036,109 @@ Control payload (quic/control.rs), the body of a Control frame, one per
   QuicInbound::controls and counts refusals per path
   (control_unknown_version, control_unknown_type, control_malformed); they
   are counted only through it, not by QuicControl::decode.
-Not here: export of the QUIC-only counters (per path, QuicPath::stats).
+Counts: per path (QuicPath::stats) and node-wide ("QUIC data telemetry" above).
+QUIC send route (#5940 e5b-6, quic/upgrade/data_route.rs,
+  peer_connection/quic_send.rs, quic/path/route.rs):
+  A message has one route, chosen when it is sent, from
+  QuicPathState::data_route: the live attempt's DataRoute, held only once both
+  sides set the data bit (Action::EnableData), unless the peer refused data. None
+  with QUIC off, in shadow and after a teardown, which takes the attempt under the
+  same lock. With QUIC off no task, arm or GlobalRng draw is added. Streams already
+  running on UDP when a path comes up finish on UDP.
+  NOTHING HERE WAITS IN THE CONNECTION'S TASK. A message of one packet goes through
+  DataRoute::queue_short, a try_send into a per-path queue of 256 (full: on UDP at
+  once, counted short_overflow_udp; closed: on UDP). One worker per path holds a
+  FuturesUnordered of at most MAX_UNI_STREAMS send_short_bounded calls: without
+  that cap the queue would never fill. A larger message, a Stream and a pipe each
+  run as a task in outbound_stream_futures, the arm that accounts for a UDP stream.
+  A larger message is a Short on the path and a stream of its own on UDP, under an
+  id taken when it is sent.
+  Fallback: QuicPath::settle counts an outcome and path::route::next_step says what
+  happens next. A message goes on UDP only when the outcome proves the receiver
+  cannot deliver it:
+    Sent: done (StreamSendOutcome::Delivered).
+    MaybeDelivered: never resent, the peer may hold it. A stream reports
+      StreamSendOutcome::Dropped: quinn may still have held part of it unsent, and
+      Delivered would make the broadcast queue record a state the peer may lack,
+      with only anti-entropy to correct it. Dropped costs one spare full-state send.
+    Failed(NotOpened), a frame that cannot be built: UDP, a stream under its id with
+      its completion_tx. A pipe reads its stream again from the start.
+    Failed(TimedOut), a connection lost before the end: a Short goes on UDP, as it
+      needs its end to be delivered. A Stream is Dropped.
+    NOT_ACCEPTING_DATA: UDP for both.
+    BUDGET_REFUSED: a Short goes on UDP, which charges none. A Stream is Dropped.
+    Any other stop, Source, LengthMismatch: Dropped, counted (stops by code).
+  A stream that opened never goes again under its id: the receiver may remember it
+  and drops UDP fragments under it while still acking them. The operation layer
+  retries with a fresh id, as after a UDP stream failure, so a Dropped stream ends
+  as OutboundStreamFailed, which is stream-scoped. A source that ends or fails before
+  its first chunk is Dropped too: it has nothing to send on any route.
+  UdpSender sends a Short from the worker, and UdpStreamSender is what send_stream
+  and pipe_stream take of a connection, so flight size is charged by the same code
+  and rules as on UDP (#4345). A send that stays on the path charges none.
+  The worker is not one of the attempt's tasks, which are aborted. It watches
+  connection.closed(), closes the queue and hands what it holds to UDP, so a path
+  that ends costs only what may already have arrived. A message taken in the gap
+  before the close is seen fails to open and goes the same way. The UDP send of a
+  session that has already ended goes nowhere, as on a dropped connection.
+  A path that stops moving: STALLED_SENDS_LIMIT (8) timeouts in a row close it with
+  DOWNGRADE (stalled_closed), but only timeouts while nothing on the connection was
+  newly acknowledged within STALL_PROGRESS_WINDOW (ACK_WATCH_WINDOW, 10 s), read
+  from CappedCubic's record (recycle::AckProgress) when a send settles
+  (route::StallCount). Any acknowledgement or any Sent starts the count again. All
+  three kinds count: Failed(NotOpened(TimedOut)), Failed(TimedOut),
+  MaybeDelivered(TimedOut). NotOpened must count: a path whose permits are all
+  held by sends stuck waiting for acknowledgements is recycled only by this close.
+  The window must stay: without it a busy relay whose 48 permits hold transfers
+  that are being acknowledged, or a receiver whose consumer is slow while its QUIC
+  stack acknowledges, is closed and loses what the receiver's readers hold. Known
+  gap: a consumer stalled past the window while nothing else on the path is
+  acknowledged reads as a stalled path. An egress cap hold counts as progress,
+  by the ack watch's rule (recycle::cap_held, shared): while
+  total-bandwidth-limit holds QUIC transmits nothing can be acknowledged, and at
+  a low cap one held transmit waits longer than the window. A pipe that timed out
+  waiting for its source does not count (WatchedSource). It costs a normal
+  backoff.
+  Fast path: Session::routed is an atomic set only while the live attempt holds a
+  route, so a connection with no route (shadow, the default on Linux and macOS)
+  sends without taking the session's lock. enable_data runs once per activation
+  (debug assertion); a second route would orphan the first one's worker.
+  A path gone dark: the first send timeout that counts toward the stall close
+  (nothing acknowledged for the window, no cap hold) makes the path suspect
+  (QuicPath::is_suspect, suspect_entered). data_route() then gives no route and
+  the worker sends what it takes on UDP, so new data goes on UDP while sends
+  already on the path stay there (a resend could deliver twice). The first time
+  it is asked after the acknowledgement count moved (quinn's keepalive brings one
+  within 15 s on a live path), the path takes data again (suspect_left). Without
+  it every short into a dark path ends MaybeDelivered(TimedOut), is never resent
+  and is lost, and an operation's retry lands in the same place until quinn's
+  idle timeout. A path that stays dark ends on quinn's idle timeout (120 s in
+  production, Fallback(Idle)), not on the stall close: once suspect no new send
+  reaches it, so the stall close fires only when STALLED_SENDS_LIMIT sends were
+  already on it. New data goes on UDP meanwhile, so nothing is lost. Entering
+  and leaving are under one lock. Fallback is a testing-period crutch: this
+  routing goes with it when the legacy transport is removed.
+  Receiver side: a path whose own data bit is 0 stops the first data frame with
+  NOT_ACCEPTING_DATA and closes the path with DOWNGRADE REFUSAL_CLOSE_DELAY (2 s)
+  later (closed_refusing_data, a WARN once per path). The delay lets the stops
+  reach the sender first: a sender that sees the close before a stream's stop
+  drops the stream, where the stop sends it on UDP. Without the close, a Short of
+  one packet is acknowledged before its stop arrives, so its sender reads Sent,
+  never clears send_data and loses every short on the path. The pair then
+  negotiates again after the normal backoff. Residual: a one-packet short sent
+  in the 2 s window is acknowledged before its stop is seen and is lost.
+  NOT_ACCEPTING_DATA at the sender: this node's gating or the peer's is wrong.
+  Logged once per path, counted (data_refused, and every time), and new sends go
+  on UDP; the receiver closes the path. send_data has three states so a send racing the refusal does not trip
+  debug_assert_carries_data. A small send acked before the stop is lost, and that
+  count is the only sign of it.
+  Telemetry: a transfer on a path emits transfer_started, _completed and _failed
+  and reports through the same arm. What comes from the UDP congestion controller
+  and sent tracker does not exist there: those fields are None or 0. A send that
+  falls back reports two starts under one id. The counts are per path
+  (QuicPathStats::send_count, send_event_count, stop_count).
+  Clocks: a send's deadlines are on the path's clock (DataRoute::clock), a transfer's
+  duration on the connection's. They differ in simulation.
 QUIC receive flow (#5940 e5b-4):
   The session owns one pair of data channels for its lifetime (data_channels; 256
   each) and every path it builds delivers to them, always with try_send. The
@@ -1840,8 +2233,8 @@ Errors: TransportError::Quic(QuicError), beside TransportError::Udp and
     buffer, so the code alone does not blame the endpoint),
     Refused{reason}:
     Handshake (a TLS alert, codes 0x100 to 0x1ff), Version,
-    ConnectionRefused (CONNECTION_REFUSED), Downgrade and
-    IdentityMismatch (the peer's close codes), AllowSetFull, KeyConflict,
+    ConnectionRefused (CONNECTION_REFUSED), Downgrade, IdentityMismatch and
+    SessionEnded (the peer's close codes), AllowSetFull, KeyConflict,
     UnusableKey, Local.
   → Attribution: error::attribute(availability, kind) turns every
     connection-scope kind into EndpointDown while the endpoint is Down,
@@ -1871,7 +2264,15 @@ Application error codes, one range per QUIC frame type, all one-byte
                 recycling, M6; the peer reads both as Downgrade),
                 CONTROL_REFUSED 5 (a control frame of an unknown version or
                 type arrived during path setup; the peer reads it as
-                Downgrade, a node without this code as ConnectionLost)
+                Downgrade, a node without this code as ConnectionLost),
+                SESSION_ENDED 6 (the UDP session ended; sent by the upgrade
+                machine's session-end shut-off and for a dial that connects
+                after the session ended; the peer reads it as
+                Refused{SessionEnded}, falls back and charges as for Downgrade,
+                and counts quic_fallback_session_ended_rx, or
+                setup_downgrade_rx in setup; a node without this code reads
+                ConnectionLost: quic_fallback_reset, or
+                quic_upgrade_handshake_failed in setup)
     0x10..=0x1f STOP_SENDING: path::stop_code (receiver refusals;
                 NOT_ACCEPTING_DATA 0x19 is a shadow path refusing data. Data
                 may be sent only after caps negotiation, so it is a counter

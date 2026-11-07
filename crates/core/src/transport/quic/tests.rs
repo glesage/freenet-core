@@ -138,6 +138,40 @@ where
     }
 }
 
+/// [`drive`] on a multi-thread runtime. There, a task can still be running on
+/// another worker when this one runs out of things to poll, so after its turns it
+/// pauses briefly in real time, and moves the clock only to a wakeup that is
+/// armed. A stuck test is caught by the caller's real-time limit.
+pub(in crate::transport) async fn drive_on_threads<F>(
+    time: &VirtualTime,
+    limit: Duration,
+    fut: F,
+) -> F::Output
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    let task = tokio::spawn(fut);
+    let limit_ns = time.now_nanos() + limit.as_nanos() as u64;
+    loop {
+        for _ in 0..64 {
+            if task.is_finished() {
+                return task.await.expect("the driven future panicked");
+            }
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        if task.is_finished() {
+            return task.await.expect("the driven future panicked");
+        }
+        time.advance_to_next_wakeup();
+        assert!(
+            time.now_nanos() <= limit_ns,
+            "virtual time passed {limit:?} before the future finished"
+        );
+    }
+}
+
 /// How long a QUIC test may run, in real time, before it is failed.
 const WATCHDOG: Duration = Duration::from_secs(120);
 
@@ -204,6 +238,7 @@ fn settings() -> QuicSettings {
         max_connections: 4,
         memory_limit: 1024 * 1024 * 1024,
         idle_timeout: None,
+        rate_limit: Default::default(),
     }
 }
 
@@ -408,7 +443,7 @@ fn handshake_and_one_mib_stream_on_virtual_time() {
                 .inner()
                 .congestion_state()
                 .into_any()
-                .downcast::<super::recycle::AckCounting>()
+                .downcast::<super::recycle::CappedCubic>()
                 .expect("the acknowledgement-counting controller");
             assert!(
                 controller.wraps::<quinn::congestion::Cubic>(),
@@ -1747,6 +1782,7 @@ fn windows_never_exceed_the_reassembly_allowance() {
                 max_connections,
                 memory_limit,
                 idle_timeout: None,
+                rate_limit: Default::default(),
             };
             let window = settings.window_bytes();
             assert!(
@@ -1908,7 +1944,7 @@ fn the_transport_builds_an_endpoint_only_with_the_key_on() {
                 port,
                 false,
                 UdpTransportConfig {
-                    quic,
+                    quic: quic.clone(),
                     ..UdpTransportConfig::default()
                 },
             )
@@ -2132,9 +2168,9 @@ fn a_hold_left_by_an_ended_connection_stops_pausing_the_ack_watch() {
 
 /// #5940 step M6: `socket::cap_hold_validity`, without its margin, bounds
 /// the longest wait the real cap gives a QUIC transmit before its poller is
-/// polled again: with the cap at its deepest debt (`DEBT_LIMIT`) and the
-/// most waiters it queues (`MAX_ADMISSION_WAKERS`), the last waiter's timer
-/// is no later than that.
+/// polled again: with the cap at its deepest debt (`DEBT_LIMIT`) and 500
+/// more waiters queued than it holds wakers for (`MAX_ADMISSION_WAKERS`),
+/// the last waiter's timer is no later than that.
 #[test]
 fn cap_hold_validity_bounds_the_longest_admission_wait() {
     use super::socket::{CAP_HOLD_VALIDITY_MARGIN, cap_hold_validity};
@@ -2148,7 +2184,9 @@ fn cap_hold_validity_bounds_the_longest_admission_wait() {
         // Past the debt limit: the rest is forgiven.
         let deepest = cap.burst_bytes() + 2 * rate * DEBT_LIMIT.as_secs();
         cap.charge_unpaced(deepest as usize);
-        let mut waiters: Vec<AdmissionWaiter> = (0..MAX_ADMISSION_WAKERS)
+        // More than the queue holds wakers for: the queue keeps every place,
+        // and the stagger counts at most `MAX_ADMISSION_WAKERS` ahead.
+        let mut waiters: Vec<AdmissionWaiter> = (0..MAX_ADMISSION_WAKERS + 500)
             .map(|_| AdmissionWaiter::default())
             .collect();
         for waiter in &mut waiters {
@@ -2607,6 +2645,9 @@ fn close_codes_reach_the_peer() {
             QuicCloseCode::IdentityMismatch => QuicErrorKind::Refused {
                 reason: QuicRefusal::IdentityMismatch,
             },
+            QuicCloseCode::SessionEnded => QuicErrorKind::Refused {
+                reason: QuicRefusal::SessionEnded,
+            },
         };
         let mut sent_by_a = Vec::new();
         let mut sent_by_b = Vec::new();
@@ -2954,7 +2995,7 @@ fn the_transport_reports_quic_availability() {
                 port,
                 false,
                 UdpTransportConfig {
-                    quic,
+                    quic: quic.clone(),
                     ..UdpTransportConfig::default()
                 },
             )
@@ -4489,5 +4530,130 @@ fn a_retry_token_is_honoured_for_its_lifetime_on_the_endpoint_clock() {
     assert!(
         matches!(arrive(&mut server), Some(DatagramEvent::Response(_))),
         "past its lifetime the token is answered with a close"
+    );
+}
+
+/// The QUIC poller hands its admission to the transmit that follows it on the
+/// same thread, as quinn 0.11.12 calls them (`poll_writable`, then `try_send`,
+/// back to back): that transmit's take uses exactly that admission, and other
+/// senders' admissions, made before the poll and between the poll and the
+/// send, stay outstanding. A send on another thread (quinn's endpoint
+/// `respond`, which never polls) finds no handoff and uses no admission. Pins
+/// the call order this relies on: a quinn bump must keep it.
+#[test]
+fn a_poller_hands_its_admission_to_the_transmit_that_follows() {
+    use crate::transport::egress_cap::AdmissionWaiter;
+    use quinn::AsyncUdpSocket;
+    use std::task::Context;
+    let time = VirtualTime::new();
+    let local: SocketAddr = "10.201.9.1:5000".parse().unwrap();
+    let target: SocketAddr = "10.201.9.2:5000".parse().unwrap();
+    let (socket, demux) = scripted(local, SendMode::Send, Vec::new(), Some((1_000_000, &time)));
+    let cap = demux.egress_cap().unwrap();
+    let waker = futures::task::noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    let mut before = AdmissionWaiter::default();
+    assert!(cap.poll_admit(1200, &mut before, &mut cx).is_ready());
+    let mut poller = socket.clone().create_io_poller();
+    assert!(poller.as_mut().poll_writable(&mut cx).is_ready());
+    let mut between = AdmissionWaiter::default();
+    assert!(cap.poll_admit(1200, &mut between, &mut cx).is_ready());
+    let (before_id, between_id) = (before.admission().unwrap(), between.admission().unwrap());
+
+    // quinn's endpoint response, on another thread: no handoff there.
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| socket.try_send(&transmit(&[0xC0; 1200], target)))
+            .join()
+            .unwrap()
+            .expect("the bucket has room for a response beside three admissions");
+    });
+    assert_eq!(
+        cap.admissions_outstanding(),
+        3,
+        "the response used no admission"
+    );
+
+    socket.try_send(&transmit(&[0xC0; 1200], target)).unwrap();
+    assert_eq!(
+        cap.admissions_outstanding(),
+        2,
+        "the transmit used one admission"
+    );
+    assert!(
+        cap.admission_outstanding(before_id),
+        "not the older sender's"
+    );
+    assert!(cap.admission_outstanding(between_id), "nor the newer one's");
+}
+
+/// A handoff whose transmit never reached the cap (the send returned first)
+/// goes to no other transmit: the poller's next poll clears it, and a send
+/// with no poll then uses no admission.
+#[test]
+fn an_unused_handoff_goes_to_no_other_transmit() {
+    use quinn::AsyncUdpSocket;
+    use std::task::Context;
+    let time = VirtualTime::new();
+    let local: SocketAddr = "10.201.9.1:5000".parse().unwrap();
+    let target: SocketAddr = "10.201.9.2:5000".parse().unwrap();
+    let (socket, demux) = scripted(local, SendMode::Send, Vec::new(), Some((1_000_000, &time)));
+    let cap = demux.egress_cap().unwrap();
+    // Room for one datagram and a bit.
+    cap.charge_unpaced(cap.burst_bytes() as usize - 1300);
+    let waker = futures::task::noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    let mut admitted = socket.clone().create_io_poller();
+    assert!(admitted.as_mut().poll_writable(&mut cx).is_ready());
+    // Another connection polls on this thread before any send: refused, as
+    // the datagram is owed.
+    let mut other = socket.clone().create_io_poller();
+    assert!(other.as_mut().poll_writable(&mut cx).is_pending());
+    let err = socket
+        .try_send(&transmit(&[0xC0; 1200], target))
+        .unwrap_err();
+    assert_eq!(
+        err.kind(),
+        std::io::ErrorKind::WouldBlock,
+        "a send with no handoff must leave the admitted connection's datagram"
+    );
+    assert_eq!(cap.admissions_outstanding(), 1);
+}
+
+/// A handoff names its cap: a transmit on another node's socket on the same
+/// thread (a simulation runs many nodes on one) uses none of that node's
+/// admissions, even one with the same number.
+#[test]
+fn a_handoff_is_used_only_by_its_own_cap() {
+    use crate::transport::egress_cap::AdmissionWaiter;
+    use quinn::AsyncUdpSocket;
+    use std::task::Context;
+    let time = VirtualTime::new();
+    let target: SocketAddr = "10.201.9.3:5000".parse().unwrap();
+    let (x, _x_demux) = scripted(
+        "10.201.9.1:5000".parse().unwrap(),
+        SendMode::Send,
+        Vec::new(),
+        Some((1_000_000, &time)),
+    );
+    let (y, y_demux) = scripted(
+        "10.201.9.2:5000".parse().unwrap(),
+        SendMode::Send,
+        Vec::new(),
+        Some((1_000_000, &time)),
+    );
+    let y_cap = y_demux.egress_cap().unwrap();
+    let waker = futures::task::noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    let mut x_poller = x.clone().create_io_poller();
+    assert!(x_poller.as_mut().poll_writable(&mut cx).is_ready());
+    // The first admission on each cap: the same number.
+    let mut y_waiter = AdmissionWaiter::default();
+    assert!(y_cap.poll_admit(1200, &mut y_waiter, &mut cx).is_ready());
+    let y_id = y_waiter.admission().unwrap();
+    y.try_send(&transmit(&[0xC0; 1200], target)).unwrap();
+    assert!(
+        y_cap.admission_outstanding(y_id),
+        "Y's send must not use X's handoff as Y's admission"
     );
 }
