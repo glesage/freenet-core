@@ -11,7 +11,7 @@
 //! | Key | What |
 //! |---|---|
 //! | `quic_data_send_<kind>_<result>` | data sends by kind and how they ended |
-//! | `quic_data_event_<event>` | short overflow to UDP, refusals, stall closes, lost UDP sends |
+//! | `quic_data_event_<event>` | short overflow to UDP, refusals, stall closes, lost UDP sends, ack waits released at their bound |
 //! | `quic_data_stop_<code>` | stops the peer sent to data sends, by code |
 //! | `quic_inbound_<outcome>` | every `QuicInboundOutcome`, node-wide |
 //! | `quic_enabled_data_paths` | paths where both sides set the data bit |
@@ -25,6 +25,13 @@
 //! | `quic_ended_loss_rate_<bucket>` | paths that ended in the period, by the bucket they were in at the end (same buckets) |
 //! | `quic_ended_paths_below_floor` | paths that ended in the period before sending 200 packets, so in no bucket |
 //! | `quic_streams_sampled_paths`, `quic_streams_open_ge_<n>`, `quic_streams_peak_max` | per path and period, the peak of inbound streams read at once: the paths sampled, those whose peak reached each level, and the highest peak |
+//! | `quic_gate_loss_<verdict>` | congestion events by the loss gate's verdict (`recycle::loss_gate`): passed to Cubic as `queue`, `share` (loss share above the ceiling), `persistent`, `ecn` (a congestion mark), `no_sample`, or `ignored` as random loss; summed over the node's paths up to each path's last tick. Over a path's life they sum to its `quic_congestion_events`; within one period they can differ by the events between the two reads of a tick |
+//! | `quic_gate_ended_queue_<bucket>` | paths that ended in the period after at least 20 gate verdicts, by the share of them passed as `queue`: `lt_10pct`, `lt_50pct`, `ge_50pct`. A path whose losses mostly read as a queue runs as plain Cubic, whether the queue is real or jitter |
+//! | `quic_send_resets`, `quic_path_ms` | sends a path reset on this side, and the time QUIC paths were up, shadow paths included, up to each path's last tick: resets per connection-hour is their ratio |
+//! | `quic_budget_bytes`, `quic_budget_charged_bytes`, `quic_budget_charged_peak_bytes` | the node's QUIC buffer budget, what its data paths' windows have grown above their floor grants now (the floor grants are each path's fixed charge, not the budget's, so a node with every path at the floor reports 0 and uploads nothing; gauges, not reset, uploaded when not 0), and the most charged at once in the period (`quic::budget`) |
+//! | `quic_staged_peak_pct` | the most any connection staged in the period (bytes read for streams whose header its reader had not taken yet) as a percentage of its staging cap (`quic::path::inbound::ConnStaging`); streams stopped at the cap are `quic_inbound_evicted_staged` |
+//! | `quic_window_grew`, `quic_window_grow_refused`, `quic_window_shrank` | window-limited data paths whose receive window grew, those that found no room, and paths whose windows the budget lowered |
+//! | `quic_send_resets_reached_<n>`, `quic_send_resets_path_max` | paths whose lifetime reset count reached each level in the period, and the highest count a reset in the period took a path to: how close paths get to `recycle::SEND_ABORT_LIMIT` |
 //!
 //! What the loss rate is: quinn's lost over sent (quinn-proto 0.11.19). `sent`
 //! counts every packet quinn built, acknowledgement-only ones included. `lost`
@@ -45,6 +52,15 @@
 //! `quic_sends` and `quic_stream_permit_waited` over `quic_streamed_sends` below 0.5%, and
 //! `quic_streams_open_ge_48` below 0.2% of `quic_streams_sampled_paths`. Both
 //! wait counts are of attempts: a send that waits and then times out is counted.
+//!
+//! The reset counts are for the per-connection fixed charge
+//! (`quic::config::QUIC_CONNECTION_CHARGE_BYTES`): each reset of a stream
+//! whose `stopped()` was polled leaves an entry in quinn's `stopped` map until
+//! the connection closes, so the charge takes the limit's worst case
+//! (`SEND_ABORT_LIMIT` x `QUIC_STOPPED_ENTRY_BYTES`). Field rates and peaks well
+//! under the limit are what would justify a lower charge or limit. A path whose
+//! acknowledgement watch is off or panicked stops adding to `quic_path_ms`,
+//! while its resets are still counted.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -54,6 +70,7 @@ use super::QuicPathAge;
 use crate::transport::quic::path::{
     QuicInboundOutcome, QuicSendEvent, QuicSendResult, SendKind, stop_code,
 };
+use crate::transport::quic::recycle::loss_gate::{GATE_VERDICTS, VERDICT_LABELS, Verdict};
 
 /// The gauge's key, uploaded in every snapshot ([`QuicDataSnapshot::upload_keys`]).
 const LIVE_DATA_PATHS: &str = "quic_live_data_paths";
@@ -93,6 +110,58 @@ fn loss_rate_bucket(lost: u64, sent: u64) -> usize {
         .take_while(|bound| per_mille_times_sent >= sent.saturating_mul(**bound))
         .count()
 }
+
+/// A path enters a `quic_gate_ended_queue_` bucket only after this many gate
+/// verdicts; below it the share says too little.
+pub(crate) const GATE_MIN_VERDICTS: u64 = 20;
+
+/// The labels of the gate's per-path buckets
+/// (`quic_gate_ended_queue_<label>`), by the share of verdicts passed as a
+/// queue: under 10%, under 50%, 50% or more.
+pub(crate) const GATE_QUEUE_LABELS: [&str; 3] = ["lt_10pct", "lt_50pct", "ge_50pct"];
+
+/// The bucket of a path that had `queue` of `total` verdicts passed as a queue.
+fn gate_queue_bucket(queue: u64, total: u64) -> usize {
+    if queue.saturating_mul(10) < total {
+        0
+    } else if queue.saturating_mul(2) < total {
+        1
+    } else {
+        2
+    }
+}
+
+/// One path's loss-gate verdicts since it started. Owned by the path's report
+/// (`recycle::PathReport`); dropping it, when the path ends, counts the path in
+/// its `quic_gate_ended_queue_` bucket.
+#[derive(Debug)]
+pub(crate) struct PathGateWindow {
+    node: &'static QuicDataCounters,
+    verdicts: [u64; GATE_VERDICTS],
+}
+
+impl PathGateWindow {
+    pub(crate) fn new(node: &'static QuicDataCounters) -> Self {
+        Self {
+            node,
+            verdicts: [0; GATE_VERDICTS],
+        }
+    }
+}
+
+impl Drop for PathGateWindow {
+    fn drop(&mut self) {
+        let total: u64 = self.verdicts.iter().sum();
+        if total >= GATE_MIN_VERDICTS {
+            let bucket = gate_queue_bucket(self.verdicts[GATE_QUEUE], total);
+            self.node.gate_ended_queue[bucket].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// The index of `queue` among the gate's verdicts (`loss_gate::Verdict::ALL`).
+const GATE_QUEUE: usize = 0;
+const _: () = assert!(matches!(Verdict::ALL[GATE_QUEUE], Verdict::Queue));
 
 /// One path's packets since it started, and the loss-rate bucket it is counted
 /// in. Owned by the path's acknowledgement watch; dropping it, however the watch
@@ -166,6 +235,15 @@ struct LossCounts {
 /// (`quic::config::STREAMED_SEND_LIMIT`), which is the bar.
 pub(crate) const QUIC_STREAMS_OPEN_THRESHOLDS: [u32; 4] = [8, 16, 32, 48];
 
+/// The levels `quic_send_resets_reached_<n>` reports, up to
+/// `recycle::SEND_ABORT_LIMIT`: one more reset past the last closes the path.
+pub(crate) const QUIC_SEND_RESET_LEVELS: [u64; 4] = [64, 512, 2048, 4096];
+const _: () = assert!(
+    QUIC_SEND_RESET_LEVELS[QUIC_SEND_RESET_LEVELS.len() - 1]
+        == crate::transport::quic::recycle::SEND_ABORT_LIMIT,
+    "the last level is the reset limit"
+);
+
 /// The streams-open counts of one period, under one lock with its period, as the
 /// connection-level inbound concurrency counts are.
 #[derive(Debug, Default, Clone, Copy)]
@@ -204,6 +282,17 @@ pub(crate) struct QuicDataCounters {
     loss: Mutex<LossCounts>,
     streams_epoch: AtomicU64,
     streams: Mutex<StreamsOpenCounts>,
+    send_resets: AtomicU64,
+    path_ms: AtomicU64,
+    send_resets_reached: [AtomicU64; QUIC_SEND_RESET_LEVELS.len()],
+    send_resets_path_max: AtomicU64,
+    budget_bytes: AtomicU64,
+    budget_charged: AtomicU64,
+    budget_charged_peak: AtomicU64,
+    window_changes: [AtomicU64; 3],
+    staged_peak_pct: AtomicU64,
+    gate_loss: [AtomicU64; GATE_VERDICTS],
+    gate_ended_queue: [AtomicU64; GATE_QUEUE_LABELS.len()],
 }
 
 impl QuicDataCounters {
@@ -226,6 +315,17 @@ impl QuicDataCounters {
             loss: Mutex::new(LossCounts::default()),
             streams_epoch: AtomicU64::new(1),
             streams: Mutex::new(StreamsOpenCounts::default()),
+            send_resets: zero(),
+            path_ms: zero(),
+            send_resets_reached: std::array::from_fn(|_| zero()),
+            send_resets_path_max: zero(),
+            budget_bytes: zero(),
+            budget_charged: zero(),
+            budget_charged_peak: zero(),
+            window_changes: std::array::from_fn(|_| zero()),
+            staged_peak_pct: zero(),
+            gate_loss: std::array::from_fn(|_| zero()),
+            gate_ended_queue: std::array::from_fn(|_| zero()),
         }
     }
 
@@ -361,6 +461,72 @@ impl QuicDataCounters {
         counts.max = counts.max.max(open);
     }
 
+    /// A path reset a send on this side, its `path_count`th
+    /// (`recycle::SendAborts`, while the connection is open).
+    pub(crate) fn record_send_reset(&self, path_count: u64) {
+        self.send_resets.fetch_add(1, Ordering::Relaxed);
+        // A path's count rises by one per reset, so it equals each level once.
+        if let Some(i) = QUIC_SEND_RESET_LEVELS
+            .iter()
+            .position(|level| *level == path_count)
+        {
+            self.send_resets_reached[i].fetch_add(1, Ordering::Relaxed);
+        }
+        self.send_resets_path_max
+            .fetch_max(path_count, Ordering::Relaxed);
+    }
+
+    /// A path's loss gate gave `delta` more verdicts, in the order of
+    /// `loss_gate::Verdict::ALL`, since its last report: summed node-wide for
+    /// the period and added to the path's window.
+    pub(crate) fn record_gate(&self, window: &mut PathGateWindow, delta: [u64; GATE_VERDICTS]) {
+        debug_assert!(
+            std::ptr::eq(window.node, self),
+            "a window of these counters"
+        );
+        for (i, n) in delta.into_iter().enumerate() {
+            if n != 0 {
+                self.gate_loss[i].fetch_add(n, Ordering::Relaxed);
+                window.verdicts[i] = window.verdicts[i].saturating_add(n);
+            }
+        }
+    }
+
+    /// A path was up for `ms` more milliseconds (`recycle::PathReport`).
+    pub(crate) fn record_path_time(&self, ms: u64) {
+        self.path_ms.fetch_add(ms, Ordering::Relaxed);
+    }
+
+    /// The node's QUIC buffer budget, set when the endpoint is built.
+    pub(crate) fn set_budget_bytes(&self, bytes: u64) {
+        self.budget_bytes.store(bytes, Ordering::Relaxed);
+    }
+
+    /// What the node's data paths are charged against the budget now.
+    pub(crate) fn set_budget_charged(&self, bytes: u64) {
+        self.budget_charged.store(bytes, Ordering::Relaxed);
+        self.budget_charged_peak.fetch_max(bytes, Ordering::Relaxed);
+    }
+
+    /// What one evaluation did to a path's windows.
+    pub(crate) fn record_window_change(
+        &self,
+        change: crate::transport::quic::budget::WindowChange,
+    ) {
+        use crate::transport::quic::budget::WindowChange;
+        let index = match change {
+            WindowChange::Grew => 0,
+            WindowChange::Refused => 1,
+            WindowChange::Shrank => 2,
+        };
+        self.window_changes[index].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A connection's staged bytes reached `pct` percent of its staging cap.
+    pub(crate) fn record_staged_level(&self, pct: u64) {
+        self.staged_peak_pct.fetch_max(pct, Ordering::Relaxed);
+    }
+
     /// The period's counts, reset when `reset`. The gauge is read, never reset.
     pub(crate) fn snapshot(&self, reset: bool) -> QuicDataSnapshot {
         let get = |a: &AtomicU64| {
@@ -415,6 +581,27 @@ impl QuicDataCounters {
             streams_open_paths_sampled: streams.paths_sampled,
             streams_open_ge: streams.ge.to_vec(),
             streams_open_max: streams.max,
+            send_resets: get(&self.send_resets),
+            path_ms: get(&self.path_ms),
+            send_resets_reached: self.send_resets_reached.iter().map(get).collect(),
+            send_resets_path_max: get(&self.send_resets_path_max),
+            budget_bytes: self.budget_bytes.load(Ordering::Relaxed),
+            budget_charged: self.budget_charged.load(Ordering::Relaxed),
+            // The peak of the period starts again from what is charged now.
+            budget_charged_peak: if reset {
+                self.budget_charged_peak.swap(
+                    self.budget_charged.load(Ordering::Relaxed),
+                    Ordering::Relaxed,
+                )
+            } else {
+                self.budget_charged_peak.load(Ordering::Relaxed)
+            },
+            window_grew: get(&self.window_changes[0]),
+            window_grow_refused: get(&self.window_changes[1]),
+            window_shrank: get(&self.window_changes[2]),
+            staged_peak_pct: get(&self.staged_peak_pct),
+            gate_loss: self.gate_loss.iter().map(get).collect(),
+            gate_ended_queue: self.gate_ended_queue.iter().map(get).collect(),
         }
     }
 }
@@ -456,6 +643,29 @@ pub struct QuicDataSnapshot {
     /// By `QUIC_STREAMS_OPEN_THRESHOLDS`.
     pub streams_open_ge: Vec<u32>,
     pub streams_open_max: u32,
+    pub send_resets: u64,
+    pub path_ms: u64,
+    /// By `QUIC_SEND_RESET_LEVELS`.
+    pub send_resets_reached: Vec<u64>,
+    pub send_resets_path_max: u64,
+    /// A gauge, not reset.
+    pub budget_bytes: u64,
+    /// A gauge, not reset.
+    pub budget_charged: u64,
+    pub budget_charged_peak: u64,
+    pub window_grew: u64,
+    pub window_grow_refused: u64,
+    pub window_shrank: u64,
+    pub staged_peak_pct: u64,
+    /// Congestion events by loss-gate verdict, by `loss_gate::Verdict::ALL`.
+    /// Defaulted, so JSON from before the gate decodes. This does not help
+    /// bincode: the local event log drops a snapshot written by an older
+    /// release (see `upload_json`).
+    #[serde(default)]
+    pub gate_loss: Vec<u64>,
+    /// Paths that ended in the period, by `GATE_QUEUE_LABELS`.
+    #[serde(default)]
+    pub gate_ended_queue: Vec<u64>,
 }
 
 impl QuicDataSnapshot {
@@ -498,6 +708,19 @@ impl QuicDataSnapshot {
             streams_open_paths_sampled,
             streams_open_ge,
             streams_open_max,
+            send_resets,
+            path_ms,
+            send_resets_reached,
+            send_resets_path_max,
+            budget_bytes,
+            budget_charged,
+            budget_charged_peak,
+            window_grew,
+            window_grow_refused,
+            window_shrank,
+            staged_peak_pct,
+            gate_loss,
+            gate_ended_queue,
         } = self;
         let mut keys = Vec::new();
         let mut family = |prefix: &'static str, labels: Vec<String>, values: Vec<u64>| {
@@ -570,6 +793,24 @@ impl QuicDataSnapshot {
                 .collect(),
             streams_open_ge.iter().map(|n| u64::from(*n)).collect(),
         );
+        family(
+            "quic_send_resets_reached_",
+            QUIC_SEND_RESET_LEVELS
+                .iter()
+                .map(|level| level.to_string())
+                .collect(),
+            send_resets_reached.clone(),
+        );
+        family(
+            "quic_gate_loss_",
+            VERDICT_LABELS.iter().map(|l| l.to_string()).collect(),
+            gate_loss.clone(),
+        );
+        family(
+            "quic_gate_ended_queue_",
+            GATE_QUEUE_LABELS.iter().map(|l| l.to_string()).collect(),
+            gate_ended_queue.clone(),
+        );
         for (key, value) in [
             ("quic_enabled_data_paths", *data_enabled),
             (LIVE_DATA_PATHS, *data_paths),
@@ -589,6 +830,16 @@ impl QuicDataSnapshot {
                 u64::from(*streams_open_paths_sampled),
             ),
             ("quic_streams_peak_max", u64::from(*streams_open_max)),
+            ("quic_send_resets", *send_resets),
+            ("quic_path_ms", *path_ms),
+            ("quic_send_resets_path_max", *send_resets_path_max),
+            ("quic_budget_bytes", *budget_bytes),
+            ("quic_budget_charged_bytes", *budget_charged),
+            ("quic_budget_charged_peak_bytes", *budget_charged_peak),
+            ("quic_window_grew", *window_grew),
+            ("quic_window_grow_refused", *window_grow_refused),
+            ("quic_window_shrank", *window_shrank),
+            ("quic_staged_peak_pct", *staged_peak_pct),
         ] {
             keys.push((None, key.to_string(), value));
         }
@@ -634,6 +885,19 @@ impl QuicDataSnapshot {
             streams_open_paths_sampled,
             streams_open_ge: _,
             streams_open_max: _,
+            send_resets,
+            path_ms,
+            send_resets_reached,
+            send_resets_path_max: _,
+            budget_bytes: _,
+            budget_charged: _,
+            budget_charged_peak: _,
+            window_grew,
+            window_grow_refused,
+            window_shrank,
+            staged_peak_pct: _,
+            gate_loss,
+            gate_ended_queue,
         } = self;
         let any = |values: &[u64]| values.iter().any(|n| *n != 0);
         any(sends)
@@ -642,6 +906,9 @@ impl QuicDataSnapshot {
             || any(inbound)
             || any(session_ended_with_data_path)
             || any(ended_loss_rate)
+            || any(send_resets_reached)
+            || any(gate_loss)
+            || any(gate_ended_queue)
             || [
                 *data_enabled,
                 *sends_opened,
@@ -656,6 +923,11 @@ impl QuicDataSnapshot {
                 *congestion_events,
                 *ended_below_floor,
                 u64::from(*streams_open_paths_sampled),
+                *send_resets,
+                *path_ms,
+                *window_grew,
+                *window_grow_refused,
+                *window_shrank,
             ]
             .iter()
             .any(|n| *n != 0)
@@ -727,6 +999,58 @@ mod tests {
         // A new period counts the path again.
         counters.record_streams_open(&mut path, 5);
         assert_eq!(counters.snapshot(true).streams_open_paths_sampled, 1);
+    }
+
+    /// The gate's verdicts reach their keys and reset; a path that ends after
+    /// enough verdicts is counted once in the bucket of its share passed as a
+    /// queue, and one with too few in none.
+    #[test]
+    fn gate_verdicts_reach_their_keys_and_ended_paths_their_bucket() {
+        let counters: &'static QuicDataCounters = Box::leak(Box::new(QuicDataCounters::new()));
+        // queue, share, persistent, ecn, no_sample, ignored.
+        let mut cubic_like = PathGateWindow::new(counters);
+        counters.record_gate(&mut cubic_like, [12, 0, 0, 0, 0, 4]);
+        counters.record_gate(&mut cubic_like, [3, 1, 0, 0, 0, 0]);
+        let mut gated = PathGateWindow::new(counters);
+        counters.record_gate(&mut gated, [1, 0, 1, 2, 1, 30]);
+        let mut middle = PathGateWindow::new(counters);
+        counters.record_gate(&mut middle, [5, 0, 0, 0, 0, 15]);
+        let mut short = PathGateWindow::new(counters);
+        counters.record_gate(&mut short, [19, 0, 0, 0, 0, 0]);
+        let snap = counters.snapshot(true);
+        assert!(snap.has_activity());
+        let keys: std::collections::BTreeMap<_, _> = snap.keys().into_iter().collect();
+        assert_eq!(keys["quic_gate_loss_queue"], 40);
+        assert_eq!(keys["quic_gate_loss_share"], 1);
+        assert_eq!(keys["quic_gate_loss_persistent"], 1);
+        assert_eq!(keys["quic_gate_loss_ecn"], 2);
+        assert_eq!(keys["quic_gate_loss_no_sample"], 1);
+        assert_eq!(keys["quic_gate_loss_ignored"], 49);
+        assert!(
+            snap.gate_ended_queue.iter().all(|n| *n == 0),
+            "no path ended"
+        );
+
+        drop((cubic_like, gated, middle, short));
+        let ended = counters.snapshot(true);
+        let keys: std::collections::BTreeMap<_, _> = ended.keys().into_iter().collect();
+        // 1 of 35 (3%), 5 of 20 (25%), 15 of 20 (75%); 19 verdicts is too few.
+        assert_eq!(keys["quic_gate_ended_queue_lt_10pct"], 1);
+        assert_eq!(keys["quic_gate_ended_queue_lt_50pct"], 1);
+        assert_eq!(keys["quic_gate_ended_queue_ge_50pct"], 1);
+        assert_eq!(keys["quic_gate_loss_queue"], 0, "reset by the snapshot");
+        assert!(ended.has_activity(), "an ended path alone is activity");
+        assert!(!counters.snapshot(true).has_activity());
+    }
+
+    #[test]
+    fn the_gate_bucket_bounds() {
+        assert_eq!(gate_queue_bucket(0, 20), 0);
+        assert_eq!(gate_queue_bucket(1, 20), 0);
+        assert_eq!(gate_queue_bucket(2, 20), 1, "10% is not under 10%");
+        assert_eq!(gate_queue_bucket(9, 20), 1);
+        assert_eq!(gate_queue_bucket(10, 20), 2, "50% is not under 50%");
+        assert_eq!(gate_queue_bucket(20, 20), 2);
     }
 
     /// The gauge goes out in every snapshot, 0 included, so 0 is told apart from
@@ -1043,6 +1367,53 @@ mod tests {
         let uploaded: std::collections::HashMap<String, u64> =
             counters.snapshot(true).upload_keys().collect();
         assert_eq!(uploaded.get("quic_ended_paths_below_floor"), Some(&1));
+    }
+
+    /// Resets reach their keys: the total, each level a path's count passes,
+    /// and the highest count; path time sums. All reset by the snapshot.
+    #[test]
+    fn send_resets_and_path_time_reach_their_keys_and_reset() {
+        let counters = QuicDataCounters::new();
+        // One path to 600 resets, another to 3.
+        for count in 1..=600 {
+            counters.record_send_reset(count);
+        }
+        for count in 1..=3 {
+            counters.record_send_reset(count);
+        }
+        counters.record_path_time(2_000);
+        counters.record_path_time(1_500);
+        let snap = counters.snapshot(true);
+        assert!(snap.has_activity());
+        let keys: std::collections::BTreeMap<_, _> = snap.keys().into_iter().collect();
+        assert_eq!(keys["quic_send_resets"], 603);
+        assert_eq!(keys["quic_path_ms"], 3_500);
+        assert_eq!(keys["quic_send_resets_reached_64"], 1);
+        assert_eq!(keys["quic_send_resets_reached_512"], 1);
+        assert_eq!(keys["quic_send_resets_reached_2048"], 0);
+        assert_eq!(keys["quic_send_resets_reached_4096"], 0);
+        assert_eq!(keys["quic_send_resets_path_max"], 600);
+
+        let after = counters.snapshot(true);
+        assert!(!after.has_activity());
+        assert!(after.keys().iter().all(|(_, value)| *value == 0));
+    }
+
+    /// The reset and path-time counts are activity on their own, so a period with
+    /// only them is uploaded.
+    #[test]
+    fn resets_or_path_time_alone_are_activity() {
+        let counters = QuicDataCounters::new();
+        counters.record_send_reset(1);
+        assert!(counters.snapshot(true).has_activity(), "a reset");
+        counters.record_path_time(1);
+        assert!(counters.snapshot(true).has_activity(), "path time");
+        let reached = QuicDataSnapshot {
+            send_resets_reached: vec![0, 1, 0, 0],
+            ..QuicDataSnapshot::default()
+        };
+        assert!(reached.has_activity(), "a level reached");
+        assert!(!counters.snapshot(true).has_activity());
     }
 
     /// The snapshot round-trips through bincode, as the event log stores it.

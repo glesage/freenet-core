@@ -25,14 +25,14 @@
 use dashmap::DashMap;
 use std::net::SocketAddr;
 use std::sync::LazyLock;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use tokio::sync::mpsc;
 
 use crate::tracing::{TransferDirection, TransferEvent};
 
 mod quic_data;
 pub use quic_data::QuicDataSnapshot;
-pub(crate) use quic_data::{PathLossWindow, QuicDataCounters, StreamsOpenPeak};
+pub(crate) use quic_data::{PathGateWindow, PathLossWindow, QuicDataCounters, StreamsOpenPeak};
 
 /// Global transport metrics instance.
 ///
@@ -360,6 +360,10 @@ labelled_counters! {
         SourceFull => "source_full",
         /// Dropped: no QUIC ingress is enabled, or its receiver is gone.
         NoIngress => "no_ingress",
+        /// Dropped: only the queue's reserve for quiet sources was free
+        /// (`demux::QUIC_INGRESS_QUIET_RESERVE`) and this source already had
+        /// `demux::QUIC_INGRESS_QUIET_SOURCE_DATAGRAMS` or more queued.
+        ReserveFull => "reserve_full",
     }
 }
 
@@ -387,6 +391,14 @@ labelled_counters! {
         /// This node's UDP session to the peer ended, so the path went with
         /// it.
         SessionEnded => "session_ended",
+        /// The peer held more of this node's QUIC buffer budget than it
+        /// allows (its gaps past the cap a second time).
+        OverBudget => "over_budget",
+        /// A native connection's peer sent a `Hello` with a version this node
+        /// cannot talk to.
+        VersionIncompatible => "version_incompatible",
+        /// A native connection's peer sent a malformed or oversized `Hello`.
+        HelloRefused => "hello_refused",
     }
 }
 
@@ -513,6 +525,10 @@ labelled_counters! {
         /// not a QUIC failure. A peer on a release before the code sends
         /// `downgrade` in the same case, which counts as `downgrade_rx`.
         SessionEndedReceived => "session_ended_rx",
+        /// The peer closed it with `over_budget`: this node held more of the
+        /// peer's QUIC buffer budget than it allows. A peer on a release
+        /// before the code does not send it.
+        OverBudgetReceived => "over_budget_rx",
     }
 }
 
@@ -843,6 +859,34 @@ pub struct TransportMetrics {
     /// Whether the crash-loop breaker keeps QUIC off in this process (a
     /// state, never reset).
     quic_breaker_suppressed: AtomicBool,
+    /// The QUIC endpoint's state, a [`QuicEndpointState`] as `u8` (a state,
+    /// never reset).
+    quic_endpoint_state: AtomicU8,
+    /// QUIC-native connect offers this node built as joiner, at percent 0
+    /// and above 0 (#5940; reset each snapshot).
+    connect_native_offered_zero: AtomicU64,
+    connect_native_offered_nonzero: AtomicU64,
+    /// QUIC-native decisions this node made as acceptor for a request that
+    /// carried an offer, by decision (reset each snapshot). One per accept: a
+    /// relay accepts a transaction at most once, but a join re-routed to
+    /// several acceptors counts at each of them, so these count decisions,
+    /// not joins.
+    connect_native_decided_native: AtomicU64,
+    connect_native_decided_udp: AtomicU64,
+    /// Responses deciding `Native` this node received as joiner and could not
+    /// use: to a request with no offer or percent 0, or to a real offer this
+    /// build cannot dial (reset each snapshot). Each failed that attempt.
+    connect_native_decision_without_offer: AtomicU64,
+    connect_native_decision_native_unsupported: AtomicU64,
+    /// `Native` responses dropped unanswered once a CONNECT had refused as
+    /// many acceptors as its acceptor limit (reset each snapshot). Not counted
+    /// as failures above.
+    connect_native_decision_over_cap: AtomicU64,
+    /// The last offer this node built: level, percent and whether it was
+    /// ready to dial native (a state, never reset).
+    connect_native_offer_level: AtomicU8,
+    connect_native_offer_percent: AtomicU8,
+    connect_native_offer_ready: AtomicBool,
     /// QUIC connections this node closed, by [`QuicCloseCode`] (reset each
     /// snapshot). Counted when the close is queued, and only while it can
     /// still be sent (not after the endpoint went Down or its socket adapter
@@ -871,9 +915,11 @@ pub struct TransportMetrics {
     quic_paths_offered_or_dialing: AtomicU64,
     /// Paths active on this node's evidence (state, never reset).
     quic_paths_active: AtomicU64,
-    /// The flow-control window of this node's QUIC connections, per
-    /// connection and direction (`quic::config::connection_window_bytes`):
-    /// a state set when the endpoint is built, 0 without one.
+    /// The flow-control window every QUIC connection of this node starts
+    /// with, per direction (`quic::config::QuicSettings::window_bytes`, the
+    /// floor): a state set when the endpoint is built, 0 without one. A data
+    /// path's windows then move within the buffer budget
+    /// (`quic_budget_*`, `quic_window_*`).
     quic_flow_control_window_bytes: AtomicU64,
     /// What QUIC paths' data sends and receives did (`quic_data`).
     pub(crate) quic_data: QuicDataCounters,
@@ -946,6 +992,17 @@ struct EgressCounters {
     debt_hwm_bytes: AtomicU64,
     /// Unpaced bytes forgiven because the debt reached the debt limit.
     debt_forgiven_bytes: AtomicU64,
+    /// Refusals of a due legacy UDP RTO resend by the node-wide egress cap
+    /// (`EgressCap::admit_retransmit`). Counts refusals, not packets: a
+    /// resend refused at each of several wakes counts once per wake.
+    retransmits_deferred: AtomicU64,
+    /// Legacy UDP RTO resends sent uncapped after being deferred for
+    /// `RETX_DEFER_LIMIT_RTOS` effective RTOs.
+    retransmits_uncapped: AtomicU64,
+    /// Bytes of those resends: what the node sent past the retransmit limits.
+    retransmits_uncapped_bytes: AtomicU64,
+    /// Legacy UDP tail-loss probes skipped because the egress cap had no room for them.
+    probes_skipped: AtomicU64,
 }
 
 /// Period counters for packet loss, retransmission and standalone-ACK
@@ -1186,6 +1243,25 @@ impl ConnRttDistribution {
 
 #[cfg(test)]
 thread_local! {
+    /// Test-only: joiner decision failures recorded on this thread, by
+    /// `JoinerDecisionFailure` discriminant. The global counters are reset by
+    /// any test that takes a snapshot, so a test reads these instead.
+    pub(crate) static NATIVE_DECISION_FAILURES_ON_THIS_THREAD: std::cell::Cell<[u64; 2]> =
+        const { std::cell::Cell::new([0; 2]) };
+
+    /// Test-only: `Native` responses dropped past the per-CONNECT cap on
+    /// this thread, for the same reason.
+    pub(crate) static NATIVE_DECISIONS_OVER_CAP_ON_THIS_THREAD: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+
+    /// Test-only: QUIC-native offers recorded on this thread, for the same
+    /// reason.
+    pub(crate) static NATIVE_OFFERS_ON_THIS_THREAD: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+thread_local! {
     /// Test-only per-address byte totals returned by
     /// [`TransportMetrics::connection_peer_bytes`] in place of the global table.
     pub(crate) static PEER_BYTES_OVERRIDE: std::cell::RefCell<
@@ -1276,6 +1352,17 @@ impl TransportMetrics {
             quic_breaker_trips: AtomicU64::new(0),
             quic_send_refused: AtomicU64::new(0),
             quic_breaker_suppressed: AtomicBool::new(false),
+            quic_endpoint_state: AtomicU8::new(QuicEndpointState::Unknown as u8),
+            connect_native_offered_zero: AtomicU64::new(0),
+            connect_native_offered_nonzero: AtomicU64::new(0),
+            connect_native_decided_native: AtomicU64::new(0),
+            connect_native_decided_udp: AtomicU64::new(0),
+            connect_native_decision_without_offer: AtomicU64::new(0),
+            connect_native_decision_native_unsupported: AtomicU64::new(0),
+            connect_native_decision_over_cap: AtomicU64::new(0),
+            connect_native_offer_level: AtomicU8::new(0),
+            connect_native_offer_percent: AtomicU8::new(0),
+            connect_native_offer_ready: AtomicBool::new(false),
             quic_close_sent: Default::default(),
             quic_close_received: Default::default(),
             quic_upgrade: Default::default(),
@@ -1729,6 +1816,7 @@ impl TransportMetrics {
         #[cfg(not(test))]
         let _ = local;
         self.quic_endpoint_down.fetch_add(1, Ordering::Relaxed);
+        self.set_quic_endpoint_state(QuicEndpointState::Died);
     }
 
     /// The socket adapter of the QUIC endpoint bound at `local` caught its
@@ -1768,6 +1856,95 @@ impl TransportMetrics {
     pub(crate) fn set_quic_breaker_suppressed(&self, suppressed: bool) {
         self.quic_breaker_suppressed
             .store(suppressed, Ordering::Relaxed);
+    }
+
+    /// Record the QUIC endpoint's state. [`QuicEndpointState::Died`] is final
+    /// for the process: an endpoint that died is never rebuilt, so nothing
+    /// set after it replaces it.
+    pub(crate) fn set_quic_endpoint_state(&self, state: QuicEndpointState) {
+        let died = QuicEndpointState::Died as u8;
+        // An `Err` is a death already recorded, which stays.
+        self.quic_endpoint_state
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                (current != died).then_some(state as u8)
+            })
+            .ok();
+    }
+
+    /// The QUIC endpoint's state as last recorded.
+    pub(crate) fn quic_endpoint_state(&self) -> QuicEndpointState {
+        QuicEndpointState::from_u8(self.quic_endpoint_state.load(Ordering::Relaxed))
+    }
+
+    /// The joiner built a connect request carrying `offer`; `ready` is
+    /// whether it could dial native. Also records the offer as the current
+    /// state.
+    pub(crate) fn record_connect_native_offered(
+        &self,
+        offer: crate::operations::connect::native::NativeOffer,
+        ready: bool,
+    ) {
+        let counter = if offer.percent == 0 {
+            &self.connect_native_offered_zero
+        } else {
+            &self.connect_native_offered_nonzero
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+        self.connect_native_offer_level
+            .store(offer.level, Ordering::Relaxed);
+        self.connect_native_offer_percent
+            .store(offer.percent, Ordering::Relaxed);
+        self.connect_native_offer_ready
+            .store(ready, Ordering::Relaxed);
+        #[cfg(test)]
+        NATIVE_OFFERS_ON_THIS_THREAD.with(|count| count.set(count.get() + 1));
+    }
+
+    /// A `Native` response was dropped unanswered: the CONNECT had already
+    /// refused its cap of acceptors.
+    pub(crate) fn record_connect_native_decision_over_cap(&self) {
+        self.connect_native_decision_over_cap
+            .fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        NATIVE_DECISIONS_OVER_CAP_ON_THIS_THREAD.with(|count| count.set(count.get() + 1));
+    }
+
+    /// The acceptor decided `decision` for a request that carried an offer.
+    pub(crate) fn record_connect_native_decided(
+        &self,
+        decision: crate::operations::connect::native::NativeDecision,
+    ) {
+        use crate::operations::connect::native::NativeDecision;
+        let counter = match decision {
+            NativeDecision::Native => &self.connect_native_decided_native,
+            // This node never decides a value it does not know; were one to
+            // reach here, it is not `Native`.
+            NativeDecision::Udp | NativeDecision::Unknown(_) => &self.connect_native_decided_udp,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The joiner could not use a response deciding `Native`.
+    pub(crate) fn record_connect_native_decision_failure(
+        &self,
+        failure: crate::operations::connect::native::JoinerDecisionFailure,
+    ) {
+        use crate::operations::connect::native::JoinerDecisionFailure;
+        let counter = match failure {
+            JoinerDecisionFailure::DecisionWithoutOffer => {
+                &self.connect_native_decision_without_offer
+            }
+            JoinerDecisionFailure::NativeUnsupported => {
+                &self.connect_native_decision_native_unsupported
+            }
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        NATIVE_DECISION_FAILURES_ON_THIS_THREAD.with(|counts| {
+            let mut now = counts.get();
+            now[failure as usize] += 1;
+            counts.set(now);
+        });
     }
 
     /// Test-only: how many times the QUIC endpoint bound at `local` went
@@ -2186,6 +2363,29 @@ impl TransportMetrics {
             .fetch_add(bytes, Ordering::Relaxed);
     }
 
+    /// Record a legacy UDP retransmit the egress cap deferred.
+    pub(crate) fn record_egress_retransmit_deferred(&self) {
+        self.egress
+            .retransmits_deferred
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a legacy UDP RTO resend of `bytes` sent uncapped after its
+    /// deferral limit.
+    pub(crate) fn record_egress_retransmit_uncapped(&self, bytes: u64) {
+        self.egress
+            .retransmits_uncapped
+            .fetch_add(1, Ordering::Relaxed);
+        self.egress
+            .retransmits_uncapped_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Record a legacy UDP tail-loss probe skipped for want of egress cap.
+    pub(crate) fn record_egress_probe_skipped(&self) {
+        self.egress.probes_skipped.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Record `n` recent traversal failures the listener forgot early
     /// because its table was full.
     pub(crate) fn record_stray_intro_failures_evicted(&self, n: u32) {
@@ -2557,6 +2757,21 @@ impl TransportMetrics {
             quic_breaker_trips: get64(&self.quic_breaker_trips),
             quic_send_refused: get64(&self.quic_send_refused),
             quic_breaker_suppressed: self.quic_breaker_suppressed.load(Ordering::Relaxed),
+            quic_endpoint: self.quic_endpoint_state().label().to_string(),
+            connect_native_offered_zero: get64(&self.connect_native_offered_zero),
+            connect_native_offered_nonzero: get64(&self.connect_native_offered_nonzero),
+            connect_native_decided_native: get64(&self.connect_native_decided_native),
+            connect_native_decided_udp: get64(&self.connect_native_decided_udp),
+            connect_native_decision_without_offer: get64(
+                &self.connect_native_decision_without_offer,
+            ),
+            connect_native_decision_native_unsupported: get64(
+                &self.connect_native_decision_native_unsupported,
+            ),
+            connect_native_decision_over_cap: get64(&self.connect_native_decision_over_cap),
+            connect_native_offer_level: self.connect_native_offer_level.load(Ordering::Relaxed),
+            connect_native_offer_percent: self.connect_native_offer_percent.load(Ordering::Relaxed),
+            connect_native_offer_ready: self.connect_native_offer_ready.load(Ordering::Relaxed),
             quic_close_sent_node_dropped_peer: get64(
                 &self.quic_close_sent[QuicCloseCode::NodeDroppedPeer as usize],
             ),
@@ -2574,6 +2789,15 @@ impl TransportMetrics {
             ),
             quic_close_sent_session_ended: get64(
                 &self.quic_close_sent[QuicCloseCode::SessionEnded as usize],
+            ),
+            quic_close_sent_over_budget: get64(
+                &self.quic_close_sent[QuicCloseCode::OverBudget as usize],
+            ),
+            quic_close_sent_version_incompatible: get64(
+                &self.quic_close_sent[QuicCloseCode::VersionIncompatible as usize],
+            ),
+            quic_close_sent_hello_refused: get64(
+                &self.quic_close_sent[QuicCloseCode::HelloRefused as usize],
             ),
             quic_close_received: std::array::from_fn(|i| get64(&self.quic_close_received[i])),
             quic_upgrade: std::array::from_fn(|i| get64(&self.quic_upgrade[i])),
@@ -2660,6 +2884,7 @@ impl TransportMetrics {
             quic_ingress_queue_full: get64(&quic[QuicIngressOutcome::QueueFull as usize]),
             quic_ingress_source_full: get64(&quic[QuicIngressOutcome::SourceFull as usize]),
             quic_ingress_no_ingress: get64(&quic[QuicIngressOutcome::NoIngress as usize]),
+            quic_ingress_reserve_full: get64(&quic[QuicIngressOutcome::ReserveFull as usize]),
             egress_immediate: get64(&egress.packets[EgressDecision::Immediate as usize]),
             egress_waited: get64(&egress.packets[EgressDecision::Waited as usize]),
             egress_unpaced: get64(&egress.packets[EgressDecision::Unpaced as usize]),
@@ -2684,6 +2909,10 @@ impl TransportMetrics {
             egress_streams_refused_other: get64(&egress.streams_refused[WaitCause::Other as usize]),
             egress_debt_hwm_bytes: get64(&egress.debt_hwm_bytes),
             egress_debt_forgiven_bytes: get64(&egress.debt_forgiven_bytes),
+            egress_retransmits_deferred: get64(&egress.retransmits_deferred),
+            egress_retransmits_uncapped: get64(&egress.retransmits_uncapped),
+            egress_retransmits_uncapped_bytes: get64(&egress.retransmits_uncapped_bytes),
+            egress_probes_skipped: get64(&egress.probes_skipped),
             conn_identity_set_dialed: get32(&identity[ConnIdentity::SetDialed as usize]),
             conn_identity_expected_inbound_bound: get32(
                 &identity[ConnIdentity::ExpectedInboundBound as usize],
@@ -3005,6 +3234,67 @@ impl TransportMetrics {
     }
 }
 
+/// The node's QUIC endpoint state for telemetry: whether it is up, and if
+/// not, why. The telemetry gate for removing the UDP transport counts nodes
+/// whose endpoint is up, not nodes on a release that has one (#5940).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum QuicEndpointState {
+    /// Not decided yet: the node has not reached the point where it builds
+    /// the endpoint (or it is not a node, as in many tests).
+    Unknown = 0,
+    /// The endpoint was built and its driver runs.
+    Up = 1,
+    /// `transport-quic` is set to `off`, or to a value this binary does not
+    /// know.
+    OffConfig = 2,
+    /// `transport-quic` is unset and this platform's default is off.
+    OffPlatform = 3,
+    /// The build aborts on panic, which the QUIC transport refuses.
+    OffAbort = 4,
+    /// The endpoint could not be built (socket or configuration error).
+    OffBind = 5,
+    /// The crash-loop breaker keeps QUIC off for this run.
+    OffBreaker = 6,
+    /// The endpoint died while the node held it: its driver ended, or its
+    /// socket adapter caught a panic (`quic::liveness`). Final.
+    Died = 7,
+}
+
+impl QuicEndpointState {
+    const ALL: [Self; 8] = [
+        Self::Unknown,
+        Self::Up,
+        Self::OffConfig,
+        Self::OffPlatform,
+        Self::OffAbort,
+        Self::OffBind,
+        Self::OffBreaker,
+        Self::Died,
+    ];
+
+    /// The value uploaded in `quic_endpoint`.
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Up => "up",
+            Self::OffConfig => "off_config",
+            Self::OffPlatform => "off_platform",
+            Self::OffAbort => "off_abort",
+            Self::OffBind => "off_bind",
+            Self::OffBreaker => "off_breaker",
+            Self::Died => "died",
+        }
+    }
+
+    fn from_u8(value: u8) -> Self {
+        Self::ALL
+            .into_iter()
+            .find(|state| *state as u8 == value)
+            .unwrap_or(Self::Unknown)
+    }
+}
+
 /// Periodic transport metrics snapshot.
 ///
 /// Emitted every N seconds to provide aggregate transport layer statistics
@@ -3138,7 +3428,8 @@ pub struct TransportSnapshot {
     pub quic_adapter_panicked: u64,
     /// Times the QUIC crash-loop breaker tripped, so this run started with
     /// QUIC off (#5940): on unix a run with QUIC enabled ended abnormally, on
-    /// Windows three runs in a row ended within ten minutes for any reason.
+    /// Windows three runs in a row ended within ten minutes after a panic in
+    /// QUIC code.
     pub quic_breaker_trips: u64,
     /// Sends the QUIC socket refused with `WouldBlock` (egress cap or full
     /// socket buffer). Chiefly datagrams quinn's endpoint made on its own,
@@ -3146,6 +3437,29 @@ pub struct TransportSnapshot {
     pub quic_send_refused: u64,
     /// Whether the crash-loop breaker keeps QUIC off in this process.
     pub quic_breaker_suppressed: bool,
+    /// The QUIC endpoint's state ([`QuicEndpointState::label`]): `up`, or why
+    /// there is no endpoint. A state, never reset, and not activity.
+    pub quic_endpoint: String,
+    /// QUIC-native connect offers built as joiner, at percent 0 and above 0
+    /// (#5940).
+    pub connect_native_offered_zero: u64,
+    pub connect_native_offered_nonzero: u64,
+    /// QUIC-native decisions made as acceptor for an offered request.
+    pub connect_native_decided_native: u64,
+    pub connect_native_decided_udp: u64,
+    /// `Native` decisions received as joiner that failed the attempt: to a
+    /// request with no offer (or percent 0), and to a real offer this build
+    /// cannot dial.
+    pub connect_native_decision_without_offer: u64,
+    pub connect_native_decision_native_unsupported: u64,
+    /// `Native` responses dropped past the per-CONNECT cap on refused
+    /// acceptors.
+    pub connect_native_decision_over_cap: u64,
+    /// The last offer built: level, percent, and whether the node could dial
+    /// native. States, never reset, and not activity.
+    pub connect_native_offer_level: u8,
+    pub connect_native_offer_percent: u8,
+    pub connect_native_offer_ready: bool,
     /// QUIC connections this node closed, by close code
     /// ([`QuicCloseCode`]).
     pub quic_close_sent_node_dropped_peer: u64,
@@ -3155,6 +3469,12 @@ pub struct TransportSnapshot {
     pub quic_close_sent_peer_not_acknowledging: u64,
     pub quic_close_sent_control_refused: u64,
     pub quic_close_sent_session_ended: u64,
+    /// QUIC connections this node closed with `over_budget`.
+    pub quic_close_sent_over_budget: u64,
+    /// Native QUIC connections this node closed with `version_incompatible`.
+    pub quic_close_sent_version_incompatible: u64,
+    /// Native QUIC connections this node closed with `hello_refused`.
+    pub quic_close_sent_hello_refused: u64,
     /// QUIC connections closed by the peer's application close, by
     /// [`QuicCloseCode`] in order; the last slot is a code this node does not
     /// know (`quic_close_received_<label>`, `..._unknown_code`).
@@ -3261,6 +3581,7 @@ pub struct TransportSnapshot {
     pub quic_ingress_queue_full: u64,
     pub quic_ingress_source_full: u64,
     pub quic_ingress_no_ingress: u64,
+    pub quic_ingress_reserve_full: u64,
     /// Datagrams sent during the period by how the node-wide egress cap
     /// paced them, by [`EgressDecision`], with their bytes, the bytes and
     /// total and longest wait (microseconds) of those that waited, the
@@ -3288,6 +3609,10 @@ pub struct TransportSnapshot {
     pub egress_streams_refused_other: u64,
     pub egress_debt_hwm_bytes: u64,
     pub egress_debt_forgiven_bytes: u64,
+    pub egress_retransmits_deferred: u64,
+    pub egress_retransmits_uncapped: u64,
+    pub egress_retransmits_uncapped_bytes: u64,
+    pub egress_probes_skipped: u64,
     /// Connection identity decisions during the period, by
     /// [`ConnIdentity`] (the field suffix is its label). Counts only, no
     /// addresses or keys.
@@ -3532,6 +3857,17 @@ impl TransportSnapshot {
             quic_breaker_trips,
             quic_send_refused,
             quic_breaker_suppressed,
+            quic_endpoint,
+            connect_native_offered_zero,
+            connect_native_offered_nonzero,
+            connect_native_decided_native,
+            connect_native_decided_udp,
+            connect_native_decision_without_offer,
+            connect_native_decision_native_unsupported,
+            connect_native_decision_over_cap,
+            connect_native_offer_level,
+            connect_native_offer_percent,
+            connect_native_offer_ready,
             quic_close_sent_node_dropped_peer,
             quic_close_sent_downgrade,
             quic_close_sent_identity_mismatch,
@@ -3539,6 +3875,9 @@ impl TransportSnapshot {
             quic_close_sent_peer_not_acknowledging,
             quic_close_sent_control_refused,
             quic_close_sent_session_ended,
+            quic_close_sent_over_budget,
+            quic_close_sent_version_incompatible,
+            quic_close_sent_hello_refused,
             quic_close_received,
             quic_upgrade,
             quic_fallback,
@@ -3585,6 +3924,7 @@ impl TransportSnapshot {
             quic_ingress_queue_full,
             quic_ingress_source_full,
             quic_ingress_no_ingress,
+            quic_ingress_reserve_full,
             egress_immediate,
             egress_waited,
             egress_unpaced,
@@ -3603,6 +3943,10 @@ impl TransportSnapshot {
             egress_streams_refused_other,
             egress_debt_hwm_bytes,
             egress_debt_forgiven_bytes,
+            egress_retransmits_deferred,
+            egress_retransmits_uncapped,
+            egress_retransmits_uncapped_bytes,
+            egress_probes_skipped,
             conn_identity_set_dialed,
             conn_identity_expected_inbound_bound,
             conn_identity_expected_inbound_unbound,
@@ -3674,6 +4018,18 @@ impl TransportSnapshot {
         self.quic_breaker_trips = quic_breaker_trips;
         self.quic_send_refused = quic_send_refused;
         self.quic_breaker_suppressed = quic_breaker_suppressed;
+        self.quic_endpoint = quic_endpoint;
+        self.connect_native_offered_zero = connect_native_offered_zero;
+        self.connect_native_offered_nonzero = connect_native_offered_nonzero;
+        self.connect_native_decided_native = connect_native_decided_native;
+        self.connect_native_decided_udp = connect_native_decided_udp;
+        self.connect_native_decision_without_offer = connect_native_decision_without_offer;
+        self.connect_native_decision_native_unsupported =
+            connect_native_decision_native_unsupported;
+        self.connect_native_decision_over_cap = connect_native_decision_over_cap;
+        self.connect_native_offer_level = connect_native_offer_level;
+        self.connect_native_offer_percent = connect_native_offer_percent;
+        self.connect_native_offer_ready = connect_native_offer_ready;
         self.quic_close_sent_node_dropped_peer = quic_close_sent_node_dropped_peer;
         self.quic_close_sent_downgrade = quic_close_sent_downgrade;
         self.quic_close_sent_identity_mismatch = quic_close_sent_identity_mismatch;
@@ -3681,6 +4037,9 @@ impl TransportSnapshot {
         self.quic_close_sent_peer_not_acknowledging = quic_close_sent_peer_not_acknowledging;
         self.quic_close_sent_control_refused = quic_close_sent_control_refused;
         self.quic_close_sent_session_ended = quic_close_sent_session_ended;
+        self.quic_close_sent_over_budget = quic_close_sent_over_budget;
+        self.quic_close_sent_version_incompatible = quic_close_sent_version_incompatible;
+        self.quic_close_sent_hello_refused = quic_close_sent_hello_refused;
         self.quic_close_received = quic_close_received;
         self.quic_upgrade = quic_upgrade;
         self.quic_fallback = quic_fallback;
@@ -3727,6 +4086,7 @@ impl TransportSnapshot {
         self.quic_ingress_queue_full = quic_ingress_queue_full;
         self.quic_ingress_source_full = quic_ingress_source_full;
         self.quic_ingress_no_ingress = quic_ingress_no_ingress;
+        self.quic_ingress_reserve_full = quic_ingress_reserve_full;
         self.egress_immediate = egress_immediate;
         self.egress_waited = egress_waited;
         self.egress_unpaced = egress_unpaced;
@@ -3745,6 +4105,10 @@ impl TransportSnapshot {
         self.egress_streams_refused_other = egress_streams_refused_other;
         self.egress_debt_hwm_bytes = egress_debt_hwm_bytes;
         self.egress_debt_forgiven_bytes = egress_debt_forgiven_bytes;
+        self.egress_retransmits_deferred = egress_retransmits_deferred;
+        self.egress_retransmits_uncapped = egress_retransmits_uncapped;
+        self.egress_retransmits_uncapped_bytes = egress_retransmits_uncapped_bytes;
+        self.egress_probes_skipped = egress_probes_skipped;
         self.conn_identity_set_dialed = conn_identity_set_dialed;
         self.conn_identity_expected_inbound_bound = conn_identity_expected_inbound_bound;
         self.conn_identity_expected_inbound_unbound = conn_identity_expected_inbound_unbound;
@@ -3862,7 +4226,8 @@ struct SnapshotExtras {
     pub quic_adapter_panicked: u64,
     /// Times the QUIC crash-loop breaker tripped, so this run started with
     /// QUIC off (#5940): on unix a run with QUIC enabled ended abnormally, on
-    /// Windows three runs in a row ended within ten minutes for any reason.
+    /// Windows three runs in a row ended within ten minutes after a panic in
+    /// QUIC code.
     pub quic_breaker_trips: u64,
     /// Sends the QUIC socket refused with `WouldBlock` (egress cap or full
     /// socket buffer). Chiefly datagrams quinn's endpoint made on its own,
@@ -3870,6 +4235,29 @@ struct SnapshotExtras {
     pub quic_send_refused: u64,
     /// Whether the crash-loop breaker keeps QUIC off in this process.
     pub quic_breaker_suppressed: bool,
+    /// The QUIC endpoint's state ([`QuicEndpointState::label`]): `up`, or why
+    /// there is no endpoint. A state, never reset, and not activity.
+    pub quic_endpoint: String,
+    /// QUIC-native connect offers built as joiner, at percent 0 and above 0
+    /// (#5940).
+    pub connect_native_offered_zero: u64,
+    pub connect_native_offered_nonzero: u64,
+    /// QUIC-native decisions made as acceptor for an offered request.
+    pub connect_native_decided_native: u64,
+    pub connect_native_decided_udp: u64,
+    /// `Native` decisions received as joiner that failed the attempt: to a
+    /// request with no offer (or percent 0), and to a real offer this build
+    /// cannot dial.
+    pub connect_native_decision_without_offer: u64,
+    pub connect_native_decision_native_unsupported: u64,
+    /// `Native` responses dropped past the per-CONNECT cap on refused
+    /// acceptors.
+    pub connect_native_decision_over_cap: u64,
+    /// The last offer built: level, percent, and whether the node could dial
+    /// native. States, never reset, and not activity.
+    pub connect_native_offer_level: u8,
+    pub connect_native_offer_percent: u8,
+    pub connect_native_offer_ready: bool,
     /// QUIC connections this node closed, by close code
     /// ([`QuicCloseCode`]).
     pub quic_close_sent_node_dropped_peer: u64,
@@ -3879,6 +4267,12 @@ struct SnapshotExtras {
     pub quic_close_sent_peer_not_acknowledging: u64,
     pub quic_close_sent_control_refused: u64,
     pub quic_close_sent_session_ended: u64,
+    /// QUIC connections this node closed with `over_budget`.
+    pub quic_close_sent_over_budget: u64,
+    /// Native QUIC connections this node closed with `version_incompatible`.
+    pub quic_close_sent_version_incompatible: u64,
+    /// Native QUIC connections this node closed with `hello_refused`.
+    pub quic_close_sent_hello_refused: u64,
     /// QUIC connections closed by the peer's application close, by
     /// [`QuicCloseCode`] in order; the last slot is a code this node does not
     /// know (`quic_close_received_<label>`, `..._unknown_code`).
@@ -3985,6 +4379,7 @@ struct SnapshotExtras {
     pub quic_ingress_queue_full: u64,
     pub quic_ingress_source_full: u64,
     pub quic_ingress_no_ingress: u64,
+    pub quic_ingress_reserve_full: u64,
     /// Datagrams sent during the period by how the node-wide egress cap
     /// paced them, by [`EgressDecision`], with their bytes, the bytes and
     /// total and longest wait (microseconds) of those that waited, the
@@ -4012,6 +4407,10 @@ struct SnapshotExtras {
     pub egress_streams_refused_other: u64,
     pub egress_debt_hwm_bytes: u64,
     pub egress_debt_forgiven_bytes: u64,
+    pub egress_retransmits_deferred: u64,
+    pub egress_retransmits_uncapped: u64,
+    pub egress_retransmits_uncapped_bytes: u64,
+    pub egress_probes_skipped: u64,
     /// Connection identity decisions during the period, by
     /// [`ConnIdentity`] (the field suffix is its label). Counts only, no
     /// addresses or keys.
@@ -4079,6 +4478,13 @@ impl SnapshotExtras {
             || self.quic_adapter_panicked != 0
             || self.quic_breaker_trips != 0
             || self.quic_send_refused != 0
+            || self.connect_native_offered_zero != 0
+            || self.connect_native_offered_nonzero != 0
+            || self.connect_native_decided_native != 0
+            || self.connect_native_decided_udp != 0
+            || self.connect_native_decision_without_offer != 0
+            || self.connect_native_decision_native_unsupported != 0
+            || self.connect_native_decision_over_cap != 0
             || self.quic_close_sent_node_dropped_peer != 0
             || self.quic_close_sent_downgrade != 0
             || self.quic_close_sent_identity_mismatch != 0
@@ -4086,6 +4492,9 @@ impl SnapshotExtras {
             || self.quic_close_sent_peer_not_acknowledging != 0
             || self.quic_close_sent_control_refused != 0
             || self.quic_close_sent_session_ended != 0
+            || self.quic_close_sent_over_budget != 0
+            || self.quic_close_sent_version_incompatible != 0
+            || self.quic_close_sent_hello_refused != 0
             || self.quic_close_received.iter().any(|n| *n != 0)
             || self.quic_upgrade.iter().any(|n| *n != 0)
             || self.quic_fallback.iter().any(|n| *n != 0)
@@ -4131,6 +4540,7 @@ impl SnapshotExtras {
             || self.quic_ingress_queue_full != 0
             || self.quic_ingress_source_full != 0
             || self.quic_ingress_no_ingress != 0
+            || self.quic_ingress_reserve_full != 0
             // The debt high-water mark alone is not activity: it is only set
             // by a charge, which also counts a packet.
             || self.egress_immediate != 0
@@ -4146,6 +4556,10 @@ impl SnapshotExtras {
             || self.egress_streams_refused_connection != 0
             || self.egress_streams_refused_other != 0
             || self.egress_debt_forgiven_bytes != 0
+            || self.egress_retransmits_deferred != 0
+            || self.egress_retransmits_uncapped != 0
+            || self.egress_retransmits_uncapped_bytes != 0
+            || self.egress_probes_skipped != 0
             || self.conn_identity_set_dialed != 0
             || self.conn_identity_expected_inbound_bound != 0
             || self.conn_identity_expected_inbound_unbound != 0
@@ -4929,6 +5343,43 @@ mod tests {
         assert_eq!(snap.inbound_queue_drops, 1);
     }
 
+    /// The QUIC-native connect counters reach the snapshot by kind and reset;
+    /// the effective offer is a state that stays.
+    #[test]
+    fn connect_native_counters_reach_snapshot_and_reset() {
+        use crate::operations::connect::native::{
+            JoinerDecisionFailure, NativeDecision, NativeOffer,
+        };
+        let metrics = TransportMetrics::new();
+        metrics.record_connect_native_offered(NativeOffer::capable(0), false);
+        metrics.record_connect_native_offered(NativeOffer::capable(0), false);
+        metrics.record_connect_native_offered(NativeOffer::capable(25), true);
+        metrics.record_connect_native_decided(NativeDecision::Udp);
+        metrics.record_connect_native_decided(NativeDecision::Udp);
+        metrics.record_connect_native_decided(NativeDecision::Native);
+        metrics.record_connect_native_decision_failure(JoinerDecisionFailure::DecisionWithoutOffer);
+        metrics.record_connect_native_decision_failure(JoinerDecisionFailure::NativeUnsupported);
+        metrics.record_connect_native_decision_failure(JoinerDecisionFailure::NativeUnsupported);
+        let snap = metrics.take_snapshot().expect("offers are activity");
+        assert_eq!(snap.connect_native_offered_zero, 2);
+        assert_eq!(snap.connect_native_offered_nonzero, 1);
+        assert_eq!(snap.connect_native_decided_udp, 2);
+        assert_eq!(snap.connect_native_decided_native, 1);
+        assert_eq!(snap.connect_native_decision_without_offer, 1);
+        assert_eq!(snap.connect_native_decision_native_unsupported, 2);
+        assert_eq!(snap.connect_native_offer_level, 1);
+        assert_eq!(snap.connect_native_offer_percent, 25);
+        assert!(snap.connect_native_offer_ready);
+        let json = serde_json::to_value(&snap).unwrap();
+        assert_eq!(json["connect_native_offered_zero"], 2);
+        assert_eq!(json["connect_native_offer_percent"], 25);
+        assert!(metrics.take_snapshot().is_none(), "the counters reset");
+        metrics.record_connect_native_decided(NativeDecision::Udp);
+        let snap = metrics.take_snapshot().expect("a decision is activity");
+        assert_eq!(snap.connect_native_offer_percent, 25, "the state stays");
+        assert_eq!(snap.connect_native_offered_zero, 0);
+    }
+
     /// Received QUIC upgrade control messages reach the snapshot, count as
     /// activity on their own, and reset.
     #[test]
@@ -5167,6 +5618,50 @@ mod tests {
         assert!(snap.quic_breaker_suppressed, "the state is not reset");
     }
 
+    /// The endpoint state reaches the snapshot as its label, is not activity,
+    /// is never reset, and `died` is final: nothing recorded after a death
+    /// replaces it.
+    #[test]
+    fn quic_endpoint_state_reaches_snapshot_and_died_is_final() {
+        let metrics = TransportMetrics::new();
+        assert_eq!(metrics.quic_endpoint_state(), QuicEndpointState::Unknown);
+        metrics.set_quic_endpoint_state(QuicEndpointState::Up);
+        assert!(
+            metrics.take_snapshot().is_none(),
+            "an endpoint state alone is not activity"
+        );
+        metrics.record_upgrade_control_received();
+        let snap = metrics.take_snapshot().expect("activity");
+        assert_eq!(snap.quic_endpoint, "up");
+        let json = serde_json::to_value(&snap).unwrap();
+        assert_eq!(json["quic_endpoint"], "up");
+        metrics.record_quic_endpoint_down("127.0.0.1:1".parse().unwrap());
+        assert_eq!(metrics.quic_endpoint_state(), QuicEndpointState::Died);
+        for state in QuicEndpointState::ALL {
+            metrics.set_quic_endpoint_state(state);
+            assert_eq!(
+                metrics.quic_endpoint_state(),
+                QuicEndpointState::Died,
+                "{state:?} after a death"
+            );
+        }
+        let snap = metrics.take_snapshot().expect("the death is activity");
+        assert_eq!(snap.quic_endpoint, "died", "the state is not reset");
+    }
+
+    /// Every endpoint state has its own label and survives the round trip
+    /// through the atomic.
+    #[test]
+    fn quic_endpoint_states_have_distinct_labels_and_round_trip() {
+        let labels: std::collections::BTreeSet<_> =
+            QuicEndpointState::ALL.iter().map(|s| s.label()).collect();
+        assert_eq!(labels.len(), QuicEndpointState::ALL.len());
+        for state in QuicEndpointState::ALL {
+            assert_eq!(QuicEndpointState::from_u8(state as u8), state);
+        }
+        assert_eq!(QuicEndpointState::from_u8(200), QuicEndpointState::Unknown);
+    }
+
     #[test]
     fn quic_send_refused_is_activity_reaches_snapshot_and_resets() {
         let metrics = TransportMetrics::new();
@@ -5193,6 +5688,9 @@ mod tests {
             QuicCloseCode::PeerNotAcknowledging => snap.quic_close_sent_peer_not_acknowledging,
             QuicCloseCode::ControlRefused => snap.quic_close_sent_control_refused,
             QuicCloseCode::SessionEnded => snap.quic_close_sent_session_ended,
+            QuicCloseCode::OverBudget => snap.quic_close_sent_over_budget,
+            QuicCloseCode::VersionIncompatible => snap.quic_close_sent_version_incompatible,
+            QuicCloseCode::HelloRefused => snap.quic_close_sent_hello_refused,
         }
     }
 
@@ -5904,6 +6402,7 @@ mod tests {
             QuicIngressOutcome::QueueFull => snap.quic_ingress_queue_full,
             QuicIngressOutcome::SourceFull => snap.quic_ingress_source_full,
             QuicIngressOutcome::NoIngress => snap.quic_ingress_no_ingress,
+            QuicIngressOutcome::ReserveFull => snap.quic_ingress_reserve_full,
         }
     }
 
@@ -6455,6 +6954,17 @@ mod tests {
             "quic_breaker_trips",
             "quic_send_refused",
             "quic_breaker_suppressed",
+            "quic_endpoint",
+            "connect_native_offered_zero",
+            "connect_native_offered_nonzero",
+            "connect_native_decided_native",
+            "connect_native_decided_udp",
+            "connect_native_decision_without_offer",
+            "connect_native_decision_native_unsupported",
+            "connect_native_decision_over_cap",
+            "connect_native_offer_level",
+            "connect_native_offer_percent",
+            "connect_native_offer_ready",
             "quic_close_sent_node_dropped_peer",
             "quic_close_sent_downgrade",
             "quic_close_sent_identity_mismatch",
@@ -6462,6 +6972,9 @@ mod tests {
             "quic_close_sent_peer_not_acknowledging",
             "quic_close_sent_control_refused",
             "quic_close_sent_session_ended",
+            "quic_close_sent_over_budget",
+            "quic_close_sent_version_incompatible",
+            "quic_close_sent_hello_refused",
             "quic_close_received",
             "quic_upgrade",
             "quic_fallback",
@@ -6507,6 +7020,7 @@ mod tests {
             "quic_ingress_queue_full",
             "quic_ingress_source_full",
             "quic_ingress_no_ingress",
+            "quic_ingress_reserve_full",
             "egress_immediate",
             "egress_waited",
             "egress_unpaced",
@@ -6525,6 +7039,8 @@ mod tests {
             "egress_streams_refused_other",
             "egress_debt_hwm_bytes",
             "egress_debt_forgiven_bytes",
+            "egress_retransmits_deferred",
+            "egress_probes_skipped",
             "conn_identity_set_dialed",
             "conn_identity_expected_inbound_bound",
             "conn_identity_expected_inbound_unbound",

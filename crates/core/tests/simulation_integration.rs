@@ -21428,6 +21428,7 @@ fn test_quic_data_path_cut_mid_transfer_falls_back_to_udp() {
     let contract = SimOperation::create_test_contract(0x63);
     let key = contract.key();
     let warm_up = SimOperation::create_test_contract(0x64);
+    let late = SimOperation::create_test_contract(0x65);
     let state: Vec<u8> = (0..STATE_LEN).map(|i| (i % 251) as u8).collect();
 
     let node = NodeLabel::node(NETWORK, 1);
@@ -21472,6 +21473,18 @@ fn test_quic_data_path_cut_mid_transfer_falls_back_to_udp() {
                 subscribe: false,
             },
         ),
+        // The gateway sends on its path after the cut, more than a stall window
+        // after its last acknowledgement, so its path goes suspect by
+        // construction rather than only if some other message of its happens
+        // to time out there.
+        ScheduledOperation::new(
+            gateway.clone(),
+            SimOperation::Put {
+                contract: late,
+                state: vec![2; 64],
+                subscribe: false,
+            },
+        ),
     ];
     // Long enough for the PUT's retry and the idle timeout.
     let result = sim.run_controlled_simulation(
@@ -21497,6 +21510,7 @@ fn test_quic_data_path_cut_mid_transfer_falls_back_to_udp() {
     }
     let records = run.trace.records();
     let mut on_udp_while_dark = false;
+    let mut idle_fallbacks = 0;
     // Each end: its path went suspect before it closed, and fell back on the
     // idle timeout. Times are compared per node: each host's trace clock starts
     // on its own.
@@ -21507,16 +21521,32 @@ fn test_quic_data_path_cut_mid_transfer_falls_back_to_udp() {
                 .filter(|r| r.node == *address && r.what.starts_with(what))
                 .collect::<Vec<_>>()
         };
+        // On the idle timeout, or on the stall close (STALLED_SENDS_LIMIT
+        // sends timed out in a row with nothing acknowledged), which this node
+        // sends and its machine reads as a lost connection (`Reset`). Which
+        // one depends on timing: an end that had a burst of sends on the path
+        // when it went dark closes on the stall; with windows set per path
+        // from the buffer budget (#5940), the gateway's sends after the
+        // node's slower transfer come in such a burst.
         let fell_back = of_node("Fallback(");
-        assert_eq!(
-            fell_back
-                .iter()
-                .map(|r| r.what.as_str())
-                .collect::<Vec<_>>(),
-            vec!["Fallback(Idle)"],
-            "{address} fell back on the idle timeout: {}",
+        let causes: Vec<&str> = fell_back.iter().map(|r| r.what.as_str()).collect();
+        let closed_here = of_node("path stall-closed: ");
+        let stall_closed = closed_here.iter().any(|r| {
+            r.what == "path stall-closed: 1, first closed by this node with: Some(Downgrade)"
+        });
+        assert!(
+            causes == ["Fallback(Idle)"] || (causes == ["Fallback(Reset)"] && stall_closed),
+            "{address} fell back once, on the idle timeout, or on a Reset that was its own \
+             stall close and no other close: {}",
             run.dump()
         );
+        // A `Reset` accepted here is this node's own stall close: the machine
+        // reads the connection loss that close causes as `Reset`, so the close
+        // comes first, and the note shows it was the only close this node
+        // sent on the path.
+        if causes == ["Fallback(Idle)"] {
+            idle_fallbacks += 1;
+        }
         let fell_back_at = fell_back[0].at;
         assert!(
             of_node("path was suspect: entered ")
@@ -21538,6 +21568,13 @@ fn test_quic_data_path_cut_mid_transfer_falls_back_to_udp() {
                 .any(|r| r.at > last_on_path && r.at < fell_back_at);
         }
     }
+    // The idle-timeout fallback this test was written for still happens: the
+    // end without a burst of sends when the path went dark waits it out.
+    assert!(
+        idle_fallbacks >= 1,
+        "at least one end fell back on the idle timeout: {}",
+        run.dump()
+    );
     // At least one end had data for the other while the path was dark, and it
     // went on UDP: without suspect routing it went on the dark path and was lost.
     assert!(
@@ -22523,4 +22560,188 @@ fn test_quic_mixed_modes_are_deterministic() {
         (run.trace.records(), run.mesh)
     };
     assert_eq!(once("quic-mixed-det-run1"), once("quic-mixed-det-run2"));
+}
+
+// =============================================================================
+// QUIC-native connect offer and decision on the wire (#5940 A3)
+// =============================================================================
+
+/// One QUIC-native wire run: the mesh of connected pairs and the trace.
+struct NativeWireRun {
+    trace: freenet::dev_tool::NativeWireTrace,
+    mesh: std::collections::BTreeSet<(SocketAddr, SocketAddr)>,
+    nodes: usize,
+}
+
+/// Runs 2 gateways and 8 nodes on the direct runner, after `configure`.
+fn run_native_wire_sim(
+    name: &str,
+    seed: u64,
+    configure: impl FnOnce(&mut SimNetwork),
+) -> NativeWireRun {
+    setup_deterministic_state(seed);
+    let rt = create_runtime();
+    let (sim, logs_handle, trace, nodes) = rt.block_on(async {
+        let mut sim = SimNetwork::new(name, 2, 8, 10, 3, 10, 3, seed).await;
+        configure(&mut sim);
+        let trace = sim.native_wire_trace();
+        let nodes = sim.all_node_addresses().len();
+        let logs_handle = sim.event_logs_handle();
+        (sim, logs_handle, trace, nodes)
+    });
+    drop(rt);
+    sim.run_simulation_direct::<rand::rngs::SmallRng>(seed, 6, 40, Duration::from_millis(200))
+        .expect("direct simulation should succeed");
+    let rt = create_runtime();
+    let mesh = rt.block_on(async {
+        let logs = logs_handle.lock().await;
+        logs.iter()
+            .filter_map(|log| log.kind.connect_connected_addrs())
+            .map(|(a, b)| if a <= b { (a, b) } else { (b, a) })
+            .collect()
+    });
+    NativeWireRun { trace, mesh, nodes }
+}
+
+/// A floor every node of this binary passes, injected because the real one
+/// is above this binary until the release that ships the decoder.
+fn native_floor_for_tests() -> (u8, u8, u16) {
+    SimNetwork::min_compatible_protocol_version()
+}
+
+/// With the floor injected low on every node and versions known on every
+/// link, offers and decisions reach the wire as `RequestNative` /
+/// `ResponseNative`, every accept decides on an offer (including accepts after
+/// a re-route), every joiner receives the decision, and no connection closes
+/// on an undecodable message. Fails closed: each count must be above zero.
+#[test_log::test]
+fn test_quic_native_offer_and_decision_reach_the_wire() {
+    const SEED: u64 = 0x0059_40A3_0001;
+    let run = run_native_wire_sim("native-wire-v2", SEED, |sim| {
+        sim.enable_gateway_ack_version();
+        sim.with_quic_native_floor(native_floor_for_tests());
+    });
+    let t = &run.trace;
+    tracing::info!(
+        requests_native = t.requests_native(),
+        responses_native = t.responses_native(),
+        requests_v1 = t.sent(0),
+        responses_v1 = t.sent(1),
+        accepts_with_offer = t.accepts_with_offer(),
+        accepts_without_offer = t.accepts_without_offer(),
+        retry_accepts_with_offer = t.retry_accepts_with_offer(),
+        joiner_decisions = t.joiner_decisions(),
+        joiner_without = t.joiner_responses_without_decision(),
+        undecodable = t.undecodable_closes(),
+        "native wire trace"
+    );
+    assert!(t.requests_native() > 0, "RequestNative went on the wire");
+    assert!(t.responses_native() > 0, "ResponseNative went on the wire");
+    assert!(t.accepts_with_offer() > 0, "acceptors received offers");
+    assert!(
+        t.retry_accepts_with_offer() > 0,
+        "an accept after a re-route still decided on the offer"
+    );
+    assert!(t.joiner_decisions() > 0, "joiners received decisions");
+    assert_eq!(t.undecodable_closes(), 0);
+    let (peers, connected) = quic_mesh_peers_and_connected(&run.mesh);
+    assert_eq!(peers.len(), run.nodes, "every node joined");
+    assert!(connected);
+}
+
+/// A network where some nodes stand in for a release below the floor: they
+/// advertise an older version and fail to decode the native variants, as that
+/// release does. The at-floor nodes send them to each other and never to the
+/// older ones, so no connection closes on an undecodable message and every
+/// node joins. Fails closed on its premises: an at-floor node did address a
+/// message carrying a native field to an older node (and it went out without
+/// it), an acceptor answered an at-floor joiner's request whose offer was
+/// dropped on the way, and an at-floor joiner received a response with no
+/// decision. Requests and responses between two pre-floor nodes count toward
+/// neither: they carry no native field by design.
+#[test_log::test]
+fn test_quic_native_pre_floor_nodes_never_receive_the_native_variants() {
+    use freenet::dev_tool::NodeLabel;
+    const SEED: u64 = 0x0059_40A3_0002;
+    let (min, real) = (
+        SimNetwork::min_compatible_protocol_version(),
+        SimNetwork::real_protocol_version(),
+    );
+    assert_ne!(
+        min, real,
+        "no older version can be advertised, so this test would check nothing"
+    );
+    let run = run_native_wire_sim("native-wire-mixed", SEED, |sim| {
+        sim.enable_gateway_ack_version();
+        // At-floor nodes advertise the real version; the older ones `min`.
+        sim.with_quic_native_floor(real);
+        let mut labels: Vec<NodeLabel> = sim.all_node_addresses().keys().cloned().collect();
+        labels.sort_by_key(|label| (label.is_node(), label.number()));
+        // One of the two gateways and three regular nodes stand in for the
+        // older release.
+        for label in [&labels[1], &labels[3], &labels[6], &labels[9]] {
+            sim.with_node_advertised_version(label, min);
+            sim.with_node_pre_floor_native_decoder(label);
+        }
+    });
+    let t = &run.trace;
+    tracing::info!(
+        requests_native = t.requests_native(),
+        responses_native = t.responses_native(),
+        native_fields_dropped = t.native_fields_dropped(),
+        accepts_without_offer = t.accepts_without_offer(),
+        joiner_without = t.joiner_responses_without_decision(),
+        undecodable = t.undecodable_closes(),
+        "mixed native wire trace"
+    );
+    assert!(
+        t.requests_native() > 0,
+        "premise: the at-floor nodes sent RequestNative"
+    );
+    assert!(
+        t.native_fields_dropped() > 0,
+        "premise: a message carrying a native field went to an older node"
+    );
+    assert!(
+        t.accepts_without_offer() > 0,
+        "an acceptor answered a request whose offer was dropped"
+    );
+    assert!(
+        t.joiner_responses_without_decision() > 0,
+        "a joiner received a response with no decision"
+    );
+    assert_eq!(
+        t.undecodable_closes(),
+        0,
+        "a node below the floor received a native variant"
+    );
+    let (peers, connected) = quic_mesh_peers_and_connected(&run.mesh);
+    assert_eq!(peers.len(), run.nodes, "every node joined");
+    assert!(connected);
+}
+
+/// At 0% (this release) the native fields change no connection: the same
+/// seed with the variants on the wire and with them never sent (every peer
+/// treated as below the floor, so every message goes out in today's
+/// encoding) forms the same mesh, edge for edge.
+#[test_log::test]
+fn test_quic_native_zero_percent_forms_the_same_mesh() {
+    const SEED: u64 = 0x0059_40A3_0003;
+    let off = run_native_wire_sim("native-wire-off", SEED, |sim| {
+        sim.enable_gateway_ack_version();
+    });
+    let on = run_native_wire_sim("native-wire-on", SEED, |sim| {
+        sim.enable_gateway_ack_version();
+        sim.with_quic_native_floor(native_floor_for_tests());
+    });
+    assert_eq!(off.trace.requests_native(), 0, "premise: off sends none");
+    assert!(on.trace.requests_native() > 0, "premise: on sends them");
+    let (off_peers, off_connected) = quic_mesh_peers_and_connected(&off.mesh);
+    let (on_peers, on_connected) = quic_mesh_peers_and_connected(&on.mesh);
+    assert_eq!(off_peers.len(), off.nodes, "premise: every node joined");
+    assert!(off_connected);
+    assert_eq!(on_peers, off_peers, "the same peers join");
+    assert!(on_connected);
+    assert_eq!(on.mesh, off.mesh, "the same connections form");
+    assert_eq!(on.trace.undecodable_closes(), 0);
 }

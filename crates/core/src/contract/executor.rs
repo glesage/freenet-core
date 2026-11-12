@@ -1220,9 +1220,10 @@ pub(crate) trait ContractExecutor: Send + 'static {
     }
 
     /// Import delegate secrets from an encrypted `bundle` into the node's secrets
-    /// store at `target_scope`, LIVE (#4592). Runs ON the contract loop
-    /// (serialized with delegate `store_secret`) — DELIBERATELY not off-loop like
-    /// the export, because the import WRITES and the store write path assumes
+    /// store at `target_scope`, LIVE (#4592). Awaited on the contract loop and
+    /// serialized with delegate `store_secret` (the pool runs it under the
+    /// delegate executor's lock), DELIBERATELY not off-loop like the export,
+    /// because the import WRITES and the store write path assumes
     /// node-wide write serialization (see `RuntimePool::import_secrets` and the
     /// `ImportSecrets` arm in `contract.rs`).
     ///
@@ -1327,6 +1328,14 @@ pub(crate) trait ContractExecutor: Send + 'static {
     fn delegate_capabilities(
         &self,
     ) -> Option<Arc<crate::contract::delegate_capabilities::DelegateCapabilities>> {
+        None
+    }
+
+    /// The runner every delegate `process()` of this executor goes through,
+    /// shared with the delegate lane (`contract::delegate_lane`). `None`
+    /// keeps every delegate run on the contract loop, as before the lane
+    /// existed; mock executors answer `None` unless a test opts in.
+    fn delegate_runner(&self) -> Option<Arc<dyn crate::contract::delegate_lane::DelegateRunner>> {
         None
     }
 
@@ -1767,8 +1776,11 @@ pub(crate) fn declared_cache_ceiling_terms(
     let summary = summary_budget_for(memory_limit, pool_size);
     let delta = delta_budget_for(memory_limit, pool_size);
     // One wasmtime Store per executor, each holding retired-instance bytes up
-    // to its arena budget between refreshes.
+    // to its arena budget between refreshes. The node's ONE delegate executor
+    // (`runtime::pool::PooledDelegateRunner`), outside the pool, has its own
+    // Store with a fixed budget, summed below as a node-wide term.
     let arena = crate::wasm_runtime::engine::store_arena_budget_for(memory_limit, pool_size);
+    let delegate_arena = crate::wasm_runtime::DELEGATE_STORE_ARENA_BYTES;
 
     // NODE-WIDE — one of each, shared by every executor.
     let contract_modules = crate::wasm_runtime::budget_for_ram(memory_limit);
@@ -1805,8 +1817,11 @@ pub(crate) fn declared_cache_ceiling_terms(
     // endpoint per node, and fixed. Summed whatever `transport-quic` says, as
     // the ingress queue is. The QUIC flow-control windows and quinn's
     // per-connection state are NOT summed, so this aggregate does not
-    // account a node's QUIC connections; see `NOT_SUMMED` and
-    // `quic::config::connection_window_bytes`.
+    // account a node's QUIC connections; see `NOT_SUMMED`. The aggregate
+    // step (#5940, PR 5) must sum data paths x (the fixed charge
+    // `QUIC_CONNECTION_CHARGE_BYTES` + the floor grant `quic::budget::floor_grant`)
+    // + the buffer budget `quic_buffer_budget_for`, which holds only growth
+    // above the floor grants.
     let quic_incoming = crate::transport::quic::config::INCOMING_BUFFER_TOTAL_BYTES as usize;
     // The delegate context cache (`ctx.write()` bytes). One per node, shared
     // by every executor, so NOT multiplied by the pool.
@@ -1827,6 +1842,7 @@ pub(crate) fn declared_cache_ceiling_terms(
         ("summary_budget_for", pool_size * summary),
         ("delta_budget_for", pool_size * delta),
         ("store_arena_budget_for", pool_size * arena),
+        ("DELEGATE_STORE_ARENA_BYTES", delegate_arena),
         ("budget_for_ram", contract_modules),
         // Labelled by the DIVISOR because the delegate module cache has no
         // budget function of its own: it is a fraction of the contract module
@@ -2149,6 +2165,7 @@ where
                     db.clone(),
                     shared.delegate_index,
                     shared.delegate_code,
+                    shared.clean_delegate_tmp_records,
                 )?,
             ),
             // Standalone / mock executors own their state.
@@ -2318,6 +2335,7 @@ mod tests {
             "delta_budget_for",
             "store_arena_budget_for",
             // node-wide
+            "DELEGATE_STORE_ARENA_BYTES",
             "budget_for_ram",
             "DELEGATE_MODULE_CACHE_BUDGET_DIVISOR",
             "SOURCE_CODE_CACHE_MAX_BYTES",
@@ -2367,23 +2385,37 @@ mod tests {
                 .map(|(_, bytes)| *bytes)
                 .unwrap_or_else(|| panic!("`{label}` must be a summed term"))
         };
-        for (label, per_executor) in [
-            ("summary_budget_for", summary_budget_for(ONE_GIB, POOL)),
-            ("delta_budget_for", delta_budget_for(ONE_GIB, POOL)),
+        // The delegate executor (`PooledDelegateRunner`) is outside the pool
+        // and has its own fixed arena, checked below.
+        for (label, per_executor, executors) in [
+            (
+                "summary_budget_for",
+                summary_budget_for(ONE_GIB, POOL),
+                POOL,
+            ),
+            ("delta_budget_for", delta_budget_for(ONE_GIB, POOL), POOL),
             (
                 "store_arena_budget_for",
                 crate::wasm_runtime::engine::store_arena_budget_for(ONE_GIB, POOL),
+                POOL,
             ),
         ] {
             assert_eq!(
                 value(&terms, label),
-                POOL * per_executor,
+                executors * per_executor,
                 "`{label}` is PER-EXECUTOR, so the aggregate must count \
-                 `pool_size` of them. Declaring one copy of a budget the node \
-                 commits {POOL} times is #5268's defect 3, and it hides memory \
-                 from the aggregate-safety checks"
+                 {executors} of them at pool size {POOL}. Declaring fewer copies \
+                 of a budget than the node commits is #5268's defect 3, and it \
+                 hides memory from the aggregate-safety checks"
             );
         }
+
+        assert_eq!(
+            value(&terms, "DELEGATE_STORE_ARENA_BYTES"),
+            crate::wasm_runtime::DELEGATE_STORE_ARENA_BYTES,
+            "the node's one delegate executor has its own Store, with a fixed \
+             arena budget outside the pool's; it must be counted once"
+        );
 
         // THE THREE TERMS NOTHING ELSE CHECKS. The non-zero check in the
         // sibling guard is a FLOOR, not a value: drop the `2 *` from
@@ -2721,6 +2753,11 @@ mod tests {
                 "CGROUP_UNLIMITED_THRESHOLD_BYTES",
                 "sentinel for reading the cgroup limit, not a budget",
             ),
+            (
+                "contract_arena_envelope",
+                "consumed inside store_arena_budget_for (the RAM share less the \
+                 delegate executor's fixed arena), which is summed",
+            ),
             ("MAX_PARKED_BYTES", "clamp inside parked_budget_for"),
             ("MIN_PARKED_BYTES", "clamp inside parked_budget_for"),
             (
@@ -2974,29 +3011,59 @@ mod tests {
                 "WAKE_DATAGRAM_BYTES",
                 "egress-cap wake threshold for a QUIC datagram (a rate quantity), not memory",
             ),
-            // The QUIC flow-control windows are the same class of
-            // per-connection exception as inbound stream reassembly (see the
-            // MAX_STREAM_TOTAL_BYTES row). The memory one QUIC connection
-            // holds (some of its terms are measured in quic::config) is NOT
-            // accounted in this aggregate,
-            // and must be before QUIC carries data by default (Step 3 at 100%,
-            // a gate in the #5940 rollout plan; shadow paths carry none). It is in addition to reassembly, not covered by
-            // it.
+            // A QUIC data path's flow-control windows are set per connection:
+            // at the floor windows a path is charged its floor grant
+            // (quic::budget::floor_grant), part of the path's fixed charge, and
+            // growth above that comes from the node's buffer budget
+            // (quic_buffer_budget_for, listed below). These are the bounds and
+            // terms inside the two, not budgets of their own.
             (
-                "connection_window_bytes",
-                "one QUIC connection's flow-control window W: a per-connection \
-                 exception like MAX_STREAM_TOTAL_BYTES; quinn holds received data \
-                 beyond W and state W does not limit (measured terms in \
-                 quic::config); not accounted here, and must be before QUIC \
-                 carries data by default",
+                "floor_window_bytes",
+                "the floor window of one QUIC connection, inside each data path's \
+                 floor grant, which is per path and not in quic_buffer_budget_for",
+            ),
+            (
+                "STAGING_BUFFER_OVERHEAD_BYTES",
+                "the overhead charged per staging buffer of ONE QUIC stream \
+                 (quic::path::inbound), against its connection's staging cap, \
+                 inside the path's floor grant and its growth charged to \
+                 quic_buffer_budget_for",
+            ),
+            (
+                "INITIAL_RECEIVE_WINDOW_BYTES",
+                "the window ONE QUIC connection starts with before a data path's \
+                 meter raises it; part of the fixed charge per connection",
             ),
             (
                 "MIN_WINDOW_BYTES",
-                "clamp inside connection_window_bytes (per connection, not summed)",
+                "floor of one QUIC connection's window, inside each data path's \
+                 floor grant (per path, not in quic_buffer_budget_for)",
+            ),
+            (
+                "MIN_WINDOW_SMALL_HOST_BYTES",
+                "floor of one QUIC connection's window under 2 GiB, inside each \
+                 data path's floor grant (per path, not in quic_buffer_budget_for)",
             ),
             (
                 "MAX_WINDOW_BYTES",
-                "clamp inside connection_window_bytes (per connection, not summed)",
+                "the largest window one QUIC connection grows to; its growth above \
+                 the floor grant is charged to quic_buffer_budget_for (per \
+                 connection, not summed)",
+            ),
+            (
+                "GAP_BYTES",
+                "the charge per received gap of one QUIC connection, inside the \
+                 path's floor grant and its growth charged to quic_buffer_budget_for",
+            ),
+            (
+                "WAITING_SHORT_BYTES",
+                "one waiting one-packet Short body on ONE QUIC data path, inside \
+                 CONTROL_BUFFER_BYTES",
+            ),
+            (
+                "CONTROL_BUFFER_BYTES",
+                "the control and short buffers of one QUIC data path, inside its \
+                 floor grant (per path, not in quic_buffer_budget_for)",
             ),
             (
                 "INCOMING_BUFFER_BYTES",
@@ -3015,17 +3082,6 @@ mod tests {
                  in the quic::config module doc; summed once a QUIC path cap exists \
                  (M4, #5940)",
             ),
-            // QUIC_ASSEMBLER_HOLD_WINDOW_MULTIPLE (a multiple of the window,
-            // so not a `_BYTES` name the discovery scan finds) is the other
-            // half of this term: streams x this + that multiple x W.
-            (
-                "QUIC_ASSEMBLER_HOLD_PER_STREAM_BYTES",
-                "a measurement of one QUIC connection term (received data per uni \
-                 stream, 1200-byte datagrams; with QUIC_ASSEMBLER_HOLD_WINDOW_MULTIPLE \
-                 x W), not a ceiling; an input to the per-path ceiling (memory gate \
-                 M2, #5940), plus the unmeasured terms in the quic::config module \
-                 doc; summed once a QUIC path cap exists (M4, #5940)",
-            ),
             (
                 "QUIC_ACK_TAIL_BYTES",
                 "a measurement of one QUIC connection term (ACK-only records after \
@@ -3034,12 +3090,46 @@ mod tests {
                  behaviour, plus the unmeasured terms in the quic::config module \
                  doc; summed once a QUIC path cap exists (M4, #5940)",
             ),
+            // Buffer-budget terms (#5940): the fixed charge per QUIC connection
+            // and the node-wide budget for what scales with the windows. Both
+            // are summed (budget + quic_connections x charge) by the buffer
+            // budget's aggregate-accounting step (PR 5), which must land before
+            // any release carries data on QUIC
+            // (`no_data_share_before_the_quic_budget_is_summed`).
             (
-                "READ_START_BYTES",
-                "initial allocation of ONE QUIC stream read (quic::path::inbound), \
-                 at most the stream's declared length, which is charged to the \
-                 per-connection inbound budget or held to a small per-message \
-                 bound; not a node budget",
+                "QUIC_OPEN_STREAM_BYTES",
+                "a measurement of one QUIC connection term (one open stream, both \
+                 sides), not a ceiling; a term inside QUIC_CONNECTION_CHARGE_BYTES",
+            ),
+            (
+                "QUIC_STOPPED_ENTRY_BYTES",
+                "a measurement of one QUIC connection term (one entry of quinn's \
+                 stopped map), not a ceiling; a term inside \
+                 QUIC_CONNECTION_CHARGE_BYTES",
+            ),
+            (
+                "QUIC_CRYPTO_BUFFER_BYTES",
+                "quinn's CRYPTO reassembly limit for ONE QUIC connection; a term \
+                 inside QUIC_CONNECTION_CHARGE_BYTES",
+            ),
+            (
+                "QUIC_CRYPTO_HOLD_BYTES",
+                "quinn's CRYPTO assembler worst case for ONE QUIC connection's \
+                 1-RTT space, derived; a term inside QUIC_CONNECTION_CHARGE_BYTES",
+            ),
+            (
+                "QUIC_CONNECTION_CHARGE_BYTES",
+                "the fixed charge per QUIC connection; summed as quic_connections x \
+                 this, plus each data path's floor grant (quic::budget::floor_grant), \
+                 by the buffer budget's aggregate-accounting step (#5940, PR 5), \
+                 before any release carries data on QUIC",
+            ),
+            (
+                "quic_buffer_budget_for",
+                "the node-wide QUIC buffer budget (memory / 16): the data paths' \
+                 window growth above their floor grants (quic::budget), which are \
+                 not in it; summed with data paths x (fixed charge + floor grant) \
+                 by the buffer budget's aggregate-accounting step (#5940)",
             ),
             (
                 "MAX_CONTROL_BYTES",
@@ -3055,6 +3145,11 @@ mod tests {
                 "MIN_FREE_BYTES",
                 "free-DISK threshold the state directory must have before the node stages \
                  a release (#5791), not memory",
+            ),
+            (
+                "SHARE_MIN_BYTES",
+                "QUIC loss gate: bytes a round trip must acknowledge or lose before its \
+                 loss share is sampled (quic::recycle::loss_gate), a threshold, not memory",
             ),
         ];
 

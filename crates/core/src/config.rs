@@ -108,6 +108,10 @@ const FALLBACK_GATEWAYS: &[(&str, &str)] = &[
         "gw2.freenet.org:31338",
         "a7e93b2b0f6c353a66a115b618547bcb739353f4640f1431cae91833beaf690c",
     ),
+    (
+        "gw3.freenet.org:31336",
+        "0d4a65d85b0772d46878668ecbad74332aa599dbea947969eb6c99def5adbb62",
+    ),
 ];
 
 #[derive(clap::Parser, Debug, Clone)]
@@ -367,7 +371,7 @@ impl Default for ConfigArgs {
                 ledbat_min_ssthresh: None, // Uses default from NetworkApiConfig
                 congestion_control: None,  // Default: fixedrate (set in NetworkApiConfig)
                 bbr_startup_rate: None,    // Uses default from BBR config
-                transport_quic: None,      // Default: shadow on Linux and macOS
+                transport_quic: None,      // Default: shadow on Linux, macOS and Windows
                 quic_max_paths: None,      // Default: max-number-of-connections
                 quic_data_percent: None,   // Default: this release's share of pairs
                 quic_ignore_crash_breaker: None,
@@ -2613,7 +2617,7 @@ pub struct NetworkArgs {
     pub bbr_startup_rate: Option<u64>,
 
     /// QUIC transport (#5940): `off`, `shadow` or `prefer`. Unset means
-    /// `shadow` on Linux and macOS, and `off` elsewhere, Windows included.
+    /// `shadow` on Linux, macOS and Windows, and `off` elsewhere.
     ///
     /// `shadow` builds a QUIC endpoint on the network port and upgrades
     /// connections to peers that also run it to a QUIC path. The path carries
@@ -2671,9 +2675,9 @@ pub struct NetworkArgs {
     ///
     /// On unix, if a run with QUIC enabled ends abnormally, the node starts
     /// with QUIC off for 24 hours. On Windows the same happens after three
-    /// short runs in a row, whatever ended them. Set this to run QUIC anyway. A
-    /// start with this set erases the trip: removing it later does not bring
-    /// the 24 hours back. Default: false.
+    /// short runs in a row that each panicked in QUIC code. Set this to run
+    /// QUIC anyway. A start with this set erases the trip: removing it later
+    /// does not bring the 24 hours back. Default: false.
     ///
     /// Works as a bare flag after the subcommand: `--quic-ignore-crash-breaker`
     /// turns it on, `--quic-ignore-crash-breaker=false` turns it off. Before
@@ -2998,7 +3002,7 @@ pub struct NetworkApiConfig {
     pub bbr_startup_rate: Option<u64>,
 
     /// QUIC transport (#5940): `off`, `shadow` or `prefer`; unset reads as
-    /// `QuicMode::default_mode` (shadow on Linux and macOS). Kept as written, so a value from a later release
+    /// `QuicMode::default_mode` (shadow on Linux, macOS and Windows). Kept as written, so a value from a later release
     /// round-trips; see [`Self::quic_settings`] for how it is read.
     #[serde(
         default,
@@ -3134,10 +3138,10 @@ impl NetworkApiConfig {
             return None;
         }
         Some(crate::transport::quic::QuicSettings {
-            max_connections: self.max_connections,
             memory_limit: crate::wasm_runtime::read_total_ram_bytes()
                 .unwrap_or(QUIC_FALLBACK_TOTAL_RAM),
             idle_timeout: None,
+            initial_window: None,
             // The transport sets it from its bandwidth settings when it binds.
             rate_limit: Default::default(),
         })
@@ -3147,12 +3151,14 @@ impl NetworkApiConfig {
     /// lowered to [`Self::max_connections`], which is also the value when the
     /// key is unset or cannot be parsed ([`Self::quic_max_paths_setting`]).
     ///
-    /// The cap is `max_connections` because the endpoint's flow-control
-    /// windows are sized for that many connections
-    /// (`quic::config::connection_window_bytes`); more paths would exceed the
-    /// memory share they were sized for. At the default the limit rarely
-    /// binds: a connection has at most one path, but a permit is held from
-    /// the offer, so a path still closing can briefly hold a slot.
+    /// The cap is `max_connections`: a path needs a UDP session, and the
+    /// node's QUIC memory is bounded per path (the fixed charge,
+    /// `quic::config::QUIC_CONNECTION_CHARGE_BYTES`, plus, for a data path, the
+    /// floor grant, `quic::budget::floor_grant`) and by the buffer budget its
+    /// data paths' windows grow into above that (`quic::budget`). At the
+    /// default the limit rarely binds: a connection has at most one path, but
+    /// a permit is held from the offer, so a path still closing can briefly
+    /// hold a slot.
     pub(crate) fn quic_max_paths(&self) -> usize {
         match self.quic_max_paths_setting() {
             QuicMaxPathsSetting::Set(limit) => limit.min(self.max_connections),
@@ -3841,7 +3847,8 @@ pub struct WebsocketApiConfig {
     pub token_cleanup_interval_seconds: u64,
 
     /// Additional hostnames allowed in the Host header for WebSocket connections.
-    /// Empty means only auto-detected hostnames (machine hostname + bound IP) are allowed.
+    /// Empty means only auto-detected hosts are allowed: the loopback names, the bound
+    /// IP, and (for a non-loopback bind only) the machine hostname and its IPs.
     #[serde(default, rename = "allowed-host")]
     pub allowed_hosts: Vec<String>,
 
@@ -4777,8 +4784,9 @@ impl ConfigPathsArgs {
                     // Ensure the parent directory exists before rename.
                     // On a fresh Local AppData install, the intermediate dirs
                     // (e.g., "The Freenet Project Inc/Freenet") won't exist yet.
+                    // A failure here surfaces as the rename's error below.
                     if let Some(parent) = app_data_dir.parent() {
-                        let _ = fs::create_dir_all(parent);
+                        drop(fs::create_dir_all(parent));
                     }
                     if let Err(e) = fs::rename(&old_roaming, &app_data_dir) {
                         tracing::warn!(
@@ -7587,16 +7595,20 @@ shutdown-drain-secs = 42
         assert_seeded_values_bound(&cfg);
     }
 
-    /// An unset `transport-quic` is shadow, and off on Windows, which must stay
-    /// off until its crash-loop breaker has been confirmed on a real Windows
+    /// An unset `transport-quic` is shadow on Linux, macOS and Windows; Windows
+    /// joined once its crash-loop breaker was confirmed on a real Windows
     /// machine (#6031). The lib tests do not compile on Windows, so
     /// `tests/quic_breaker_windows.rs` pins the Windows half through the real
     /// binary. The default is not written into the config, so a default-off
     /// release turns QUIC off on every node that did not set the key.
     #[test]
-    fn quic_is_shadow_by_default_except_on_windows() {
+    fn quic_is_shadow_by_default_on_linux_macos_and_windows() {
         use crate::transport::quic::QuicMode;
-        let expected = if cfg!(any(target_os = "linux", target_os = "macos")) {
+        let expected = if cfg!(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "windows"
+        )) {
             QuicMode::Shadow
         } else {
             QuicMode::Off
@@ -7626,8 +7638,8 @@ shutdown-drain-secs = 42
         assert_eq!(unset.network_api.transport_quic, None);
         assert_eq!(
             unset.network_api.quic_settings().is_some(),
-            cfg!(any(target_os = "linux", target_os = "macos")),
-            "an unset key builds an endpoint on Linux and macOS only"
+            crate::transport::quic::QuicMode::default_mode().builds_endpoint(),
+            "an unset key builds an endpoint where the platform default does"
         );
         assert!(
             !toml::to_string(&unset).unwrap().contains("transport-quic"),
@@ -7654,9 +7666,6 @@ shutdown-drain-secs = 42
                 on,
                 "transport-quic = {value:?}"
             );
-            if let Some(settings) = cfg.network_api.quic_settings() {
-                assert_eq!(settings.max_connections, cfg.network_api.max_connections);
-            }
             let rewritten = toml::to_string(&cfg).unwrap();
             assert!(
                 rewritten.contains(&format!("transport-quic = \"{value}\"")),

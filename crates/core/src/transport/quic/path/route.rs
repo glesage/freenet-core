@@ -126,6 +126,17 @@ quic_outcomes! {
         /// after its stream opened (`pacer` module). Also counted under its
         /// kind's result.
         PacerRefused => "pacer_refused",
+        /// A cancelled one-packet send whose acknowledgement had not come
+        /// released its send epoch at once: `ACK_WAITS_WITHOUT_PERMIT` such
+        /// sends were already waiting on the path (`Outgoing`'s drop).
+        AckWaitReleased => "ack_wait_released",
+        /// A send ended while it waited in `open_uni` for a stream credit: the
+        /// peer's uni-stream limit was full for its whole open deadline, so it
+        /// ended `NotOpened` (and went on UDP if it could). Most often a fresh
+        /// data path whose peer has not raised its limit from
+        /// `config::DATA_START_UNI_STREAMS` yet. Also counted under its
+        /// kind's result.
+        StreamLimitFull => "stream_limit_full",
     }
 }
 

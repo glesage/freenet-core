@@ -119,9 +119,31 @@
 //! window, which is what keeps a path's rate to about `rate`; its pacer reads
 //! the same window and only spreads the sends. With no limit configured, or
 //! before the first acknowledgement, the window is Cubic's. The RTT is the
-//! latest quinn reports to `on_ack`, which for the first batch of
-//! acknowledgements is still quinn's initial estimate (333 ms,
-//! `config::transport_config`), so the cap is loose for that one batch.
+//! latest quinn reports to `on_ack`. quinn updates its estimate only after it
+//! has called `on_ack` for every packet an ACK frame acknowledges, so each
+//! `on_ack` sees the estimate from before that frame, and the first ones see
+//! quinn's initial estimate (333 ms, `config::transport_config`). After the
+//! handshake the stored RTT can still be that initial estimate when the first
+//! data is sent (the e5b-9 cold-start lab saw 333 ms on an 800 ms path), so
+//! the cap is loose, or tight, until the first data is acknowledged.
+//!
+//! # The initial window
+//!
+//! Cubic starts at [`INITIAL_WINDOW_DATAGRAMS`] datagrams of
+//! [`MAX_UDP_PAYLOAD`] (38,400 bytes; a fixed byte count, not 32 x the
+//! runtime MTU) instead of quinn's 10. That is above RFC 9002's recommended
+//! 10 on purpose: quinn does not grow the window while the connection is
+//! limited by the application, so a connection that only carries small
+//! messages keeps its initial window for life, and on most connections the
+//! initial window is the window.
+//!
+//! quinn paces it, but only partly. Its pacer starts with a full bucket of at
+//! least 10 datagrams (`quinn-proto` `connection/pacing.rs`), so the first
+//! 12,000 bytes leave at once, and the remaining 22 datagrams are spread at
+//! 1.25 x window / RTT on quinn's RTT estimate, which says nothing about the
+//! bottleneck's rate. quinn's own estimate is updated by the handshake's
+//! acknowledgements; it is only the copy this controller keeps (`srtt`, see
+//! "The window cap") that can still hold the 333 ms initial value then.
 //!
 //! While the cap binds, a send it holds back counts in quinn as blocked by
 //! congestion, not limited by the application, so Cubic would keep growing on
@@ -144,8 +166,9 @@ use parking_lot::Mutex;
 use quinn::FrameStats;
 use quinn::congestion::{Controller, ControllerFactory, ControllerMetrics};
 
+use self::loss_gate::{GateVerdicts, LossGate};
 use super::QuicCloser;
-use super::config::QuicRateLimit;
+use super::config::{MAX_UDP_PAYLOAD, QuicRateLimit};
 #[cfg(doc)]
 use super::error::close_code;
 use super::socket::{CapHoldReading, CapHolds};
@@ -156,12 +179,16 @@ use crate::transport::metrics::QuicCloseCode;
 /// ([`close_code::SEND_ABORT_LIMIT`]).
 ///
 /// A healthy path resets a send only when the send is cancelled (a caller's
-/// timeout) or its chunk source fails, both rare, so 4096 is far above what
-/// one does over a long life, and a path that gets there is closed and
-/// rebuilt with nothing lost but the upgrade. The `stopped` map entries the
-/// limit bounds are about 100 bytes each, so at most about 400 KiB per
-/// path, under one connection's flow-control window
-/// (`config::MAX_WINDOW_BYTES`, 2 MiB).
+/// timeout), its chunk source fails, or a cancelled one-packet send finds
+/// `path::ACK_WAITS_WITHOUT_PERMIT` sends already waiting for their
+/// acknowledgement (a peer withholding acknowledgements), all rare, so 4096
+/// is far above what one does over a long life, and a path that gets there
+/// is closed and rebuilt with nothing lost but the upgrade. The `stopped` map entries the
+/// limit bounds are measured at under `config::QUIC_STOPPED_ENTRY_BYTES`
+/// (104 B) each, so at most 416 KiB per path, which the per-connection fixed
+/// charge (`config::QUIC_CONNECTION_CHARGE_BYTES`) takes in full. How often
+/// paths reset, and how close they come to the limit, is reported
+/// (`quic_send_resets`, `quic_path_ms`, `quic_send_resets_reached_<n>`).
 pub(crate) const SEND_ABORT_LIMIT: u64 = 4096;
 
 /// How long the peer may go on sending without acknowledging packets this
@@ -197,14 +224,20 @@ pub(crate) struct SendAborts {
     count: AtomicU64,
     limit: u64,
     closer: QuicCloser,
+    node: &'static crate::transport::metrics::QuicDataCounters,
 }
 
 impl SendAborts {
-    pub(crate) fn new(limit: u64, closer: QuicCloser) -> Self {
+    pub(crate) fn new(
+        limit: u64,
+        closer: QuicCloser,
+        node: &'static crate::transport::metrics::QuicDataCounters,
+    ) -> Self {
         Self {
             count: AtomicU64::new(0),
             limit,
             closer,
+            node,
         }
     }
 
@@ -216,6 +249,7 @@ impl SendAborts {
             return;
         }
         let count = self.count.fetch_add(1, Ordering::Relaxed) + 1;
+        self.node.record_send_reset(count);
         if count > self.limit && self.closer.close(QuicCloseCode::SendAbortLimit) {
             tracing::warn!(
                 remote = %self.closer.remote_address(),
@@ -234,8 +268,19 @@ impl SendAborts {
     }
 }
 
+/// Cubic's initial window in datagrams of [`MAX_UDP_PAYLOAD`] (quinn's default
+/// is 10; RFC 9002 recommends 10), applied as `32 x 1200` bytes whatever the
+/// connection's MTU. Measured in the e5b-9 cold-start lab against 10 and 64, with
+/// pacing: a 64 KiB message on a fresh or application-limited connection at
+/// 300 ms RTT arrives in 0.53 s instead of 0.82 s (UDP: 0.15 s), 16 KiB in one
+/// round trip, and a burst of 10 such connections on a 5 Mbit/s uplink leaves
+/// a competing loss-based flow less loss than the UDP transport does (2.2%
+/// against 17%). 64 was faster again but cost a competing flow about what the
+/// UDP transport does.
+pub(crate) const INITIAL_WINDOW_DATAGRAMS: u64 = 32;
+
 /// Builds [`CappedCubic`] controllers around Cubic, capped by `rate`.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct CappedCubicFactory {
     cubic: Arc<quinn::congestion::CubicConfig>,
     rate: QuicRateLimit,
@@ -243,17 +288,30 @@ pub(crate) struct CappedCubicFactory {
 
 impl CappedCubicFactory {
     pub(crate) fn new(rate: QuicRateLimit) -> Self {
+        let mut cubic = quinn::congestion::CubicConfig::default();
+        cubic.initial_window(INITIAL_WINDOW_DATAGRAMS * u64::from(MAX_UDP_PAYLOAD));
         Self {
-            cubic: Arc::default(),
+            cubic: Arc::new(cubic),
             rate,
         }
     }
 }
 
+impl Default for CappedCubicFactory {
+    fn default() -> Self {
+        Self::new(QuicRateLimit::default())
+    }
+}
+
 impl ControllerFactory for CappedCubicFactory {
     fn build(self: Arc<Self>, now: Instant, current_mtu: u16) -> Box<dyn Controller> {
+        let cubic = self.cubic.clone().build(now, current_mtu);
+        #[cfg(test)]
+        if self.rate.without_loss_gate {
+            return Box::new(CappedCubic::new(cubic, self.rate.clone(), current_mtu));
+        }
         Box::new(CappedCubic::new(
-            self.cubic.clone().build(now, current_mtu),
+            Box::new(LossGate::new(cubic)),
             self.rate.clone(),
             current_mtu,
         ))
@@ -375,10 +433,24 @@ impl CappedCubic {
         }
     }
 
-    /// Whether the wrapped controller is a `C`.
+    /// The loss gate's verdict counts, if the wrapped controller is a gate.
+    fn gate_verdicts(&self) -> Option<Arc<GateVerdicts>> {
+        self.inner
+            .clone_box()
+            .into_any()
+            .downcast::<LossGate>()
+            .ok()
+            .map(|gate| gate.verdicts())
+    }
+
+    /// The loss gate inside, if the wrapped controller is one.
     #[cfg(test)]
-    pub(crate) fn wraps<C: Controller + 'static>(&self) -> bool {
-        self.inner.clone_box().into_any().downcast::<C>().is_ok()
+    pub(crate) fn gate(&self) -> Option<Box<LossGate>> {
+        self.inner
+            .clone_box()
+            .into_any()
+            .downcast::<LossGate>()
+            .ok()
     }
 }
 
@@ -396,6 +468,12 @@ impl Controller for CappedCubic {
         rtt: &quinn_proto::RttEstimator,
     ) {
         self.state.lock().acked += 1;
+        // quinn updates `rtt` only after this call for the ACK frame, so this
+        // is the estimate from before it: the initial 333 ms on the first
+        // frames, and possibly still when the first data goes out after the
+        // handshake (see "The window cap" in the module docs). The cap reads
+        // it; anything that sizes a window from the RTT before the first data
+        // is acknowledged should use this packet's sample, `now - sent`.
         self.srtt = Some(rtt.get());
         // A send the cap holds back is not Cubic's doing: while the cap is
         // below Cubic's window, do not let Cubic grow (see the module docs).
@@ -802,6 +880,7 @@ pub(crate) async fn watch_acknowledgements<T: TimeSource>(
     time: T,
     cap_holds: Arc<CapHolds>,
     heard: Arc<PeerHeard>,
+    rtt: Arc<crate::transport::peer_connection::streaming::PathRtt>,
     report: &mut PathReport,
 ) {
     let Some(first) = AckSample::of(&connection, &cap_holds) else {
@@ -816,10 +895,11 @@ pub(crate) async fn watch_acknowledgements<T: TimeSource>(
     let mut watch = AckWatch::new(ACK_WATCH_WINDOW, first);
     loop {
         time.sleep(ACK_WATCH_TICK).await;
+        rtt.set(connection.rtt());
         // Read before the counts, so a closed connection's counts are its
         // final ones.
         let closed = connection.close_reason().is_some();
-        report.report();
+        report.report(Some(time.now_nanos()));
         if closed {
             return;
         }
@@ -844,12 +924,17 @@ pub(crate) async fn watch_acknowledgements<T: TimeSource>(
     }
 }
 
+pub(crate) mod loss_gate;
+
 #[cfg(test)]
 mod cap_tests;
 
 /// What a path's receive supervisor keeps for its acknowledgement watch.
 pub(crate) struct AckWatchParts {
     pub(crate) cap_holds: Arc<CapHolds>,
+    /// The connection's round trip for the consumers of its streams, set at
+    /// each tick (`streaming::PathRtt`).
+    pub(crate) rtt: Arc<crate::transport::peer_connection::streaming::PathRtt>,
     pub(crate) heard: Arc<PeerHeard>,
     pub(crate) report: PathReport,
 }
@@ -877,6 +962,16 @@ pub(crate) struct PathReport {
     bytes: UdpBytes,
     loss: PathLoss,
     window: crate::transport::metrics::PathLossWindow,
+    /// The loss gate's verdict counts and those already reported; `None` when
+    /// the connection's controller has no gate.
+    gate: Option<(Arc<GateVerdicts>, [u64; loss_gate::GATE_VERDICTS])>,
+    gate_window: crate::transport::metrics::PathGateWindow,
+    /// When the path's time was last reported, in the time source's
+    /// nanoseconds.
+    timed_at: u64,
+    /// The path's budget meter, evaluated at each tick so an idle path's send
+    /// window and held epochs are settled too.
+    meter: Option<Arc<super::budget::ConnMeter>>,
     /// The next report that finds the path in a bucket panics, once
     /// (supervisor test).
     #[cfg(test)]
@@ -884,15 +979,32 @@ pub(crate) struct PathReport {
 }
 
 impl PathReport {
+    /// A report for a path built at `built_at` (time-source nanoseconds).
     pub(crate) fn new(
         connection: quinn::Connection,
         node: &'static crate::transport::metrics::QuicDataCounters,
+        built_at: u64,
+        meter: Option<Arc<super::budget::ConnMeter>>,
     ) -> Self {
         let stats = connection.stats();
+        let gate = connection
+            .congestion_state()
+            .into_any()
+            .downcast::<CappedCubic>()
+            .ok()
+            .and_then(|capped| capped.gate_verdicts())
+            .map(|verdicts| {
+                let seen = verdicts.read();
+                (verdicts, seen)
+            });
         Self {
+            timed_at: built_at,
+            meter,
             bytes: UdpBytes::of(&stats),
             loss: PathLoss::of(&stats),
             window: crate::transport::metrics::PathLossWindow::new(node),
+            gate,
+            gate_window: crate::transport::metrics::PathGateWindow::new(node),
             connection,
             node,
             #[cfg(test)]
@@ -900,8 +1012,20 @@ impl PathReport {
         }
     }
 
-    /// Report the change since the last report, from one read of the stats.
-    fn report(&mut self) {
+    /// Report the change since the last report, from one read of the stats,
+    /// and the time since the last one when `now` is given. The final report,
+    /// on drop, has no clock, so a path's last tick to its end (under
+    /// [`ACK_WATCH_TICK`]) is not counted.
+    fn report(&mut self, now: Option<u64>) {
+        if let Some(now) = now {
+            // Whole milliseconds, carrying the rest to the next report.
+            let ms = now.saturating_sub(self.timed_at) / 1_000_000;
+            self.timed_at = self.timed_at.saturating_add(ms * 1_000_000);
+            self.node.record_path_time(ms);
+            if let Some(meter) = &self.meter {
+                meter.maybe_evaluate(now);
+            }
+        }
         let stats = self.connection.stats();
         let (next, sent, got) = self.bytes.step(UdpBytes::of(&stats));
         self.node.record_bytes(sent, got);
@@ -909,6 +1033,13 @@ impl PathReport {
         let (next, delta) = self.loss.step(PathLoss::of(&stats));
         self.node.record_path_loss(&mut self.window, delta);
         self.loss = next;
+        if let Some((verdicts, seen)) = &mut self.gate {
+            let now = verdicts.read();
+            let delta: [u64; loss_gate::GATE_VERDICTS] =
+                std::array::from_fn(|i| now[i].saturating_sub(seen[i]));
+            *seen = now;
+            self.node.record_gate(&mut self.gate_window, delta);
+        }
         #[cfg(test)]
         if self.panic_once_bucketed && self.window.is_bucketed() {
             self.panic_once_bucketed = false;
@@ -922,7 +1053,7 @@ impl Drop for PathReport {
     fn drop(&mut self) {
         // Not while unwinding: quinn's state lock may be what panicked.
         if !std::thread::panicking() {
-            self.report();
+            self.report(None);
         }
     }
 }

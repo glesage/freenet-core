@@ -2108,6 +2108,47 @@ impl SimNetwork {
         self
     }
 
+    /// Lowers the QUIC-native wire floor to `floor` on every node, so the
+    /// native connect variants go to any peer whose negotiated version is at
+    /// least `floor`. Until the release that ships them the production floor
+    /// is above this binary's version, so without this call no simulation can
+    /// put them on the wire. Call before the simulation starts.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn with_quic_native_floor(&mut self, floor: (u8, u8, u16)) -> &mut Self {
+        for label in self.pending_labels() {
+            self.node_config_mut(&label).quic_native_floor_override = Some(floor);
+        }
+        self
+    }
+
+    /// Makes the node `label` decode the QUIC-native connect variants as a
+    /// release below their floor does: such a message fails to decode and the
+    /// connection is closed. It also never sends them. Pair it with
+    /// [`Self::with_node_advertised_version`] at a pre-floor version, so the
+    /// node stands in for an older peer; a gating miss then shows as an
+    /// undecodable-message close ([`Self::native_wire_trace`]).
+    #[cfg(any(test, feature = "testing"))]
+    pub fn with_node_pre_floor_native_decoder(&mut self, label: &NodeLabel) -> &mut Self {
+        self.node_config_mut(label).native_wire_pre_floor = true;
+        let addr = *self
+            .node_addresses
+            .get(label)
+            .expect("a pre-floor node must have an address in this network");
+        crate::operations::connect::native_wire_trace::mark_pre_floor(&self.name, addr);
+        self
+    }
+
+    /// A record of the QUIC-native connect variants in this network: which
+    /// went on the wire, connections closed on an undecodable message, and
+    /// what acceptors and joiners saw. Call before the nodes start. The
+    /// handle stays readable after the run has consumed the network.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn native_wire_trace(
+        &self,
+    ) -> crate::operations::connect::native_wire_trace::NativeWireTrace {
+        crate::operations::connect::native_wire_trace::trace(&self.name)
+    }
+
     /// A record of what every node's QUIC upgrades do in this network, and the
     /// faults a test can inject into them. Call it before the nodes start. The
     /// handle stays readable after the run has consumed the network.
@@ -8512,6 +8553,31 @@ mod tests {
             code.iter()
                 .all(|line| !line.contains("network_api.quic_settings()")),
             "`build` must not read the bare `network_api` settings"
+        );
+    }
+
+    /// `build` records the QUIC endpoint state telemetry reports when QUIC is
+    /// already off before the bind (#5940 UDP removal, phase A): from the
+    /// breaker's result, after the gate, as code and not in a comment.
+    #[test]
+    fn build_records_the_endpoint_state_after_the_breaker_gate() {
+        let source = include_str!("network_bridge/p2p_protoc.rs");
+        let flat: String = method_body(source, "    pub async fn build(")
+            .lines()
+            .map(|line| line.split_once("//").map_or(line, |(code, _)| code))
+            .collect::<String>()
+            .split_whitespace()
+            .collect();
+        let gate = flat
+            .find("letquic=crate::transport::quic::breaker::gate(")
+            .expect("`build` runs the breaker gate");
+        let record = flat
+            .find("endpoint_state_before_bind(&config.config.network_api,quic.settings.is_some(),)")
+            .expect("`build` decides the state from the gate's settings");
+        assert!(record > gate, "the state is decided after the gate");
+        assert!(
+            flat[record..].contains("TRANSPORT_METRICS.set_quic_endpoint_state(state)"),
+            "`build` records it"
         );
     }
 

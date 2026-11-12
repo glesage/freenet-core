@@ -42,10 +42,13 @@
 //! `ResetByPeer` and cancels its handle; it never sees a stream that ends
 //! early as if it were complete or truncated. A dropped short message or
 //! control frame is lost. A send future dropped while it waits for
-//! acknowledgement (after `finish` was issued) is NOT reset: every byte
+//! acknowledgement (after `finish` was issued) is not reset: every byte
 //! was already written, so the message may still be delivered:
 //! [`bounded_send`] reports a timeout there as `MaybeDelivered`, not
-//! `Failed`.
+//! `Failed`. The exception is a one-packet send that holds no permit once
+//! [`ACK_WAITS_WITHOUT_PERMIT`] such sends already wait on the path: its
+//! stream is reset so quinn drops its data with its epoch, and the message
+//! may then not arrive (`Outgoing`'s drop).
 //!
 //! Streamed messages, and short messages that do not fit a packet, take one
 //! permit each, at most `config::STREAMED_SEND_LIMIT` at once, which keeps uni
@@ -104,12 +107,14 @@
 //!
 //! A Short or Stream whose channel is full waits for room in its own reader
 //! future (`reserve`, raced with the stream's age limit), not in the task: the
-//! other readers and the accept loop carry on. A Short waits after its payload
-//! is read and BEFORE the stream's end is read (reading the end frees the
-//! stream in quinn and returns its credit), and the waiting reader keeps its
-//! `RecvStream`, so at most `MAX_UNI_STREAMS` readers wait on a path, charged
-//! or not, and a slow consumer slows the sender instead of losing messages the
-//! sender has seen acknowledged. Past the age limit the stream is stopped
+//! other readers and the accept loop carry on. A waiting reader reads on (a
+//! byte past the declared end is `Overlong` at once), so quinn holds nothing
+//! for it, and reading the stream's end frees quinn's slot. A charged message
+//! is bounded by its charge; a one-packet Short, uncharged, lowers the peer's
+//! stream limit by one while it waits (`inbound::StreamLimit`), so at most
+//! `MAX_UNI_STREAMS` of them wait on a path, and a slow consumer slows the
+//! sender instead of losing messages the sender has seen acknowledged. Past
+//! the age limit the stream is stopped
 //! (`stop_code::EVICTED`). A sender still waiting for its acknowledgement sees
 //! the stop; one whose bytes were all acknowledged has already reported `Sent`,
 //! and the message is lost, as a message dropped from a full channel is on UDP.
@@ -137,7 +142,7 @@ pub(in crate::transport) mod pacer;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -145,7 +150,7 @@ use futures::{Stream, StreamExt};
 use tokio::sync::mpsc;
 
 use super::QuicConnection;
-use super::config::STREAMED_SEND_LIMIT;
+use super::config::{MAX_UNI_STREAMS, STREAMED_SEND_LIMIT};
 use super::control::{ControlError, QuicControl};
 use super::framing::{FrameHeader, HeaderError};
 use super::identity::PeerKey;
@@ -253,7 +258,8 @@ pub(crate) mod reset_code {
 /// Capacity of [`QuicDataInbox::shorts`]. A queued message of more than one
 /// packet holds its inbound budget charge, so the budget bounds those bytes; a
 /// one-packet message is uncharged and bounded by this capacity (about one
-/// packet each) plus the readers waiting for room, at most `MAX_UNI_STREAMS`.
+/// packet each) plus the readers waiting for room, at most `MAX_UNI_STREAMS`
+/// (`inbound::StreamLimit`).
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const SHORT_CHANNEL_CAPACITY: usize = 256;
 /// Capacity of [`QuicDataInbox::streams`]. Each queued stream holds its charge.
@@ -292,17 +298,48 @@ pub(crate) struct QuicPathLimits {
     /// refuses data with [`stop_code::NOT_ACCEPTING_DATA`] right after the
     /// header, before anything is charged to the inbound budget.
     pub(crate) accept_data: bool,
+    /// The uni streams a data path's peer may open at first, raised with
+    /// load up to [`MAX_UNI_STREAMS`] (`inbound::StreamLimit`).
+    pub(crate) start_streams: u32,
     /// Where the path's counts are also kept node-wide; `None` is
     /// `TRANSPORT_METRICS`. A test passes its own, since every test in a process
     /// writes the global one.
     pub(crate) counters: Option<&'static QuicDataCounters>,
-    /// The receive task panics on its first stream (supervisor test).
+    /// The receive task panics on its first short message (supervisor test).
     #[cfg(test)]
     pub(crate) panic_in_receive: bool,
     /// The acknowledgement watch panics once the path is in a loss-rate bucket
     /// (supervisor test).
     #[cfg(test)]
     pub(crate) panic_in_watch: bool,
+    /// The receive side's gap cap (`inbound::MAX_GAPS_PER_CONNECTION`), lower
+    /// in a test that trips it.
+    #[cfg(test)]
+    pub(crate) max_gaps: usize,
+    /// The cap of the connection's staged bytes for a test path with no
+    /// buffer budget (`inbound::ConnStaging`); `None` keeps the default
+    /// ([`staging_cap_without_meter`]). A metered path's follows its credit.
+    #[cfg(test)]
+    pub(crate) staging_cap: Option<usize>,
+    /// While the flag is set, the receive side cancels the handle of the
+    /// next Stream it admits, before its announce, and clears the flag: a
+    /// test of how a stream cancelled that early ends.
+    #[cfg(test)]
+    pub(crate) cancel_next_admitted: Option<&'static std::sync::atomic::AtomicBool>,
+}
+
+/// The cap of a connection's staged bytes on a path with no buffer budget
+/// meter: twice the credit its connection starts with. A shadow path keeps the
+/// endpoint's initial window (`config::INITIAL_RECEIVE_WINDOW_BYTES`); a data
+/// path without a meter (tests only: every node path has the budget) is taken
+/// to run at the floor window.
+fn staging_cap_without_meter(accept_data: bool) -> usize {
+    let credit = if accept_data {
+        super::budget::MIN_WINDOW_BYTES
+    } else {
+        super::config::INITIAL_RECEIVE_WINDOW_BYTES
+    };
+    super::budget::staging_cap(credit)
 }
 
 impl QuicPathLimits {
@@ -324,17 +361,34 @@ impl QuicPathLimits {
         control_capacity: CONTROL_CHANNEL_CAPACITY,
         max_send_aborts: recycle::SEND_ABORT_LIMIT,
         accept_data: true,
+        // The production start in every build, tests and simulations
+        // included; a test whose premise is the full limit sets it.
+        start_streams: super::config::DATA_START_UNI_STREAMS,
         counters: None,
         #[cfg(test)]
         panic_in_receive: false,
         #[cfg(test)]
         panic_in_watch: false,
+        #[cfg(test)]
+        max_gaps: inbound::MAX_GAPS_PER_CONNECTION,
+        #[cfg(test)]
+        staging_cap: None,
+        #[cfg(test)]
+        cancel_next_admitted: None,
     };
 
     /// [`Self::DEFAULT`] for a path in shadow mode: control frames only.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) const SHADOW: Self = Self {
         accept_data: false,
+        ..Self::DEFAULT
+    };
+
+    /// [`Self::DEFAULT`] with the peer let open every stream from the
+    /// start, for tests whose premise is the full limit. Tests only.
+    #[cfg(test)]
+    pub(crate) const FULL_STREAMS: Self = Self {
+        start_streams: MAX_UNI_STREAMS,
         ..Self::DEFAULT
     };
 }
@@ -439,6 +493,31 @@ quic_outcomes! {
         ShortRefusedBudget => "short_refused_budget",
         /// A Stream did not fit the inbound budget (as above).
         StreamRefusedBudget => "stream_refused_budget",
+        /// The connection's streams held more gaps (received ranges past the
+        /// first, per stream) than the connection's cap (`budget::gap_cap`); the
+        /// stream that went past it was stopped (`stop_code::EVICTED`).
+        TooManyRanges => "too_many_ranges",
+        /// The connection went past its gap cap a
+        /// second time within `inbound::STAGED_TRIP_WINDOW`, so the path was
+        /// closed with OVER_BUDGET (once per path). The gaps of streams it
+        /// stopped stay counted (`inbound::ConnRanges::keep`).
+        ClosedTooManyRanges => "closed_too_many_ranges",
+        /// Staging what the stream had read before its header, metadata or
+        /// control body was taken would have passed the connection's staging
+        /// cap (`inbound::ConnStaging`), so the stream was stopped
+        /// (`stop_code::EVICTED`).
+        EvictedStaged => "evicted_staged",
+        /// A second stream passed the staging cap within
+        /// `inbound::STAGED_TRIP_WINDOW`, so the path was closed with
+        /// OVER_BUDGET (once per path).
+        ClosedStagedOverCap => "closed_staged_over_cap",
+        /// A stream reached its age limit while its idle timer was paused
+        /// because the buffer budget was throttling the connection
+        /// (`budget::ConnMeter::throttled_since`); stopped
+        /// (`stop_code::EVICTED`), and not counted as an idle or age eviction.
+        ThrottledPastAge => "throttled_past_age",
+        /// The peer's stream limit doubled with load (`inbound::StreamLimit`).
+        StreamLimitRaised => "stream_limit_raised",
     }
 }
 
@@ -664,10 +743,19 @@ pub(crate) struct QuicPath {
     receive: tokio::task::JoinHandle<()>,
     /// Sends this side reset; closes the connection past the limit.
     aborts: Arc<SendAborts>,
+    /// Cancelled one-packet sends still waiting for their acknowledgement
+    /// ([`AckWaits`]).
+    ack_waits: Arc<AckWaits>,
+    /// The path's share of the node's buffer budget, for a path that reads
+    /// data (`budget::ConnMeter`); `None` for a shadow path.
+    meter: Option<Arc<super::budget::ConnMeter>>,
     /// One permit per streamed message in flight
     /// ([`STREAMED_SEND_LIMIT`]), so the remaining uni stream slots stay
     /// for short messages and control frames. Never closed.
     stream_slots: Arc<tokio::sync::Semaphore>,
+    /// Control frames taking their stream ([`Self::control_first`]); a data
+    /// send opens no stream while any is.
+    controls_opening: Arc<ControlsOpening>,
     /// Whether this path may send data, one of the `SEND_DATA_*` values. Off for a
     /// path in shadow, where a fragment taken from an inbound handle cannot
     /// outlive its charge because nothing is ever forwarded.
@@ -707,6 +795,12 @@ pub(crate) struct QuicPath {
     pacer: std::sync::OnceLock<Arc<dyn pacer::SendPacer>>,
     #[cfg(test)]
     budget: SharedInboundBudget,
+    /// The receive side's count of received ranges. Tests only.
+    #[cfg(test)]
+    inbound_ranges: Arc<inbound::ConnRanges>,
+    /// The receive side's staged bytes. Tests only.
+    #[cfg(test)]
+    inbound_staging: Arc<inbound::ConnStaging>,
 }
 
 /// The path never had both data bits: nothing may send data on it.
@@ -753,7 +847,8 @@ impl QuicPath {
         limits: QuicPathLimits,
     ) -> (Self, QuicInbound) {
         let budget = SharedInboundBudget::new(limits.max_streams, limits.max_bytes);
-        let (path, inbound) = Self::with_budget_and_own_channels(connection, time, limits, budget);
+        let (path, inbound) =
+            Self::with_budget_and_own_channels(connection, time, limits, budget, None);
         // A test path has no negotiation: one that accepts data sends it too.
         if limits.accept_data {
             path.enable_data();
@@ -768,9 +863,10 @@ impl QuicPath {
         time: T,
         limits: QuicPathLimits,
         budget: SharedInboundBudget,
+        windows: Option<&Arc<super::budget::QuicBudget>>,
     ) -> (Self, QuicInbound) {
         let (data, inbox) = channels_of(limits.short_capacity, limits.stream_capacity);
-        let (path, controls) = Self::with_budget(connection, time, limits, budget, data);
+        let (path, controls) = Self::with_budget(connection, time, limits, budget, data, windows);
         let QuicDataInbox { shorts, streams } = inbox;
         (
             path,
@@ -824,6 +920,7 @@ impl QuicPath {
         limits: QuicPathLimits,
         budget: SharedInboundBudget,
         data: QuicDataSenders,
+        windows: Option<&Arc<super::budget::QuicBudget>>,
     ) -> (Self, mpsc::Receiver<Bytes>) {
         let stats = Arc::new(QuicPathStats::new(
             limits
@@ -831,7 +928,12 @@ impl QuicPath {
                 .unwrap_or(&crate::transport::TRANSPORT_METRICS.quic_data),
         ));
         let (controls_tx, controls) = mpsc::channel(limits.control_capacity);
-        #[cfg_attr(not(test), allow(unused_mut))]
+        #[cfg(test)]
+        let staging_cap = limits
+            .staging_cap
+            .unwrap_or_else(|| staging_cap_without_meter(limits.accept_data));
+        #[cfg(not(test))]
+        let staging_cap = staging_cap_without_meter(limits.accept_data);
         let mut receiver = inbound::Receiver::new(
             time.clone(),
             budget.clone(),
@@ -840,12 +942,50 @@ impl QuicPath {
             controls_tx,
             limits.accept_data,
             connection.closer(),
+            staging_cap,
         );
         #[cfg(test)]
         {
             receiver.panic_on_stream = limits.panic_in_receive;
+            receiver.cancel_next_admitted = limits.cancel_next_admitted;
+            receiver.set_gap_cap(limits.max_gaps);
         }
-        let aborts = Arc::new(SendAborts::new(limits.max_send_aborts, connection.closer()));
+        // A path that reads data lets the peer open
+        // `config::DATA_START_UNI_STREAMS` streams (the endpoint starts each
+        // connection at `config::INITIAL_UNI_STREAMS`), raised with load up
+        // to `MAX_UNI_STREAMS`, less one per one-packet Short waiting for room
+        // (`inbound::StreamLimit`).
+        if limits.accept_data {
+            receiver.set_stream_limit(
+                connection.inner().clone(),
+                limits.start_streams,
+                MAX_UNI_STREAMS,
+            );
+        }
+        // A path that reads data takes a share of the node's buffer budget,
+        // which sets its windows from here on; a shadow path keeps the
+        // endpoint's floor windows.
+        let meter = windows.filter(|_| limits.accept_data).map(|windows| {
+            Arc::new(windows.register(
+                Arc::new(connection.inner().clone()),
+                receiver.ranges(),
+                receiver.staging(),
+                time.now_nanos(),
+            ))
+        });
+        if let Some(meter) = &meter {
+            receiver.set_meter(meter.clone());
+        }
+        #[cfg(test)]
+        let inbound_ranges = receiver.ranges();
+        #[cfg(test)]
+        let inbound_staging = receiver.staging();
+        let receiver_rtt = receiver.path_rtt();
+        let aborts = Arc::new(SendAborts::new(
+            limits.max_send_aborts,
+            connection.closer(),
+            stats.node(),
+        ));
         // Read once: quinn keeps one controller per connection while migration is
         // off (`config`), so the record stays the connection's. The ack watch
         // compares records by pointer because it samples, and does not need to here.
@@ -864,11 +1004,17 @@ impl QuicPath {
         );
         let heard = Arc::new(recycle::PeerHeard::default());
         #[cfg_attr(not(test), allow(unused_mut))]
-        let mut report = recycle::PathReport::new(connection.inner().clone(), stats.node());
+        let mut report = recycle::PathReport::new(
+            connection.inner().clone(),
+            stats.node(),
+            built_at,
+            meter.clone(),
+        );
         #[cfg(test)]
         {
             report.panic_once_bucketed = limits.panic_in_watch;
         }
+        let ack_waits = Arc::new(AckWaits::new(stats.clone()));
         let receive = GlobalExecutor::spawn(supervise_receive(
             connection.inner().clone(),
             connection.closer(),
@@ -877,6 +1023,7 @@ impl QuicPath {
             time,
             recycle::AckWatchParts {
                 cap_holds: connection.cap_holds(),
+                rtt: receiver_rtt,
                 heard: heard.clone(),
                 report,
             },
@@ -887,7 +1034,10 @@ impl QuicPath {
                 stats,
                 receive,
                 aborts,
+                ack_waits,
+                meter,
                 stream_slots: Arc::new(tokio::sync::Semaphore::new(STREAMED_SEND_LIMIT as usize)),
+                controls_opening: Arc::default(),
                 send_data: AtomicU8::new(SEND_DATA_NEVER),
                 counted_as_data_path: std::sync::atomic::AtomicBool::new(false),
                 stall: parking_lot::Mutex::new(stall),
@@ -903,9 +1053,20 @@ impl QuicPath {
                 pacer: std::sync::OnceLock::new(),
                 #[cfg(test)]
                 budget,
+                #[cfg(test)]
+                inbound_ranges,
+                #[cfg(test)]
+                inbound_staging,
             },
             controls,
         )
+    }
+
+    /// The code of the close this node sent on the path's connection, if it
+    /// sent one.
+    #[cfg_attr(not(any(test, feature = "testing")), allow(dead_code))]
+    pub(in crate::transport) fn closed_with(&self) -> Option<QuicCloseCode> {
+        self.connection.closer().closed_with()
     }
 
     /// Pace this path's data sends with `pacer` (`pacer` module): the
@@ -940,6 +1101,55 @@ impl QuicPath {
         })
     }
 
+    /// The most gaps the receive side's streams held at once. Tests only.
+    #[cfg(test)]
+    pub(in crate::transport) fn inbound_gaps_peak(&self) -> usize {
+        self.inbound_ranges.peak()
+    }
+
+    /// Staged bytes the receive side holds now. Tests only.
+    #[cfg(test)]
+    pub(in crate::transport) fn inbound_staged(&self) -> usize {
+        self.inbound_staging.held()
+    }
+
+    /// Charges the inbound budget holds now. Tests only.
+    #[cfg(test)]
+    pub(in crate::transport) fn inbound_budget_streams(&self) -> usize {
+        self.budget.lock().stream_count()
+    }
+
+    /// The path's buffer-budget meter, if it reads data under a budget.
+    #[cfg(test)]
+    pub(in crate::transport) fn meter(&self) -> Option<&Arc<super::budget::ConnMeter>> {
+        self.meter.as_ref()
+    }
+
+    /// The receive side's staging cap now. Tests only.
+    #[cfg(test)]
+    pub(in crate::transport) fn inbound_staging_cap(&self) -> usize {
+        self.inbound_staging.cap()
+    }
+
+    /// The most the receive side staged at once, per mille of its cap.
+    /// Tests only.
+    #[cfg(test)]
+    pub(in crate::transport) fn inbound_staged_peak_permille(&self) -> usize {
+        self.inbound_staging.peak_permille()
+    }
+
+    /// Gaps the receive side counts now. Tests only.
+    #[cfg(test)]
+    pub(in crate::transport) fn inbound_gaps_held(&self) -> usize {
+        self.inbound_ranges.held()
+    }
+
+    /// Gaps of stopped streams the receive side keeps counted. Tests only.
+    #[cfg(test)]
+    pub(in crate::transport) fn inbound_gaps_kept(&self) -> usize {
+        self.inbound_ranges.kept()
+    }
+
     /// Whether the path's data sends are paced.
     #[cfg(test)]
     pub(in crate::transport) fn is_paced(&self) -> bool {
@@ -964,10 +1174,25 @@ impl QuicPath {
         self.stats.clone()
     }
 
+    /// Cancelled sends without a permit waiting for their acknowledgement.
+    #[cfg(test)]
+    pub(crate) fn ack_waits(&self) -> &AckWaits {
+        &self.ack_waits
+    }
+
     /// Sends this side reset on this path so far.
     #[cfg(test)]
     pub(crate) fn send_aborts(&self) -> u64 {
         self.aborts.count()
+    }
+
+    /// The sends holding one of the path's send-window epochs, 0 without a
+    /// budget meter.
+    #[cfg(test)]
+    pub(crate) fn send_epoch_holders(&self) -> usize {
+        self.meter
+            .as_ref()
+            .map_or(0, |meter| meter.send_epoch_holders())
     }
 
     /// Streamed-message permits free right now.
@@ -991,6 +1216,25 @@ impl QuicPath {
     #[cfg(test)]
     pub(crate) fn charged_streams_now(&self) -> usize {
         self.budget.lock().stream_count()
+    }
+
+    /// An estimate, from below, of the gap the receiver of a stream sent on
+    /// this path allows between two pieces before it gives up:
+    /// [`quic_fragment_gap`] of the path's minimum round trip, under the idle
+    /// limit every reader uses. A pipe into this path waits on its source no
+    /// longer than this. The receiver times its gap from its own smoothed
+    /// round trip; this end's smoothed round trip also carries its own
+    /// queueing, so it can sit above the receiver's, and the minimum is used
+    /// instead. That errs short, which costs at most a pipe dropped early
+    /// (floored at 5 s), and makes a pipe that writes into a stream its
+    /// receiver has given up on unlikely, not impossible.
+    ///
+    /// [`quic_fragment_gap`]: crate::transport::peer_connection::streaming::quic_fragment_gap
+    pub(crate) fn receiver_gap(&self) -> Duration {
+        crate::transport::peer_connection::streaming::quic_fragment_gap(
+            self.connection.inner().stats().path.min_rtt,
+            crate::transport::peer_connection::streaming_handle_idle_timeout(),
+        )
     }
 
     /// The connection, for tests that write raw streams.
@@ -1195,7 +1439,9 @@ impl QuicPath {
         } else {
             (Some(self.stream_slot().await?), self.pacing())
         };
-        let mut send = self.open(&header, &[], slot, pacing, progress).await?;
+        let mut send = self
+            .open(&header, &[], slot, pacing, progress, Opener::Data)
+            .await?;
         for piece in payload.chunks(FRAGMENT_PAYLOAD_SIZE) {
             send.take_turns().await;
             send.write_paced(piece).await?;
@@ -1210,17 +1456,24 @@ impl QuicPath {
     /// [`Self::send_control_bounded`].
     #[cfg(test)]
     pub(super) async fn send_control(&self, payload: &[u8]) -> Result<(), QuicSendError> {
-        self.send_control_with(payload, SendProgress::new()).await
+        self.send_control_with(payload, SendProgress::new(), None)
+            .await
     }
 
     async fn send_control_with(
         &self,
         payload: &[u8],
         progress: SendProgress,
+        first: Option<ControlFirst>,
     ) -> Result<(), QuicSendError> {
         let header = FrameHeader::control(payload.len() as u64)?;
         // Never paced: a control frame must not wait behind data.
-        let mut send = self.open(&header, &[], None, None, progress).await?;
+        let opened = self
+            .open(&header, &[], None, None, progress, Opener::Control)
+            .await;
+        // The stream is ours (or the send failed): data may open again.
+        drop(first);
+        let mut send = opened?;
         send.write_all(payload).await?;
         send.finish().await
     }
@@ -1234,9 +1487,40 @@ impl QuicPath {
         timeout: Duration,
         control: QuicControl,
     ) -> BoundedSend {
+        self.send_control_first(time, timeout, control, self.control_first())
+            .await
+    }
+
+    /// Reserve the next stream for a control frame: until the frame sent
+    /// with `first` ([`Self::send_control_first`]) has its stream, or its
+    /// send ends, no data send on this path opens one. Taken before the
+    /// send is spawned, so data enabled after it cannot take the peer's
+    /// stream slots first: a client's `ReadyAck` goes out in the same step
+    /// that enables its data, and with the peer's slots all taken by data
+    /// it would wait out its deadline and fail the upgrade.
+    pub(crate) fn control_first(&self) -> ControlFirst {
+        self.controls_opening.pending.fetch_add(1, Ordering::SeqCst);
+        ControlFirst(Arc::clone(&self.controls_opening))
+    }
+
+    /// Control frames holding a reservation now. Tests only.
+    #[cfg(test)]
+    pub(crate) fn controls_reserved(&self) -> usize {
+        self.controls_opening.pending.load(Ordering::SeqCst)
+    }
+
+    /// [`Self::send_control_bounded`] with a reservation taken earlier
+    /// ([`Self::control_first`]).
+    pub(crate) async fn send_control_first<T: TimeSource>(
+        &self,
+        time: &T,
+        timeout: Duration,
+        control: QuicControl,
+        first: ControlFirst,
+    ) -> BoundedSend {
         let payload = control.encode();
         bounded_send(time, timeout, None, |progress| {
-            self.send_control_with(&payload[..], progress)
+            self.send_control_with(&payload[..], progress, Some(first))
         })
         .await
     }
@@ -1289,7 +1573,14 @@ impl QuicPath {
         let header = FrameHeader::stream(stream_id, payload.len() as u64, metadata.len())?;
         let slot = self.stream_slot().await?;
         let mut send = self
-            .open(&header, metadata, Some(slot), self.pacing(), progress)
+            .open(
+                &header,
+                metadata,
+                Some(slot),
+                self.pacing(),
+                progress,
+                Opener::Data,
+            )
             .await?;
         send.write_fragments(payload, observer).await?;
         send.finish().await
@@ -1331,7 +1622,7 @@ impl QuicPath {
     /// [`Self::send_stream_bounded`] does, and tells `observer` the same.
     ///
     /// Waits for the first chunk before anything else, for as long as
-    /// [`SendDeadlines::gap`] and `total` allow, so a source that has nothing
+    /// [`SendDeadlines::source_gap`] (or `gap`) and `total` allow, so a source that has nothing
     /// yet holds no permit and no stream. `open` runs from when it arrives;
     /// `total` counts the wait. A wait that runs out or a connection lost
     /// during it is [`SendFailure::NotOpened`]. A source that ends or fails
@@ -1360,7 +1651,7 @@ impl QuicPath {
         let started = time.now_nanos();
         let connection = self.connection.inner();
         let wait = deadlines
-            .gap
+            .gap_for(true)
             .map_or(deadlines.total, |gap| gap.min(deadlines.total));
         let first = tokio::select! {
             first = chunks.next() => first,
@@ -1411,7 +1702,14 @@ impl QuicPath {
         let slot = self.stream_slot().await?;
         let source_wait = progress.clone();
         let mut send = self
-            .open(&header, metadata, Some(slot), self.pacing(), progress)
+            .open(
+                &header,
+                metadata,
+                Some(slot),
+                self.pacing(),
+                progress,
+                Opener::Data,
+            )
             .await?;
         let mut delivered: u64 = 0;
         let mut next = Some(first);
@@ -1488,6 +1786,8 @@ impl QuicPath {
     /// in use. The stream takes over `slot`. With `pacing`, the header and
     /// metadata are taken from the pacer before the stream opens, so a
     /// refusal opens nothing, and the stream's later writes are paced too.
+    /// A data send first waits for control frames reserved ahead of it
+    /// ([`Self::control_first`]), within its own open deadline.
     async fn open(
         &self,
         header: &FrameHeader,
@@ -1495,7 +1795,11 @@ impl QuicPath {
         slot: Option<tokio::sync::OwnedSemaphorePermit>,
         pacing: Option<pacer::Pacing>,
         progress: SendProgress,
+        opener: Opener,
     ) -> Result<Outgoing, QuicSendError> {
+        if opener == Opener::Data {
+            self.controls_opening.wait().await;
+        }
         let paid = match &pacing {
             Some(pacing) => {
                 let bytes = super::framing::HEADER_LEN + metadata.len();
@@ -1513,12 +1817,20 @@ impl QuicPath {
             }
             std::task::Poll::Pending => {
                 self.stats.node.record_open(true);
-                open.await
+                // Counted if the send's deadline drops this wait: the peer's
+                // stream limit was full for all of it.
+                let waiting = CreditWait(Some((&self.stats, &progress)));
+                let opened = open.await;
+                waiting.disarm();
+                opened
             }
         };
         let stream = opened?;
         progress.mark_opened();
-        let mut send = Outgoing::new(stream, self.aborts.clone(), slot, pacing, progress);
+        let epoch = self.meter.as_ref().and_then(|meter| meter.send_epoch());
+        let mut send = Outgoing::new(stream, self.aborts.clone(), slot, pacing, progress, epoch);
+        send.meter = self.meter.clone();
+        send.ack_waits = Some(self.ack_waits.clone());
         send.write_all(&header.encode()).await?;
         if !metadata.is_empty() {
             send.write_all(metadata).await?;
@@ -1527,6 +1839,70 @@ impl QuicPath {
             paid.spent();
         }
         Ok(send)
+    }
+}
+
+/// Who opens a stream ([`QuicPath::open`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Opener {
+    Data,
+    Control,
+}
+
+/// Control frames reserved ahead of data ([`QuicPath::control_first`]).
+#[derive(Default)]
+struct ControlsOpening {
+    pending: AtomicUsize,
+    opened: tokio::sync::Notify,
+}
+
+impl ControlsOpening {
+    /// Wait until no control frame holds a reservation.
+    async fn wait(&self) {
+        loop {
+            let opened = self.opened.notified();
+            tokio::pin!(opened);
+            opened.as_mut().enable();
+            if self.pending.load(Ordering::SeqCst) == 0 {
+                return;
+            }
+            opened.await;
+        }
+    }
+}
+
+/// A control frame's reservation of the next stream on its path
+/// ([`QuicPath::control_first`]); dropped once the frame has its stream or
+/// its send ends.
+pub(crate) struct ControlFirst(Arc<ControlsOpening>);
+
+impl Drop for ControlFirst {
+    fn drop(&mut self) {
+        if self.0.pending.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.0.opened.notify_waiters();
+        }
+    }
+}
+
+/// A send waiting in `open_uni` for a stream credit; dropped armed at the
+/// send's open deadline (the deadline ended the wait), it counts
+/// [`QuicSendEvent::StreamLimitFull`]. A drop before it (the send cancelled
+/// by a teardown or a shutdown) is not counted.
+struct CreditWait<'a>(Option<(&'a QuicPathStats, &'a SendProgress)>);
+
+impl CreditWait<'_> {
+    fn disarm(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for CreditWait<'_> {
+    fn drop(&mut self) {
+        if let Some((stats, progress)) = self.0
+            && progress.open_deadline_passed()
+        {
+            stats.record_send_event(QuicSendEvent::StreamLimitFull);
+        }
     }
 }
 
@@ -1620,6 +1996,7 @@ async fn supervise_receive<T: TimeSource>(
     // report: it ends with this task ([`recycle::PathReport`]).
     let recycle::AckWatchParts {
         cap_holds,
+        rtt,
         heard,
         mut report,
     } = watch;
@@ -1629,6 +2006,7 @@ async fn supervise_receive<T: TimeSource>(
         time,
         cap_holds,
         heard,
+        rtt,
         &mut report,
     ))
     .catch_unwind();
@@ -1686,6 +2064,16 @@ struct Outgoing {
     wrote_a_piece: bool,
     /// The send's pacing, for a paced data send ([`Self::write_paced`]).
     pacing: Option<pacer::Pacing>,
+    /// The send-window epoch the stream was opened in (`budget::ConnMeter`),
+    /// held until its data is acknowledged, so a send window lowered since
+    /// stays charged while quinn may still hold the stream's data.
+    epoch: Option<Arc<()>>,
+    /// The path's budget meter, woken by each write so a path that only sends
+    /// still has its send window evaluated (`budget::ConnMeter::note_send`).
+    meter: Option<Arc<super::budget::ConnMeter>>,
+    /// The path's count of cancelled sends waiting for their acknowledgement
+    /// without a permit ([`AckWaits`]).
+    ack_waits: Option<Arc<AckWaits>>,
 }
 
 type StoppedResult = Result<Option<quinn::VarInt>, quinn::StoppedError>;
@@ -1697,6 +2085,7 @@ impl Outgoing {
         slot: Option<tokio::sync::OwnedSemaphorePermit>,
         pacing: Option<pacer::Pacing>,
         progress: SendProgress,
+        epoch: Option<Arc<()>>,
     ) -> Self {
         let stopped = Box::pin(send.stopped());
         Self {
@@ -1709,6 +2098,9 @@ impl Outgoing {
             awaiting_ack: false,
             wrote_a_piece: false,
             pacing,
+            epoch,
+            meter: None,
+            ack_waits: None,
         }
     }
 
@@ -1791,7 +2183,7 @@ impl Outgoing {
             written = send.write_all(buf) => written,
             result = stopped => return Err(self.stopped_early(result)),
         };
-        self.written(written)
+        self.written(written, buf.len())
     }
 
     /// Write `chunk` in pieces of at most `FRAGMENT_PAYLOAD_SIZE`, telling
@@ -1818,24 +2210,32 @@ impl Outgoing {
     }
 
     async fn write_chunk(&mut self, chunk: Bytes) -> Result<(), QuicSendError> {
+        let len = chunk.len();
         let Self { send, stopped, .. } = self;
         let written = tokio::select! {
             written = send.write_chunk(chunk) => written,
             result = stopped => return Err(self.stopped_early(result)),
         };
-        self.written(written)
+        self.written(written, len)
     }
 
-    /// The outcome of a write. A stop the peer sent is handled as in
+    /// The outcome of a write of `len` bytes. A stop the peer sent is handled as in
     /// [`Self::stopped_early`]: on STOP_SENDING both the write and the
     /// `stopped` future become ready, and `select!` may pick the write.
     /// Returned through `?` instead, the stream would be left open and
     /// `Drop` would reset it as an abort of this side's own
     /// ([`SendAborts`]), which it is not.
-    fn written(&mut self, written: Result<(), quinn::WriteError>) -> Result<(), QuicSendError> {
+    fn written(
+        &mut self,
+        written: Result<(), quinn::WriteError>,
+        len: usize,
+    ) -> Result<(), QuicSendError> {
         match written {
             Ok(()) => {
                 self.progress.step();
+                if let Some(meter) = &self.meter {
+                    meter.note_send(len as u64);
+                }
                 Ok(())
             }
             Err(quinn::WriteError::Stopped(code)) => Err(self.stopped_early(Ok(Some(code)))),
@@ -1881,6 +2281,18 @@ impl Outgoing {
         }
     }
 
+    /// Reset a stream whose end was already sent, so quinn discards what the
+    /// peer has not acknowledged (quinn-proto 0.11.19 `SendState::reset` from
+    /// `DataSent`). Counted as an abort ([`SendAborts`]): `stopped()` was
+    /// polled while the stream waited for its acknowledgement, so the reset
+    /// leaves an entry in quinn's `stopped` map, which is what the abort limit
+    /// bounds. A stream already acknowledged in full is not reset.
+    fn reset_finished(&mut self) {
+        if self.send.reset(reset_code::SENDER_ABORTED.into()).is_ok() {
+            self.aborts.record();
+        }
+    }
+
     /// End the stream and wait until the peer has acknowledged every byte or
     /// stopped it.
     async fn finish(mut self) -> Result<(), QuicSendError> {
@@ -1908,26 +2320,116 @@ impl Drop for Outgoing {
     /// that simply ended early.
     ///
     /// A stream dropped while it waits for its acknowledgement goes on to the
-    /// end, so its permit waits with it, in a small task. There are at most
-    /// [`STREAMED_SEND_LIMIT`] per path, and each ends with the connection.
+    /// end, so its permit and its send epoch wait with it, in a small task
+    /// that ends with the stream's acknowledgement or with the connection.
+    /// A send holding a permit is one of at most [`STREAMED_SEND_LIMIT`]. One
+    /// without a permit (a one-packet Short) holds only its epoch, and a peer
+    /// that acknowledges other traffic while withholding some acknowledgements
+    /// could keep any number of those waiting, so at most
+    /// [`ACK_WAITS_WITHOUT_PERMIT`] wait per path; past that the epoch is
+    /// released at once and counted ([`QuicSendEvent::AckWaitReleased`]), and
+    /// the stream is reset, which makes quinn discard its unacknowledged data
+    /// ([`Self::reset_finished`]): releasing the epoch alone would let a send
+    /// window lowered since the stream opened leave the charge while quinn
+    /// still held the packet. The Short may then not arrive; it reported
+    /// `MaybeDelivered` already, so its sender does not count on it.
     fn drop(&mut self) {
         self.reset(reset_code::SENDER_ABORTED);
         if !self.awaiting_ack {
             return;
         }
-        let Some(slot) = self.slot.take() else {
+        let (slot, epoch) = (self.slot.take(), self.epoch.take());
+        if slot.is_none() && epoch.is_none() {
             return;
-        };
-        // With no runtime the node is stopping, and the permit has no users.
+        }
+        // With no runtime the node is stopping, and neither has users.
         if tokio::runtime::Handle::try_current().is_err() {
             return;
         }
+        let waiting = if slot.is_none() {
+            match self.ack_waits.as_ref().map(AckWaits::enter) {
+                Some(Some(waiting)) => Some(waiting),
+                // Past the bound: the epoch goes now, and so does the
+                // stream's data, so the release matches the memory freed.
+                Some(None) => {
+                    self.reset_finished();
+                    return;
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
         let stopped = std::mem::replace(&mut self.stopped, Box::pin(std::future::pending()));
-        // Bounded as above and ending with the connection, so the handle is
-        // not monitored.
+        // Bounded as above, and ending with the acknowledgement or the
+        // connection, so the handle is not monitored.
         drop(GlobalExecutor::spawn(async move {
             let _ended = stopped.await;
             drop(slot);
+            drop(epoch);
+            drop(waiting);
         }));
+    }
+}
+
+/// The most cancelled sends without a permit that wait for their
+/// acknowledgement on one path, each holding its send epoch in a task
+/// ([`Outgoing`]'s drop).
+pub(crate) const ACK_WAITS_WITHOUT_PERMIT: usize = super::config::MAX_UNI_STREAMS as usize;
+
+/// A path's count of cancelled sends without a permit waiting for their
+/// acknowledgement.
+pub(crate) struct AckWaits {
+    waiting: std::sync::atomic::AtomicUsize,
+    /// [`ACK_WAITS_WITHOUT_PERMIT`], lower in a test.
+    limit: std::sync::atomic::AtomicUsize,
+    stats: Arc<QuicPathStats>,
+}
+
+/// One cancelled send waiting for its acknowledgement; dropping it frees its
+/// place.
+pub(crate) struct AckWait(Arc<AckWaits>);
+
+impl AckWaits {
+    fn new(stats: Arc<QuicPathStats>) -> Self {
+        Self {
+            waiting: std::sync::atomic::AtomicUsize::new(0),
+            limit: std::sync::atomic::AtomicUsize::new(ACK_WAITS_WITHOUT_PERMIT),
+            stats,
+        }
+    }
+
+    /// A place to wait, or `None` (counted) when [`ACK_WAITS_WITHOUT_PERMIT`]
+    /// already wait.
+    fn enter(this: &Arc<Self>) -> Option<AckWait> {
+        let limit = this.limit.load(Ordering::Relaxed);
+        let entered = this
+            .waiting
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |waiting| {
+                (waiting < limit).then_some(waiting + 1)
+            })
+            .is_ok();
+        if entered {
+            Some(AckWait(this.clone()))
+        } else {
+            this.stats.record_send_event(QuicSendEvent::AckWaitReleased);
+            None
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn waiting(&self) -> usize {
+        self.waiting.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_limit(&self, limit: usize) {
+        self.limit.store(limit, Ordering::Relaxed);
+    }
+}
+
+impl Drop for AckWait {
+    fn drop(&mut self) {
+        self.0.waiting.fetch_sub(1, Ordering::AcqRel);
     }
 }

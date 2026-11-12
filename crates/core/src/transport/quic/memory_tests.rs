@@ -7,17 +7,22 @@
 //! measurement runs both endpoints, quinn's drivers and the paths' receive
 //! tasks on the test's current-thread runtime, over `SimulationSocket` on
 //! one `VirtualTime`, with `GlobalRng` seeded, so a run is repeatable. The
-//! stream measurements drive quinn-proto directly, with no runtime at all.
+//! received-data measurements (unordered reads, ACK tail) drive quinn-proto
+//! directly, with no runtime at all. The open-stream and `stopped`-entry
+//! measurements (`StreamRig`) run real endpoints the same way as the
+//! idle-connection one, on the current-thread runtime, and take the
+//! `stopped`-entry figure as the difference of two runs, so the simulated
+//! clock's retained timer-queue capacity cancels out.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::config::{
-    QUIC_ACK_TAIL_BYTES, QUIC_ASSEMBLER_HOLD_PER_STREAM_BYTES, QUIC_ASSEMBLER_HOLD_WINDOW_MULTIPLE,
-    QUIC_CONNECTION_FIXED_BYTES, QUIC_MEMORY_MEASURED_WITH, QuicSettings,
+    QUIC_ACK_TAIL_BYTES, QUIC_CONNECTION_FIXED_BYTES, QUIC_MEMORY_MEASURED_WITH,
+    QUIC_OPEN_STREAM_BYTES, QUIC_STOPPED_ENTRY_BYTES, QuicSettings,
 };
-use super::path::{QuicInbound, QuicPath};
+use super::path::{QuicInbound, QuicPath, QuicPathLimits};
 use super::tests::{SEED, bounded, drive};
 use super::{QuicConnection, QuicEndpoint};
 use crate::config::GlobalRng;
@@ -45,13 +50,17 @@ const SETTLE: Duration = Duration::from_secs(30);
 /// still running, and the baseline would not be one.
 const SETTLE_DRIFT_BYTES: isize = 1024;
 
-/// The settings of a node with 2 GiB of memory (the shipped `MemoryMax`) and
-/// the default 200 connections: a window of 268,435 bytes.
+/// The settings of a node with 2 GiB of memory (the shipped `MemoryMax`), at
+/// a window of 268,435 bytes: the window such a node had at 200 connections
+/// before windows were set per path from the buffer budget, which the
+/// measurements' figures were taken at. A data path's window now moves from
+/// the floor (128 KiB) to `budget::MAX_WINDOW_BYTES`; the window-scaled pins
+/// are checked across that range below.
 fn settings() -> QuicSettings {
     QuicSettings {
-        max_connections: 200,
         memory_limit: 2 * 1024 * 1024 * 1024,
         idle_timeout: None,
+        initial_window: Some(268_435),
         rate_limit: Default::default(),
     }
 }
@@ -116,10 +125,10 @@ async fn settle(time: &VirtualTime) {
 ///   acknowledged are not here.
 /// - socket buffers. `SimulationSocket` has none; a real UDP socket's
 ///   kernel buffers are per endpoint, not per connection.
-async fn measure(network: &str, subnet: u8, n: usize) -> Cost {
+async fn measure(network: &str, n: usize) -> Cost {
     let _seed = GlobalRng::seed_guard(SEED);
-    let a_addr: SocketAddr = format!("10.204.{subnet}.1:5000").parse().unwrap();
-    let b_addr: SocketAddr = format!("10.204.{subnet}.2:5000").parse().unwrap();
+    let net = crate::transport::test_net::subnet();
+    let (a_addr, b_addr) = (net.addr(1), net.addr(2));
     let time = VirtualTime::new();
     register_network_time_source(network, time.clone());
     register_address_network(a_addr, network);
@@ -226,7 +235,7 @@ async fn measure(network: &str, subnet: u8, n: usize) -> Cost {
 #[test]
 fn an_idle_connection_measures_within_the_fixed_pin() {
     bounded(|| async move {
-        let cost = measure("quic-memory-fixed", 1, 16).await;
+        let cost = measure("quic-memory-fixed", 16).await;
         assert!(
             cost.settle_drift.rounded.abs() <= SETTLE_DRIFT_BYTES,
             "premise: nothing was running before the baseline: {cost:?}"
@@ -241,6 +250,218 @@ fn an_idle_connection_measures_within_the_fixed_pin() {
              ({QUIC_CONNECTION_FIXED_BYTES} B); re-measure and raise it with the margin \
              its doc states",
             cost.per_connection()
+        );
+    })
+}
+
+/// One connection with a node's path on each side, for the stream
+/// measurements, on its own network and clock.
+struct StreamRig {
+    time: VirtualTime,
+    network: String,
+    /// The client's quinn connection, to write streams by hand.
+    raw: quinn::Connection,
+    _held: [Held; 2],
+    _permit: super::QuicPeerPermit,
+    pumps: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl StreamRig {
+    async fn new(network: &str) -> Self {
+        let net = crate::transport::test_net::subnet();
+        let (a_addr, b_addr) = (net.addr(1), net.addr(2));
+        let time = VirtualTime::new();
+        register_network_time_source(network, time.clone());
+        register_address_network(a_addr, network);
+        register_address_network(b_addr, network);
+        let bind = |addr| async move {
+            Arc::new(DemuxSocket::wrap(
+                SimulationSocket::bind(addr).await.expect("sim bind"),
+                None,
+            ))
+        };
+        let (a_socket, b_socket) = (bind(a_addr).await, bind(b_addr).await);
+        let (a_keys, b_keys) = (TransportKeypair::new(), TransportKeypair::new());
+        let a = QuicEndpoint::bind(a_socket.clone(), a_addr, time.clone(), &settings(), &a_keys)
+            .expect("endpoint a");
+        let b = QuicEndpoint::bind(b_socket.clone(), b_addr, time.clone(), &settings(), &b_keys)
+            .expect("endpoint b");
+        let pumps = [a_socket, b_socket]
+            .into_iter()
+            .map(|socket| {
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; MAX_RECV_PACKET_SIZE];
+                    while socket.recv_classified(&mut buf).await.is_ok() {}
+                })
+            })
+            .collect();
+        let permit = b
+            .allow_peer(a_addr, a_keys.public())
+            .expect("allow-set has room");
+        let b_key = b_keys.public().clone();
+        let (client, server) = drive(&time, LIMIT, async move {
+            let (client, server) = tokio::join!(a.connect(b_addr, &b_key), async {
+                b.accept()
+                    .await
+                    .expect("an incoming attempt")
+                    .establish()
+                    .await
+            });
+            (
+                client.expect("client handshake"),
+                server.expect("server accepted"),
+            )
+        })
+        .await;
+        let raw = client.inner().clone();
+        let hold = |conn: QuicConnection, time: &VirtualTime| {
+            let (path, inbound) =
+                QuicPath::with_limits(conn, time.clone(), QuicPathLimits::FULL_STREAMS);
+            Held {
+                _path: path,
+                _inbound: inbound,
+            }
+        };
+        let held = [hold(client, &time), hold(server, &time)];
+        Self {
+            time,
+            network: network.to_string(),
+            raw,
+            _held: held,
+            _permit: permit,
+            pumps,
+        }
+    }
+}
+
+impl Drop for StreamRig {
+    fn drop(&mut self) {
+        for pump in &self.pumps {
+            pump.abort();
+        }
+        unregister_network_time_source(&self.network);
+    }
+}
+
+/// What `streams` open uni streams cost on one connection, both sides
+/// together: quinn's per-stream state on the sender and the receiver, and
+/// the receiver's reader for each (`path::inbound`), with one byte written
+/// on each and the stream left open. A warm-up stream first, a settled
+/// baseline, then the streams, settled, against it.
+async fn measure_open_streams(network: &str, streams: usize) -> Live {
+    let _seed = GlobalRng::seed_guard(SEED);
+    let rig = StreamRig::new(network).await;
+    let (time, raw) = (rig.time.clone(), rig.raw.clone());
+    let warm = raw.clone();
+    drive(&time, LIMIT, async move {
+        let mut send = warm.open_uni().await.expect("open");
+        send.write_all(&[1]).await.expect("write");
+        send.finish().expect("finish");
+    })
+    .await;
+    settle(&time).await;
+    let baseline = live_bytes();
+    let opened = drive(&time, LIMIT, async move {
+        let mut held = Vec::with_capacity(streams);
+        for _ in 0..streams {
+            let mut send = raw.open_uni().await.expect("open");
+            send.write_all(&[1]).await.expect("write");
+            held.push(send);
+        }
+        held
+    })
+    .await;
+    settle(&time).await;
+    let cost = live_bytes() - baseline;
+    drop(opened);
+    cost
+}
+
+/// What `streams` streams leave behind on one connection, both sides together,
+/// once each was opened, had `stopped()` polled if `poll_stopped` (as every
+/// send of a path's does, `Outgoing`), and was reset by the sender, settled.
+///
+/// The total also holds a harness artifact of about 100 B per stream: each
+/// inbound stream's reader arms a timer, `VirtualSleep` has no drop
+/// deregistration, so `VirtualTime`'s wakeup queues reach about `streams`
+/// entries, and a `Vec`/`BinaryHeap` keeps its peak capacity once they fire.
+/// Production timers deregister on drop. Compare two runs to cancel it.
+async fn measure_reset_streams(network: &str, streams: usize, poll_stopped: bool) -> Live {
+    use futures::FutureExt;
+    let _seed = GlobalRng::seed_guard(SEED);
+    let rig = StreamRig::new(network).await;
+    let (time, raw) = (rig.time.clone(), rig.raw.clone());
+    let reset_one = move |raw: quinn::Connection| async move {
+        let mut send = raw.open_uni().await.expect("open");
+        send.write_all(&[1]).await.expect("write");
+        if poll_stopped {
+            // Registers the stream in quinn's `stopped` map.
+            assert!(send.stopped().now_or_never().is_none());
+        }
+        send.reset(0u32.into()).expect("reset");
+    };
+    let warm = raw.clone();
+    drive(&time, LIMIT, reset_one(warm)).await;
+    settle(&time).await;
+    let baseline = live_bytes();
+    drive(&time, LIMIT, async move {
+        for _ in 0..streams {
+            reset_one(raw.clone()).await;
+        }
+    })
+    .await;
+    settle(&time).await;
+    live_bytes() - baseline
+}
+
+/// Polling `stopped()` on a stream this side then resets costs at most
+/// [`QUIC_STOPPED_ENTRY_BYTES`] per stream until the connection closes, in
+/// jemalloc-rounded bytes: quinn's `stopped` map entry. Measured as the
+/// difference between 1,024 resets with the poll and 1,024 without it, on
+/// connections of their own, so everything else a reset stream leaves (and the
+/// harness's timer queues, see [`measure_reset_streams`]) cancels out.
+#[test]
+fn polling_stopped_on_a_reset_stream_costs_at_most_its_entry() {
+    bounded(|| async move {
+        let streams = 1024;
+        let polled = measure_reset_streams("quic-memory-stopped", streams, true).await;
+        let plain = measure_reset_streams("quic-memory-unpolled", streams, false).await;
+        let entries = polled.rounded - plain.rounded;
+        assert!(
+            entries > 0,
+            "premise: the polls left memory: {polled:?} against {plain:?}"
+        );
+        let per_stream = (entries as usize).div_ceil(streams);
+        assert!(
+            per_stream <= QUIC_STOPPED_ENTRY_BYTES,
+            "{per_stream} B per stopped() entry ({polled:?} against {plain:?}) exceeds \
+             QUIC_STOPPED_ENTRY_BYTES ({QUIC_STOPPED_ENTRY_BYTES} B); re-measure and raise it \
+             with the margin its doc states"
+        );
+    })
+}
+
+/// An open uni stream with one byte on it, held by a node's path on both
+/// sides, measures within [`QUIC_OPEN_STREAM_BYTES`], both sides together, in
+/// jemalloc-rounded bytes. Measured with `STREAMED_SEND_LIMIT` streams on one
+/// connection.
+#[test]
+fn an_open_stream_measures_within_its_pin() {
+    bounded(|| async move {
+        // Not the whole stream limit: the warm-up stream's slot comes back only
+        // once more than an eighth of the limit is freed.
+        let streams = super::config::STREAMED_SEND_LIMIT as usize;
+        let cost = measure_open_streams("quic-memory-streams", streams).await;
+        assert!(
+            cost.rounded > 0,
+            "premise: the streams held memory: {cost:?}"
+        );
+        let per_stream = (cost.rounded as usize).div_ceil(streams);
+        assert!(
+            per_stream <= QUIC_OPEN_STREAM_BYTES,
+            "{per_stream} B per open stream ({cost:?}) exceeds QUIC_OPEN_STREAM_BYTES \
+             ({QUIC_OPEN_STREAM_BYTES} B); re-measure and raise it with the margin its doc \
+             states"
         );
     })
 }
@@ -366,22 +587,17 @@ impl Shape {
 /// What the receiver held while a peer fed it [`Shape`]s.
 #[derive(Debug, Clone)]
 struct GapHold {
-    /// The receiver's packet processing, net, after the last frame: stream
-    /// state and the data its assembler holds.
-    held: Live,
-    /// The largest rounded [`Self::held`] after any frame.
+    /// The largest rounded hold (stream state and the data quinn holds,
+    /// net) after any frame.
     peak: isize,
     /// The largest rounded hold at any instant, inside a receive call
-    /// included: compaction allocates the copy while the chunks it copies
-    /// are still alive.
+    /// included.
     transient: isize,
     /// The receiver's sending, net: the acknowledgement-only packets it
     /// tracks after its last ack-eliciting send (none is acknowledged here).
     acks_tracked: Live,
     /// Packets the receiver sent while being fed.
     receiver_sent: u64,
-    /// Rounded [`Self::held`] after each frame of the first stream.
-    first_stream_curve: Vec<isize>,
 }
 
 /// A receiver built with the node's own endpoint, transport, server and TLS
@@ -472,15 +688,21 @@ fn connected_pair_with_factory(
     let b_peer = super::identity::PeerKey::of(b_keys.public()).expect("b's key");
     let real = RealTime::new();
 
-    let receiver_transport = Arc::new(super::config::transport_config(settings, &real));
+    let mut receiver_transport = super::config::transport_config(settings, &real);
+    // The receiver is a data path, which raises the endpoint's initial stream
+    // limit (`QuicPath::with_budget`).
+    receiver_transport
+        .max_concurrent_uni_streams(quinn::VarInt::from_u32(super::config::MAX_UNI_STREAMS));
+    let receiver_transport = Arc::new(receiver_transport);
     let server = super::config::server_config(
         Arc::new(b_identity.server_tls(&a_peer).expect("server tls")),
         receiver_transport,
         super::config::system_clock(real.clone()),
     )
     .expect("server config");
+    let net = crate::transport::test_net::subnet();
     let mut receiver = ProtoPeer {
-        addr: "10.205.0.2:5000".parse().unwrap(),
+        addr: net.addr(2),
         endpoint: quinn_proto::Endpoint::new(
             Arc::new(super::config::endpoint_config().expect("endpoint config")),
             Some(Arc::new(server)),
@@ -499,7 +721,7 @@ fn connected_pair_with_factory(
         Arc::new(sender_transport),
     );
     let mut sender = ProtoPeer {
-        addr: "10.205.0.1:5000".parse().unwrap(),
+        addr: net.addr(1),
         endpoint: quinn_proto::Endpoint::new(
             Arc::new(super::config::endpoint_config().expect("endpoint config")),
             None,
@@ -561,8 +783,19 @@ fn measure_gap_hold(shapes: &[Shape]) -> GapHold {
     measure_gap_hold_at(&settings(), shapes)
 }
 
-/// [`measure_gap_hold`] with the window `settings` give.
+/// [`measure_gap_hold_at`] with nothing read, as a stream in its ordered
+/// phase (header, metadata, short or control body) is while its first bytes
+/// are missing.
 fn measure_gap_hold_at(settings: &QuicSettings, shapes: &[Shape]) -> GapHold {
+    measure_gap_hold_reading(settings, shapes, false)
+}
+
+/// [`measure_gap_hold`] with the window `settings` give. With `unordered`, the
+/// receiver reads every stream unordered after each datagram, as the path's
+/// reader does in a Stream's payload phase, and drops what it read: what is
+/// measured is then quinn's own hold, without the charged buffer the reader
+/// copies into.
+fn measure_gap_hold_reading(settings: &QuicSettings, shapes: &[Shape], unordered: bool) -> GapHold {
     use quinn_proto::Dir;
 
     let _seed = GlobalRng::seed_guard(SEED);
@@ -588,8 +821,8 @@ fn measure_gap_hold_at(settings: &QuicSettings, shapes: &[Shape]) -> GapHold {
     let mut acks_tracked = Live::default();
     let mut peak = 0isize;
     let mut transient = 0isize;
-    let mut first_stream_curve = Vec::new();
-    for (index, shape) in shapes.iter().enumerate() {
+    let mut accepted = Vec::new();
+    for shape in shapes {
         let id = sender
             .conn()
             .streams()
@@ -607,16 +840,30 @@ fn measure_gap_hold_at(settings: &QuicSettings, shapes: &[Shape]) -> GapHold {
                 usize::from(super::config::MAX_UDP_PAYLOAD),
                 "padded to the MTU"
             );
-            let (_, delta, inside) = peak_delta(|| receiver.receive(now, sender.addr, &datagram));
+            let (_, delta, inside) = peak_delta(|| {
+                receiver.receive(now, sender.addr, &datagram);
+                if unordered {
+                    while let Some(stream) = receiver.conn().streams().accept(Dir::Uni) {
+                        accepted.push(stream);
+                    }
+                    for stream in &accepted {
+                        let mut recv = receiver.conn().recv_stream(*stream);
+                        if let Ok(mut chunks) = recv.read(false) {
+                            while let Ok(Some(chunk)) = chunks.next(usize::MAX) {
+                                drop(chunk);
+                            }
+                            // The receiver transmits after each datagram anyway.
+                            let _should_transmit: quinn_proto::ShouldTransmit = chunks.finalize();
+                        }
+                    }
+                }
+            });
             transient = transient.max(held.rounded + inside);
             // The receiver's acknowledgements are dropped.
             let (_, acks) = live_delta(|| drop(receiver.transmit(now)));
             held += delta;
             acks_tracked += acks;
             peak = peak.max(held.rounded);
-            if index == 0 {
-                first_stream_curve.push(held.rounded);
-            }
         }
     }
     assert!(
@@ -629,159 +876,10 @@ fn measure_gap_hold_at(settings: &QuicSettings, shapes: &[Shape]) -> GapHold {
         "the sender declared nothing lost"
     );
     GapHold {
-        held,
         peak,
         transient,
         acks_tracked,
         receiver_sent: receiver.conn().stats().path.sent_packets - sent_before,
-        first_stream_curve,
-    }
-}
-
-/// The node's flow-control window at 2 GiB.
-fn window() -> usize {
-    settings().window_bytes() as usize
-}
-
-/// What the assembler pins allow for `streams` uni streams at window `w`:
-/// `streams x QUIC_ASSEMBLER_HOLD_PER_STREAM_BYTES` plus
-/// `QUIC_ASSEMBLER_HOLD_WINDOW_MULTIPLE x w`.
-fn assembler_pin(streams: usize, w: usize) -> isize {
-    (streams * QUIC_ASSEMBLER_HOLD_PER_STREAM_BYTES + QUIC_ASSEMBLER_HOLD_WINDOW_MULTIPLE * w)
-        as isize
-}
-
-/// With one-byte frames above a gap, each in a padded datagram, a stream
-/// held about one datagram per frame until the assembler's waste estimate
-/// passed 32 KiB and it compacted: one stream's peak is within
-/// [`QUIC_ASSEMBLER_HOLD_PER_STREAM_BYTES`], and [`MAX_UNI_STREAMS`] such
-/// streams, which use almost none of the window, are within that many
-/// times the pin.
-///
-/// [`MAX_UNI_STREAMS`]: super::config::MAX_UNI_STREAMS
-#[test]
-fn one_byte_frames_measure_within_the_per_stream_pin() {
-    let single = measure_gap_hold(&[Shape::one_byte(64)]);
-    let curve = &single.first_stream_curve;
-    let peak = *curve.iter().max().expect("frames");
-    let at = curve.iter().position(|held| *held == peak).expect("peak");
-    assert!(
-        peak <= QUIC_ASSEMBLER_HOLD_PER_STREAM_BYTES as isize,
-        "one stream peaked at {peak} B: {single:?}"
-    );
-    let after = *curve
-        .get(at + 1)
-        .unwrap_or_else(|| panic!("premise: the stream compacted within the frames: {curve:?}"));
-    assert!(
-        peak >= 32 * 1024 && after < 8 * 1024,
-        "premise: datagrams were held until compaction, then copied out: {curve:?}"
-    );
-
-    let streams = super::config::MAX_UNI_STREAMS as usize;
-    let many = measure_gap_hold(&vec![Shape::one_byte(at + 1); streams]);
-    let pinned = (streams * QUIC_ASSEMBLER_HOLD_PER_STREAM_BYTES) as isize;
-    assert!(
-        many.transient <= pinned,
-        "{streams} streams of {} one-byte frames held {} B, over the pinned {pinned} B: \
-         {many:?}",
-        at + 1,
-        many.transient
-    );
-    assert!(
-        many.held.rounded >= streams as isize * 32 * 1024,
-        "premise: every stream held its datagrams: {many:?}"
-    );
-}
-
-/// With frames long enough that the proportional compaction threshold
-/// governs, a stream held a datagram per frame up to the window, and
-/// compaction copied while the old chunks were alive. The hold at any
-/// instant is within [`assembler_pin`] for the shapes the manual sweep in
-/// the constants' docs found worst and the ways to combine them: one stream
-/// filling the window at 444 B (highest at any instant at 2 GiB, 4.115 W),
-/// at 470 B (highest between packets, 3.05 W), both also at the smallest
-/// and largest windows, and at 50 B (thousands of short frames, compacted
-/// again and again); 64 streams sharing the window; and
-/// `MAX_UNI_STREAMS - 1` one-byte streams beside one that fills the rest.
-/// All datagrams are padded to 1200 B; other sizes are not measured.
-#[test]
-fn frames_filling_the_window_measure_within_the_window_multiple() {
-    let w = window();
-    let one_byte_streams = super::config::MAX_UNI_STREAMS as usize - 1;
-    let mut mixed = vec![Shape::one_byte(28); one_byte_streams];
-    let used: usize = mixed.iter().map(Shape::credit).sum();
-    mixed.push(Shape::filling(444, w - used));
-    let cases: Vec<(&str, Vec<Shape>)> = vec![
-        ("444 B frames", vec![Shape::filling(444, w)]),
-        ("470 B frames", vec![Shape::filling(470, w)]),
-        ("50 B frames", vec![Shape::filling(50, w)]),
-        (
-            "64 streams of 460 B frames",
-            vec![Shape::filling(460, w / 64); 64],
-        ),
-        ("one-byte streams and one of 444 B frames", mixed),
-    ];
-    for (name, shapes) in cases {
-        let hold = measure_gap_hold(&shapes);
-        let pinned = assembler_pin(shapes.len(), w);
-        assert!(
-            hold.transient <= pinned,
-            "{name}: held {} B at its highest, over the pinned {pinned} B: {hold:?}",
-            hold.transient
-        );
-        if name == "470 B frames" {
-            assert!(
-                hold.peak as f64 >= 2.8 * w as f64,
-                "premise: no compaction, a datagram held per frame: {} B",
-                hold.peak
-            );
-        }
-        if name == "444 B frames" {
-            assert!(
-                hold.transient as f64 >= 3.5 * w as f64,
-                "premise: the copy overlapped the old chunks, over 3.5 x W: {} B",
-                hold.transient
-            );
-        }
-        if name.starts_with("one-byte") {
-            assert!(
-                hold.held.rounded >= one_byte_streams as isize * 32 * 1024,
-                "premise: the one-byte streams held their datagrams: {hold:?}"
-            );
-        }
-    }
-
-    // The same two lengths at the smallest window (MIN_WINDOW_BYTES, a
-    // 512 MiB node) and the largest (MAX_WINDOW_BYTES, a 64 GiB node). At
-    // the largest, these lengths make over 2048 chunks, so the chunk-count
-    // trigger compacts them; the premise is only that the stream held more
-    // than the window.
-    for (memory_limit, expected) in [
-        (512usize << 20, super::config::MIN_WINDOW_BYTES),
-        (64usize << 30, super::config::MAX_WINDOW_BYTES),
-    ] {
-        let settings = QuicSettings {
-            max_connections: 200,
-            memory_limit,
-            idle_timeout: None,
-            rate_limit: Default::default(),
-        };
-        let w = settings.window_bytes() as usize;
-        assert_eq!(w, expected as usize, "premise: the window at its extreme");
-        for len in [444, 470] {
-            let hold = measure_gap_hold_at(&settings, &[Shape::filling(len, w)]);
-            assert!(
-                hold.transient <= assembler_pin(1, w),
-                "{len} B frames at W = {w}: held {} B at its highest, over the pinned {} B",
-                hold.transient,
-                assembler_pin(1, w)
-            );
-            assert!(
-                hold.peak as f64 >= 1.5 * w as f64,
-                "premise: the stream held more than the window at W = {w}: {} B",
-                hold.peak
-            );
-        }
     }
 }
 
@@ -822,21 +920,69 @@ fn the_ack_tail_measures_within_its_pin() {
 /// in the constants' docs, and moves the pin.
 #[test]
 fn quic_memory_figures_match_the_locked_versions() {
-    let lock = include_str!("../../../../../Cargo.lock").replace("\r\n", "\n");
     for (name, measured) in QUIC_MEMORY_MEASURED_WITH {
-        let header = format!("[[package]]\nname = \"{name}\"\nversion = \"");
-        let locked: Vec<&str> = lock
-            .match_indices(&header)
-            .map(|(at, _)| {
-                let rest = &lock[at + header.len()..];
-                &rest[..rest.find('"').expect("closing quote")]
-            })
-            .collect();
+        let locked = super::tests::locked_versions(name);
         assert_eq!(
             locked,
             [measured],
             "Cargo.lock locks {name} at {locked:?}, the QUIC memory figures were measured \
              with {measured}: re-measure (quic::memory_tests) before moving the pin"
         );
+    }
+}
+
+/// The fixed charge per connection is the sum the buffer-budget design gives
+/// (888 KiB, the `stopped` map at the reset limit's worst case), and the budget
+/// for what scales with the windows is a sixteenth of node memory. A change to
+/// any term moves the first figure, so the design's connection caps are
+/// re-derived with it.
+#[test]
+fn the_fixed_charge_and_the_buffer_budget_match_the_design() {
+    use super::config::{QUIC_CONNECTION_CHARGE_BYTES, quic_buffer_budget_for};
+    assert_eq!(
+        super::recycle::SEND_ABORT_LIMIT as usize * QUIC_STOPPED_ENTRY_BYTES,
+        416 * 1024
+    );
+    assert_eq!(QUIC_CONNECTION_CHARGE_BYTES, 909_312);
+    const MIB: usize = 1024 * 1024;
+    assert_eq!(quic_buffer_budget_for(1024 * MIB), 64 * MIB);
+    assert_eq!(quic_buffer_budget_for(2048 * MIB), 128 * MIB);
+    assert_eq!(quic_buffer_budget_for(7600 * MIB), 475 * MIB);
+}
+
+/// Every stream is read unordered from its first byte (`path::inbound`), so
+/// quinn hands over every chunk as it arrives, gap or not: with the stream's
+/// first byte withheld and the reader reading after each datagram, quinn
+/// holds at most the window's worth, within the `W + debt` the buffer budget
+/// charges a data path for
+/// received data that is not read yet (`budget::receive_charge`). Measured at
+/// the floor window and at the largest a path grows to.
+#[test]
+fn an_unordered_reader_leaves_quinn_within_the_window_charge() {
+    for window in [
+        super::budget::MIN_WINDOW_BYTES,
+        super::budget::MAX_WINDOW_BYTES,
+    ] {
+        let settings = QuicSettings {
+            memory_limit: 2 * 1024 * 1024 * 1024,
+            idle_timeout: None,
+            initial_window: Some(window),
+            rate_limit: Default::default(),
+        };
+        let w = window as usize;
+        for len in [444, 470] {
+            let held = measure_gap_hold_reading(&settings, &[Shape::filling(len, w)], false);
+            assert!(
+                held.peak > w as isize,
+                "premise: unread, {len} B frames held more than W = {w}: {} B",
+                held.peak
+            );
+            let read = measure_gap_hold_reading(&settings, &[Shape::filling(len, w)], true);
+            assert!(
+                read.transient <= w as isize,
+                "read unordered, {len} B frames at W = {w}: quinn held {} B, over the window",
+                read.transient
+            );
+        }
     }
 }

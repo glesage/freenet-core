@@ -485,6 +485,25 @@ Current wire-gated floors:
   requires real upgrades once the crate reaches 0.2.154, so raising the floor also
   means moving `QUIC_FIRST_NEGOTIATING_RELEASE` beside it.
 
+- `QUIC_NATIVE_MIN_VERSION` in
+  `crates/core/src/node/network_bridge/p2p_protoc.rs` (the QUIC-native connect
+  offer and decision, the appended `ConnectMsg` wire variants `RequestNative`
+  and `ResponseNative` at indices 5 and 6 of
+  `operations/connect/wire.rs::ConnectMsgWire`, #5940).
+
+  Set to **`(0, 2, 157)`**, the release intended to first ship the decoder,
+  and guarded by `QUIC_NATIVE_SHIPPED_IN`, currently `None`, checked by
+  `p2p_protoc::quic_native_floor_tests::quic_native_floor_tracks_the_shipping_release`.
+  When the 0.2.157 bump fails that test, set the marker to the literal
+  `Some((0, 2, 157))` if the release carries the decoder, otherwise raise the
+  floor. Same failure mode as the application-message floors above: a peer at
+  or above the floor without the decoder closes the connection on the variant,
+  so bias high. Only `connect::wire::encode_for_peer`, at the one peer-bound
+  serialize in `handle_peer_channel_message`, emits the variants; every other
+  encode emits today's bytes.
+  `quic_native_floor_stays_above_every_release_without_the_decoder` catches the
+  floor being lowered.
+
 - `QUIC_DATA_PERCENT` in `crates/core/src/transport/quic/upgrade/policy.rs` (the
   share of pairs that carry data on QUIC, #5940). It stays at its value unless
   this release is a rollout step (0, 5, 25, 100), changed in its own PR. That PR also edits the expectations that pin 0:
@@ -837,10 +856,15 @@ variants a peer can receive.
 
 `release.yml` ships the committed value unchanged, so raising it is its own
 reviewed PR, never a side effect of a release. (`scripts/release.sh` still
-rewrites it; see #5833.) `build.rs` requires an `X.Y.Z` value with the same
-major.minor as the package and no higher than the package version. The
-handshake carries only the patch component. A minor or major version bump
-therefore has to reset the floor in the same PR, or the build fails.
+rewrites it; see #5833.) `build.rs` requires an `X.Y.Z` value no higher than
+the package version. A floor in the same major.minor series is carried as a
+patch number (wire format 1). A floor in a different series (for example a
+1.0.0 build keeping floor 0.2.N) uses wire format 2 and is accepted only if
+its major is at most one below the package's, its minor is below 64 and its
+patch is below 256; `build.rs` fails the build otherwise. Releases before the
+version-floor bridge (0.2.156 and earlier) cannot read format 2: they reject
+such a peer and take the update path, so a cross-series floor only becomes
+safe once the bridge release is on the fleet.
 
 Raise it only to cut off versions that cannot rejoin by themselves, such as
 0.2.120 and 0.2.121, which cannot detect updates (#5221). Set it to the first

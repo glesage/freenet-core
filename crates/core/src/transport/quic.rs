@@ -37,6 +37,7 @@
 //! [`TimeSource`]: crate::simulation::TimeSource
 
 pub(crate) mod breaker;
+pub(crate) mod budget;
 pub(crate) mod cid;
 pub(crate) mod config;
 pub(crate) mod control;
@@ -44,6 +45,9 @@ pub(crate) mod error;
 pub(crate) mod framing;
 pub(crate) mod identity;
 pub(crate) mod liveness;
+pub(crate) mod native;
+#[cfg(any(test, feature = "quic-panic-injection"))]
+pub(crate) mod panic_injection;
 pub(crate) mod path;
 pub(crate) mod recycle;
 pub(crate) mod runtime;
@@ -81,12 +85,13 @@ pub(crate) use liveness::QuicAvailabilityWatch;
 
 /// Whether the node may use QUIC: the `transport-quic` config key.
 ///
-/// An unset key is [`QuicMode::default_mode`]: shadow on Linux and macOS, and
-/// off elsewhere. Windows stays off until the crash-loop breaker has been
-/// confirmed on a real Windows machine (#6031), and other platforms because the
-/// breaker reads no boot identity there and so cannot trip. That breaker counts short runs instead of
-/// detecting crashes ([`breaker`]). The default is decided when the value is
-/// read and never written to `config.toml`, so a later release can change it
+/// An unset key is [`QuicMode::default_mode`]: shadow on Linux, macOS and
+/// Windows, and off elsewhere, because the breaker reads no boot identity
+/// there and so cannot trip. The Windows breaker counts short runs that
+/// panicked in QUIC code instead of detecting crashes ([`breaker`]); it was
+/// confirmed on a real Windows machine before Windows defaulted to shadow
+/// (#6031). The default is decided when the value is read and
+/// never written to `config.toml`, so a later release can change it
 /// for every node that did not set the key, which is how a default-off
 /// release turns QUIC off. A value given with `--transport-quic` or
 /// `FREENET_TRANSPORT_QUIC` is saved to `config.toml` like any other setting,
@@ -94,7 +99,7 @@ pub(crate) use liveness::QuicAvailabilityWatch;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuicMode {
     /// No QUIC endpoint is built and no QUIC datagram is read. The default on
-    /// platforms other than Linux and macOS.
+    /// platforms other than Linux, macOS and Windows.
     Off,
     /// The node builds a QUIC endpoint on its UDP port and upgrades a UDP
     /// session to a QUIC path that carries only control frames: all
@@ -105,7 +110,8 @@ pub enum QuicMode {
     /// endpoint driver and one upgrade task per connection run; a promoted
     /// connection's higher key sends `Upgrade` messages on its UDP session; and
     /// the endpoint's memory. If the endpoint cannot be built the node logs a
-    /// warning and runs with QUIC off. The default on Linux and macOS.
+    /// warning and runs with QUIC off. The default on Linux, macOS and
+    /// Windows.
     Shadow,
     /// Negotiates data on a path to a peer in the release's slice
     /// (`upgrade::slice`), and sends its data on a path where both sides did. At a
@@ -113,6 +119,19 @@ pub enum QuicMode {
     /// that sets it early starts carrying data over QUIC once it runs a release
     /// with a share above 0. That release's notes must say so.
     Prefer,
+}
+
+/// The endpoint state a bind leaves: `Up` when it built the endpoint, and
+/// otherwise why not. An aborting build is refused before anything is bound
+/// (`QuicEndpoint::bind_checked`), so a failure there is the abort, not the
+/// socket.
+fn bound_state(unwinds: bool, built: bool) -> crate::transport::metrics::QuicEndpointState {
+    use crate::transport::metrics::QuicEndpointState;
+    match (built, unwinds) {
+        (true, _) => QuicEndpointState::Up,
+        (false, true) => QuicEndpointState::OffBind,
+        (false, false) => QuicEndpointState::OffAbort,
+    }
 }
 
 impl Default for QuicMode {
@@ -129,11 +148,16 @@ impl QuicMode {
     /// See [`QuicMode::Prefer`].
     pub const PREFER: &'static str = "prefer";
 
-    /// What an unset `transport-quic` means on this platform: shadow on Linux
-    /// and macOS, and off elsewhere (Windows until #6031; other platforms
-    /// because the crash-loop breaker cannot trip there).
+    /// What an unset `transport-quic` means on this platform: shadow on Linux,
+    /// macOS and Windows, and off elsewhere, because the crash-loop breaker
+    /// cannot trip there. Windows joined once its breaker was confirmed on a
+    /// real Windows machine (#6031).
     pub const fn default_mode() -> Self {
-        if cfg!(any(target_os = "linux", target_os = "macos")) {
+        if cfg!(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "windows"
+        )) {
             Self::Shadow
         } else {
             Self::Off
@@ -221,6 +245,9 @@ pub(crate) struct EndpointCore {
     /// Empty hold records for the endpoint's cap; each connection gets a copy
     /// of its own (`socket::CapHolds`, `socket::with_poller_holds`).
     cap_holds: Arc<socket::CapHolds>,
+    /// The node's buffer budget, from which each data path's windows are set
+    /// (`budget`).
+    buffer_budget: Arc<budget::QuicBudget>,
     /// Test hooks that inject faults into quinn's drivers.
     #[cfg(any(test, feature = "testing"))]
     faults: Arc<socket::SocketFaults>,
@@ -425,6 +452,11 @@ fn require_unwinding(unwinds: bool) -> io::Result<()> {
 pub(crate) const UNWINDS: bool = cfg!(panic = "unwind");
 
 impl EndpointCore {
+    /// The node's buffer budget, which sets each data path's windows.
+    pub(crate) fn buffer_budget(&self) -> &Arc<budget::QuicBudget> {
+        &self.buffer_budget
+    }
+
     /// Connection pollers this endpoint's socket built outside
     /// `socket::with_poller_holds`: their cap holds go into a record nobody
     /// reads. Expected 0 (quinn 0.11.12 builds one elsewhere only on a
@@ -506,7 +538,10 @@ impl QuicEndpoint {
         settings: &QuicSettings,
         keypair: &TransportKeypair,
     ) -> Option<Self> {
-        match Self::bind_checked(unwinds, socket, local_addr, time, settings, keypair) {
+        let result = Self::bind_checked(unwinds, socket, local_addr, time, settings, keypair);
+        crate::transport::metrics::TRANSPORT_METRICS
+            .set_quic_endpoint_state(bound_state(unwinds, result.is_ok()));
+        match result {
             Ok(endpoint) => Some(endpoint),
             Err(error) => {
                 tracing::warn!(
@@ -579,10 +614,16 @@ impl QuicEndpoint {
                     "the socket's QUIC ingress is already enabled",
                 )
             })??;
+        let buffer_budget = budget::QuicBudget::new(
+            config::quic_buffer_budget_for(settings.memory_limit) as u64,
+            settings.window_bytes(),
+            &super::TRANSPORT_METRICS.quic_data,
+        );
         tracing::info!(
             %local_addr,
-            window_bytes = settings.window_bytes(),
-            "QUIC endpoint built; its paths carry control frames only, application traffic stays on UDP"
+            floor_window_bytes = settings.window_bytes(),
+            buffer_budget_bytes = buffer_budget.total(),
+            "QUIC endpoint built; a data path's windows grow from the floor within the buffer budget"
         );
         Ok(Self {
             owner: Arc::new(EndpointOwner {
@@ -600,6 +641,7 @@ impl QuicEndpoint {
                 health: health.clone(),
                 // Set by the closure, which ran: `endpoint` is built.
                 cap_holds: cap_holds.expect("the QUIC socket's cap holds"),
+                buffer_budget,
                 #[cfg(any(test, feature = "testing"))]
                 faults: faults.unwrap_or_default(),
                 #[cfg(any(test, feature = "testing"))]
@@ -1171,14 +1213,22 @@ pub(crate) struct QuicCloser {
     /// The endpoint's health: a close is counted only while it can still
     /// be sent ([`EndpointHealth::closes_can_be_sent`]).
     health: Arc<EndpointHealth>,
+    /// The code of the close this closer sent, if it sent one.
+    closed_with: Arc<std::sync::OnceLock<QuicCloseCode>>,
 }
 
 impl QuicCloser {
+    /// The connection's smoothed round trip, as quinn estimates it.
+    pub(crate) fn rtt(&self) -> std::time::Duration {
+        self.connection.rtt()
+    }
+
     fn new(connection: quinn::Connection, health: Arc<EndpointHealth>) -> Self {
         Self {
             connection,
             closing: Arc::default(),
             health,
+            closed_with: Arc::default(),
         }
     }
 
@@ -1198,6 +1248,14 @@ impl QuicCloser {
     /// close the connection's watcher makes on Down, and a close after a
     /// panic that left the endpoint Released.
     pub(crate) fn close(&self, code: QuicCloseCode) -> bool {
+        self.close_with_reason(code, code.reason())
+    }
+
+    /// [`Self::close`] with `reason` in place of the code's own text: the
+    /// native Hello exchange closes with `VERSION_INCOMPATIBLE` and this
+    /// node's 8 version bytes.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn close_with_reason(&self, code: QuicCloseCode, reason: &[u8]) -> bool {
         if self.closing.swap(true, std::sync::atomic::Ordering::AcqRel) {
             return false;
         }
@@ -1207,8 +1265,14 @@ impl QuicCloser {
         if self.health.closes_can_be_sent() {
             TRANSPORT_METRICS.record_quic_close_sent(code, self.connection.remote_address());
         }
-        self.connection.close(code.code().into(), code.reason());
+        self.connection.close(code.code().into(), reason);
+        let _first = self.closed_with.set(code);
         true
+    }
+
+    /// The code of the close this node sent on the connection, if it sent one.
+    pub(crate) fn closed_with(&self) -> Option<QuicCloseCode> {
+        self.closed_with.get().copied()
     }
 
     /// Whether the connection is still open (quinn has no close reason).

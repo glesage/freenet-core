@@ -511,6 +511,10 @@ pub(crate) struct ConnectionManager {
     /// exercises the hash-first path before the crate version reaches the
     /// production floor. See `NodeConfig`.
     hash_first_summaries_floor_override: Option<(u8, u8, u16)>,
+    /// How this node encodes and decodes the QUIC-native connect variants:
+    /// the floor (`NodeConfig::quic_native_floor_override` or the production
+    /// one) and the simulation's pre-floor decoder mode.
+    native_wire: crate::operations::connect::native::NativeWire,
     /// Version-gate refusal counters (#5156). Both `supports_hash_first_summaries`
     /// and `supports_summary_first_put` fail closed to the full-bytes fallback
     /// for two causes with opposite implications — a pre-floor peer self-heals
@@ -544,6 +548,12 @@ pub(crate) struct ConnectionManager {
     migration_scan_cursor: Arc<AtomicUsize>,
     /// Transient connections keyed by socket address.
     transient_connections: Arc<DashMap<SocketAddr, TransientEntry>>,
+    /// Addresses of the transports the network bridge holds open, whether or
+    /// not they are ring connections or still tracked as transient (a
+    /// transient entry expires while its transport can stay open). Written by
+    /// the bridge's `ConnectionMap::insert` / `remove`, the only ways that
+    /// map's keys change, so it holds exactly those keys; bounded by it.
+    open_transports: Arc<dashmap::DashSet<SocketAddr>>,
     transient_in_use: Arc<AtomicUsize>,
     transient_budget: usize,
     transient_ttl: Duration,
@@ -694,6 +704,10 @@ impl ConnectionManager {
         cm.subscribe_hint_floor_override = config.subscribe_hint_floor_override;
         cm.summary_first_put_floor_override = config.summary_first_put_floor_override;
         cm.hash_first_summaries_floor_override = config.hash_first_summaries_floor_override;
+        cm.native_wire = crate::operations::connect::native::NativeWire::new(
+            config.quic_native_floor_override,
+            config.native_wire_pre_floor,
+        );
         cm.broadcast_target_list_floor_override = config.broadcast_target_list_floor_override;
         cm
     }
@@ -732,6 +746,7 @@ impl ConnectionManager {
             // Default off; `new(config)` overrides from config after init.
             summary_first_put_floor_override: None,
             hash_first_summaries_floor_override: None,
+            native_wire: crate::operations::connect::native::NativeWire::new(None, false),
             hash_first_declined_unknown_version: Arc::new(AtomicU64::new(0)),
             hash_first_declined_pre_floor: Arc::new(AtomicU64::new(0)),
             summary_first_put_declined_unknown_version: Arc::new(AtomicU64::new(0)),
@@ -739,6 +754,7 @@ impl ConnectionManager {
             broadcast_target_list_floor_override: None,
             migration_scan_cursor: Arc::new(AtomicUsize::new(0)),
             transient_connections: Arc::new(DashMap::new()),
+            open_transports: Arc::new(dashmap::DashSet::new()),
             transient_in_use: Arc::new(AtomicUsize::new(0)),
             transient_budget,
             transient_ttl,
@@ -1589,6 +1605,11 @@ impl ConnectionManager {
         self.subscribe_hint_floor_override
     }
 
+    /// How this node encodes and decodes the QUIC-native connect variants.
+    pub(crate) fn native_wire(&self) -> crate::operations::connect::native::NativeWire {
+        self.native_wire
+    }
+
     /// Record (or CLEAR) the negotiated protocol version for a peer at `addr`,
     /// mirroring `P2pConnManager.connections[addr].remote_version` so op
     /// drivers can read it via `op_manager.ring.connection_manager`.
@@ -1631,6 +1652,26 @@ impl ConnectionManager {
                 self.remote_version.write().remove(&addr);
             }
         }
+    }
+
+    /// The recorded protocol version of each live ring connection, one entry
+    /// per connection (`None` where none was recorded), for `join_versions`.
+    /// Reads the live set, so a stale mirror entry for an address no longer
+    /// connected is never counted. The two locks are taken one after the
+    /// other, never together.
+    pub(crate) fn live_neighbour_versions(&self) -> Vec<Option<(u8, u8, u16)>> {
+        let addrs: Vec<Option<SocketAddr>> = self
+            .connections_by_location
+            .read()
+            .values()
+            .flatten()
+            .map(|conn| conn.location.socket_addr())
+            .collect();
+        let versions = self.remote_version.read();
+        addrs
+            .into_iter()
+            .map(|addr| addr.and_then(|addr| versions.get(&addr).copied()))
+            .collect()
     }
 
     /// Look up the negotiated protocol version recorded for `addr` via
@@ -1963,6 +2004,28 @@ impl ConnectionManager {
             self.transient_in_use.fetch_sub(1, Ordering::SeqCst);
         }
         removed
+    }
+
+    /// The bridge opened a transport to `addr`.
+    pub(crate) fn note_transport_open(&self, addr: SocketAddr) {
+        self.open_transports.insert(addr);
+    }
+
+    /// The bridge closed its transport to `addr`.
+    pub(crate) fn note_transport_closed(&self, addr: SocketAddr) {
+        self.open_transports.remove(&addr);
+    }
+
+    /// Whether the bridge holds an open transport to `addr`.
+    pub(crate) fn has_open_transport(&self, addr: SocketAddr) -> bool {
+        self.open_transports.contains(&addr)
+    }
+
+    /// The addresses in the open-transport set, for tests that check it
+    /// against the bridge's connection map.
+    #[cfg(test)]
+    pub(crate) fn open_transport_addrs(&self) -> std::collections::BTreeSet<SocketAddr> {
+        self.open_transports.iter().map(|addr| *addr).collect()
     }
 
     /// Check whether a peer is currently tracked as transient.
@@ -3248,6 +3311,25 @@ mod tests {
         );
         assert!(!cm.supports_summary_first_put(addr));
         assert!(!cm.supports_hash_first_summaries(addr));
+    }
+
+    /// `join_versions` reads live connections only: a version recorded for an
+    /// address with no ring connection is not a neighbour.
+    #[test]
+    fn live_neighbour_versions_counts_live_connections_only() {
+        let cm = make_connection_manager(Some(make_addr(9000)), 1, 10, false);
+        let live = make_addr(9011);
+        let unknown = make_addr(9012);
+        let gone = make_addr(9013);
+        for (port, addr) in [(1, live), (2, unknown)] {
+            let peer = PeerKeyLocation::new(TransportKeypair::new().public().clone(), addr);
+            cm.insert_raw_connection_for_test(Location::new(0.1 * port as f64), peer);
+        }
+        cm.record_remote_version(live, Some((0, 2, 150)));
+        cm.record_remote_version(gone, Some((0, 2, 140)));
+        let mut versions = cm.live_neighbour_versions();
+        versions.sort();
+        assert_eq!(versions, vec![None, Some((0, 2, 150))]);
     }
 
     /// The other half of the same rule: a `Some` at a reused address overwrites

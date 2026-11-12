@@ -12,7 +12,7 @@ use quinn::congestion::{Controller, ControllerFactory};
 use super::super::config::{QuicRateLimit, QuicSettings};
 use super::super::memory_tests::{connected_pair_with, transfer_one_stream};
 use super::super::tests::{bounded, drive};
-use super::{CappedCubic, CappedCubicFactory, rate_window};
+use super::{CappedCubic, CappedCubicFactory, INITIAL_WINDOW_DATAGRAMS, rate_window};
 use crate::simulation::{TimeSource, VirtualTime};
 use crate::transport::Socket;
 use crate::transport::crypto::TransportKeypair;
@@ -24,6 +24,7 @@ use crate::transport::in_memory_socket::{
     unregister_address_network, unregister_network_time_source,
 };
 use crate::transport::packet_data::MAX_RECV_PACKET_SIZE;
+use crate::transport::peer_connection::streaming_buffer::FRAGMENT_PAYLOAD_SIZE;
 
 const MTU: u16 = 1200;
 
@@ -98,11 +99,38 @@ fn after_a_transfer(rate: QuicRateLimit) -> (Box<dyn Controller>, u64) {
     (controller, cubic)
 }
 
+/// A node's controller starts at [`INITIAL_WINDOW_DATAGRAMS`] full datagrams,
+/// not quinn's 10, and the bandwidth cap still lowers that start once there
+/// is an RTT.
+#[test]
+fn the_initial_window_is_thirty_two_datagrams_and_the_cap_still_lowers_it() {
+    let start = INITIAL_WINDOW_DATAGRAMS * u64::from(MTU);
+    assert_eq!(start, 38_400);
+    let fresh =
+        Arc::new(CappedCubicFactory::new(QuicRateLimit::default())).build(Instant::now(), MTU);
+    assert_eq!(fresh.initial_window(), start);
+    assert_eq!(fresh.window(), start);
+    let mut capped = Arc::new(CappedCubicFactory::new(QuicRateLimit::new(
+        Some(100_000),
+        None,
+    )))
+    .build(Instant::now(), MTU)
+    .into_any()
+    .downcast::<CappedCubic>()
+    .expect("the CappedCubic");
+    assert_eq!(capped.window(), start, "no RTT yet: Cubic's start");
+    capped.srtt = Some(Duration::from_millis(100));
+    assert_eq!(capped.window(), 10_000, "100 kB/s x 100 ms");
+}
+
 /// Without a limit the window is Cubic's, sample or not.
 #[test]
 fn with_no_limit_the_window_is_cubics() {
     let (controller, cubic) = after_a_transfer(QuicRateLimit::default());
     assert_eq!(controller.window(), cubic);
+    // quinn's default Cubic, not the node's factory: this checks the cap's
+    // pass-through, not the initial window (see
+    // `the_initial_window_is_thirty_two_datagrams_and_the_cap_still_lowers_it`).
     let fresh = CappedCubic::new(
         Arc::new(quinn::congestion::CubicConfig::default()).build(Instant::now(), MTU),
         QuicRateLimit::new(Some(1000), None),
@@ -123,7 +151,7 @@ fn with_no_limit_the_window_is_cubics() {
 /// loss left the window far above the start.
 #[test]
 fn cubic_does_not_grow_behind_the_cap_and_still_backs_off() {
-    let initial = Arc::new(quinn::congestion::CubicConfig::default())
+    let initial = Arc::new(CappedCubicFactory::default())
         .build(Instant::now(), MTU)
         .initial_window();
     let (_, uncapped) = after_a_transfer(QuicRateLimit::default());
@@ -132,7 +160,11 @@ fn cubic_does_not_grow_behind_the_cap_and_still_backs_off() {
         "a free transfer grows Cubic: {uncapped}"
     );
 
-    let (controller, cubic) = after_a_transfer(QuicRateLimit::new(Some(100_000), None));
+    // Plain Cubic: this in-memory pair has no queue, so the loss gate would
+    // ignore the loss below, and what is checked is Cubic's own response.
+    let mut rate = QuicRateLimit::new(Some(100_000), None);
+    rate.without_loss_gate = true;
+    let (controller, cubic) = after_a_transfer(rate);
     assert_eq!(cubic, initial, "Cubic stayed where it was while capped");
 
     let mut capped = controller
@@ -172,6 +204,7 @@ fn with_a_limit_the_window_is_the_lower_of_cubics_and_the_rates() {
     // A limit far above what the path does leaves Cubic's window. (This
     // in-memory pair has a round trip of 0, where any rate gives the floor,
     // so the RTT is set here.)
+    // quinn's default Cubic, not the node's factory: only the cap is checked.
     let mut fast = CappedCubic::new(
         Arc::new(quinn::congestion::CubicConfig::default()).build(Instant::now(), MTU),
         QuicRateLimit::new(Some(usize::MAX / 2), None),
@@ -187,13 +220,21 @@ fn with_a_limit_the_window_is_the_lower_of_cubics_and_the_rates() {
 }
 
 /// A socket that delivers each datagram `delay` after it is sent, on
-/// `time`, and counts the bytes it sends with the virtual time.
+/// `time`, and counts the bytes it sends with the virtual time. With
+/// `drop_every` above 0 it drops every `drop_every`-th datagram after the
+/// first [`LOSSLESS_DATAGRAMS`] (so the handshake is not what is measured):
+/// random loss with no queue, deterministically.
 struct Delayed {
     inner: Arc<SimulationSocket>,
     time: VirtualTime,
     delay: Duration,
     sent: Arc<Mutex<Vec<(u64, usize, bool)>>>,
+    drop_every: u64,
+    count: AtomicU64,
 }
+
+/// Datagrams a lossy [`Delayed`] sends before it starts dropping.
+const LOSSLESS_DATAGRAMS: u64 = 20;
 
 impl Delayed {
     fn send_later(&self, buf: &[u8], target: SocketAddr) -> usize {
@@ -203,6 +244,10 @@ impl Delayed {
             .lock()
             .unwrap()
             .push((self.time.now_nanos(), buf.len(), quic));
+        let n = self.count.fetch_add(1, Ordering::Relaxed) + 1;
+        if self.drop_every > 0 && n > LOSSLESS_DATAGRAMS && n % self.drop_every == 0 {
+            return buf.len();
+        }
         // The wakeup is registered now, so datagrams keep their order.
         let wake = self.time.sleep(self.delay);
         let (inner, bytes) = (self.inner.clone(), buf.to_vec());
@@ -256,28 +301,32 @@ struct Link {
 const ONE_WAY: Duration = Duration::from_millis(20);
 
 impl Link {
-    async fn new(network: &str, subnet: u8, rate: QuicRateLimit, a_cap: Option<u64>) -> Self {
-        Self::with(
-            network,
-            subnet,
-            [rate, QuicRateLimit::default()],
-            a_cap,
-            ONE_WAY,
-        )
-        .await
+    async fn new(network: &str, rate: QuicRateLimit, a_cap: Option<u64>) -> Self {
+        Self::with(network, [rate, QuicRateLimit::default()], a_cap, ONE_WAY).await
     }
 
     /// [`Self::new`] with `rates` for `a` and `b`, and `one_way` of delay.
     async fn with(
         network: &str,
-        subnet: u8,
         rates: [QuicRateLimit; 2],
         a_cap: Option<u64>,
         one_way: Duration,
     ) -> Self {
+        Self::lossy(network, rates, a_cap, one_way, 0).await
+    }
+
+    /// [`Self::with`], each direction dropping every `drop_every`-th
+    /// datagram (see [`Delayed`]); 0 drops none.
+    async fn lossy(
+        network: &str,
+        rates: [QuicRateLimit; 2],
+        a_cap: Option<u64>,
+        one_way: Duration,
+        drop_every: u64,
+    ) -> Self {
         let [a_rate, b_rate] = rates;
-        let a_addr: SocketAddr = format!("10.207.{subnet}.1:5000").parse().unwrap();
-        let b_addr: SocketAddr = format!("10.207.{subnet}.2:5000").parse().unwrap();
+        let net = crate::transport::test_net::subnet();
+        let (a_addr, b_addr) = (net.addr(1), net.addr(2));
         let time = VirtualTime::new();
         register_network_time_source(network, time.clone());
         register_address_network(a_addr, network);
@@ -293,6 +342,8 @@ impl Link {
                         time,
                         delay: one_way,
                         sent,
+                        drop_every,
+                        count: AtomicU64::new(0),
                     },
                     cap,
                 ))
@@ -305,10 +356,12 @@ impl Link {
         )
         .await;
         let b_socket = socket(b_addr, None, Arc::default()).await;
+        // At a data path's floor window, which its meter raises a fresh
+        // connection to (`budget`).
         let settings = |rate_limit| QuicSettings {
-            max_connections: 4,
             memory_limit: 1024 * 1024 * 1024,
             idle_timeout: None,
+            initial_window: Some(crate::transport::quic::budget::MIN_WINDOW_BYTES),
             rate_limit,
         };
         let (a_keys, b_keys) = (TransportKeypair::new(), TransportKeypair::new());
@@ -385,7 +438,16 @@ impl Link {
             let mut send = sender.open_uni().await.expect("open");
             let (_, read) = tokio::join!(
                 async {
-                    send.write_all(&vec![7u8; len]).await.expect("write");
+                    // In the data path's pieces (`QuicPath::send_short`,
+                    // `write_fragments`), not one write: a write counts
+                    // against the send window until all of it is
+                    // acknowledged, so with the send window now at the floor
+                    // a write the size of the window stalls the writer for a
+                    // round trip plus the peer's ACK delay each time the
+                    // window turns over, a stall the cap does not cause.
+                    for piece in vec![7u8; len].chunks(FRAGMENT_PAYLOAD_SIZE) {
+                        send.write_all(piece).await.expect("write");
+                    }
                     send.finish().expect("finish");
                 },
                 async {
@@ -413,6 +475,38 @@ impl Drop for Link {
     }
 }
 
+/// A message of 32 KiB on a fresh connection over a 300 ms round trip
+/// arrives in one round trip of the initial window: it fits in
+/// [`INITIAL_WINDOW_DATAGRAMS`] datagrams, where quinn's 10 would take two
+/// more round trips (12 kB, then 24 kB). Freenet connections mostly carry
+/// small messages and quinn does not grow the window while the connection is
+/// application-limited, so this is the time most messages of this size take.
+///
+/// Measured from both ends having finished `establish` to `b` having read the
+/// whole message, on `VirtualTime` (deterministic, so no timing noise and no
+/// retry can move it). That includes quinn's pacing of the 22 datagrams after
+/// its first 10: 300 ms with 32 datagrams, 600 ms with 10. The bound, one
+/// round trip plus one one-way delay (450 ms), sits halfway between them.
+#[test]
+fn a_32_kib_message_on_a_fresh_connection_arrives_within_one_round_trip() {
+    bounded(|| async move {
+        const ONE_WAY_LONG: Duration = Duration::from_millis(150);
+        let link = Link::with(
+            "quic-cap-initial-window",
+            [QuicRateLimit::default(), QuicRateLimit::default()],
+            None,
+            ONE_WAY_LONG,
+        )
+        .await;
+        let elapsed = link.send(32 * 1024, Duration::from_secs(60)).await;
+        let rtt = 2 * ONE_WAY_LONG;
+        assert!(
+            elapsed < rtt + ONE_WAY_LONG,
+            "{elapsed:?}: more than one round trip of sending plus the one-way delay"
+        );
+    })
+}
+
 /// A path under `bandwidth-limit` transfers at the limit, within 10%, on
 /// `VirtualTime` over a 40 ms round trip, where the flow-control window alone
 /// would allow about 50 times as much.
@@ -423,7 +517,6 @@ fn a_path_under_a_bandwidth_limit_keeps_to_it() {
         const LEN: usize = 2_000_000;
         let link = Link::new(
             "quic-cap-bandwidth-limit",
-            1,
             QuicRateLimit::new(Some(LIMIT), None),
             None,
         )
@@ -449,11 +542,10 @@ fn the_floor_keeps_two_datagrams_in_flight_both_ways() {
         const LEN: usize = 400_000;
         const ONE_WAY_SHORT: Duration = Duration::from_millis(2);
         let two_per_rtt = 2.0 * f64::from(MTU) / (2.0 * ONE_WAY_SHORT.as_secs_f64());
-        for (subnet, from_a) in [(5, true), (6, false)] {
+        for from_a in [true, false] {
             let rate = || QuicRateLimit::new(Some(LIMIT), None);
             let link = Link::with(
-                &format!("quic-cap-floor-{subnet}"),
-                subnet,
+                &format!("quic-cap-floor-{from_a}"),
                 [rate(), rate()],
                 None,
                 ONE_WAY_SHORT,
@@ -490,7 +582,6 @@ fn a_quic_path_and_udp_streams_both_progress_under_an_egress_cap() {
         let link = Arc::new(
             Link::new(
                 "quic-cap-shared",
-                2,
                 QuicRateLimit::new(None, Some(manager)),
                 Some(CAP),
             )
@@ -623,7 +714,6 @@ async fn paced_udp_stream(
 /// connection was up), and the fragments abandoned at the stream deadline.
 async fn quic_and_udp_rates(
     network: &str,
-    subnet: u8,
     seed: u64,
     minimum: Option<usize>,
     streams: usize,
@@ -637,7 +727,6 @@ async fn quic_and_udp_rates(
     let link = Arc::new(
         Link::new(
             network,
-            subnet,
             QuicRateLimit::new(None, Some(manager.clone())),
             Some(CAP),
         )
@@ -717,10 +806,9 @@ async fn quic_and_udp_rates(
 fn a_quic_path_and_udp_streams_each_get_their_fair_share_under_a_saturated_egress_cap() {
     bounded(|| async move {
         let share = 500_000.0 / 2.0;
-        for (subnet, minimum) in [(7, Some(1000)), (8, None)] {
+        for (case, minimum) in [("min", Some(1000)), ("none", None)] {
             let (quic_rate, udp_rate, abandoned) = quic_and_udp_rates(
-                &format!("quic-cap-fair-share-{subnet}"),
-                subnet,
+                &format!("quic-cap-fair-share-{case}"),
                 0x5940_6112,
                 minimum,
                 1,
@@ -811,15 +899,40 @@ fn a_limit_does_not_delay_a_control_sized_exchange() {
     bounded(|| async move {
         use crate::transport::peer_connection::MIN_BANDWIDTH_LIMIT;
         let mut finished = Vec::new();
-        for (subnet, rate) in [
-            (3, QuicRateLimit::default()),
-            (4, QuicRateLimit::new(Some(MIN_BANDWIDTH_LIMIT), None)),
+        for (case, rate) in [
+            ("default", QuicRateLimit::default()),
+            ("min", QuicRateLimit::new(Some(MIN_BANDWIDTH_LIMIT), None)),
         ] {
             let _seed = crate::config::GlobalRng::seed_guard(0x5940_E5B7);
-            let link = Link::new(&format!("quic-cap-control-{subnet}"), subnet, rate, None).await;
+            let link = Link::new(&format!("quic-cap-control-{case}"), rate, None).await;
             let elapsed = link.send(32, Duration::from_secs(10)).await;
             finished.push((elapsed, link.time.now_nanos()));
         }
         assert_eq!(finished[0], finished[1], "with and without a limit");
+    })
+}
+
+/// A 1 MiB message over a 100 ms round trip with 5% of datagrams lost in
+/// each direction and no queue anywhere arrives within 3 s on
+/// `VirtualTime`. Every loss here is random, so the loss gate
+/// (`recycle::loss_gate`) passes none of them to Cubic and the window keeps
+/// growing. Plain Cubic cuts its window by 30% at every loss and takes about
+/// 14 s (0.75 s with the gate; measured with it removed from the factory).
+#[test]
+fn a_one_mib_message_through_five_percent_random_loss_is_not_slowed_by_it() {
+    bounded(|| async move {
+        let link = Link::lossy(
+            "quic-cap-random-loss",
+            [QuicRateLimit::default(), QuicRateLimit::default()],
+            None,
+            Duration::from_millis(50),
+            20,
+        )
+        .await;
+        let elapsed = link.send(1024 * 1024, Duration::from_secs(600)).await;
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "{elapsed:?}: random loss slowed the transfer"
+        );
     })
 }

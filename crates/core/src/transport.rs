@@ -192,7 +192,10 @@ mod crypto;
 pub(crate) mod demux;
 pub(crate) mod egress_cap;
 pub mod in_memory_socket;
+pub(crate) mod join_versions;
 pub(crate) mod quic;
+#[cfg(test)]
+pub(crate) mod test_net;
 
 /// Mock transport infrastructure for testing and benchmarking.
 /// Provides MockSocket and helper functions to create mock peer connections
@@ -349,8 +352,8 @@ impl From<SocketAddr> for ObservedAddr {
 pub(crate) use self::boundary::TransportHandle;
 pub(crate) use self::boundary::{
     CloseReason, InboundAcceptor, InboundExpectations, InboundStreamRegistry, ListenerExit,
-    NextConnection, OutboundConnector, PeerConnectionApi, PendingConnection, ReceiptStamp,
-    StreamProgressObserver, StreamSendOutcome,
+    NextConnection, ObservedSend, OutboundConnector, PeerConnectionApi, PendingConnection,
+    ReceiptStamp, StreamProgressObserver, StreamSendOutcome,
 };
 pub use self::boundary::{IncomingChunks, IncomingStream, StreamIdentity};
 #[cfg(test)]
@@ -537,6 +540,19 @@ pub(in crate::transport) enum QuicRefusal {
     /// this node ended, so it dropped the path. Fall back to UDP.
     #[error("the peer's UDP session to this node ended")]
     SessionEnded,
+    /// The peer closed with `close_code::OVER_BUDGET`: this node held more of
+    /// its QUIC buffer budget than it allows. Fall back to UDP.
+    #[error("the peer closed the path for holding more than its budget")]
+    OverBudget,
+    /// The peer closed a native connection with
+    /// `close_code::VERSION_INCOMPATIBLE`: its version and this node's cannot
+    /// talk to each other.
+    #[error("the peer's version is incompatible with this node's")]
+    VersionIncompatible,
+    /// The peer closed a native connection with `close_code::HELLO_REFUSED`:
+    /// it could not read this node's `Hello`.
+    #[error("the peer refused this node's Hello")]
+    HelloRefused,
     /// The peer closed with `close_code::IDENTITY_MISMATCH`: the key this
     /// node proved is not the one the peer has on record for it.
     #[error("the peer reported an identity mismatch")]

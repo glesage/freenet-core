@@ -453,6 +453,8 @@ pub enum EventPriority {
 ///   `INTEREST_HEARTBEAT_INTERVAL` (2.5 min), from `Ring::interest_heartbeat`.
 /// - `subscription_health_snapshot`: at most one per half
 ///   `INTEREST_SWEEP_INTERVAL` (30 s), from the interest sweep.
+/// - `join_versions`: one per `transport::join_versions::JOIN_VERSIONS_INTERVAL`
+///   (1 h) from one task with `MissedTickBehavior::Delay`.
 ///
 /// The router-snapshot interval and the worker's two intervals use
 /// `MissedTickBehavior::Delay`, so their timer is the bound even after a
@@ -469,7 +471,7 @@ pub enum EventPriority {
 /// peer, per contract or per subscription: only a fixed timer makes bypassing
 /// the cap safe. `interest_expired`, for example, is emitted from the 1-minute
 /// interest sweep but once per expired interest, so it stays operational.
-pub(crate) const PERIODIC_EVENT_TYPES: [&str; 12] = [
+pub(crate) const PERIODIC_EVENT_TYPES: [&str; 13] = [
     "transport_snapshot",
     "resource_utilization",
     "router_snapshot",
@@ -482,6 +484,7 @@ pub(crate) const PERIODIC_EVENT_TYPES: [&str; 12] = [
     "outbound_message_mix",
     "interest_heartbeat_cycle",
     "subscription_health_snapshot",
+    "join_versions",
 ];
 
 /// Rate bound for a periodic event whose producer loop runs on a burst-mode
@@ -538,7 +541,7 @@ fn priority_for_event_type(event_type: &str) -> EventPriority {
 /// final `other` row, so the exported cardinality never depends on what a
 /// producer names its event. A non-zero `other` means an event type is
 /// missing from this list.
-pub(crate) const KNOWN_EVENT_TYPES: [&str; 74] = [
+pub(crate) const KNOWN_EVENT_TYPES: [&str; 75] = [
     // `event_kind_to_string`, in its order.
     "connect_start",
     "connect_connected",
@@ -614,6 +617,7 @@ pub(crate) const KNOWN_EVENT_TYPES: [&str; 74] = [
     "subscription_renewal_outcome",
     "stranded_recovery",
     crate::ring::FLAG_TELEMETRY_EVENT,
+    "join_versions",
     // Must stay last.
     "other",
 ];
@@ -3056,6 +3060,50 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 serde_json::json!(snapshot.quic_breaker_suppressed),
             );
             m.insert(
+                "quic_endpoint".into(),
+                serde_json::json!(snapshot.quic_endpoint),
+            );
+            m.insert(
+                "connect_native_offered_zero".into(),
+                serde_json::json!(snapshot.connect_native_offered_zero),
+            );
+            m.insert(
+                "connect_native_offered_nonzero".into(),
+                serde_json::json!(snapshot.connect_native_offered_nonzero),
+            );
+            m.insert(
+                "connect_native_decided_native".into(),
+                serde_json::json!(snapshot.connect_native_decided_native),
+            );
+            m.insert(
+                "connect_native_decided_udp".into(),
+                serde_json::json!(snapshot.connect_native_decided_udp),
+            );
+            m.insert(
+                "connect_native_decision_without_offer".into(),
+                serde_json::json!(snapshot.connect_native_decision_without_offer),
+            );
+            m.insert(
+                "connect_native_decision_native_unsupported".into(),
+                serde_json::json!(snapshot.connect_native_decision_native_unsupported),
+            );
+            m.insert(
+                "connect_native_decision_over_cap".into(),
+                serde_json::json!(snapshot.connect_native_decision_over_cap),
+            );
+            m.insert(
+                "connect_native_offer_level".into(),
+                serde_json::json!(snapshot.connect_native_offer_level),
+            );
+            m.insert(
+                "connect_native_offer_percent".into(),
+                serde_json::json!(snapshot.connect_native_offer_percent),
+            );
+            m.insert(
+                "connect_native_offer_ready".into(),
+                serde_json::json!(snapshot.connect_native_offer_ready),
+            );
+            m.insert(
                 "quic_close_sent_node_dropped_peer".into(),
                 serde_json::json!(snapshot.quic_close_sent_node_dropped_peer),
             );
@@ -3082,6 +3130,18 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
             m.insert(
                 "quic_close_sent_session_ended".into(),
                 serde_json::json!(snapshot.quic_close_sent_session_ended),
+            );
+            m.insert(
+                "quic_close_sent_over_budget".into(),
+                serde_json::json!(snapshot.quic_close_sent_over_budget),
+            );
+            m.insert(
+                "quic_close_sent_version_incompatible".into(),
+                serde_json::json!(snapshot.quic_close_sent_version_incompatible),
+            );
+            m.insert(
+                "quic_close_sent_hello_refused".into(),
+                serde_json::json!(snapshot.quic_close_sent_hello_refused),
             );
             {
                 use crate::transport::metrics::{
@@ -3274,6 +3334,10 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 serde_json::json!(snapshot.quic_ingress_no_ingress),
             );
             m.insert(
+                "quic_ingress_reserve_full".into(),
+                serde_json::json!(snapshot.quic_ingress_reserve_full),
+            );
+            m.insert(
                 "egress_immediate".into(),
                 serde_json::json!(snapshot.egress_immediate),
             );
@@ -3344,6 +3408,22 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
             m.insert(
                 "egress_debt_forgiven_bytes".into(),
                 serde_json::json!(snapshot.egress_debt_forgiven_bytes),
+            );
+            m.insert(
+                "egress_retransmits_deferred".into(),
+                serde_json::json!(snapshot.egress_retransmits_deferred),
+            );
+            m.insert(
+                "egress_retransmits_uncapped".into(),
+                serde_json::json!(snapshot.egress_retransmits_uncapped),
+            );
+            m.insert(
+                "egress_retransmits_uncapped_bytes".into(),
+                serde_json::json!(snapshot.egress_retransmits_uncapped_bytes),
+            );
+            m.insert(
+                "egress_probes_skipped".into(),
+                serde_json::json!(snapshot.egress_probes_skipped),
             );
             for (key, count) in snapshot.nonzero_conn_identity() {
                 m.insert(key, serde_json::json!(count));
@@ -4009,6 +4089,56 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     "hosting_retractions_dropped".to_string(),
                     serde_json::json!(snapshot.hosting_retractions_dropped),
                 );
+                // Delegate lane counters. Pinned by
+                // `router_snapshot_json_includes_delegate_lane_counters`.
+                obj.insert(
+                    "delegate_lane_requests_refused".to_string(),
+                    serde_json::json!(snapshot.delegate_lane_requests_refused),
+                );
+                obj.insert(
+                    "delegate_lane_panics".to_string(),
+                    serde_json::json!(snapshot.delegate_lane_panics),
+                );
+                obj.insert(
+                    "delegate_lane_deaths".to_string(),
+                    serde_json::json!(snapshot.delegate_lane_deaths),
+                );
+                obj.insert(
+                    "inter_delegate_messages_dropped".to_string(),
+                    serde_json::json!(snapshot.inter_delegate_messages_dropped),
+                );
+                obj.insert(
+                    "delegate_lane_runs".to_string(),
+                    serde_json::json!(snapshot.delegate_lane_runs),
+                );
+                obj.insert(
+                    "delegate_lane_forwarded_busy".to_string(),
+                    serde_json::json!(snapshot.delegate_lane_forwarded_busy),
+                );
+                obj.insert(
+                    "delegate_lane_forwarded_parked".to_string(),
+                    serde_json::json!(snapshot.delegate_lane_forwarded_parked),
+                );
+                obj.insert(
+                    "delegate_lane_forwarded_loop_owned".to_string(),
+                    serde_json::json!(snapshot.delegate_lane_forwarded_loop_owned),
+                );
+                obj.insert(
+                    "delegate_lane_forwarded_unit_bound".to_string(),
+                    serde_json::json!(snapshot.delegate_lane_forwarded_unit_bound),
+                );
+                obj.insert(
+                    "delegate_lane_forwarded_not_runnable".to_string(),
+                    serde_json::json!(snapshot.delegate_lane_forwarded_not_runnable),
+                );
+                obj.insert(
+                    "delegate_lane_forwarded_forged".to_string(),
+                    serde_json::json!(snapshot.delegate_lane_forwarded_forged),
+                );
+                obj.insert(
+                    "delegate_lane_forwarded_lane_down".to_string(),
+                    serde_json::json!(snapshot.delegate_lane_forwarded_lane_down),
+                );
                 // Streamed-transfer abort counters (Group B), routing/hosting
                 // attribution (Group C), and connect-emit counters — same
                 // hand-mirror footgun: a new `RouterSnapshotInfo` field is
@@ -4520,8 +4650,10 @@ mod tests {
         // digits); no fleet value approaches it, so it constrains schema shape
         // rather than real bytes. Raised by #5647 for the same 7 counters as
         // MAX_WORST_CASE_JSON_BYTES (147 bytes at u64::MAX): measured 15414.
-        // Raised by #6001 for `tel_t` and `tel`: measured 18703.
-        const MAX_WORST_OTLP_MARGINAL_BYTES: usize = 18_816;
+        // Raised by #6001 for `tel_t` and `tel`: measured 18703. Raised for the
+        // `join_versions` row of `tel_t` (2 counters, 44 bytes at u64::MAX):
+        // measured 18845.
+        const MAX_WORST_OTLP_MARGINAL_BYTES: usize = 18_944;
         const MAX_NULL_OTLP_MARGINAL_BYTES: usize = 64;
 
         let diagnostic = |value| crate::router::NetworkEfficiencyV1 {
@@ -5108,6 +5240,47 @@ mod tests {
         for (key, want) in [
             ("hosting_retractions_emitted", 509),
             ("hosting_retractions_dropped", 521),
+        ] {
+            assert_eq!(json[key], want, "{key} must reach the OTLP body");
+        }
+    }
+
+    /// Pin: the delegate lane counters must reach the hand-mirrored OTLP
+    /// body. Each counts a client-visible loss (a refused request, a panicked
+    /// run, a dropped inter-delegate message) that is otherwise only a log
+    /// line.
+    #[test]
+    fn router_snapshot_json_includes_delegate_lane_counters() {
+        use arbitrary::{Arbitrary, Unstructured};
+        let mut u = Unstructured::new(&[0u8; 4096]);
+        let mut info = crate::router::RouterSnapshotInfo::arbitrary(&mut u)
+            .expect("construct RouterSnapshotInfo for test");
+        info.delegate_lane_requests_refused = Some(601);
+        info.delegate_lane_panics = Some(607);
+        info.inter_delegate_messages_dropped = Some(613);
+        info.delegate_lane_runs = Some(617);
+        info.delegate_lane_forwarded_busy = Some(619);
+        info.delegate_lane_forwarded_parked = Some(621);
+        info.delegate_lane_forwarded_loop_owned = Some(623);
+        info.delegate_lane_forwarded_unit_bound = Some(625);
+        info.delegate_lane_forwarded_not_runnable = Some(627);
+        info.delegate_lane_forwarded_forged = Some(629);
+        info.delegate_lane_deaths = Some(631);
+        info.delegate_lane_forwarded_lane_down = Some(641);
+        let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
+        for (key, want) in [
+            ("delegate_lane_requests_refused", 601),
+            ("delegate_lane_panics", 607),
+            ("inter_delegate_messages_dropped", 613),
+            ("delegate_lane_runs", 617),
+            ("delegate_lane_forwarded_busy", 619),
+            ("delegate_lane_forwarded_parked", 621),
+            ("delegate_lane_forwarded_loop_owned", 623),
+            ("delegate_lane_forwarded_unit_bound", 625),
+            ("delegate_lane_forwarded_not_runnable", 627),
+            ("delegate_lane_forwarded_forged", 629),
+            ("delegate_lane_deaths", 631),
+            ("delegate_lane_forwarded_lane_down", 641),
         ] {
             assert_eq!(json[key], want, "{key} must reach the OTLP body");
         }
@@ -6545,7 +6718,7 @@ mod tests {
     /// fixed-timer shape. Written out here rather than read from
     /// [`PERIODIC_EVENT_TYPES`], so that dropping a stream from that list fails
     /// the saturation test below instead of shrinking what it checks.
-    const EXPECTED_PERIODIC_EVENT_TYPES: [&str; 12] = [
+    const EXPECTED_PERIODIC_EVENT_TYPES: [&str; 13] = [
         "transport_snapshot",
         "resource_utilization",
         "router_snapshot",
@@ -6558,6 +6731,7 @@ mod tests {
         "outbound_message_mix",
         "interest_heartbeat_cycle",
         "subscription_health_snapshot",
+        "join_versions",
     ];
 
     /// Saturate the per-second cap with operational events, as a busy gateway
@@ -7154,7 +7328,7 @@ mod tests {
         // Exact count of call sites with a literal event type (production and
         // test). A new producer changes it: bump it deliberately after giving
         // the event its own `KNOWN_EVENT_TYPES` row.
-        const EXPECTED_LITERAL_STANDALONE_CALLS: usize = 16;
+        const EXPECTED_LITERAL_STANDALONE_CALLS: usize = 17;
         assert_eq!(
             literal_names.len(),
             EXPECTED_LITERAL_STANDALONE_CALLS,
@@ -7715,6 +7889,19 @@ mod tests {
         data.loss_rate = (1019..1027).collect();
         data.ended_loss_rate = (1027..1035).collect();
         data.ended_below_floor = 1035;
+        data.send_resets = 1036;
+        data.path_ms = 1037;
+        data.send_resets_reached = (1038..1042).collect();
+        data.send_resets_path_max = 1042;
+        data.budget_bytes = 1043;
+        data.budget_charged = 1044;
+        data.budget_charged_peak = 1045;
+        data.window_grew = 1046;
+        data.window_grow_refused = 1047;
+        data.window_shrank = 1048;
+        data.staged_peak_pct = 1049;
+        data.gate_loss = (1050..1056).collect();
+        data.gate_ended_queue = (1056..1059).collect();
         let want: std::collections::BTreeMap<String, u64> =
             snapshot.quic_data.keys().into_iter().collect();
         assert!(want.values().all(|value| *value != 0));
@@ -7765,6 +7952,7 @@ mod tests {
             quic_ingress_queue_full: 48,
             quic_ingress_source_full: 50,
             quic_ingress_no_ingress: 49,
+            quic_ingress_reserve_full: 51,
             egress_immediate: 22,
             egress_waited: 23,
             egress_unpaced: 25,
@@ -7783,6 +7971,10 @@ mod tests {
             egress_streams_refused_other: 119,
             egress_debt_hwm_bytes: 30,
             egress_debt_forgiven_bytes: 31,
+            egress_retransmits_deferred: 32,
+            egress_probes_skipped: 33,
+            egress_retransmits_uncapped: 34,
+            egress_retransmits_uncapped_bytes: 35,
             ..Default::default()
         };
         let reference = serde_json::to_value(&snapshot).unwrap();
@@ -7814,6 +8006,7 @@ mod tests {
             ("quic_ingress_queue_full", 48),
             ("quic_ingress_source_full", 50),
             ("quic_ingress_no_ingress", 49),
+            ("quic_ingress_reserve_full", 51),
             ("egress_immediate", 22),
             ("egress_waited", 23),
             ("egress_unpaced", 25),
@@ -7832,6 +8025,10 @@ mod tests {
             ("egress_streams_refused_other", 119),
             ("egress_debt_hwm_bytes", 30),
             ("egress_debt_forgiven_bytes", 31),
+            ("egress_retransmits_deferred", 32),
+            ("egress_probes_skipped", 33),
+            ("egress_retransmits_uncapped", 34),
+            ("egress_retransmits_uncapped_bytes", 35),
         ] {
             assert_eq!(json[key], expected, "event-log value for {key}");
             assert_eq!(json[key], reference[key], "serde value for {key}");
@@ -7970,6 +8167,9 @@ mod tests {
             quic_close_sent_peer_not_acknowledging: 6,
             quic_close_sent_control_refused: 8,
             quic_close_sent_session_ended: 10,
+            quic_close_sent_over_budget: 11,
+            quic_close_sent_version_incompatible: 12,
+            quic_close_sent_hello_refused: 13,
             quic_breaker_trips: 7,
             quic_send_refused: 9,
             quic_breaker_suppressed: true,
@@ -7989,6 +8189,9 @@ mod tests {
             ("quic_close_sent_peer_not_acknowledging", 6),
             ("quic_close_sent_control_refused", 8),
             ("quic_close_sent_session_ended", 10),
+            ("quic_close_sent_over_budget", 11),
+            ("quic_close_sent_version_incompatible", 12),
+            ("quic_close_sent_hello_refused", 13),
             ("quic_breaker_trips", 7),
             ("quic_send_refused", 9),
         ] {
