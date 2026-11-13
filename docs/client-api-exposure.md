@@ -21,6 +21,15 @@ others. It says nothing about wanting the machine's control API driveable by
 whoever else is on the wifi. Earlier releases conflated the two and defaulted
 network-mode nodes to every interface.
 
+An embedded node (`crates/mobile`, used by mobile app hosts) is loopback-only
+in the same way, but does not even fix the port: unless the host pins one, it
+binds an ephemeral `127.0.0.1` port at start and reports it back through
+`FreenetNode::api_port()`, so two apps embedding a node on the same device —
+or an app sharing a machine with a desktop node on the default port — never
+collide. See
+[mobile-web-runtime-protocol.md](mobile-web-runtime-protocol.md) for how a
+mobile host's WebView-hosted client learns that port and connects to it.
+
 ## Serving clients on other machines
 
 Pick the narrowest option that fits.

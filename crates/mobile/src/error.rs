@@ -31,6 +31,13 @@ pub enum ClientErrorKind {
     Deserialization,
     /// The node reported that the operation failed.
     OperationFailed,
+    /// A put or update was sent and no definite reply came back: the time
+    /// limit passed, the connection closed or the reply named another
+    /// contract. The node may still apply it; keep the exact operation and
+    /// reconcile it against the contract's state.
+    UncertainWrite,
+    /// A read's reply named a different contract than the request.
+    IdentityMismatch,
     /// Anything else, with the node's message.
     Other,
 }
@@ -59,6 +66,18 @@ pub enum MobileError {
     Bundle { reason: String },
     #[error("the {backend} Wasm backend is not available on this target")]
     BackendUnavailable { backend: String },
+    /// The node is stopped, but releasing its resources was not verified by
+    /// the stop deadline. `node_exited` is false when the node had to be
+    /// aborted; `port_released` is false when the client API port was still
+    /// held. The next start retries while the store is still locked.
+    #[error(
+        "the node stopped incompletely after {elapsed_ms} ms (node exited: {node_exited}, port released: {port_released})"
+    )]
+    IncompleteShutdown {
+        node_exited: bool,
+        port_released: bool,
+        elapsed_ms: u64,
+    },
     #[error("internal error: {reason}")]
     Internal { reason: String },
 }

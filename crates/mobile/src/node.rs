@@ -3,8 +3,10 @@
 //! One coordinator runs every start and stop, so two never overlap. Start
 //! binds a loopback port for the client API (the preferred port when it is
 //! free), builds the node inside the process runtime and reports the resolved
-//! port. Stop is explicit: it drains in-flight requests, shuts the node down
-//! and waits for its tasks to release the port and store locks.
+//! port. Stop is explicit: within one deadline it drains in-flight requests,
+//! shuts the node down, waits for its tasks to release the store and checks
+//! that the client API port is free again. A stop that had to abort the node
+//! or found the port still held reports `IncompleteShutdown`.
 
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -72,6 +74,15 @@ pub struct NodeInfo {
     pub data_dir: String,
     /// A stale persisted config was removed before this start.
     pub discarded_config: bool,
+    /// This session's embedder secret. The client API answers only callers
+    /// that present it: the SDK sends it as a header, and the host's web view
+    /// holds it as the cookie `freenet-embedder` for `http_base` before it
+    /// loads a page. A new secret is made for every session.
+    pub embedder_secret: String,
+    /// Legacy telemetry in the resolved config. Always false.
+    pub telemetry_enabled: bool,
+    /// The OpenTelemetry exporter in the resolved config. Always false.
+    pub otel_enabled: bool,
     pub timings: StartTimings,
 }
 
@@ -101,6 +112,7 @@ struct Running {
     shutdown: ShutdownHandle,
     run_task: JoinHandle<()>,
     monitor: Option<JoinHandle<()>>,
+    gateway_refresh: Option<JoinHandle<()>>,
 }
 
 #[derive(uniffi::Object)]
@@ -117,13 +129,35 @@ pub(crate) fn ws_url(port: u16) -> String {
     format!("ws://127.0.0.1:{port}/v1/contract/command?encodingProtocol=native")
 }
 
+/// Everything a stop does, from drain to port release, fits in this. iOS
+/// gives an app about five seconds after it moves to the background.
+pub const STOP_DEADLINE: Duration = Duration::from_millis(4500);
+
 fn elapsed_ms(since: Instant) -> f64 {
     since.elapsed().as_secs_f64() * 1000.0
 }
 
-/// Open a client API connection with the native (bincode) encoding.
+/// Each running session's embedder secret, by client API port. Only callers
+/// in this process (the SDK client and the host's web view) can present it,
+/// so other processes on the device are refused.
+static SESSION_SECRETS: std::sync::LazyLock<Mutex<std::collections::HashMap<u16, String>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Open a client API connection with the native (bincode) encoding, carrying
+/// the session's embedder secret.
 pub(crate) async fn connect_native(port: u16) -> Result<WebApi, MobileError> {
-    let (stream, _) = tokio_tungstenite::connect_async(ws_url(port))
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite::tungstenite::http::HeaderValue;
+    let mut request = ws_url(port)
+        .into_client_request()
+        .map_err(|e| MobileError::client(ClientErrorKind::Disconnected, e.to_string()))?;
+    if let Some(secret) = SESSION_SECRETS.lock().get(&port) {
+        let value = HeaderValue::from_str(secret).map_err(MobileError::internal)?;
+        request
+            .headers_mut()
+            .insert(freenet::server::EMBEDDER_SECRET_HEADER, value);
+    }
+    let (stream, _) = tokio_tungstenite::connect_async(request)
         .await
         .map_err(|e| MobileError::client(ClientErrorKind::Disconnected, e.to_string()))?;
     Ok(WebApi::start(stream))
@@ -210,8 +244,13 @@ impl MobileNode {
                 return Ok(running.info.clone());
             }
         }
-        if let Some(monitor) = slot.take().and_then(|exited| exited.monitor) {
-            monitor.abort();
+        if let Some(exited) = slot.take() {
+            for task in [exited.monitor, exited.gateway_refresh]
+                .into_iter()
+                .flatten()
+            {
+                task.abort();
+            }
         }
         self.update_status(|s| {
             s.state = NodeState::Starting;
@@ -312,19 +351,31 @@ impl MobileNode {
             .build()
             .await
             .map_err(|e| start_failure("configuration", e))?;
+        crate::settings::force_reports_off(&mut config);
+        let refresh_gateways = (self.settings.mode == NodeMode::Network
+            && self.settings.gateways.is_empty()
+            && config.network_api.skip_load_from_network)
+            .then(|| config.clone());
         // The resolved port, never a persisted one.
         config.ws_api.address = Ipv4Addr::LOCALHOST.into();
         config.ws_api.port = port;
         config.ws_api.webapp_cache_dir = layout.webapp_cache.clone();
         let config_ms = elapsed_ms(phase);
+        let telemetry_enabled = config.telemetry.enabled;
+        let otel_enabled = config.otel.enabled;
 
         let phase = Instant::now();
-        let clients =
-            freenet::server::serve_client_api_with_listener(config.ws_api.clone(), listener)
-                .await
-                .map_err(|e| MobileError::StartFailed {
-                    reason: format!("client API: {e}"),
-                })?;
+        let secret = freenet::dev_tool::AuthToken::generate().as_str().to_owned();
+        let clients = freenet::server::serve_client_api_with_embedder_secret(
+            config.ws_api.clone(),
+            listener,
+            secret.clone(),
+        )
+        .await
+        .map_err(|e| MobileError::StartFailed {
+            reason: format!("client API: {e}"),
+        })?;
+        SESSION_SECRETS.lock().insert(port, secret.clone());
         let client_api_ms = elapsed_ms(phase);
 
         let phase = Instant::now();
@@ -348,11 +399,20 @@ impl MobileNode {
 
         let phase = Instant::now();
         if let Err(err) = wait_for_client_api(port, &run_task).await {
+            SESSION_SECRETS.lock().remove(&port);
             shutdown.shutdown().await;
             run_task.abort();
             return Err(LaunchError::Fatal(err));
         }
         let api_ready_ms = elapsed_ms(phase);
+        let gateway_refresh = refresh_gateways.map(|config| {
+            tokio::spawn(async move {
+                match config.refresh_gateway_cache().await {
+                    Ok(count) => tracing::info!(count, "refreshed the saved gateway list"),
+                    Err(err) => tracing::info!("the saved gateway list was not refreshed: {err:#}"),
+                }
+            })
+        });
 
         let info = NodeInfo {
             ws_port: port,
@@ -363,6 +423,9 @@ impl MobileNode {
             session,
             data_dir: layout.data.display().to_string(),
             discarded_config: layout.discarded_config,
+            embedder_secret: secret,
+            telemetry_enabled,
+            otel_enabled,
             timings: StartTimings {
                 layout_ms,
                 config_ms,
@@ -378,6 +441,7 @@ impl MobileNode {
             shutdown,
             run_task,
             monitor: None,
+            gateway_refresh,
         })
     }
 
@@ -419,32 +483,59 @@ impl MobileNode {
             });
             return Ok(());
         };
+        let started = Instant::now();
+        let deadline = tokio::time::Instant::now() + STOP_DEADLINE;
         self.update_status(|s| s.state = NodeState::Stopping);
-        if let Some(monitor) = running.monitor {
-            monitor.abort();
-        }
-        running.shutdown.shutdown().await;
-        let mut run_task = running.run_task;
-        if tokio::time::timeout(Duration::from_secs(10), &mut run_task)
-            .await
-            .is_err()
+        for task in [running.monitor, running.gateway_refresh]
+            .into_iter()
+            .flatten()
         {
-            tracing::warn!("the node did not exit within 10 s of shutdown; aborting it");
+            task.abort();
+        }
+        let mut run_task = running.run_task;
+        // Shutdown drains in-flight requests, then the node's tasks end. Both
+        // count against the one deadline.
+        let exited = tokio::time::timeout_at(deadline, async {
+            running.shutdown.shutdown().await;
+            let _ = (&mut run_task).await;
+        })
+        .await
+        .is_ok();
+        if !exited {
+            tracing::warn!("the node did not exit by the stop deadline; aborting it");
             run_task.abort();
             let _ = run_task.await;
         }
         // The client API's listener closes a moment after the node's tasks
         // end. Wait for the port, so the next start gets it back and web apps
         // keep the same origin.
-        wait_for_port_release(running.info.ws_port).await;
+        let port_released = wait_for_port_release(running.info.ws_port, deadline).await;
+        SESSION_SECRETS.lock().remove(&running.info.ws_port);
         *self.info.lock() = None;
+        let incomplete = (!exited || !port_released).then(|| MobileError::IncompleteShutdown {
+            node_exited: exited,
+            port_released,
+            elapsed_ms: started.elapsed().as_millis() as u64,
+        });
         self.update_status(|s| {
             s.state = NodeState::Stopped;
             s.ws_port = None;
             s.connected_peers = 0;
+            s.last_error = incomplete.as_ref().map(ToString::to_string);
         });
-        tracing::info!("freenet-mobile node stopped");
-        Ok(())
+        match incomplete {
+            Some(err) => {
+                tracing::warn!("freenet-mobile node stopped incompletely: {err}");
+                Err(err)
+            }
+            None => {
+                tracing::info!(
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "freenet-mobile node stopped"
+                );
+                Ok(())
+            }
+        }
     }
 
     fn running_port(&self) -> Result<u16, MobileError> {
@@ -508,7 +599,10 @@ impl MobileNode {
         runtime::run(self.start_on_runtime()).await
     }
 
-    /// Stop the node. Stopping a stopped node does nothing.
+    /// Stop the node within one deadline: drain, node exit (aborted when
+    /// late) and client API port release. Fails with `IncompleteShutdown`
+    /// when the node had to be aborted or the port was still held; the node
+    /// is stopped either way. Stopping a stopped node does nothing.
     pub async fn stop(self: Arc<Self>) -> Result<(), MobileError> {
         runtime::run(self.stop_on_runtime()).await
     }
@@ -559,16 +653,22 @@ impl MobileNode {
     }
 }
 
-/// Wait up to 3 s until `port` can be bound again.
-async fn wait_for_port_release(port: u16) {
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while Instant::now() < deadline {
+/// Wait until `port` can be bound again, or until `deadline`. Always checks
+/// at least once.
+async fn wait_for_port_release(port: u16, deadline: tokio::time::Instant) -> bool {
+    loop {
         if std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_ok() {
-            return;
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            tracing::warn!(
+                port,
+                "the client API port was still in use at the stop deadline"
+            );
+            return false;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    tracing::warn!(port, "the client API port was still in use 3 s after stop");
 }
 
 /// Wait until the client API accepts a WebSocket connection.

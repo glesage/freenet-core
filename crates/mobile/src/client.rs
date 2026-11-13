@@ -2,20 +2,29 @@
 //!
 //! A `NodeClient` owns one client API connection. One actor task sends each
 //! request and waits for its reply before sending the next, so a reply always
-//! belongs to the request in flight. Subscription updates that arrive in
-//! between go to their listeners in the order the node sent them.
+//! belongs to the request in flight.
 //!
-//! A request that times out has an uncertain outcome: the node may still apply
-//! it. The actor then drops the connection, so a late reply can never reach a
-//! later request, and tells every subscription listener its subscription
-//! closed.
+//! - A request the caller cancels while it waits in the queue is never sent.
+//! - Every reply must name the full contract identity the request named:
+//!   instance ID and code hash. A reply for another contract is an identity
+//!   mismatch, and the connection is reset.
+//! - A put or update with no definite reply (time limit, closed connection,
+//!   identity mismatch) fails with `UncertainWrite`: the node may still apply
+//!   it, so the caller keeps the exact operation for reconciliation.
+//! - Subscription updates go to each listener through its own queue, in the
+//!   order the node sent them. A slow listener never holds up requests; a
+//!   listener that falls `LISTENER_QUEUE` updates behind is closed.
+//! - A request that times out resets the connection, so a late reply can
+//!   never reach a later request. The actor then opens a new connection and
+//!   subscribes every watched contract again, once. A listener whose
+//!   subscription cannot be restored is closed.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use freenet_stdlib::client_api::{
-    ClientRequest, ContractRequest, ContractResponse, HostResponse, WebApi,
+    ClientError, ClientRequest, ContractRequest, ContractResponse, HostResponse, WebApi,
 };
 use freenet_stdlib::prelude::{
     CodeHash, ContractCode, ContractContainer, ContractInstanceId, ContractKey,
@@ -23,6 +32,7 @@ use freenet_stdlib::prelude::{
     WrappedState,
 };
 use futures::StreamExt;
+use futures::future::BoxFuture;
 use serde::Serialize;
 use tokio::sync::{mpsc, oneshot};
 
@@ -62,6 +72,11 @@ pub(crate) fn parse_instance_id(id: &str) -> Result<ContractInstanceId, MobileEr
     ContractInstanceId::try_from(id.to_owned()).map_err(|e| MobileError::InvalidSettings {
         reason: format!("contract instance id {id:?} is not valid: {e}"),
     })
+}
+
+/// `ContractKey`'s own equality compares instance IDs only.
+fn same_identity(a: &ContractKey, b: &ContractKey) -> bool {
+    a.id() == b.id() && a.code_hash() == b.code_hash()
 }
 
 /// How long the node took to answer, measured in Rust from sending the
@@ -106,11 +121,40 @@ pub enum UpdateKind {
 }
 
 /// Receives a subscription's updates, in the order the node sent them.
+///
+/// Called on a blocking runtime thread, one call at a time per listener.
+/// Implementations hand the update to the platform's own executor.
 #[uniffi::export(with_foreign)]
 pub trait ContractListener: Send + Sync {
     fn on_update(&self, contract: ContractRef, kind: UpdateKind, bytes: Vec<u8>);
     fn on_closed(&self, reason: String);
 }
+
+/// Updates a listener may fall behind before it is closed.
+const LISTENER_QUEUE: usize = 1024;
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Time limit for each subscription restored after a reset.
+const RESTORE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The actor's view of one client API connection.
+pub(crate) trait Connection: Send {
+    fn send(&mut self, request: ClientRequest<'static>) -> BoxFuture<'_, Result<(), String>>;
+    fn next(&mut self) -> BoxFuture<'_, Option<Result<HostResponse, ClientError>>>;
+}
+
+impl Connection for WebApi {
+    fn send(&mut self, request: ClientRequest<'static>) -> BoxFuture<'_, Result<(), String>> {
+        Box::pin(async move { WebApi::send(self, request).await.map_err(|e| e.to_string()) })
+    }
+
+    fn next(&mut self) -> BoxFuture<'_, Option<Result<HostResponse, ClientError>>> {
+        Box::pin(StreamExt::next(self))
+    }
+}
+
+/// Opens a new connection to the same node.
+pub(crate) type Connector =
+    Arc<dyn Fn() -> BoxFuture<'static, Result<Box<dyn Connection>, MobileError>> + Send + Sync>;
 
 type Reply = oneshot::Sender<Result<(HostResponse, f64), MobileError>>;
 
@@ -130,34 +174,85 @@ enum Command {
     },
 }
 
-/// Which reply completes a request.
+/// Which reply completes a request, and the identity it must carry.
 #[derive(Debug, Clone)]
 enum Expect {
-    Put,
+    Put(ContractKey),
     Get(ContractInstanceId),
-    Update(ContractInstanceId),
+    Update(ContractKey),
     Subscribe(ContractInstanceId),
 }
 
+enum Verdict {
+    /// The reply to the request in flight.
+    Reply,
+    /// The right kind of reply for another contract.
+    Mismatch(String),
+    /// Not a reply to this request, such as a subscription update.
+    Other,
+}
+
 impl Expect {
-    fn matches(&self, response: &HostResponse) -> bool {
+    fn is_write(&self) -> bool {
+        matches!(self, Self::Put(_) | Self::Update(_))
+    }
+
+    fn judge(&self, response: &HostResponse) -> Verdict {
         let HostResponse::ContractResponse(response) = response else {
-            return false;
+            return Verdict::Other;
+        };
+        let mismatch = |got: &dyn std::fmt::Display| {
+            Verdict::Mismatch(format!("asked about {self:?}, the reply named {got}"))
         };
         match (self, response) {
-            (Self::Put, ContractResponse::PutResponse { .. }) => true,
-            (Self::Get(id), ContractResponse::GetResponse { key, .. }) => key.id() == id,
-            (Self::Get(id), ContractResponse::NotFound { instance_id }) => instance_id == id,
-            (Self::Update(id), ContractResponse::UpdateResponse { key, .. }) => key.id() == id,
-            (Self::Subscribe(id), ContractResponse::SubscribeResponse { key, .. }) => {
-                key.id() == id
+            (Self::Put(want), ContractResponse::PutResponse { key }) => {
+                if same_identity(want, key) {
+                    Verdict::Reply
+                } else {
+                    mismatch(&ContractRef::from_key(key).describe())
+                }
             }
-            _ => false,
+            (Self::Get(id), ContractResponse::GetResponse { key, contract, .. }) => {
+                let code_matches = contract
+                    .as_ref()
+                    .is_none_or(|c| same_identity(&c.key(), key));
+                if key.id() == id && code_matches {
+                    Verdict::Reply
+                } else {
+                    mismatch(&ContractRef::from_key(key).describe())
+                }
+            }
+            (Self::Get(id), ContractResponse::NotFound { instance_id }) => {
+                if instance_id == id {
+                    Verdict::Reply
+                } else {
+                    mismatch(instance_id)
+                }
+            }
+            (Self::Update(want), ContractResponse::UpdateResponse { key, .. }) => {
+                if same_identity(want, key) {
+                    Verdict::Reply
+                } else {
+                    mismatch(&ContractRef::from_key(key).describe())
+                }
+            }
+            (Self::Subscribe(id), ContractResponse::SubscribeResponse { key, .. }) => {
+                if key.id() == id {
+                    Verdict::Reply
+                } else {
+                    mismatch(&ContractRef::from_key(key).describe())
+                }
+            }
+            _ => Verdict::Other,
         }
     }
 }
 
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+impl ContractRef {
+    fn describe(&self) -> String {
+        format!("{}/{}", self.instance_id, self.code_hash)
+    }
+}
 
 #[derive(uniffi::Object)]
 pub struct NodeClient {
@@ -168,39 +263,56 @@ pub struct NodeClient {
 /// Connect to the node's client API on `ws_port`.
 #[uniffi::export]
 pub async fn connect_client(ws_port: u16) -> Result<Arc<NodeClient>, MobileError> {
-    runtime::run(async move {
-        let api = connect_native(ws_port).await?;
-        let (commands, inbox) = mpsc::channel(64);
-        tokio::spawn(actor(ws_port, api, inbox));
-        Ok(Arc::new(NodeClient { commands, ws_port }))
-    })
-    .await
+    let connector: Connector = Arc::new(move || {
+        Box::pin(async move {
+            let api = connect_native(ws_port).await?;
+            Ok(Box::new(api) as Box<dyn Connection>)
+        })
+    });
+    runtime::run(async move { NodeClient::spawn(ws_port, connector).await }).await
 }
 
 impl NodeClient {
+    /// Open the first connection and start the actor on the current runtime.
+    pub(crate) async fn spawn(
+        ws_port: u16,
+        connector: Connector,
+    ) -> Result<Arc<Self>, MobileError> {
+        let connection = connector().await?;
+        let (commands, inbox) = mpsc::channel(64);
+        tokio::spawn(actor(connector, connection, inbox));
+        Ok(Arc::new(NodeClient { commands, ws_port }))
+    }
+
+    /// Queue a request and wait for its reply. The wait runs on the caller's
+    /// executor: when the caller cancels, the reply channel closes and the
+    /// actor skips the request if it has not been sent yet.
     async fn request(
         &self,
         request: ClientRequest<'static>,
         expect: Expect,
         timeout: Duration,
     ) -> Result<(HostResponse, f64), MobileError> {
-        let commands = self.commands.clone();
-        runtime::run(async move {
-            let (reply, answer) = oneshot::channel();
-            commands
-                .send(Command::Request {
-                    request: Box::new(request),
-                    expect,
-                    timeout,
-                    reply,
-                })
-                .await
-                .map_err(|_| MobileError::client(ClientErrorKind::Disconnected, "client closed"))?;
-            answer
-                .await
-                .map_err(|_| MobileError::client(ClientErrorKind::Disconnected, "client closed"))?
-        })
-        .await
+        let (reply, answer) = oneshot::channel();
+        self.commands
+            .send(Command::Request {
+                request: Box::new(request),
+                expect,
+                timeout,
+                reply,
+            })
+            .await
+            .map_err(|_| MobileError::client(ClientErrorKind::Disconnected, "client closed"))?;
+        answer
+            .await
+            .map_err(|_| MobileError::client(ClientErrorKind::Disconnected, "client closed"))?
+    }
+
+    async fn command(&self, command: Command) -> Result<(), MobileError> {
+        self.commands
+            .send(command)
+            .await
+            .map_err(|_| MobileError::client(ClientErrorKind::Disconnected, "client closed"))
     }
 }
 
@@ -234,6 +346,7 @@ impl NodeClient {
             Arc::new(ContractCode::from(code)),
             Parameters::from(parameters),
         )));
+        let key = contract.key();
         let request = ClientRequest::ContractOp(ContractRequest::Put {
             contract,
             state: WrappedState::new(state),
@@ -242,7 +355,7 @@ impl NodeClient {
             blocking_subscribe: false,
         });
         let (response, node_ms) = self
-            .request(request, Expect::Put, timeout_from(timeout_ms))
+            .request(request, Expect::Put(key), timeout_from(timeout_ms))
             .await?;
         match response {
             HostResponse::ContractResponse(ContractResponse::PutResponse { key }) => {
@@ -308,7 +421,7 @@ impl NodeClient {
             data: UpdateData::Delta(StateDelta::from(delta)),
         });
         let (response, node_ms) = self
-            .request(request, Expect::Update(*key.id()), timeout_from(timeout_ms))
+            .request(request, Expect::Update(key), timeout_from(timeout_ms))
             .await?;
         match response {
             HostResponse::ContractResponse(ContractResponse::UpdateResponse { key, summary }) => {
@@ -323,7 +436,8 @@ impl NodeClient {
     }
 
     /// Subscribe to a contract's updates. `listener` receives them until
-    /// `unsubscribe` or until the connection closes.
+    /// `unsubscribe`, until the connection closes, or until a restore after a
+    /// reset fails.
     pub async fn subscribe(
         &self,
         instance_id: String,
@@ -331,48 +445,41 @@ impl NodeClient {
         timeout_ms: Option<u64>,
     ) -> Result<OpTiming, MobileError> {
         let id = parse_instance_id(&instance_id)?;
-        let commands = self.commands.clone();
-        runtime::run(async move {
-            commands
-                .send(Command::Watch { id, listener })
-                .await
-                .map_err(|_| MobileError::client(ClientErrorKind::Disconnected, "client closed"))
-        })
-        .await?;
+        self.command(Command::Watch { id, listener }).await?;
         let request = ClientRequest::ContractOp(ContractRequest::Subscribe {
             key: id,
             summary: None,
         });
-        let (response, node_ms) = self
+        let result = self
             .request(request, Expect::Subscribe(id), timeout_from(timeout_ms))
-            .await?;
-        match response {
-            HostResponse::ContractResponse(ContractResponse::SubscribeResponse {
-                subscribed: true,
-                ..
-            }) => Ok(OpTiming { node_ms }),
-            HostResponse::ContractResponse(ContractResponse::SubscribeResponse { key, .. }) => {
-                Err(MobileError::client(
-                    ClientErrorKind::OperationFailed,
-                    format!("the node did not subscribe to {key}"),
-                ))
-            }
-            other => Err(unexpected(other)),
-        }
+            .await;
+        let outcome = match result {
+            Ok((
+                HostResponse::ContractResponse(ContractResponse::SubscribeResponse {
+                    subscribed: true,
+                    ..
+                }),
+                node_ms,
+            )) => return Ok(OpTiming { node_ms }),
+            Ok((
+                HostResponse::ContractResponse(ContractResponse::SubscribeResponse { key, .. }),
+                _,
+            )) => MobileError::client(
+                ClientErrorKind::OperationFailed,
+                format!("the node did not subscribe to {key}"),
+            ),
+            Ok((other, _)) => unexpected(other),
+            Err(err) => err,
+        };
+        let _ = self.command(Command::Unwatch { id }).await;
+        Err(outcome)
     }
 
     /// Stop delivering a contract's updates to its listener. The node keeps
     /// the subscription until this connection closes.
     pub async fn unsubscribe(&self, instance_id: String) -> Result<(), MobileError> {
         let id = parse_instance_id(&instance_id)?;
-        let commands = self.commands.clone();
-        runtime::run(async move {
-            commands
-                .send(Command::Unwatch { id })
-                .await
-                .map_err(|_| MobileError::client(ClientErrorKind::Disconnected, "client closed"))
-        })
-        .await
+        self.command(Command::Unwatch { id }).await
     }
 }
 
@@ -383,21 +490,69 @@ pub fn echo_bytes(bytes: Vec<u8>) -> Vec<u8> {
     bytes
 }
 
+enum Delivery {
+    Update(ContractRef, UpdateKind, Vec<u8>),
+    Closed(String),
+}
+
+/// One listener's ordered delivery queue, drained off the actor.
+struct Watch {
+    queue: mpsc::Sender<Delivery>,
+}
+
+impl Watch {
+    fn new(listener: Arc<dyn ContractListener>) -> Self {
+        let (queue, mut deliveries) = mpsc::channel::<Delivery>(LISTENER_QUEUE);
+        tokio::spawn(async move {
+            while let Some(delivery) = deliveries.recv().await {
+                let listener = listener.clone();
+                let last = matches!(delivery, Delivery::Closed(_));
+                let _ = tokio::task::spawn_blocking(move || match delivery {
+                    Delivery::Update(contract, kind, bytes) => {
+                        listener.on_update(contract, kind, bytes)
+                    }
+                    Delivery::Closed(reason) => listener.on_closed(reason),
+                })
+                .await;
+                if last {
+                    return;
+                }
+            }
+        });
+        Self { queue }
+    }
+
+    /// Queue an update. `false` when the listener has fallen too far behind.
+    fn offer(&self, delivery: Delivery) -> bool {
+        self.queue.try_send(delivery).is_ok()
+    }
+
+    fn close(self, reason: String) {
+        let queue = self.queue;
+        tokio::spawn(async move {
+            let _ = queue.send(Delivery::Closed(reason)).await;
+        });
+    }
+}
+
 struct Actor {
-    port: u16,
-    api: Option<WebApi>,
-    listeners: HashMap<ContractInstanceId, Arc<dyn ContractListener>>,
+    connector: Connector,
+    api: Option<Box<dyn Connection>>,
+    watches: HashMap<ContractInstanceId, Watch>,
+    /// Set when the last request lost its connection; the subscriptions are
+    /// restored after the caller has its answer.
+    pending_reset: Option<&'static str>,
 }
 
 impl Actor {
-    fn deliver(&self, response: HostResponse) {
+    fn deliver(&mut self, response: HostResponse) {
         let HostResponse::ContractResponse(ContractResponse::UpdateNotification { key, update }) =
             response
         else {
             tracing::debug!("dropping an unrequested reply: {response}");
             return;
         };
-        let Some(listener) = self.listeners.get(key.id()) else {
+        let Some(watch) = self.watches.get(key.id()) else {
             return;
         };
         let (kind, bytes) = match update {
@@ -408,20 +563,105 @@ impl Actor {
             }
             _ => (UpdateKind::Related, Vec::new()),
         };
-        listener.on_update(ContractRef::from_key(&key), kind, bytes);
+        if !watch.offer(Delivery::Update(ContractRef::from_key(&key), kind, bytes)) {
+            if let Some(watch) = self.watches.remove(key.id()) {
+                watch.close(format!("the listener fell {LISTENER_QUEUE} updates behind"));
+            }
+        }
     }
 
     fn close_subscriptions(&mut self, reason: &str) {
-        for (_, listener) in self.listeners.drain() {
-            listener.on_closed(reason.to_owned());
+        for (_, watch) in self.watches.drain() {
+            watch.close(reason.to_owned());
         }
     }
 
-    async fn connection(&mut self) -> Result<&mut WebApi, MobileError> {
+    async fn connection(&mut self) -> Result<&mut Box<dyn Connection>, MobileError> {
         if self.api.is_none() {
-            self.api = Some(connect_native(self.port).await?);
+            self.api = Some((self.connector)().await?);
         }
         Ok(self.api.as_mut().expect("connected above"))
+    }
+
+    /// A request's outcome was uncertain and its connection was dropped, so a
+    /// late reply cannot complete a later request. Restore the subscriptions
+    /// once on a new connection.
+    async fn reset(&mut self, why: &str) {
+        if self.watches.is_empty() {
+            return;
+        }
+        let ids: Vec<ContractInstanceId> = self.watches.keys().copied().collect();
+        if let Err(err) = self.connection().await {
+            self.close_subscriptions(&format!("{why}; reconnecting failed: {err}"));
+            return;
+        }
+        for id in ids {
+            let request = ClientRequest::ContractOp(ContractRequest::Subscribe {
+                key: id,
+                summary: None,
+            });
+            let restored = match self
+                .exchange(request, &Expect::Subscribe(id), RESTORE_TIMEOUT)
+                .await
+            {
+                Ok((
+                    HostResponse::ContractResponse(ContractResponse::SubscribeResponse {
+                        subscribed: true,
+                        ..
+                    }),
+                    _,
+                )) => Ok(()),
+                Ok((other, _)) => Err(format!("unexpected reply {other}")),
+                Err(Exchange::Failed(err)) => Err(err.to_string()),
+                Err(Exchange::Lost(lost)) => {
+                    // No second reset: the remaining subscriptions close.
+                    self.api = None;
+                    let err = lost.into_error(&Expect::Subscribe(id));
+                    self.close_subscriptions(&format!("{why}; restoring failed: {err}"));
+                    return;
+                }
+            };
+            if let Err(err) = restored {
+                if let Some(watch) = self.watches.remove(&id) {
+                    watch.close(format!("{why}; restoring the subscription failed: {err}"));
+                }
+            }
+        }
+    }
+
+    /// Send one request and wait for its reply on the current connection.
+    async fn exchange(
+        &mut self,
+        request: ClientRequest<'static>,
+        expect: &Expect,
+        timeout: Duration,
+    ) -> Result<(HostResponse, f64), Exchange> {
+        let started = Instant::now();
+        let api = self.connection().await.map_err(Exchange::Failed)?;
+        api.send(request)
+            .await
+            .map_err(|e| Exchange::Failed(MobileError::client(ClientErrorKind::Disconnected, e)))?;
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let api = self.api.as_mut().expect("connected");
+            match tokio::time::timeout_at(deadline, api.next()).await {
+                Ok(Some(Ok(response))) => match expect.judge(&response) {
+                    Verdict::Reply => {
+                        return Ok((response, started.elapsed().as_secs_f64() * 1000.0));
+                    }
+                    Verdict::Mismatch(detail) => {
+                        return Err(Exchange::Lost(Lost::Mismatch(detail)));
+                    }
+                    Verdict::Other => self.deliver(response),
+                },
+                Ok(Some(Err(err))) => {
+                    let kind = classify_client_error(&err);
+                    return Err(Exchange::Failed(MobileError::client(kind, err.to_string())));
+                }
+                Ok(None) => return Err(Exchange::Lost(Lost::Closed)),
+                Err(_) => return Err(Exchange::Lost(Lost::TimedOut)),
+            }
+        }
     }
 
     async fn run_request(
@@ -430,52 +670,84 @@ impl Actor {
         expect: Expect,
         timeout: Duration,
     ) -> Result<(HostResponse, f64), MobileError> {
-        let started = Instant::now();
-        let api = self.connection().await?;
-        api.send(request)
-            .await
-            .map_err(|e| MobileError::client(ClientErrorKind::Disconnected, e.to_string()))?;
-        let deadline = tokio::time::Instant::now() + timeout;
-        loop {
-            let next =
-                tokio::time::timeout_at(deadline, self.api.as_mut().expect("connected").next())
-                    .await;
-            match next {
-                Ok(Some(Ok(response))) if expect.matches(&response) => {
-                    return Ok((response, started.elapsed().as_secs_f64() * 1000.0));
+        match self.exchange(request, &expect, timeout).await {
+            Ok(reply) => Ok(reply),
+            Err(Exchange::Failed(err)) => Err(err),
+            Err(Exchange::Lost(lost)) => {
+                match &lost {
+                    Lost::Closed => {
+                        self.api = None;
+                        self.close_subscriptions("the connection closed");
+                    }
+                    Lost::TimedOut => {
+                        self.api = None;
+                        self.pending_reset =
+                            Some("a request timed out and the connection was reset");
+                    }
+                    Lost::Mismatch(_) => {
+                        self.api = None;
+                        self.pending_reset =
+                            Some("a reply named another contract and the connection was reset");
+                    }
                 }
-                Ok(Some(Ok(response))) => self.deliver(response),
-                Ok(Some(Err(err))) => {
-                    let kind = classify_client_error(&err);
-                    return Err(MobileError::client(kind, err.to_string()));
-                }
-                Ok(None) => {
-                    self.api = None;
-                    self.close_subscriptions("the connection closed");
-                    return Err(MobileError::client(
-                        ClientErrorKind::Disconnected,
-                        "the connection closed",
-                    ));
-                }
-                Err(_) => {
-                    // Uncertain outcome. Drop the connection so the late reply
-                    // cannot complete a later request.
-                    self.api = None;
-                    self.close_subscriptions("a request timed out and the connection was reset");
-                    return Err(MobileError::Timeout {
-                        what: format!("the reply to {expect:?}"),
-                    });
-                }
+                Err(lost.into_error(&expect))
             }
         }
     }
 }
 
-async fn actor(port: u16, api: WebApi, mut inbox: mpsc::Receiver<Command>) {
+/// Why a request ended without its reply.
+enum Exchange {
+    /// A definite failure: the request was refused or never sent.
+    Failed(MobileError),
+    /// The request was sent and its outcome is unknown.
+    Lost(Lost),
+}
+
+enum Lost {
+    TimedOut,
+    Closed,
+    Mismatch(String),
+}
+
+impl Lost {
+    fn into_error(self, expect: &Expect) -> MobileError {
+        let write = expect.is_write();
+        match self {
+            Self::TimedOut if write => MobileError::client(
+                ClientErrorKind::UncertainWrite,
+                format!("no reply to {expect:?} in time"),
+            ),
+            Self::TimedOut => MobileError::Timeout {
+                what: format!("the reply to {expect:?}"),
+            },
+            Self::Closed if write => MobileError::client(
+                ClientErrorKind::UncertainWrite,
+                "the connection closed before the reply",
+            ),
+            Self::Closed => {
+                MobileError::client(ClientErrorKind::Disconnected, "the connection closed")
+            }
+            Self::Mismatch(detail) if write => {
+                MobileError::client(ClientErrorKind::UncertainWrite, detail)
+            }
+            Self::Mismatch(detail) => {
+                MobileError::client(ClientErrorKind::IdentityMismatch, detail)
+            }
+        }
+    }
+}
+
+async fn actor(
+    connector: Connector,
+    connection: Box<dyn Connection>,
+    mut inbox: mpsc::Receiver<Command>,
+) {
     let mut actor = Actor {
-        port,
-        api: Some(api),
-        listeners: HashMap::new(),
+        connector,
+        api: Some(connection),
+        watches: HashMap::new(),
+        pending_reset: None,
     };
     loop {
         let command = match actor.api.as_mut() {
@@ -496,6 +768,7 @@ async fn actor(port: u16, api: WebApi, mut inbox: mpsc::Receiver<Command>) {
             None => inbox.recv().await,
         };
         let Some(command) = command else {
+            actor.close_subscriptions("the client closed");
             return;
         };
         match command {
@@ -505,15 +778,28 @@ async fn actor(port: u16, api: WebApi, mut inbox: mpsc::Receiver<Command>) {
                 timeout,
                 reply,
             } => {
+                // Canceled while queued: never sent.
+                if reply.is_closed() {
+                    tracing::debug!("skipping {expect:?}: canceled before it was sent");
+                    continue;
+                }
                 let result = actor.run_request(*request, expect, timeout).await;
                 let _ = reply.send(result);
+                if let Some(why) = actor.pending_reset.take() {
+                    actor.reset(why).await;
+                }
             }
             Command::Watch { id, listener } => {
-                actor.listeners.insert(id, listener);
+                if let Some(old) = actor.watches.insert(id, Watch::new(listener)) {
+                    old.close("replaced by a new listener".into());
+                }
             }
             Command::Unwatch { id } => {
-                actor.listeners.remove(&id);
+                actor.watches.remove(&id);
             }
         }
     }
 }
+
+#[cfg(test)]
+mod tests;
