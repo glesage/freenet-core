@@ -35,11 +35,11 @@ pub(in crate::transport) const SEED: u64 = 0x0059_40C2;
 
 /// One datagram as a test socket saw it leave.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Sent {
-    at_ns: u64,
-    from: SocketAddr,
-    to: SocketAddr,
-    bytes: Vec<u8>,
+pub(in crate::transport::quic) struct Sent {
+    pub(in crate::transport::quic) at_ns: u64,
+    pub(in crate::transport::quic) from: SocketAddr,
+    pub(in crate::transport::quic) to: SocketAddr,
+    pub(in crate::transport::quic) bytes: Vec<u8>,
 }
 
 /// A socket that records every datagram sent through it, with the time on
@@ -138,10 +138,32 @@ where
     }
 }
 
-/// [`drive`] on a multi-thread runtime. There, a task can still be running on
-/// another worker when this one runs out of things to poll, so after its turns it
-/// pauses briefly in real time, and moves the clock only to a wakeup that is
-/// armed. A stuck test is caught by the caller's real-time limit.
+/// [`drive`] on a multi-thread runtime. The clock moves to the next wakeup
+/// only when the runtime is idle ([`idle_workers`]): every worker parked
+/// and nothing in the global queue, the same on two readings a real-time
+/// millisecond apart (a worker that ran in between changes its park count).
+/// Moving it while a worker is still busy (a handshake's crypto in a debug
+/// build, say) fires that work's timers before it has had a chance to run,
+/// up to quinn's idle timeout (#6220). A stuck test is caught by the
+/// caller's real-time limit.
+///
+/// Must run on the thread that called `block_on`, not on a worker: its own
+/// worker would never read as parked.
+///
+/// Limits: idleness is read from the workers only. Work elsewhere is
+/// invisible to it: `spawn_blocking` and `block_in_place` threads, a
+/// `std::thread` that wakes tasks, real I/O or real-time timers. So is a
+/// worker preempted between parking and taking a task another thread just
+/// queued for it, for as long as the global queue is not read. A caller with
+/// any of those can still have the clock advanced over busy work; the QUIC
+/// tests here use none (in-memory sockets on virtual time).
+///
+/// A run that cannot go on prints why once, so a caller's real-time watchdog
+/// failure shows it: the runtime never read as idle for
+/// [`DRIVE_DIAGNOSTIC_CHECKS`] checks in a row (busy work it cannot see the
+/// end of, or a task that never parks), or it was idle with no wakeup left
+/// to advance to for as many (a lost wakeup, or a task waiting on something
+/// no timer will bring).
 pub(in crate::transport) async fn drive_on_threads<F>(
     time: &VirtualTime,
     limit: Duration,
@@ -151,8 +173,16 @@ where
     F: std::future::Future + Send + 'static,
     F::Output: Send + 'static,
 {
+    assert_ne!(
+        std::thread::current().name(),
+        Some("tokio-rt-worker"),
+        "drive_on_threads runs on the block_on thread, not on a worker"
+    );
     let task = tokio::spawn(fut);
     let limit_ns = time.now_nanos() + limit.as_nanos() as u64;
+    // Checks in a row that found the runtime busy, and that found it idle
+    // with nothing to advance to.
+    let (mut busy, mut stuck) = (0u32, 0u32);
     loop {
         for _ in 0..64 {
             if task.is_finished() {
@@ -160,16 +190,63 @@ where
             }
             tokio::task::yield_now().await;
         }
-        tokio::time::sleep(Duration::from_millis(1)).await;
+        let before = idle_workers();
+        // Blocks only this thread (not a worker), and sets no runtime timer
+        // that would wake the worker holding the time driver and change its
+        // park count.
+        std::thread::sleep(Duration::from_millis(1));
         if task.is_finished() {
             return task.await.expect("the driven future panicked");
         }
-        time.advance_to_next_wakeup();
+        if before.is_none() || before != idle_workers() {
+            busy += 1;
+            if busy == DRIVE_DIAGNOSTIC_CHECKS {
+                eprintln!(
+                    "drive_on_threads: the runtime has not been idle for {busy} checks in a row \
+                     at {} ns: work it cannot see the end of, or a task that never parks",
+                    time.now_nanos()
+                );
+            }
+            continue;
+        }
+        busy = 0;
+        if time.advance_to_next_wakeup().is_none() {
+            stuck += 1;
+            if stuck == DRIVE_DIAGNOSTIC_CHECKS {
+                eprintln!(
+                    "drive_on_threads: the runtime is idle and no wakeup is left to advance to \
+                     at {} ns: a lost wakeup, or a task waiting on something no timer brings",
+                    time.now_nanos()
+                );
+            }
+            continue;
+        }
+        stuck = 0;
         assert!(
             time.now_nanos() <= limit_ns,
-            "virtual time passed {limit:?} before the future finished"
+            "virtual time passed {limit:?} before the future finished, advancing only while \
+             the runtime was idle"
         );
     }
+}
+
+/// Checks in a row of one kind after which [`drive_on_threads`] prints why
+/// it cannot go on: about a second or more of real time.
+const DRIVE_DIAGNOSTIC_CHECKS: u32 = 1000;
+
+/// Each worker's park count if the runtime is idle (every worker parked,
+/// none queued globally), else `None`. Two equal readings mean no worker
+/// ran between them.
+fn idle_workers() -> Option<Vec<u64>> {
+    let metrics = tokio::runtime::Handle::current().metrics();
+    if metrics.global_queue_depth() > 0 {
+        return None;
+    }
+    let counts: Vec<u64> = (0..metrics.num_workers())
+        .map(|worker| metrics.worker_park_unpark_count(worker))
+        .collect();
+    // Odd while the worker is parked.
+    counts.iter().all(|count| count % 2 == 1).then_some(counts)
 }
 
 /// How long a QUIC test may run, in real time, before it is failed.
@@ -389,7 +466,7 @@ impl Pair {
         result
     }
 
-    fn sent(&self) -> Vec<Sent> {
+    pub(in crate::transport::quic) fn sent(&self) -> Vec<Sent> {
         self.log.lock().unwrap().clone()
     }
 
@@ -705,7 +782,12 @@ fn client_config_presenting(
     server_key: &TransportPublicKey,
 ) -> (quinn::ClientConfig, PeerKey) {
     let peer = PeerKey::of(server_key).unwrap();
-    let tls = config::tls_client_config(key, Arc::new(PinnedServerKey::new(&peer))).unwrap();
+    let tls = config::tls_client_config(
+        key,
+        Arc::new(PinnedServerKey::new(&peer)),
+        config::Alpn::Upgrade,
+    )
+    .unwrap();
     (endpoint.client_config(Arc::new(tls)), peer)
 }
 
@@ -1853,8 +1935,10 @@ fn transport_quic_values_and_unknown_ones() {
     assert_eq!(QuicMode::from_config_value(Some("force")), QuicMode::Off);
     assert_eq!(QuicMode::from_config_value(Some("")), QuicMode::Off);
     assert_eq!(QuicMode::default(), QuicMode::default_mode());
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    assert_eq!(QuicMode::from_config_value(None), QuicMode::Shadow);
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    assert_eq!(QuicMode::from_config_value(None), QuicMode::Prefer);
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    assert_eq!(QuicMode::from_config_value(None), QuicMode::Off);
 }
 
 /// The socket sends one datagram per transmit and receives one per call.
@@ -2775,6 +2859,9 @@ fn close_codes_reach_the_peer() {
             },
             QuicCloseCode::SessionEnded => QuicErrorKind::Refused {
                 reason: QuicRefusal::SessionEnded,
+            },
+            QuicCloseCode::RecycleForData => QuicErrorKind::Refused {
+                reason: QuicRefusal::RecycleForData,
             },
             QuicCloseCode::OverBudget => QuicErrorKind::Refused {
                 reason: QuicRefusal::OverBudget,
@@ -4767,6 +4854,367 @@ fn a_handoff_is_used_only_by_its_own_cap() {
         y_cap.admission_outstanding(y_id),
         "Y's send must not use X's handoff as Y's admission"
     );
+}
+
+/// Connect `a` to `b` on `pair` and return both connections.
+async fn connected(pair: &Pair) -> (QuicConnection, QuicConnection) {
+    let permit = pair
+        .b
+        .allow_peer(pair.a_addr, pair.a_keys.public())
+        .expect("allow-set has room");
+    let (a, b) = (pair.a.clone(), pair.b.clone());
+    let (b_addr, b_key) = (pair.b_addr, pair.b_key());
+    let result = drive(&pair.time, Duration::from_secs(30), async move {
+        let (client, server) = tokio::join!(a.connect(b_addr, &b_key), async {
+            b.accept()
+                .await
+                .expect("an incoming attempt")
+                .establish()
+                .await
+        });
+        (
+            client.expect("client handshake"),
+            server.expect("server accepted"),
+        )
+    })
+    .await;
+    drop(permit);
+    result
+}
+
+/// DATA_BLOCKED and STREAM_DATA_BLOCKED frames this side sent.
+fn blocked_frames(connection: &QuicConnection) -> u64 {
+    let tx = connection.inner().stats().frame_tx;
+    tx.data_blocked + tx.stream_data_blocked
+}
+
+/// The credit rule (`recycle::CreditWatch`) depends on quinn sending a
+/// DATA_BLOCKED or STREAM_DATA_BLOCKED frame when a write is blocked by the
+/// peer's flow-control limit, and none when it is held by this side's own
+/// send window. Pinned on a real connection, so a quinn version that changes
+/// either fails here instead of silently disabling the rule.
+#[test]
+fn quinn_reports_a_write_blocked_by_the_peers_credit_and_only_that() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        // Held by the peer's credit: the receiver reads nothing, and this
+        // side's send window is far above the peer's credit.
+        let net = crate::transport::test_net::subnet();
+        let credit = pair("quic-blocked-credit", net.addr(1), net.addr(2), None).await;
+        let (client, server) = connected(&credit).await;
+        client.inner().set_send_window(8 * MIB as u64);
+        let (raw, time) = (client.inner().clone(), credit.time.clone());
+        let blocked = drive(&credit.time, Duration::from_secs(30), async move {
+            let mut send = raw.open_uni().await.expect("open");
+            let writer = tokio::spawn(async move {
+                // Twice the peer's whole credit (`TEST_WINDOW`).
+                send.write_all(&payload(2 * TEST_WINDOW as usize))
+                    .await
+                    .ok();
+                send
+            });
+            let _recv = server.inner().accept_uni().await.expect("accept");
+            time.sleep(Duration::from_secs(5)).await;
+            writer.abort();
+            blocked_frames(&client)
+        })
+        .await;
+        assert!(blocked > 0, "a write held by the peer's credit is reported");
+
+        // Held by this side's send window only: the receiver reads at once
+        // and its window is far above this side's send window.
+        let net = crate::transport::test_net::subnet();
+        let own = pair("quic-blocked-own", net.addr(1), net.addr(2), None).await;
+        let (client, server) = connected(&own).await;
+        server
+            .inner()
+            .set_receive_window(quinn::VarInt::from_u32(8 * MIB as u32));
+        client.inner().set_send_window(8 * 1024);
+        let raw = client.inner().clone();
+        let (written, read) = drive(&own.time, Duration::from_secs(120), async move {
+            let mut send = raw.open_uni().await.expect("open");
+            tokio::join!(
+                async {
+                    send.write_all(&payload(MIB)).await.expect("write");
+                    send.finish().expect("finish");
+                    blocked_frames(&client)
+                },
+                async {
+                    let mut recv = server.inner().accept_uni().await.expect("accept");
+                    recv.read_to_end(2 * MIB).await.expect("read").len()
+                }
+            )
+        })
+        .await;
+        assert_eq!(read, MIB, "premise: the whole stream arrived");
+        assert_eq!(
+            written, 0,
+            "a write held by this side's send window is not reported"
+        );
+    })
+}
+
+/// A sample of `connection` as the acknowledgement watch takes it, with
+/// `writers` as the path's sends still writing.
+fn ack_sample(
+    connection: &QuicConnection,
+    writers: &super::recycle::Writers,
+) -> super::recycle::AckSample {
+    super::recycle::AckSample::of(connection.inner(), &connection.cap_holds(), writers)
+        .expect("a CappedCubic controller")
+}
+
+/// Feed an acknowledgement watch a sample of `connection` every
+/// `ACK_WATCH_TICK` on `time` for `ticks` ticks; why and after how many
+/// ticks it said close, if it did.
+async fn watch_for(
+    connection: &QuicConnection,
+    writers: &super::recycle::Writers,
+    time: &VirtualTime,
+    ticks: u32,
+) -> Option<(u32, super::recycle::Stall)> {
+    use super::recycle::{ACK_WATCH_TICK, ACK_WATCH_WINDOW, AckWatch};
+    let mut watch = AckWatch::new(ACK_WATCH_WINDOW, ack_sample(connection, writers));
+    for tick in 1..=ticks {
+        time.sleep(ACK_WATCH_TICK).await;
+        if watch.observe(time.now_nanos(), ack_sample(connection, writers)) {
+            return Some((tick, watch.stall().expect("a reason")));
+        }
+    }
+    None
+}
+
+/// The credit rule (`recycle::CreditWatch`) on real connections. A peer that
+/// acknowledges everything but returns no credit is closed as credit-starved
+/// within a window of the block. One that returns credit far below the floor
+/// rate (it reads 4 KiB every 200 ms, 20 KiB/s) is closed too, though later:
+/// quinn returns a slow reader's credit in large steps, about one every 13 s
+/// here, and a window holding a step is at the floor rate, so the close comes
+/// in the first window between two steps. A sender held back by its congestion window (100 ms round trips
+/// and 20% loss) while also blocked by the peer's credit, because it buffered
+/// more than the credit, is not, although its acknowledged rate is under the
+/// floor rate too: quinn reports its batches as not application-limited.
+#[test]
+fn the_credit_rule_on_real_connections() {
+    bounded(|| async move {
+        use super::recycle::{FLOOR_RATE_BYTES_PER_SEC, Stall, Writers};
+        let _seed = GlobalRng::seed_guard(SEED);
+        // A credit-starved sender on its own pair, watched from before its
+        // first write (as a path's watch runs from the path's start: quinn
+        // sends one blocked frame per limit, which the watch must see).
+        // `read_every` is how often the peer reads 4 KiB, if it reads.
+        let starved = |name: &'static str, read_every: Option<Duration>| async move {
+            let net = crate::transport::test_net::subnet();
+            let pair = pair(name, net.addr(1), net.addr(2), None).await;
+            let (client, server) = connected(&pair).await;
+            client.inner().set_send_window(8 * MIB as u64);
+            let (raw, time) = (client.inner().clone(), pair.time.clone());
+            let writers = Arc::new(Writers::default());
+            let writing = writers.start();
+            let result = drive(&pair.time, Duration::from_secs(300), async move {
+                let writer = tokio::spawn(async move {
+                    let mut send = raw.open_uni().await.expect("open");
+                    send.write_all(&payload(4 * TEST_WINDOW as usize))
+                        .await
+                        .ok();
+                    send
+                });
+                let reader = tokio::spawn({
+                    let time = time.clone();
+                    async move {
+                        let mut recv = server.inner().accept_uni().await.expect("accept");
+                        let Some(every) = read_every else {
+                            return std::future::pending::<()>().await;
+                        };
+                        loop {
+                            recv.read_chunk(4096, false).await.ok();
+                            time.sleep(every).await;
+                        }
+                    }
+                });
+                let result = watch_for(&client, &writers, &time, 30).await;
+                assert!(blocked_frames(&client) > 0, "premise: blocked by credit");
+                reader.abort();
+                writer.abort();
+                result
+            })
+            .await;
+            drop(writing);
+            result
+        };
+        let none = starved("quic-credit-none", None).await;
+        assert!(
+            matches!(none, Some((tick, Stall::CreditStarved)) if tick <= 6),
+            "a peer returning no credit is credit-starved within a window: {none:?}"
+        );
+        let slow = starved("quic-credit-slow", Some(Duration::from_millis(200))).await;
+        assert!(
+            matches!(slow, Some((tick, Stall::CreditStarved)) if tick <= 20),
+            "a peer returning credit at 20 KiB/s is credit-starved: {slow:?}"
+        );
+
+        let network = "quic-cwnd-held";
+        let net = crate::transport::test_net::subnet();
+        let cwnd = pair(network, net.addr(1), net.addr(2), None).await;
+        let (client, server) = connected(&cwnd).await;
+        client.inner().set_send_window(8 * MIB as u64);
+        let count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        crate::transport::in_memory_socket::set_packet_delivery_callback(
+            network,
+            Some(Arc::new(move |_, _, _, _| {
+                let n = count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n % 7 == 6 {
+                    crate::transport::in_memory_socket::PacketDeliveryDecision::Drop
+                } else {
+                    crate::transport::in_memory_socket::PacketDeliveryDecision::DelayedDelivery(
+                        Duration::from_millis(200),
+                    )
+                }
+            })),
+        );
+        let (raw, time) = (client.inner().clone(), cwnd.time.clone());
+        let writers = Arc::new(Writers::default());
+        let writing = writers.start();
+        let (held, blocked, acked, congestion_limited) =
+            drive(&cwnd.time, Duration::from_secs(300), async move {
+                let mut send = raw.open_uni().await.expect("open");
+                let writer = tokio::spawn(async move {
+                    // More than the peer's credit, so quinn buffers up to it
+                    // and blocks on it while the congestion window drains it.
+                    send.write_all(&payload(4 * TEST_WINDOW as usize))
+                        .await
+                        .ok();
+                    send
+                });
+                let reader = tokio::spawn(async move {
+                    let mut recv = server.inner().accept_uni().await.expect("accept");
+                    while let Ok(Some(_)) = recv.read_chunk(64 * 1024, false).await {}
+                });
+                let before = ack_sample(&client, &writers);
+                let held = watch_for(&client, &writers, &time, 15).await;
+                let after = ack_sample(&client, &writers);
+                reader.abort();
+                writer.abort();
+                (
+                    held,
+                    blocked_frames(&client),
+                    after.acked_bytes() - before.acked_bytes(),
+                    after.congestion_limited_batches() - before.congestion_limited_batches(),
+                )
+            })
+            .await;
+        drop(writing);
+        crate::transport::in_memory_socket::set_packet_delivery_callback(network, None);
+        assert!(blocked > 0, "premise: blocked by the peer's credit too");
+        assert!(
+            congestion_limited > 0,
+            "premise: held by the congestion window"
+        );
+        assert!(
+            acked < FLOOR_RATE_BYTES_PER_SEC * 30,
+            "premise: under the floor rate, {acked} B in 30 s"
+        );
+        assert_eq!(
+            held, None,
+            "a congestion-limited sender is not credit-starved"
+        );
+    })
+}
+
+/// The credit rule's congestion test (`recycle::CreditWatch`) rests on
+/// quinn's application-limited flag on each batch of acknowledgements: a
+/// sender whose data its congestion window holds back reports batches that
+/// are not application-limited, and one blocked by the peer's credit reports
+/// application-limited batches between the peer's credit steps. A step larger
+/// than the congestion window holds data back for a moment, so some batches
+/// of a credit-blocked sender are not (2 of 5 when measured); those intervals
+/// are not counted, and the rest are. Pinned on real connections as a
+/// fraction of the batches, so a quinn version that changes the flag fails
+/// here.
+#[test]
+fn quinn_reports_application_limited_batches_as_the_credit_rule_needs() {
+    bounded(|| async move {
+        use super::recycle::Writers;
+        let _seed = GlobalRng::seed_guard(SEED);
+        let writers = Arc::new(Writers::default());
+        let net = crate::transport::test_net::subnet();
+        let credit = pair("quic-app-limited-credit", net.addr(1), net.addr(2), None).await;
+        let (client, server) = connected(&credit).await;
+        client.inner().set_send_window(8 * MIB as u64);
+        let (raw, time) = (client.inner().clone(), credit.time.clone());
+        let (before, after) = drive(&credit.time, Duration::from_secs(120), async move {
+            let writer = tokio::spawn(async move {
+                let mut send = raw.open_uni().await.expect("open");
+                send.write_all(&payload(2 * TEST_WINDOW as usize))
+                    .await
+                    .ok();
+                send
+            });
+            let mut recv = server.inner().accept_uni().await.expect("accept");
+            time.sleep(Duration::from_secs(5)).await;
+            assert!(blocked_frames(&client) > 0, "premise: blocked by credit");
+            let before = ack_sample(&client, &writers);
+            for _ in 0..100 {
+                recv.read_chunk(4096, false).await.ok();
+                time.sleep(Duration::from_millis(200)).await;
+            }
+            let after = ack_sample(&client, &writers);
+            writer.abort();
+            (before, after)
+        })
+        .await;
+        let batches = after.batches() - before.batches();
+        let held = after.congestion_limited_batches() - before.congestion_limited_batches();
+        assert!(batches > 0, "premise: acknowledgements came while blocked");
+        assert!(
+            2 * held <= batches,
+            "credit-blocked: {held} of {batches} batches not application-limited"
+        );
+
+        let network = "quic-app-limited-cwnd";
+        let net = crate::transport::test_net::subnet();
+        let cwnd = pair(network, net.addr(1), net.addr(2), None).await;
+        let (client, server) = connected(&cwnd).await;
+        client.inner().set_send_window(8 * MIB as u64);
+        crate::transport::in_memory_socket::set_packet_delivery_callback(
+            network,
+            Some(Arc::new(|_, _, _, _| {
+                crate::transport::in_memory_socket::PacketDeliveryDecision::DelayedDelivery(
+                    Duration::from_millis(50),
+                )
+            })),
+        );
+        let raw = client.inner().clone();
+        let writers = Arc::new(Writers::default());
+        let (before, after, blocked) = drive(&cwnd.time, Duration::from_secs(120), async move {
+            let before = ack_sample(&client, &writers);
+            let mut send = raw.open_uni().await.expect("open");
+            tokio::join!(
+                async {
+                    send.write_all(&payload(MIB)).await.expect("write");
+                    send.finish().expect("finish");
+                },
+                async {
+                    let mut recv = server.inner().accept_uni().await.expect("accept");
+                    recv.read_to_end(2 * MIB).await.expect("read");
+                }
+            );
+            (
+                before,
+                ack_sample(&client, &writers),
+                blocked_frames(&client),
+            )
+        })
+        .await;
+        crate::transport::in_memory_socket::set_packet_delivery_callback(network, None);
+        let batches = after.batches() - before.batches();
+        let held = after.congestion_limited_batches() - before.congestion_limited_batches();
+        assert_eq!(blocked, 0, "premise: never blocked by credit");
+        assert!(
+            2 * held > batches,
+            "cwnd-held: only {held} of {batches} batches not application-limited"
+        );
+    })
 }
 
 /// A bind reports `up` when it built the endpoint, and otherwise why not: an

@@ -85,11 +85,11 @@ pub(crate) use liveness::QuicAvailabilityWatch;
 
 /// Whether the node may use QUIC: the `transport-quic` config key.
 ///
-/// An unset key is [`QuicMode::default_mode`]: shadow on Linux, macOS and
+/// An unset key is [`QuicMode::default_mode`]: prefer on Linux, macOS and
 /// Windows, and off elsewhere, because the breaker reads no boot identity
 /// there and so cannot trip. The Windows breaker counts short runs that
 /// panicked in QUIC code instead of detecting crashes ([`breaker`]); it was
-/// confirmed on a real Windows machine before Windows defaulted to shadow
+/// confirmed on a real Windows machine before Windows defaulted to an endpoint
 /// (#6031). The default is decided when the value is read and
 /// never written to `config.toml`, so a later release can change it
 /// for every node that did not set the key, which is how a default-off
@@ -110,14 +110,12 @@ pub enum QuicMode {
     /// endpoint driver and one upgrade task per connection run; a promoted
     /// connection's higher key sends `Upgrade` messages on its UDP session; and
     /// the endpoint's memory. If the endpoint cannot be built the node logs a
-    /// warning and runs with QUIC off. The default on Linux, macOS and
-    /// Windows.
+    /// warning and runs with QUIC off.
     Shadow,
     /// Negotiates data on a path to a peer in the release's slice
-    /// (`upgrade::slice`), and sends its data on a path where both sides did. At a
-    /// share of 0, this release's, it acts as [`Self::Shadow`] on the wire. A node
-    /// that sets it early starts carrying data over QUIC once it runs a release
-    /// with a share above 0. That release's notes must say so.
+    /// (`upgrade::slice`, the release's ramp from `QUIC_DATA_RAMP_START`), and sends
+    /// its data on a path where both sides did. With no ramp start set it acts as
+    /// [`Self::Shadow`] on the wire. The default on Linux, macOS and Windows.
     Prefer,
 }
 
@@ -148,7 +146,7 @@ impl QuicMode {
     /// See [`QuicMode::Prefer`].
     pub const PREFER: &'static str = "prefer";
 
-    /// What an unset `transport-quic` means on this platform: shadow on Linux,
+    /// What an unset `transport-quic` means on this platform: prefer on Linux,
     /// macOS and Windows, and off elsewhere, because the crash-loop breaker
     /// cannot trip there. Windows joined once its breaker was confirmed on a
     /// real Windows machine (#6031).
@@ -158,7 +156,7 @@ impl QuicMode {
             target_os = "macos",
             target_os = "windows"
         )) {
-            Self::Shadow
+            Self::Prefer
         } else {
             Self::Off
         }
@@ -230,6 +228,9 @@ pub(crate) struct EndpointCore {
     sources: Arc<dyn QuicSources>,
     /// The transport settings of every connection (`config::transport_config`).
     transport: Arc<quinn::TransportConfig>,
+    /// The transport settings of a native client
+    /// (`config::native_client_transport_config`).
+    native_transport: Arc<quinn::TransportConfig>,
     /// The server settings every accepted connection starts from
     /// (`config::server_config`), with TLS that refuses every client: each
     /// accepted attempt replaces the TLS with one pinned to the client it
@@ -286,6 +287,10 @@ struct ExpectedClients {
 
 struct ExpectedEntry {
     key: PeerKey,
+    /// The one ALPN an attempt from the address is accepted with: native
+    /// only for an address allowed by `QuicEndpoint::allow_native_peer`
+    /// (`native::endpoint`).
+    alpn: config::Alpn,
     permits: usize,
     holds: usize,
 }
@@ -301,14 +306,15 @@ impl ExpectedClients {
             .map(|entry| entry.key.clone())
     }
 
-    /// The key `addr` was allowed with and a hold on it, in one step, if a
-    /// permit for it is alive.
-    fn hold(self: &Arc<Self>, addr: SocketAddr) -> Option<(PeerKey, KeyHold)> {
+    /// The key and ALPN `addr` was allowed with and a hold on it, in one
+    /// step, if a permit for it is alive.
+    fn hold(self: &Arc<Self>, addr: SocketAddr) -> Option<(PeerKey, config::Alpn, KeyHold)> {
         let mut by_addr = self.by_addr.lock();
         let entry = by_addr.get_mut(&addr).filter(|entry| entry.permits > 0)?;
         entry.holds += 1;
         Some((
             entry.key.clone(),
+            entry.alpn,
             KeyHold {
                 expected: self.clone(),
                 addr,
@@ -376,10 +382,12 @@ pub(crate) enum QuicAllowError {
     /// The demux socket's allow-set is full.
     #[error("the QUIC allow-set is full")]
     AllowSetFull,
-    /// The address is already bound to another key: a permit for it, or an
-    /// attempt or connection authenticated against it, is alive. The earlier
-    /// key wins until all of those are gone, so an address cannot be moved to
-    /// a new key while anything for the old one is using it.
+    /// The address is already bound to another key, or to the same key for
+    /// the other kind of connection (an upgrade or a native one): a permit
+    /// for it, or an attempt or connection authenticated against it, is
+    /// alive. The earlier binding wins until all of those are gone, so an
+    /// address cannot be moved to a new key or kind while anything for the
+    /// old one is using it.
     #[error("the address is already allowed for another key")]
     KeyConflict,
     #[error(transparent)]
@@ -390,6 +398,8 @@ pub(crate) enum QuicAllowError {
 trait QuicSources: Send + Sync {
     fn allow(&self, addr: SocketAddr) -> Option<QuicSourcePermit>;
     fn allow_existing(&self, addr: SocketAddr) -> Option<QuicSourcePermit>;
+    /// Send one datagram outside quinn, without waiting (a native punch).
+    fn try_send(&self, datagram: &[u8], to: SocketAddr) -> io::Result<usize>;
 }
 
 impl<S: Socket> QuicSources for DemuxSocket<S> {
@@ -399,6 +409,10 @@ impl<S: Socket> QuicSources for DemuxSocket<S> {
 
     fn allow_existing(&self, addr: SocketAddr) -> Option<QuicSourcePermit> {
         self.allow_existing_quic_source(addr)
+    }
+
+    fn try_send(&self, datagram: &[u8], to: SocketAddr) -> io::Result<usize> {
+        Socket::try_send_to(self, datagram, to)
     }
 }
 
@@ -571,6 +585,7 @@ impl QuicEndpoint {
         let refusing = identity.refusing_server_tls().map_err(|e| invalid(&e))?;
         let sources: Arc<dyn QuicSources> = socket.clone();
         let transport = Arc::new(config::transport_config(settings, &time));
+        let native_transport = Arc::new(config::native_client_transport_config(settings, &time));
         let clock = config::system_clock(time.clone());
         let server = Arc::new(config::server_config(
             Arc::new(refusing),
@@ -635,6 +650,7 @@ impl QuicEndpoint {
                 endpoint,
                 sources,
                 transport,
+                native_transport,
                 server,
                 identity,
                 expected_clients: Arc::new(ExpectedClients::default()),
@@ -804,6 +820,17 @@ impl QuicEndpoint {
         addr: SocketAddr,
         expected: &TransportPublicKey,
     ) -> Result<QuicPeerPermit, QuicAllowError> {
+        self.allow_peer_for(addr, expected, config::Alpn::Upgrade)
+    }
+
+    /// [`Self::allow_peer`] with the one ALPN an attempt from `addr` is
+    /// accepted with (`native::endpoint` allows a native peer through it).
+    fn allow_peer_for(
+        &self,
+        addr: SocketAddr,
+        expected: &TransportPublicKey,
+        alpn: config::Alpn,
+    ) -> Result<QuicPeerPermit, QuicAllowError> {
         let key = PeerKey::of(expected)?;
         let source = self
             .sources
@@ -815,13 +842,14 @@ impl QuicEndpoint {
         {
             let mut by_addr = self.expected_clients.by_addr.lock();
             match by_addr.get_mut(&addr) {
-                Some(entry) if entry.key == key => entry.permits += 1,
+                Some(entry) if entry.key == key && entry.alpn == alpn => entry.permits += 1,
                 Some(_) => return Err(QuicAllowError::KeyConflict),
                 None => {
                     by_addr.insert(
                         addr,
                         ExpectedEntry {
                             key,
+                            alpn,
                             permits: 1,
                             holds: 0,
                         },
@@ -956,12 +984,12 @@ impl EndpointCore {
                 incoming.ignore();
                 continue;
             };
-            let Some((expected, hold)) = self.expected_clients.hold(permit.addr()) else {
+            let Some((expected, alpn, hold)) = self.expected_clients.hold(permit.addr()) else {
                 tracing::debug!(%remote, "Ignoring a QUIC connection attempt from a source with no expected key");
                 incoming.ignore();
                 continue;
             };
-            let tls = match self.identity.server_tls(&expected) {
+            let tls = match self.identity.server_tls_for(&expected, alpn) {
                 Ok(tls) => tls,
                 Err(error) => {
                     tracing::warn!(%remote, %error, "Could not build the TLS configuration for a QUIC connection attempt");
@@ -977,6 +1005,7 @@ impl EndpointCore {
                 permit,
                 config: Arc::new(config),
                 peer: expected,
+                alpn,
                 hold,
                 cap_holds: Arc::new(self.cap_holds.like()),
             });
@@ -996,6 +1025,8 @@ pub(crate) struct QuicIncoming {
     config: Arc<quinn::ServerConfig>,
     /// That key, which the handshake must prove.
     peer: PeerKey,
+    /// The one ALPN the attempt is accepted with.
+    alpn: config::Alpn,
     /// Keeps the address bound to `peer` while the attempt lives.
     hold: KeyHold,
     /// The connection's own record of cap-held transmits, given to its poller.
@@ -1006,6 +1037,12 @@ impl QuicIncoming {
     /// The address the attempt came from, normalized as the allow-set does.
     pub(crate) fn source(&self) -> SocketAddr {
         self.permit.addr()
+    }
+
+    /// Whether the attempt is for a native connection: its address was
+    /// allowed by `QuicEndpoint::allow_native_peer` (`native::endpoint`).
+    pub(crate) fn is_native(&self) -> bool {
+        self.alpn == config::Alpn::Native
     }
 
     /// Drop the attempt without answering it: the client retransmits its
@@ -1215,6 +1252,9 @@ pub(crate) struct QuicCloser {
     health: Arc<EndpointHealth>,
     /// The code of the close this closer sent, if it sent one.
     closed_with: Arc<std::sync::OnceLock<QuicCloseCode>>,
+    /// Why this node closed, when the caller said (`close_for`). Set before
+    /// the close is sent, so whoever sees the connection end sees it.
+    closed_for: Arc<std::sync::OnceLock<crate::transport::boundary::QuicPathEnd>>,
 }
 
 impl QuicCloser {
@@ -1229,6 +1269,7 @@ impl QuicCloser {
             closing: Arc::default(),
             health,
             closed_with: Arc::default(),
+            closed_for: Arc::default(),
         }
     }
 
@@ -1256,11 +1297,33 @@ impl QuicCloser {
     /// node's 8 version bytes.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn close_with_reason(&self, code: QuicCloseCode, reason: &[u8]) -> bool {
+        self.close_inner(code, reason, None)
+    }
+
+    /// [`Self::close`], recording `cause` as why this node closed
+    /// ([`Self::closed_for`]) if this call closes the connection.
+    pub(crate) fn close_for(
+        &self,
+        code: QuicCloseCode,
+        cause: crate::transport::boundary::QuicPathEnd,
+    ) -> bool {
+        self.close_inner(code, code.reason(), Some(cause))
+    }
+
+    fn close_inner(
+        &self,
+        code: QuicCloseCode,
+        reason: &[u8],
+        cause: Option<crate::transport::boundary::QuicPathEnd>,
+    ) -> bool {
         if self.closing.swap(true, std::sync::atomic::Ordering::AcqRel) {
             return false;
         }
         if self.connection.close_reason().is_some() {
             return false;
+        }
+        if let Some(cause) = cause {
+            let _first = self.closed_for.set(cause);
         }
         if self.health.closes_can_be_sent() {
             TRANSPORT_METRICS.record_quic_close_sent(code, self.connection.remote_address());
@@ -1273,6 +1336,12 @@ impl QuicCloser {
     /// The code of the close this node sent on the connection, if it sent one.
     pub(crate) fn closed_with(&self) -> Option<QuicCloseCode> {
         self.closed_with.get().copied()
+    }
+
+    /// Why this node closed the connection, if it closed it with
+    /// [`Self::close_for`].
+    pub(crate) fn closed_for(&self) -> Option<crate::transport::boundary::QuicPathEnd> {
+        self.closed_for.get().copied()
     }
 
     /// Whether the connection is still open (quinn has no close reason).

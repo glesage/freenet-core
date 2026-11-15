@@ -207,6 +207,14 @@ pub(in crate::transport::quic) struct Receiver<T> {
     accept_data: bool,
     /// Closes the path on the first data frame it refuses ([`Self::accept_data`]).
     closer: super::super::QuicCloser,
+    /// A data frame was refused on this path: the receive task arms the one
+    /// delayed close ([`REFUSAL_CLOSE_DELAY`]) and the refused reader ends.
+    refused_data: AtomicBool,
+    /// The kind of the first refused data frame, for the close's WARN.
+    refused_kind: parking_lot::Mutex<Option<FrameKind>>,
+    /// The most stream readers the receive task held at once. Tests only.
+    #[cfg(test)]
+    readers_peak: Arc<AtomicUsize>,
     /// The connection's gaps over all its streams.
     ranges: Arc<ConnRanges>,
     /// The connection's share of the node's buffer budget, for a path that
@@ -231,6 +239,30 @@ pub(in crate::transport::quic) struct Receiver<T> {
 }
 
 impl<T: TimeSource> Receiver<T> {
+    /// Close the path after a refused data frame ([`Self::refused_data`]).
+    /// `QuicCloser::close` is at most once per connection and a no-op once it
+    /// has ended, so only a close that happens is counted and logged.
+    fn close_refusing_data(&self) {
+        if self.closer.close_for(
+            QuicCloseCode::Downgrade,
+            crate::transport::boundary::QuicPathEnd::RefusedData,
+        ) {
+            self.stats.record(QuicInboundOutcome::ClosedRefusingData);
+            let kind = *self.refused_kind.lock();
+            tracing::warn!(
+                ?kind,
+                "QUIC path: the peer sent data on a path where this node did not \
+                 set its data bit; closing the path so the peer falls back to UDP"
+            );
+        }
+    }
+
+    /// The most stream readers the receive task held at once. Tests only.
+    #[cfg(test)]
+    pub(in crate::transport::quic) fn readers_peak(&self) -> Arc<AtomicUsize> {
+        self.readers_peak.clone()
+    }
+
     /// The connection's gap count.
     pub(in crate::transport::quic) fn ranges(&self) -> Arc<ConnRanges> {
         self.ranges.clone()
@@ -346,6 +378,10 @@ impl<T: TimeSource> Receiver<T> {
             accept_data,
             rtt: Arc::new(PathRtt::new(closer.rtt())),
             closer,
+            refused_data: AtomicBool::new(false),
+            refused_kind: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            readers_peak: Arc::new(AtomicUsize::new(0)),
             ranges: Arc::new(ConnRanges::new(
                 MAX_GAPS_PER_CONNECTION,
                 super::super::config::MAX_UNI_STREAMS as usize,
@@ -587,8 +623,27 @@ pub(in crate::transport::quic) async fn receive<T: TimeSource>(
     // task that reads, so the meter's evaluations never run concurrently.
     let meter = receiver.meter.clone();
     let mut sending = std::pin::pin!(send_progress(&meter));
+    // The close after a refused data frame: one per connection, armed here
+    // rather than held by each refused reader, so the readers stay within the
+    // peer's stream grant.
+    let mut refusal_close: Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>> =
+        None;
     loop {
+        if refusal_close.is_none() && receiver.refused_data.load(Ordering::Relaxed) {
+            refusal_close = Some(receiver.time.sleep(REFUSAL_CLOSE_DELAY));
+        }
+        #[cfg(test)]
+        receiver
+            .readers_peak
+            .fetch_max(readers.len(), Ordering::Relaxed);
         tokio::select! {
+            // The precondition makes this arm run only while a close is armed,
+            // and `select!` evaluates it before polling the arm, so the
+            // `expect` cannot fire.
+            () = async { refusal_close.as_mut().expect("the precondition checks it is armed").await }, if refusal_close.is_some() => {
+                refusal_close = Some(Box::pin(std::future::pending()));
+                receiver.close_refusing_data();
+            }
             () = &mut sending => {
                 if let Some(meter) = &meter {
                     meter.maybe_evaluate(receiver.time.now_nanos());
@@ -720,6 +775,20 @@ struct BodyReader<T: TimeSource> {
     /// The stream's place in its path's stream limit; `None` in tests that
     /// build a reader alone.
     ticket: Option<LimitTicket>,
+    /// An admitted stream's age, extended while its connection delivers
+    /// ([`Self::set_stream_age`]); `None` before admission and for an
+    /// uncharged message.
+    age: Option<StreamAge>,
+}
+
+/// An admitted stream's age ([`BodyReader::set_stream_age`]).
+struct StreamAge {
+    /// When it was admitted.
+    admitted_at: u64,
+    /// The connection's bytes read then ([`ConnRanges::read_bytes`]).
+    read_then: u64,
+    /// The hard ceiling: admission plus [`STREAM_AGE_LIMIT`].
+    ceiling_at: u64,
 }
 
 impl<T: TimeSource> BodyReader<T> {
@@ -759,7 +828,58 @@ impl<T: TimeSource> BodyReader<T> {
             paused: false,
             progressed: false,
             ticket: None,
+            age: None,
         }
+    }
+
+    /// The age of an admitted stream of `total` bytes. It is first
+    /// `inbound_stream_age_limit(total)`: the stream at
+    /// `MIN_INBOUND_STREAM_RATE_BYTES_PER_SEC` (32 KiB/s), at least 5 min,
+    /// as on UDP. When that is reached, the stream is kept as long as its
+    /// connection has read at least that rate since the stream was admitted
+    /// ([`Self::extend_age`]), up to [`STREAM_AGE_LIMIT`] (2 h). quinn shares
+    /// a connection between its streams round-robin, so an honest stream's
+    /// own rate falls with the streams beside it, while the connection's
+    /// does not; and a peer that holds streams open must keep its connection
+    /// delivering at the floor to keep them.
+    fn set_stream_age(&mut self, total: u64) {
+        let now = self.time.now_nanos();
+        self.age = Some(StreamAge {
+            admitted_at: now,
+            read_then: self.conn_ranges.read_bytes(),
+            ceiling_at: now.saturating_add(nanos(stream_age_limit())),
+        });
+        self.set_age_limit(inbound_stream_age_limit(total).min(stream_age_limit()));
+    }
+
+    /// At `now`, past the age deadline: whether the stream is kept, its
+    /// deadline moved to when the connection would fall under the floor at
+    /// the bytes it has read so far (at least a second on, at most the
+    /// ceiling). Not for a stream without an extendable age, or past the
+    /// ceiling, or whose connection read less than the floor since the
+    /// stream was admitted.
+    fn extend_age(&mut self, now: u64) -> bool {
+        let Some(age) = &self.age else {
+            return false;
+        };
+        if now >= age.ceiling_at {
+            return false;
+        }
+        let rate = u128::from(
+            crate::transport::peer_connection::streaming::MIN_INBOUND_STREAM_RATE_BYTES_PER_SEC,
+        );
+        let read = u128::from(self.conn_ranges.read_bytes().saturating_sub(age.read_then));
+        let elapsed = u128::from(now.saturating_sub(age.admitted_at));
+        if read * 1_000_000_000 < elapsed * rate {
+            return false;
+        }
+        let caught_up = u64::try_from(read * 1_000_000_000 / rate)
+            .unwrap_or(u64::MAX)
+            .saturating_add(age.admitted_at);
+        self.age_deadline = caught_up
+            .max(now.saturating_add(1_000_000_000))
+            .min(age.ceiling_at);
+        true
     }
 
     fn deadline(&self) -> u64 {
@@ -813,6 +933,7 @@ impl<T: TimeSource> BodyReader<T> {
                 }
                 let prefix = self.ranges.prefix();
                 let added = self.ranges.insert(start, stop)?;
+                self.conn_ranges.note_read(stop - start);
                 if let Some(meter) = &self.meter {
                     // Every byte read is a credit quinn returns; only bytes that
                     // extend the in-order prefix are delivery that grows a window.
@@ -889,7 +1010,7 @@ impl<T: TimeSource> BodyReader<T> {
                     {
                         return Err(ReadFailure::Idle);
                     }
-                    if now >= self.age_deadline {
+                    if now >= self.age_deadline && !self.extend_age(now) {
                         return Err(if self.paused {
                             ReadFailure::ThrottledPastAge
                         } else {
@@ -951,13 +1072,20 @@ impl<T: TimeSource> BodyReader<T> {
     /// `ready` is not already available.
     async fn until_age<F: Future>(&mut self, ready: F) -> Result<F::Output, ReadFailure> {
         debug_assert!(self.finished, "a reader that waits keeps reading");
-        if self.timer_at != self.age_deadline {
-            self.timer_at = self.age_deadline;
-            self.timer = self.time.sleep_until(self.timer_at);
-        }
-        let out = tokio::select! {
-            out = ready => out,
-            () = &mut self.timer => return Err(ReadFailure::Age),
+        let mut ready = std::pin::pin!(ready);
+        let out = loop {
+            if self.timer_at != self.age_deadline {
+                self.timer_at = self.age_deadline;
+                self.timer = self.time.sleep_until(self.timer_at);
+            }
+            tokio::select! {
+                out = &mut ready => break out,
+                () = &mut self.timer => {
+                    if !self.extend_age(self.time.now_nanos()) {
+                        return Err(ReadFailure::Age);
+                    }
+                }
+            }
         };
         // Re-arming alone would fail a wait longer than the idle timeout as
         // Idle at once, so progress is reset first.
@@ -1479,6 +1607,9 @@ pub(in crate::transport::quic) struct ConnRanges {
     /// check whether it has ended; false on the common path, which then
     /// takes no lock.
     grace_pending: AtomicBool,
+    /// Bytes read on the connection's streams so far, for the admitted
+    /// streams' age ([`BodyReader::extend_age`]).
+    read: AtomicU64,
     /// The most held at once. Tests only.
     #[cfg(test)]
     peak: AtomicUsize,
@@ -1495,6 +1626,7 @@ impl ConnRanges {
             last_trip: AtomicU64::new(0),
             frozen: parking_lot::Mutex::new(Frozen::default()),
             grace_pending: AtomicBool::new(false),
+            read: AtomicU64::new(0),
             #[cfg(test)]
             peak: AtomicUsize::new(0),
         }
@@ -1586,6 +1718,16 @@ impl ConnRanges {
         #[cfg(test)]
         self.peak.fetch_max(held, Ordering::Relaxed);
         held <= self.cap.load(Ordering::Relaxed) || delta <= 0
+    }
+
+    /// `bytes` more were read on one of the connection's streams.
+    fn note_read(&self, bytes: u64) {
+        self.read.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Bytes read on the connection's streams so far.
+    fn read_bytes(&self) -> u64 {
+        self.read.load(Ordering::Relaxed)
     }
 
     /// Set the cap, from the connection's window (`budget::gap_cap`).
@@ -1767,6 +1909,24 @@ fn nanos(duration: Duration) -> u64 {
 /// or the simulation idle threshold under that accommodation).
 fn uncharged_age_limit() -> Duration {
     inbound_stream_age_limit(0)
+}
+
+/// The ceiling on a charged stream's age, sender and receiver alike, whatever
+/// its size. A stream's age starts at its length at 32 KiB/s, at least
+/// 5 min, and is extended only while its connection reads at least that
+/// rate ([`BodyReader::set_stream_age`]): quinn shares a connection between
+/// its streams round-robin, so a per-stream rate would fail honest streams
+/// on a busy connection. To keep streams open past their first age a peer
+/// must keep its connection delivering at the floor; this ceiling ends even
+/// that. What held streams cost is bounded by their charges, at most the
+/// per-peer inbound budget (`MAX_INBOUND_STREAM_BYTES_PER_CONNECTION`), and
+/// by the stream limit; there is no node-wide allowance.
+pub(in crate::transport::quic) const STREAM_AGE_LIMIT: Duration = Duration::from_secs(2 * 60 * 60);
+
+/// [`STREAM_AGE_LIMIT`], or the (longer) simulation idle threshold when it
+/// is on, as `inbound_stream_age_limit` does.
+pub(in crate::transport::quic) fn stream_age_limit() -> Duration {
+    STREAM_AGE_LIMIT.max(inbound_stream_age_limit(0))
 }
 
 /// How long a stream may take to deliver its header. An honest header is
@@ -1996,24 +2156,12 @@ async fn read_one<T: TimeSource>(
             .stats
             .record(QuicInboundOutcome::RefusedNotAcceptingData);
         reader.stop(stop_code::NOT_ACCEPTING_DATA);
-        // The close waits, in this reader alone, so the stops already sent reach
-        // the sender first: a sender that sees the close before a stream's stop
-        // reads the stream as lost and drops it, where the stop sends it on UDP.
-        // Every refused frame's reader waits and then asks; `QuicCloser::close`
-        // is at most once per connection and a no-op once it has ended, so the
-        // first close is the only one counted and logged. The waits are bounded
-        // by the peer's stream credit and end with the connection.
-        receiver.time.sleep(REFUSAL_CLOSE_DELAY).await;
-        if receiver.closer.close(QuicCloseCode::Downgrade) {
-            receiver
-                .stats
-                .record(QuicInboundOutcome::ClosedRefusingData);
-            tracing::warn!(
-                kind = ?header.kind(),
-                "QUIC path: the peer sent data on a path where this node did not \
-                 set its data bit; closing the path so the peer falls back to UDP"
-            );
-        }
+        // The close waits, so the stops already sent reach the sender first: a
+        // sender that sees the close before a stream's stop reads the stream as
+        // lost and drops it, where the stop sends it on UDP. The receive task
+        // arms it once per connection ([`receive`]); this reader ends here.
+        receiver.refused_kind.lock().get_or_insert(header.kind());
+        receiver.refused_data.store(true, Ordering::Relaxed);
         return;
     }
     match header.kind() {
@@ -2082,7 +2230,10 @@ impl<T: TimeSource> Receiver<T> {
                 // The peer falls back to the UDP session and counts it as
                 // `quic_fallback_over_budget_rx`.
                 if self.ranges.trip(self.time.now_nanos())
-                    && self.closer.close(QuicCloseCode::OverBudget)
+                    && self.closer.close_for(
+                        QuicCloseCode::OverBudget,
+                        crate::transport::boundary::QuicPathEnd::PeerOverBudget,
+                    )
                 {
                     stats.record(QuicInboundOutcome::ClosedTooManyRanges);
                     tracing::warn!(
@@ -2101,7 +2252,10 @@ impl<T: TimeSource> Receiver<T> {
                 // The peer falls back to the UDP session and counts it as
                 // `quic_fallback_over_budget_rx`.
                 if self.staging.trip(self.time.now_nanos())
-                    && self.closer.close(QuicCloseCode::OverBudget)
+                    && self.closer.close_for(
+                        QuicCloseCode::OverBudget,
+                        crate::transport::boundary::QuicPathEnd::PeerOverBudget,
+                    )
                 {
                     stats.record(QuicInboundOutcome::ClosedStagedOverCap);
                     tracing::warn!(
@@ -2197,7 +2351,7 @@ impl<T: TimeSource> Receiver<T> {
                     return;
                 }
             }
-            reader.set_age_limit(inbound_stream_age_limit(total));
+            reader.set_stream_age(total);
         }
         let was_charged = if guard.is_some() {
             Charged::Yes
@@ -2341,7 +2495,7 @@ impl<T: TimeSource> Receiver<T> {
         {
             guard.handle().cancel();
         }
-        reader.set_age_limit(inbound_stream_age_limit(total));
+        reader.set_stream_age(total);
         reader.source = guard.handle().quic_source().cloned();
         if let Some(source) = &reader.source {
             // The round trip as of this stream; the watch keeps it current.

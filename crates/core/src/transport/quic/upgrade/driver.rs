@@ -89,6 +89,7 @@ use crate::transport::peer_connection::inbound_budget::SharedInboundBudget;
 use crate::transport::quic::config::QuicRateLimit;
 use crate::transport::quic::control::ControlError;
 use crate::transport::quic::identity::PeerKey;
+use crate::transport::quic::native::waiters::NativeWaiters;
 use crate::transport::quic::path::pacer::{LimitPacer, SendPacer};
 use crate::transport::quic::path::{
     BoundedSend, QuicDataInbox, QuicDataSenders, QuicPath, QuicPathLimits, data_channels,
@@ -149,6 +150,23 @@ impl DeclineGate {
 pub(in crate::transport) enum PathClock {
     Real(RealTime),
     Virtual(VirtualTime),
+}
+
+impl PathClock {
+    /// The wall clock: the system's, or in a simulation the Unix epoch plus the
+    /// network's virtual time, so a simulation can place a ramp start on it.
+    /// The real arm reads `SystemTime::now()`, not the path's time source,
+    /// which is monotonic with no epoch to compare a Unix ramp start against.
+    /// A backward step of the system clock lowers the share; that recycles
+    /// nothing (a path with data is never rechecked), so a pair carrying data
+    /// stays, but a pair whose next session starts during the step may lose
+    /// its bit until the clock is back.
+    pub(in crate::transport) fn wall_now(&self) -> std::time::SystemTime {
+        match self {
+            Self::Real(_) => std::time::SystemTime::now(),
+            Self::Virtual(time) => std::time::UNIX_EPOCH + Duration::from_nanos(time.now_nanos()),
+        }
+    }
 }
 
 impl TimeSource for PathClock {
@@ -365,7 +383,7 @@ impl Drop for Attempt {
             routed.store(false, Ordering::Release);
         }
         if let Some(route) = &self.route {
-            route.path().uncount_as_data_path();
+            route.path().end_as_data_path();
         }
     }
 }
@@ -433,6 +451,10 @@ pub(in crate::transport) struct QuicUpgrades {
     /// throttles the warning; the exported count is
     /// `quic_upgrade_inbox_overflow`.
     inbox_overflow: AtomicU64,
+    /// Native servers waiting for their peer's attempt, which the router hands
+    /// every native attempt to (`native::waiters`). Filled only by the native
+    /// accept.
+    native: Arc<NativeWaiters>,
     #[cfg(any(test, feature = "testing"))]
     trace: Option<super::sim_trace::NodeTrace>,
     /// Where a test's paths keep their node-wide counts in place of
@@ -463,6 +485,7 @@ impl QuicUpgrades {
             seeds: Mutex::new(SeedStore::new(SEED_STORE_ENTRIES)),
             next_session: AtomicU64::new(1),
             inbox_overflow: AtomicU64::new(0),
+            native: Arc::default(),
             #[cfg(any(test, feature = "testing"))]
             trace,
             #[cfg(test)]
@@ -483,7 +506,7 @@ impl QuicUpgrades {
         let handle = GlobalExecutor::spawn(async move {
             while let Some(incoming) = attempts.recv().await {
                 match hub.upgrade() {
-                    Some(hub) => hub.route(incoming),
+                    Some(hub) => hub.dispatch(incoming),
                     None => incoming.ignore(),
                 }
             }
@@ -492,6 +515,24 @@ impl QuicUpgrades {
             std::future::pending::<()>().await;
         });
         registrar.register("quic_attempt_router", handle);
+    }
+
+    /// Route one attempt: an attempt from an address allowed as native goes
+    /// only to a native waiter, never to an upgrade session; any other to the
+    /// session of its address.
+    fn dispatch(&self, incoming: QuicIncoming) {
+        if incoming.is_native() {
+            let route = self.native.route(incoming);
+            tracing::debug!(?route, "Routed a native QUIC connection attempt");
+        } else {
+            self.route(incoming);
+        }
+    }
+
+    /// The native waiters the router hands native attempts to.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(in crate::transport) fn native_waiters(&self) -> &Arc<NativeWaiters> {
+        &self.native
     }
 
     /// Hand `incoming` to the session of its address, without waiting. With no
@@ -610,6 +651,59 @@ impl QuicUpgrades {
         reported
     }
 
+    /// What a test's trace notes of a data-share decision for `peer`: the pair's
+    /// bucket and the share now (`slice`).
+    #[cfg(any(test, feature = "testing"))]
+    fn share_note(&self, peer: &TransportPublicKey, caps: u32) -> String {
+        let (share, now) = self
+            .trace_ramp()
+            .unwrap_or((self.policy.share(), self.path_clock.wall_now()));
+        format!(
+            "data share: bucket {}, percent {}, caps {caps}",
+            super::slice::bucket(&self.local_key, peer),
+            share.percent_at(now),
+        )
+    }
+
+    /// The ramp a test's trace gives, and the wall clock now to read it at,
+    /// for a node with no `quic-data-percent`. A start before the epoch (one
+    /// before the run began, on the virtual wall clock) moves both forward by
+    /// the same amount: the share reads only the time since the start.
+    #[cfg(any(test, feature = "testing"))]
+    fn trace_ramp(&self) -> Option<(super::policy::DataShare, std::time::SystemTime)> {
+        if self.policy.percent_set() {
+            return None;
+        }
+        let start = self.trace.as_ref()?.data_ramp_start()?;
+        let shift = Duration::from_secs(start.min(0).unsigned_abs());
+        let share = super::policy::DataShare::Ramp {
+            start_unix_secs: start.max(0).unsigned_abs(),
+        };
+        Some((share, self.path_clock.wall_now() + shift))
+    }
+
+    /// Whether this node's data bit can still come on ([`QuicPolicy::bit_may_come_on`]).
+    /// A test's trace may give the ramp a start of its own.
+    fn bit_may_come_on(&self) -> bool {
+        #[cfg(any(test, feature = "testing"))]
+        if let Some((share, _)) = self.trace_ramp() {
+            return self.policy.bit_may_come_on_with(share);
+        }
+        self.policy.bit_may_come_on()
+    }
+
+    /// This node's caps on a path to `peer`, from the share at the wall clock now
+    /// ([`QuicPolicy::own_caps`]). A test's trace may give the ramp a start of
+    /// its own.
+    fn own_caps(&self, peer: &TransportPublicKey) -> u32 {
+        #[cfg(any(test, feature = "testing"))]
+        if let Some((share, now)) = self.trace_ramp() {
+            return self.policy.own_caps_with(share, &self.local_key, peer, now);
+        }
+        self.policy
+            .own_caps(&self.local_key, peer, self.path_clock.wall_now())
+    }
+
     fn file_seed(&self, key: &TransportPublicKey, session: u64, seed: BackoffSeed) {
         self.seeds.lock().file(key, session, seed);
     }
@@ -685,10 +779,21 @@ impl Session {
     }
 
     fn step(&self, state: &mut SessionState, event: Event) -> Vec<Action> {
+        let key = state.peer_key.clone();
+        let own_caps = || {
+            key.as_ref().map_or(0, |key| {
+                let caps = self.hub.own_caps(key);
+                self.note_share(key, caps);
+                caps
+            })
+        };
+        let bit_may_come_on = || self.hub.bit_may_come_on();
         let inputs = Inputs {
             now: (self.now)(),
             sample: GlobalRng::random_range(0.0..1.0),
             policy: &self.hub.policy,
+            own_caps: &own_caps,
+            bit_may_come_on: &bit_may_come_on,
         };
         state.machine.step(inputs, event)
     }
@@ -775,6 +880,9 @@ impl Session {
                     path.stats().node().record_data_enabled();
                 }
             }
+            // Not a fallback, and counted by its close code
+            // (`quic_close_sent_recycle_for_data`, `quic_close_received_recycle_for_data`).
+            Outcome::RecycledForData { .. } => {}
             Outcome::Declined { reason, uncharged } => {
                 count(declined(reason));
                 if uncharged {
@@ -805,6 +913,9 @@ impl Session {
             }
             Outcome::ChurnedFallback(cause) => {
                 TRANSPORT_METRICS.record_quic_churned_fallback(fallback_label(cause), self.remote)
+            }
+            Outcome::CarryingFallback(cause) => {
+                TRANSPORT_METRICS.record_quic_carried_fallback(fallback_label(cause), self.remote)
             }
         }
     }
@@ -1141,8 +1252,14 @@ impl Session {
             return;
         };
         // Only the teardown of an active path ends one, so this is where its
-        // age is known.
-        if let Some(since) = held.gauge.active_since {
+        // age is known. A recycle for data (either side's) is no failure and
+        // comes about a recheck after activation, so it is left out of the
+        // ages: counted in them it would fill `lt_1m` / `lt_10m` through the
+        // ramp and hide real short-lived paths. It is counted by its close
+        // code alone.
+        if let Some(since) = held.gauge.active_since
+            && code != QuicCloseCode::RecycleForData
+        {
             TRANSPORT_METRICS
                 .record_quic_path_closed((self.now)().saturating_sub(since), self.remote);
         }
@@ -1261,7 +1378,8 @@ impl Session {
             older.end();
         }
         let backoff = self.hub.seeds.lock().seed_for(&key);
-        let own_caps = self.hub.policy.own_caps(&self.hub.local_key, &key);
+        let own_caps = self.hub.own_caps(&key);
+        self.note_share(&key, own_caps);
         let sends = {
             let mut state = self.state.lock();
             if state.ended {
@@ -1330,6 +1448,15 @@ impl Session {
         self.note(|| "session ended".to_string());
     }
 
+    /// Note a data-share decision for the peer in a test's trace
+    /// (`data share: bucket B, percent P, caps C`).
+    fn note_share(&self, peer: &TransportPublicKey, caps: u32) {
+        #[cfg(any(test, feature = "testing"))]
+        self.note(|| self.hub.share_note(peer, caps));
+        #[cfg(not(any(test, feature = "testing")))]
+        let _ = (peer, caps);
+    }
+
     /// Write a line to a test's trace, when it has one.
     fn note(&self, what: impl FnOnce() -> String) {
         #[cfg(any(test, feature = "testing"))]
@@ -1353,8 +1480,12 @@ async fn report(inbox: &mpsc::Sender<SessionEvent>, event: SessionEvent) {
 }
 
 /// Run `task`. If it panics, count that and raise the same panic again, so the
-/// runtime sees what it saw before.
-async fn report_panics(remote: SocketAddr, task: impl Future<Output = ()>) {
+/// runtime sees what it saw before. Also wraps a native connection's route
+/// worker, whose panic counts here too.
+pub(in crate::transport) async fn report_panics(
+    remote: SocketAddr,
+    task: impl Future<Output = ()>,
+) {
     use futures::FutureExt;
     if let Err(payload) = std::panic::AssertUnwindSafe(task).catch_unwind().await {
         TRANSPORT_METRICS.record_quic_upgrade(QuicUpgradeOutcome::TaskPanicked, remote);

@@ -75,6 +75,13 @@ pub(super) fn no_fanout() -> FanoutTargets {
 /// lossy uplinks on any transport: a 31 MiB broadcast needs about 271 KB/s to
 /// finish in 120 s.
 ///
+/// On UDP that limit is the receiver's whole age limit. On a QUIC path it is
+/// the stream's first age, which the receiver extends while the connection
+/// reads at 32 KiB/s or more (up to 2 h), so a stream it keeps past this wait
+/// can still complete after the wait counted it undelivered; that costs one
+/// full-state resend, as any timed-out wait does. Either way the wait is no
+/// longer than the receiver's limit, which is what the margin is for.
+///
 /// The margin keeps the sender from recording a delivery the receiver may
 /// already have dropped. On UDP the completion fires when the last fragment is
 /// first handed to the socket, and lost fragments are resent after that; and
@@ -7229,8 +7236,8 @@ mod tests {
     /// #6143 review round 6: a targeted heal registers its leg
     /// (`heal_target`) once its peer resolves, so a heal's skip accounts for
     /// that leg and not for a fan-out's. An unknown peer starts no leg. And
-    /// `handle_sync_state_to_peer` resolves its peer through this, after the
-    /// broken-contract gate and before either send path.
+    /// `handle_sync_state_to_peer` resolves its peer through this, before
+    /// either send path.
     #[tokio::test(flavor = "current_thread")]
     async fn a_resolved_heal_registers_its_leg() {
         use freenet_stdlib::prelude::WrappedState;
@@ -7271,8 +7278,7 @@ mod tests {
 
         // The heal handler lives on the event loop's state, which no test
         // builds, so its use of this is pinned by source: comments and
-        // whitespace removed, inside the handler, between the gate and the
-        // sends.
+        // whitespace removed, inside the handler, before the sends.
         let src = include_str!("p2p_protoc/broadcast.rs");
         let signature = "\n    pub(super) async fn handle_sync_state_to_peer(";
         assert_eq!(src.matches(signature).count(), 1, "heal handler signature");
@@ -7291,16 +7297,12 @@ mod tests {
         let at = body
             .find(call)
             .expect("the heal handler resolves its peer here");
-        let gate = body.find("is_contract_broken(&key)").expect("broken gate");
         let first_send = [".enqueue(", "broadcast_to_single_peer("]
             .iter()
             .filter_map(|send| body.find(send))
             .min()
             .expect("the heal's sends");
-        assert!(
-            gate < at && at < first_send,
-            "gate, then resolve, then send"
-        );
+        assert!(at < first_send, "resolve, then send");
         // At the handler's top level, not inside a block that may never run
         // (`if false { ... }`): the braces before it leave only the handler's
         // own open. The body's format strings hold balanced braces only.

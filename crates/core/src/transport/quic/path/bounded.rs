@@ -73,6 +73,16 @@ pub(crate) struct SendDeadlines {
     pub(crate) source_gap: Option<Duration>,
     /// From the start of the send to its end, whatever the send is doing.
     pub(crate) total: Duration,
+    /// The longest wait for the acknowledgement once the end of the stream
+    /// is sent, within `total`. `None`: only `total` applies. Past it the
+    /// send ends `MaybeDelivered` and its stream is reset, counted as an
+    /// abort (`Outgoing`'s drop), so a peer that never acknowledges a
+    /// stream's last packet cannot hold its permit and send epoch for long.
+    pub(crate) ack_wait: Option<Duration>,
+    /// The ack wait also covers the backlog ahead of the stream's end, read
+    /// when the end is sent ([`SendProgress::mark_finished_behind`]): a
+    /// node's sends (`QuicPath::stream_deadlines`).
+    pub(crate) ack_wait_covers_backlog: bool,
 }
 
 impl SendDeadlines {
@@ -83,6 +93,8 @@ impl SendDeadlines {
             gap: None,
             source_gap: None,
             total: timeout,
+            ack_wait: None,
+            ack_wait_covers_backlog: false,
         }
     }
 
@@ -96,22 +108,49 @@ impl SendDeadlines {
                 gap: None,
                 source_gap: None,
                 total: SHORT_TOTAL_TIMEOUT,
+                ack_wait: None,
+                ack_wait_covers_backlog: false,
             }
         } else {
-            Self::stream(len)
+            // It holds a permit and shares the link as a stream does, so its
+            // ack wait covers the backlog ahead of its end too.
+            Self {
+                ack_wait_covers_backlog: true,
+                ..Self::stream(len)
+            }
         }
     }
 
     /// For a streamed message of `len` bytes. The gap is the one the UDP
-    /// sender and the receiver work to, and past `total` the receiver evicts
-    /// the stream anyway.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// sender and the receiver work to. The total is the ceiling on a
+    /// charged stream's age (`inbound::STREAM_AGE_LIMIT`, 2 h), whatever the
+    /// size: while the stream is written, its connection's progress is
+    /// judged by `recycle::AckWatch` and by the gap, and the receiver keeps
+    /// it past its first age only while the connection delivers at the
+    /// floor. The wait for the acknowledgement after the end is sent is
+    /// bounded by the stream's first age, its length at 32 KiB/s and at
+    /// least 5 min (`inbound_stream_age_limit`): by then the peer has had
+    /// the whole stream, and at most a send window of backlog (8 MiB, 256 s
+    /// at that rate) was ahead of its end.
     pub(crate) fn stream(len: u64) -> Self {
+        let total = super::inbound::stream_age_limit();
         Self {
             open: STREAM_OPEN_TIMEOUT,
             gap: Some(STREAM_INACTIVITY_TIMEOUT),
             source_gap: None,
-            total: inbound_stream_age_limit(len),
+            total,
+            ack_wait: Some(inbound_stream_age_limit(len).min(total)),
+            ack_wait_covers_backlog: false,
+        }
+    }
+
+    /// The same, with `gap` as the gap ([`Self::gap`]); the open deadline
+    /// stays within it.
+    pub(crate) fn with_gap(self, gap: Duration) -> Self {
+        Self {
+            gap: Some(gap),
+            open: self.open.min(gap),
+            ..self
         }
     }
 
@@ -222,7 +261,8 @@ struct ProgressState {
     /// bring the deadline earlier.
     armed_on_source: AtomicBool,
     /// Told when a wait for the source starts while `extended`, or ends while
-    /// `armed_on_source`: the loop re-arms its timer.
+    /// `armed_on_source`, and when the end of the stream is sent (the ack
+    /// wait may end before the deadline armed): the loop re-arms its timer.
     source_wait: tokio::sync::Notify,
     /// Timers armed by [`bounded_send`]. Tests only.
     #[cfg(test)]
@@ -234,6 +274,18 @@ struct ProgressState {
     /// The path's pacer refused a write, so the send ends as at its current
     /// deadline (`pacer` module).
     refused: AtomicBool,
+    /// When the end of the stream was sent, on `now`; 0 before.
+    finished_at: AtomicU64,
+    /// [`SendProgress::ack_wait_ended`].
+    ack_wait_ended: AtomicBool,
+    /// [`SendProgress::ack_wait_due`].
+    ack_wait_due: AtomicU64,
+    /// The ack wait's deadline once the end is sent, recorded each time the
+    /// loop arms; zero before ([`SendProgress::ack_wait_left`]).
+    ack_wait_deadline: AtomicU64,
+    /// The backlog ahead of the end when it was sent, in nanoseconds
+    /// ([`SendProgress::mark_finished_behind`]).
+    backlog_wait: AtomicU64,
 }
 
 impl SendProgress {
@@ -252,6 +304,11 @@ impl SendProgress {
             now: Box::new(|| 0),
             deadlines: None,
             refused: AtomicBool::new(false),
+            finished_at: AtomicU64::new(0),
+            ack_wait_ended: AtomicBool::new(false),
+            ack_wait_due: AtomicU64::new(0),
+            ack_wait_deadline: AtomicU64::new(0),
+            backlog_wait: AtomicU64::new(0),
         }))
     }
 
@@ -269,6 +326,11 @@ impl SendProgress {
             now: Box::new(move || time.now_nanos()),
             deadlines: Some((deadlines, started)),
             refused: AtomicBool::new(false),
+            finished_at: AtomicU64::new(0),
+            ack_wait_ended: AtomicBool::new(false),
+            ack_wait_due: AtomicU64::new(0),
+            ack_wait_deadline: AtomicU64::new(0),
+            backlog_wait: AtomicU64::new(0),
         }))
     }
 
@@ -367,8 +429,43 @@ impl SendProgress {
     }
 
     /// Every byte was written and the end of the stream queued.
+    #[cfg(test)]
     pub(super) fn mark_finished(&self) {
+        self.mark_finished_behind(Duration::ZERO);
+    }
+
+    /// [`Self::mark_finished`], with `backlog`: how long the bytes still
+    /// ahead of the stream's end may take to go out, which extends its ack
+    /// wait ([`SendDeadlines::ack_wait`]) to at least that, within its total.
+    pub(super) fn mark_finished_behind(&self, backlog: Duration) {
+        self.0.backlog_wait.store(nanos(backlog), Ordering::Release);
+        self.0.finished_at.store((self.0.now)(), Ordering::Release);
         self.0.stage.store(STAGE_FINISHED, Ordering::Release);
+        // The loop re-arms at the ack wait's end, which may come before the
+        // gap deadline it has armed.
+        self.0.source_wait.notify_one();
+    }
+
+    /// The send's deadline ran out after the end of its stream was sent: its
+    /// ack wait ([`SendDeadlines::ack_wait`]), or its total if that came
+    /// first. Set by [`bounded_send`] before it returns, so the stream's drop
+    /// sees it.
+    pub(super) fn ack_wait_ended(&self) -> bool {
+        self.0.ack_wait_ended.load(Ordering::Acquire)
+    }
+
+    /// When the ack wait that ended was due, in nanoseconds on the send's
+    /// clock ([`Self::ack_wait_ended`]).
+    pub(super) fn ack_wait_due(&self) -> u64 {
+        self.0.ack_wait_due.load(Ordering::Acquire)
+    }
+
+    /// What is left of the ack wait of a send whose end was sent, if it has
+    /// one: from now to its deadline, at most `deadlines.total` from the
+    /// start (recorded by [`bounded_send`]).
+    pub(super) fn ack_wait_left(&self) -> Option<Duration> {
+        let deadline = self.0.ack_wait_deadline.load(Ordering::Acquire);
+        (deadline != 0).then(|| Duration::from_nanos(deadline.saturating_sub((self.0.now)())))
     }
 
     fn stage(&self) -> u8 {
@@ -411,7 +508,21 @@ impl SendProgress {
                 let longer = on_source && deadlines.gap_for(true) > deadlines.gap_for(false);
                 (deadline, longer)
             }
-            _ => (total, false),
+            _ => (
+                deadlines.ack_wait.map_or(total, |wait| {
+                    let backlog = if deadlines.ack_wait_covers_backlog {
+                        self.0.backlog_wait.load(Ordering::Acquire)
+                    } else {
+                        0
+                    };
+                    self.0
+                        .finished_at
+                        .load(Ordering::Acquire)
+                        .saturating_add(nanos(wait).max(backlog))
+                        .min(total)
+                }),
+                false,
+            ),
         }
     }
 
@@ -776,6 +887,12 @@ where
         }
         #[cfg(test)]
         progress.0.arms.fetch_add(1, Ordering::Relaxed);
+        if progress.stage() == STAGE_FINISHED && deadlines.ack_wait.is_some() {
+            progress
+                .0
+                .ack_wait_deadline
+                .store(deadline, Ordering::Release);
+        }
         let wait = Duration::from_nanos(deadline.saturating_sub(time.now_nanos()));
         tokio::select! {
             result = &mut send => {
@@ -801,6 +918,16 @@ where
                         && let Some(watch) = watch.as_ref()
                     {
                         watch.prove_quiet();
+                    }
+                    // A send with an ack wait (a stream's): its deadline
+                    // after the end, whichever, ends the wait for good. A
+                    // send without one keeps waiting for its acknowledgement
+                    // past its own deadline (`Outgoing`'s drop).
+                    if progress.stage() == STAGE_FINISHED && deadlines.ack_wait.is_some() {
+                        // The deadline this timer slept to: a late wake is
+                        // judged against it (`StrikeCheck`).
+                        progress.0.ack_wait_due.store(deadline, Ordering::Release);
+                        progress.0.ack_wait_ended.store(true, Ordering::Release);
                     }
                     return progress.timed_out();
                 }

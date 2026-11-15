@@ -61,6 +61,38 @@ pub(crate) const QUIC_VERSION: u32 = 1;
 /// fails the handshake.
 pub(crate) const ALPN: &[u8] = b"freenet-quic/1";
 
+/// The ALPN protocol of a native connection (#5940): one set up without a UDP
+/// session, which begins with the Hello exchange (`native::exchange`). Only
+/// an attempt the endpoint was told to expect as native offers it, and such
+/// an attempt offers nothing else.
+pub(crate) const NATIVE_ALPN: &[u8] = b"freenet-quic/2";
+
+/// Which kind of connection an attempt makes, and so the one ALPN protocol
+/// its TLS offers on either side.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Alpn {
+    /// An upgrade of a UDP session ([`ALPN`]).
+    Upgrade,
+    /// A native connection ([`NATIVE_ALPN`]).
+    Native,
+}
+
+impl Alpn {
+    /// The protocol identifier offered in TLS.
+    pub(crate) fn protocol(self) -> &'static [u8] {
+        match self {
+            Alpn::Upgrade => ALPN,
+            Alpn::Native => NATIVE_ALPN,
+        }
+    }
+}
+
+/// The initial RTT estimate of a native client. A native dial has an 8 s
+/// window for the handshake and the Hello exchange, so the client
+/// retransmits a lost Initial after about 300 ms rather than about a second
+/// at quinn's estimate here (333 ms).
+pub(crate) const NATIVE_INITIAL_RTT: Duration = Duration::from_millis(100);
+
 /// The server name quinn requires for a connection attempt. With SNI off it
 /// is never sent; peers are identified by their raw public keys.
 pub(crate) const SERVER_NAME: &str = "freenet";
@@ -318,7 +350,17 @@ pub(crate) const QUIC_CRYPTO_BUFFER_BYTES: usize = 16 * 1024;
 /// takes one space; during the handshake up to three hold this each.
 pub(crate) const QUIC_CRYPTO_HOLD_BYTES: usize = QUIC_CRYPTO_BUFFER_BYTES + 32 * 1024;
 
-/// The fixed charge per QUIC connection, shadow paths included: the terms of
+/// What one send waiting for its acknowledgement in a task costs beyond its
+/// stream (`path::Outgoing`'s drop), in jemalloc-rounded bytes: the task, the
+/// boxed `stopped()` future and quinn's `stopped` map entry it registers.
+/// Measured at 296 B (`quic::memory_tests::an_ack_wait_task_measures_within_its_pin`,
+/// 32 waits against 32 open streams without them); set to 384 B, about 30%
+/// over. A path has at most `path::ACK_WAITS_WITHOUT_PERMIT` (64) without a
+/// permit and `STREAMED_SEND_LIMIT` (48) holding one.
+pub(crate) const QUIC_ACK_WAIT_BYTES: usize = 384;
+
+/// The fixed charge per QUIC connection that may carry data (a shadow path's
+/// is [`QUIC_SHADOW_CONNECTION_CHARGE_BYTES`]): the terms of
 /// one connection's memory that are fixed per connection rather than scaled
 /// with its windows, so the node-wide buffer budget
 /// ([`quic_buffer_budget_for`]) does not meter them. Terms that depend on
@@ -332,7 +374,8 @@ pub(crate) const QUIC_CRYPTO_HOLD_BYTES: usize = QUIC_CRYPTO_BUFFER_BYTES + 32 *
 /// | quinn's `stopped` map, `recycle::SEND_ABORT_LIMIT` x [`QUIC_STOPPED_ENTRY_BYTES`] | 425,984 |
 /// | ACK-only tail ([`QUIC_ACK_TAIL_BYTES`]) | 245,760 |
 /// | receive side at the initial window: unread credit and the staging cap (`budget::receive_charge` of [`INITIAL_RECEIVE_WINDOW_BYTES`]) | 49,152 |
-/// | **total** | **909,312 (888 KiB)** |
+/// | acknowledgement waits, (`path::ACK_WAITS_WITHOUT_PERMIT` + [`STREAMED_SEND_LIMIT`]) x [`QUIC_ACK_WAIT_BYTES`] | 43,008 |
+/// | **total** | **952,320 (930 KiB)** |
 ///
 /// A data path's receive side at its own window is in its buffer-budget
 /// charge (`budget`); this term covers every connection, a shadow path
@@ -348,16 +391,41 @@ pub(crate) const QUIC_CRYPTO_HOLD_BYTES: usize = QUIC_CRYPTO_BUFFER_BYTES + 32 *
 /// reported (`quic_send_resets`, `quic_path_ms`,
 /// `quic_send_resets_reached_<n>`) so field data can justify a lower charge.
 ///
-/// Not yet summed in the node aggregate: the aggregate-accounting step of the
-/// buffer budget (#5940) sums `quic_connections x` this, plus each data path's
-/// floor grant (`budget::floor_grant`), and waits for the small-host decision.
-#[cfg_attr(not(test), allow(dead_code))]
+/// Summed in the node's memory aggregate by [`quic_memory_ceiling_terms`], at
+/// [`quic_connection_cap`] connections, each counted as a data path.
 pub(crate) const QUIC_CONNECTION_CHARGE_BYTES: usize = QUIC_CONNECTION_FIXED_BYTES
     + MAX_UNI_STREAMS as usize * QUIC_OPEN_STREAM_BYTES
     + QUIC_CRYPTO_HOLD_BYTES
     + super::recycle::SEND_ABORT_LIMIT as usize * QUIC_STOPPED_ENTRY_BYTES
     + QUIC_ACK_TAIL_BYTES
-    + super::budget::receive_charge(INITIAL_RECEIVE_WINDOW_BYTES) as usize;
+    + super::budget::receive_charge(INITIAL_RECEIVE_WINDOW_BYTES) as usize
+    + (super::path::ACK_WAITS_WITHOUT_PERMIT + STREAMED_SEND_LIMIT as usize) * QUIC_ACK_WAIT_BYTES;
+
+/// What one shadow path (no data, `QuicPathLimits::SHADOW`) may hold, from what
+/// it GRANTS the peer, not from what an honest peer sends: the fixed state and
+/// CRYPTO terms as for any connection; quinn's state for the
+/// [`INITIAL_UNI_STREAMS`] uni streams the endpoint lets a peer open, which a
+/// shadow path never raises; the receive charge at the
+/// [`INITIAL_RECEIVE_WINDOW_BYTES`] window it keeps (the unread credit plus
+/// its staging cap, 2 x that window); its gap cap without a meter
+/// (`budget::MIN_GAPS_PER_CONNECTION` x `budget::GAP_BYTES`); the control
+/// channel full (`path::CONTROL_CHANNEL_CAPACITY` frames of
+/// `framing::MAX_CONTROL_BYTES`); the ACK-only tail; and for its own sends,
+/// at most `upgrade::machine::CONTROL_SENDS_PER_PATH` control frames, each of
+/// which can leave a `stopped` map entry and an acknowledgement wait. Data
+/// frames are refused before their body is read, so none is held. 498,152 B
+/// (about 486 KiB), against the data charge's [`QUIC_CONNECTION_CHARGE_BYTES`]
+/// plus a floor grant.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const QUIC_SHADOW_CONNECTION_CHARGE_BYTES: usize = QUIC_CONNECTION_FIXED_BYTES
+    + INITIAL_UNI_STREAMS as usize * QUIC_OPEN_STREAM_BYTES
+    + QUIC_CRYPTO_HOLD_BYTES
+    + QUIC_ACK_TAIL_BYTES
+    + super::budget::receive_charge(INITIAL_RECEIVE_WINDOW_BYTES) as usize
+    + super::budget::MIN_GAPS_PER_CONNECTION * super::budget::GAP_BYTES as usize
+    + super::path::CONTROL_CHANNEL_CAPACITY * super::framing::MAX_CONTROL_BYTES as usize
+    + super::upgrade::machine::CONTROL_SENDS_PER_PATH
+        * (QUIC_STOPPED_ENTRY_BYTES + QUIC_ACK_WAIT_BYTES);
 
 /// The share of the node's memory for QUIC buffers that scale with the windows,
 /// as a divisor: one sixteenth.
@@ -370,10 +438,84 @@ const QUIC_BUFFER_BUDGET_DIVISOR: usize = 16;
 /// which is per path and NOT in this budget; what does not scale with the
 /// windows is charged per connection ([`QUIC_CONNECTION_CHARGE_BYTES`]). So the
 /// node's QUIC memory is at most data paths x (that charge + floor grant) +
-/// this budget, and the aggregate-accounting step (#5940) sums all three
-/// terms. Each data path's windows are set from it (`budget::QuicBudget`).
+/// this budget; [`quic_memory_ceiling_terms`] sums all three at
+/// [`quic_connection_cap`]. Each data path's windows are set from it
+/// (`budget::QuicBudget`).
 pub(crate) fn quic_buffer_budget_for(memory_limit: usize) -> usize {
     memory_limit / QUIC_BUFFER_BUDGET_DIVISOR
+}
+
+/// The share of the node's memory QUIC may hold at [`quic_connection_cap`]
+/// connections, as a divisor: one eighth. Checked against the room the
+/// caches and the hosting budget leave
+/// (`declared_caches_plus_hosting_budget_leave_room_for_the_runtime`); the
+/// tightest shape is a 1 GiB host, where an eighth is 128 MiB of 128.2.
+pub(crate) const QUIC_MEMORY_DIVISOR: usize = 8;
+
+/// The most QUIC connections whose memory fits in an eighth of the node's
+/// memory: what is left of it after the buffer budget
+/// ([`quic_buffer_budget_for`]), over the fixed charge plus the floor grant
+/// (`budget::floor_grant`) of one data path. Every connection is counted as a
+/// data path, which is what each becomes once all pairs carry data; a shadow
+/// path costs less (`QUIC_SHADOW_CONNECTION_CHARGE_BYTES`). 48 at 1 GiB, 80 at 2 GiB, 161 at
+/// 4 GiB, 323 at 8 GiB. It
+/// is not monotonic across 2 GiB: the floor window doubles at
+/// `budget::SMALL_HOST_MEMORY`, so just under 2 GiB it is about 96. The node's
+/// connection limit is lowered to it while this node may carry QUIC data
+/// (`NetworkApiConfig::connection_limit`), so at run time QUIC memory is
+/// bounded by the cap; the summed form (`quic_memory_ceiling`) exists for the
+/// aggregate test only.
+pub(crate) fn quic_connection_cap(memory_limit: usize) -> usize {
+    let per_connection = QUIC_CONNECTION_CHARGE_BYTES as u64
+        + super::budget::floor_grant(super::budget::floor_window_bytes(memory_limit));
+    let room = (memory_limit / QUIC_MEMORY_DIVISOR)
+        .saturating_sub(quic_buffer_budget_for(memory_limit)) as u64;
+    usize::try_from(room / per_connection).unwrap_or(usize::MAX)
+}
+
+/// The most memory a node's QUIC connections hold at [`quic_connection_cap`]
+/// data paths, as labelled terms: the buffer budget, the fixed charges, and
+/// the floor grants. A term reaches the sum only by being in this list, so a
+/// test reading the labels sees what was summed. Read only by the memory
+/// aggregate's tests, as `contract::declared_cache_ceiling` is.
+#[cfg(test)]
+pub(crate) fn quic_memory_ceiling_terms(memory_limit: usize) -> [(&'static str, usize); 3] {
+    let cap = quic_connection_cap(memory_limit);
+    let floor_grant =
+        super::budget::floor_grant(super::budget::floor_window_bytes(memory_limit)) as usize;
+    [
+        (
+            "quic_buffer_budget_for",
+            quic_buffer_budget_for(memory_limit),
+        ),
+        (
+            "QUIC_CONNECTION_CHARGE_BYTES",
+            cap.saturating_mul(QUIC_CONNECTION_CHARGE_BYTES),
+        ),
+        ("floor_grant", cap.saturating_mul(floor_grant)),
+    ]
+}
+
+/// The most memory a node's QUIC connections hold with data off: every one a
+/// shadow path ([`QUIC_SHADOW_CONNECTION_CHARGE_BYTES`]) at the default
+/// connection limit, which is not lowered without data. Shadow paths take no
+/// growth budget. A node set to more connections holds proportionally more
+/// (1,000 shadow paths: about 475 MiB); that is stated, not clamped.
+#[cfg(test)]
+pub(crate) fn quic_shadow_memory_ceiling() -> usize {
+    crate::config::DEFAULT_MAX_CONNECTIONS * QUIC_SHADOW_CONNECTION_CHARGE_BYTES
+}
+
+/// The most memory a node's QUIC connections hold, data on or off: the sum of
+/// [`quic_memory_ceiling_terms`] (data on, at the cap) or
+/// [`quic_shadow_memory_ceiling`] (data off), whichever is larger.
+#[cfg(test)]
+pub(crate) fn quic_memory_ceiling(memory_limit: usize) -> usize {
+    let data_on: usize = quic_memory_ceiling_terms(memory_limit)
+        .iter()
+        .map(|(_, bytes)| bytes)
+        .sum();
+    data_on.max(quic_shadow_memory_ceiling())
 }
 
 /// The quinn, quinn-proto and rustls versions the figures above were
@@ -537,12 +679,25 @@ pub(crate) fn endpoint_config_with_cid_key(cid_key: [u8; 32]) -> std::io::Result
         // Must stay false: a cleared fixed bit could make a short-header
         // packet start with 0x01 or 0x02, which the demux reads as a UDP
         // transport packet, or 0x03, which it drops as a native punch
-        // (demux::PUNCH_FIRST_BYTE) (RFC 9287; transport::demux). Every
-        // endpoint, native connections included, is built from this config.
+        // (demux::PUNCH_FIRST_BYTE) (RFC 9287; transport::demux). A native
+        // connection must run on an endpoint built from this config (today
+        // it uses the node's one endpoint, built here); a separate native
+        // endpoint must keep greasing off too.
         .grease_quic_bit(false)
         .min_reset_interval(Duration::from_millis(20))
         .rng_seed(Some(seed));
     Ok(config)
+}
+
+/// [`transport_config`] for a native client: the same, with
+/// [`NATIVE_INITIAL_RTT`].
+pub(crate) fn native_client_transport_config<T: TimeSource>(
+    settings: &QuicSettings,
+    time: &T,
+) -> TransportConfig {
+    let mut config = transport_config(settings, time);
+    config.initial_rtt(NATIVE_INITIAL_RTT);
+    config
 }
 
 /// The transport configuration shared by both directions of a connection.
@@ -667,23 +822,35 @@ fn provider() -> Arc<rustls::crypto::CryptoProvider> {
 }
 
 /// The TLS server configuration: TLS 1.3 only with the ring provider, the
-/// raw public key in `key`, peers checked by `verifier`, the fixed ALPN, and
+/// raw public key in `key`, peers checked by `verifier`, the one ALPN of
+/// `alpn`, and
 /// no session resumption, tickets or early data. `identity` builds the key
 /// and the verifiers.
 pub(crate) fn tls_server_config(
     key: Arc<rustls::sign::CertifiedKey>,
     verifier: Arc<dyn rustls::server::danger::ClientCertVerifier>,
+    alpn: Alpn,
 ) -> Result<quinn::crypto::rustls::QuicServerConfig, TlsConfigError> {
-    let config = rustls_server_config(key, verifier)?;
+    let config = rustls_server_config_for(key, verifier, alpn)?;
     Ok(quinn::crypto::rustls::QuicServerConfig::try_from(
         Arc::new(config),
     )?)
 }
 
-/// The rustls half of [`tls_server_config`].
+/// The rustls half of [`tls_server_config`] for an upgrade.
+#[cfg(test)]
 pub(crate) fn rustls_server_config(
     key: Arc<rustls::sign::CertifiedKey>,
     verifier: Arc<dyn rustls::server::danger::ClientCertVerifier>,
+) -> Result<rustls::ServerConfig, rustls::Error> {
+    rustls_server_config_for(key, verifier, Alpn::Upgrade)
+}
+
+/// The rustls half of [`tls_server_config`], offering `alpn` only.
+pub(crate) fn rustls_server_config_for(
+    key: Arc<rustls::sign::CertifiedKey>,
+    verifier: Arc<dyn rustls::server::danger::ClientCertVerifier>,
+    alpn: Alpn,
 ) -> Result<rustls::ServerConfig, rustls::Error> {
     let mut config = rustls::ServerConfig::builder_with_provider(provider())
         .with_protocol_versions(&[&rustls::version::TLS13])?
@@ -691,7 +858,7 @@ pub(crate) fn rustls_server_config(
         .with_cert_resolver(Arc::new(
             rustls::server::AlwaysResolvesServerRawPublicKeys::new(key),
         ));
-    config.alpn_protocols = vec![ALPN.to_vec()];
+    config.alpn_protocols = vec![alpn.protocol().to_vec()];
     config.max_early_data_size = 0;
     config.send_tls13_tickets = 0;
     config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
@@ -701,23 +868,34 @@ pub(crate) fn rustls_server_config(
 }
 
 /// The TLS client configuration: TLS 1.3 only with the ring provider, the
-/// raw public key in `key`, the server checked by `verifier`, the fixed
-/// ALPN, no SNI, and no session resumption or early data. `identity` builds
+/// raw public key in `key`, the server checked by `verifier`, the one ALPN
+/// of `alpn`, no SNI, and no session resumption or early data. `identity` builds
 /// the key and the verifier.
 pub(crate) fn tls_client_config(
     key: Arc<rustls::sign::CertifiedKey>,
     verifier: Arc<dyn rustls::client::danger::ServerCertVerifier>,
+    alpn: Alpn,
 ) -> Result<quinn::crypto::rustls::QuicClientConfig, TlsConfigError> {
-    let config = rustls_client_config(key, verifier)?;
+    let config = rustls_client_config_for(key, verifier, alpn)?;
     Ok(quinn::crypto::rustls::QuicClientConfig::try_from(
         Arc::new(config),
     )?)
 }
 
-/// The rustls half of [`tls_client_config`].
+/// The rustls half of [`tls_client_config`] for an upgrade.
+#[cfg(test)]
 pub(crate) fn rustls_client_config(
     key: Arc<rustls::sign::CertifiedKey>,
     verifier: Arc<dyn rustls::client::danger::ServerCertVerifier>,
+) -> Result<rustls::ClientConfig, rustls::Error> {
+    rustls_client_config_for(key, verifier, Alpn::Upgrade)
+}
+
+/// The rustls half of [`tls_client_config`], offering `alpn` only.
+pub(crate) fn rustls_client_config_for(
+    key: Arc<rustls::sign::CertifiedKey>,
+    verifier: Arc<dyn rustls::client::danger::ServerCertVerifier>,
+    alpn: Alpn,
 ) -> Result<rustls::ClientConfig, rustls::Error> {
     let mut config = rustls::ClientConfig::builder_with_provider(provider())
         .with_protocol_versions(&[&rustls::version::TLS13])?
@@ -726,7 +904,7 @@ pub(crate) fn rustls_client_config(
         .with_client_cert_resolver(Arc::new(
             rustls::client::AlwaysResolvesClientRawPublicKeys::new(key),
         ));
-    config.alpn_protocols = vec![ALPN.to_vec()];
+    config.alpn_protocols = vec![alpn.protocol().to_vec()];
     config.enable_sni = false;
     config.enable_early_data = false;
     config.resumption = rustls::client::Resumption::disabled();
