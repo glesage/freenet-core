@@ -206,5 +206,16 @@ accept the token:
 A connection open when its grant is revoked is closed with 4401 and the reason
 `app grant revoked`.
 
+Before each of these closes the node sends one serialized error naming the
+reason (`AUTH_TOKEN_INVALID`, `AUTH_TOKEN_NOT_USABLE_HERE` or
+`AUTH_TOKEN_UNAVAILABLE`). A connection can ask for a stale page token (an
+`authToken` in the query string) to be reported by the 4401 close alone, by
+adding `invalidTokenReport=close` to its URL. The gateway shell does so for the
+sockets it opens for a web app: after a node restart it gets a new page token
+with a request for its own contract root and keeps the app's page open, and the
+error would otherwise reach the app first. The option changes how that one
+refusal is reported and nothing else. Every other refusal, and every connection
+that does not set it, is reported as before.
+
 Approval does not protect against a malicious program already running as the
 same user, which can open and answer the approval page itself.

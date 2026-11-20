@@ -8274,36 +8274,103 @@ mod tests {
         );
     }
 
+    /// The text between two marker comments of the shell bridge. Bounds a pin
+    /// to the code it is about: an assertion on the whole file is satisfied
+    /// by the same words in an unrelated handler or in a comment elsewhere.
+    fn bridge_region(begin: &str, end: &str) -> &'static str {
+        let from = SHELL_BRIDGE_JS
+            .find(begin)
+            .unwrap_or_else(|| panic!("shell_bridge.js must contain `{begin}`"));
+        let len = SHELL_BRIDGE_JS[from..]
+            .find(end)
+            .unwrap_or_else(|| panic!("shell_bridge.js must contain `{end}` after `{begin}`"));
+        &SHELL_BRIDGE_JS[from..from + len]
+    }
+
+    /// The command-socket region of the shell bridge: credential injection,
+    /// the real socket, and recovery from a stale page credential. The same
+    /// region `shell_bridge_reload.test.mjs` extracts and runs.
+    fn command_socket_region() -> &'static str {
+        bridge_region(
+            "command-socket-recovery:BEGIN",
+            "command-socket-recovery:END",
+        )
+    }
+
     /// Pins the shell's peer-restart recovery, which is driven AUTONOMOUSLY by
-    /// the node's trusted stale-token close code (PR #4781, server-4401 design).
-    /// On a node restart the shell's in-memory auth token is invalidated; the
-    /// node answers the reconnecting WebSocket with application close code 4401
-    /// (`AUTH_TOKEN_INVALID_CLOSE_CODE`) and closes it. The shell — which owns
-    /// the WS and the token — sees that close and re-fetches THIS shell HTML
-    /// (minting a fresh token) with a cache-busting top-level `location.replace`.
-    /// The shell does NOT depend on the sandboxed app asking (the old, spoofable
+    /// the node's trusted stale-token close code (PR #4781, server-4401 design)
+    /// and happens IN PLACE. On a node restart the shell's in-memory auth token
+    /// is invalidated; the node answers the reconnecting WebSocket with
+    /// application close code 4401 (`AUTH_TOKEN_INVALID_CLOSE_CODE`) and closes
+    /// it. The shell — which owns the WS and the token — sees that close and
+    /// fetches its own contract root for a fresh token, which the app's next
+    /// socket presents. Nothing navigates, so the app's document survives. The
+    /// shell does NOT depend on the sandboxed app asking (the old, spoofable
     /// `type:'reload'` message path is removed).
+    ///
+    /// Scope: these are substring pins on the emitted JS, a fast local signal
+    /// that the wiring is still there. They execute nothing. The behaviour is
+    /// guarded by `shell_bridge_reload.test.mjs` (the region run as shipped)
+    /// and, in real engines, by `shell-restart-recovery.spec.ts`.
     #[test]
-    fn bridge_js_reloads_shell_on_auth_token_invalid_close() {
+    fn bridge_js_renews_credential_in_place_on_auth_token_invalid_close() {
+        let region = command_socket_region();
         assert!(
             SHELL_BRIDGE_JS.contains("code === 4401 && !clientClosed"),
             "shell must recover on the node's trusted stale-token close code (4401)"
         );
         assert!(
-            SHELL_BRIDGE_JS.contains("if (isTrustedStaleTokenClose(e.code, ws._clientClosed))"),
-            "recovery must trigger on a SERVER-initiated 4401 close only"
+            region.contains(
+                "if (isTrustedStaleTokenClose(e.code, ws._clientClosed)) {\n        \
+                 onStaleTokenClose(socketGeneration);"
+            ),
+            "a SERVER-initiated 4401 close, and only that, must start the in-place \
+             renewal for the credential the socket was opened with"
         );
         assert!(
-            SHELL_BRIDGE_JS.contains("triggerRecoveryReload()"),
-            "the 4401 close must drive the autonomous recovery reload"
+            region.contains("var socketGeneration = credentialGeneration;")
+                && region.contains("if (socketGeneration !== credentialGeneration) return;"),
+            "a close for a credential that has already been replaced must do nothing"
         );
         assert!(
-            SHELL_BRIDGE_JS.contains("location.replace(decision.url)"),
-            "recovery must be a cache-busting top-level navigation (location.replace)"
+            region.contains("if (credentialRenewal) return;"),
+            "sockets refused together must share one renewal"
+        );
+        // The renewal: the shell's own contract root, same-origin, uncached,
+        // no redirect followed, and the token read from the response header.
+        assert!(
+            region.contains("request = fetch(contractPrefix, {"),
+            "the renewal must fetch the shell's own canonical contract root"
+        );
+        for option in [
+            "method: 'GET'",
+            "credentials: 'same-origin'",
+            "cache: 'no-store'",
+            "redirect: 'error'",
+        ] {
+            assert!(
+                region.contains(option),
+                "the renewal request must set {option}"
+            );
+        }
+        assert!(
+            region.contains("parseBearerToken(response.headers.get('Authorization'))"),
+            "the fresh token must come from the Authorization response header"
         );
         assert!(
-            SHELL_BRIDGE_JS.contains("_freload"),
-            "recovery must cache-bust so a stale cached shell (dead token) can't loop"
+            region.contains("authToken = fresh;\n      credentialGeneration++;"),
+            "the fresh token must replace the credential the next socket presents"
+        );
+        // The 4401 close itself must not navigate: every reload call sits in
+        // the renewal's failure branches (see the fallback pin below).
+        assert!(
+            !region.contains("location.replace") && !region.contains("location.reload"),
+            "the in-place path must not navigate the shell"
+        );
+        // The credential stays in the bridge closure.
+        assert!(
+            !region.contains("console."),
+            "the command-socket region must log nothing (it handles the credential)"
         );
         // The untrusted, spoofable iframe-initiated reload path must be GONE.
         assert!(
@@ -8311,6 +8378,102 @@ mod tests {
             "the iframe-initiated reload trigger must be removed (recovery is \
              driven by the node's trusted close code, not the app's say-so)"
         );
+    }
+
+    /// Pins the FALLBACK of the in-place renewal: when no usable credential
+    /// can be obtained, or the renewal budget is spent, the shell still
+    /// recovers the way it did before in-place renewal existed — a capped,
+    /// cache-busting top-level `location.replace` of itself.
+    #[test]
+    fn bridge_js_falls_back_to_the_capped_shell_reload() {
+        let region = command_socket_region();
+        // Reached from exactly two places, both in the renewal: a spent
+        // budget, and a renewal that produced no new credential.
+        assert!(
+            region.contains(
+                "if (credentialRenewalTimes.length >= CREDENTIAL_RENEWAL_MAX) {\n      \
+                 triggerRecoveryReload();"
+            ),
+            "a spent renewal budget must fall back to the capped reload"
+        );
+        assert!(
+            region
+                .contains("if (!fresh || fresh === authToken) {\n        triggerRecoveryReload();"),
+            "a renewal without a new credential must fall back to the capped reload"
+        );
+        assert_eq!(
+            SHELL_BRIDGE_JS.matches("triggerRecoveryReload();").count(),
+            2,
+            "the top-level reload must be reachable only as the renewal's fallback"
+        );
+        assert_eq!(
+            region.matches("triggerRecoveryReload();").count(),
+            2,
+            "both reload calls must sit in the command-socket region"
+        );
+        // The fallback itself is unchanged: capped by the URL stamp, once per
+        // document, a cache-busting replace.
+        let fallback = bridge_region("function triggerRecoveryReload() {", "\n  }\n");
+        assert!(
+            fallback.contains("if (recoveryReloadTriggered) return;"),
+            "the fallback must fire at most once per document"
+        );
+        assert!(
+            fallback.contains("reloadUrlCapDecision(location.href, Date.now())")
+                && fallback.contains("if (!decision.allow) return;"),
+            "the fallback must consult the URL-param cap before reloading"
+        );
+        assert!(
+            fallback.contains("location.replace(decision.url)"),
+            "the fallback must be a cache-busting top-level navigation (location.replace)"
+        );
+        assert!(
+            SHELL_BRIDGE_JS.contains("_freload"),
+            "the fallback must cache-bust so a stale cached shell (dead token) can't loop"
+        );
+    }
+
+    /// Drift pin: the shell opts its command sockets into close-only
+    /// reporting of a stale page token with a query option the node reads
+    /// (`InvalidTokenReport`). The JS spells the name and value as literals;
+    /// nothing else ties them to the Rust constants, and a drift would
+    /// silently bring back the serialized `AUTH_TOKEN_INVALID` error that
+    /// makes already-published apps reload themselves.
+    #[test]
+    fn bridge_js_invalid_token_report_matches_rust_constants() {
+        use crate::client_events::websocket::{
+            INVALID_TOKEN_REPORT_CLOSE_ONLY, INVALID_TOKEN_REPORT_QUERY,
+        };
+        assert!(
+            command_socket_region().contains(&format!(
+                "u.searchParams.set('{INVALID_TOKEN_REPORT_QUERY}', \
+                 '{INVALID_TOKEN_REPORT_CLOSE_ONLY}');"
+            )),
+            "shell_bridge.js must opt its command sockets into close-only reporting \
+             with the node's option name and value"
+        );
+    }
+
+    /// Drift pin: the shell accepts a renewed credential only when the
+    /// `Authorization` header carries a token shaped like the node's page
+    /// tokens. If `AuthToken::generate` changes shape, the renewal would
+    /// reject every token and silently degrade to the reload fallback.
+    #[test]
+    fn bridge_js_bearer_token_pattern_accepts_node_tokens() {
+        const BASE58: &str = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+        assert!(
+            command_socket_region().contains(r"/^Bearer ([1-9A-HJ-NP-Za-km-z]{32,64})$/"),
+            "the bearer pattern this test mirrors changed; update both together"
+        );
+        for _ in 0..2000 {
+            let token = AuthToken::generate();
+            assert!(
+                (32..=64).contains(&token.as_str().len())
+                    && token.as_str().chars().all(|c| BASE58.contains(c)),
+                "a generated page token must match the shell's bearer pattern: {} chars",
+                token.as_str().len()
+            );
+        }
     }
 
     /// Call-site pins for the `_freload` hygiene in the shell bridge. The pure
@@ -8357,7 +8520,8 @@ mod tests {
         );
     }
 
-    /// Pins the two safeguards on the recovery reload (PR #4781 review, MAJOR #2):
+    /// Pins the two safeguards on stale-token recovery (PR #4781 review, MAJOR #2),
+    /// which hold for the in-place renewal and for its reload fallback alike:
     /// (1) it is UNFORGEABLE — a sandboxed contract cannot manufacture the 4401
     /// trigger by asking the shell to close its own socket, because the close
     /// proxy marks iframe-initiated closes (`_clientClosed`) and clamps any
@@ -8854,15 +9018,39 @@ mod tests {
         // Effect 2 — the WS-open handler refuses while hostedNoToken, BEFORE it
         // would otherwise open a socket on the shared Local namespace. Assert the
         // refusal check precedes the real WebSocket construction.
-        let refuse = SHELL_BRIDGE_JS
+        // Bounded to the open handler: the first `if (hostedNoToken)` in the
+        // file is the page-level block, which precedes everything.
+        let open_handler = bridge_region("      case 'open': {", "      case 'send': {");
+        let refuse = open_handler
             .find("if (hostedNoToken)")
             .expect("WS-open handler must refuse while hosted+no-token");
-        let open_socket = SHELL_BRIDGE_JS
-            .find("new WebSocket(u.toString()")
-            .expect("bridge must have a WebSocket open site");
+        let open_socket = open_handler
+            .find("openCommandSocket(msg, u);")
+            .expect("the WS-open handler must hand the validated URL to openCommandSocket");
         assert!(
             refuse < open_socket,
             "the hostedNoToken refusal must precede opening the real socket"
+        );
+        // ...and that handler is the only way to a real socket: one
+        // construction site, inside the command-socket region, reached only
+        // through openCommandSocket, which only the open handler calls.
+        assert_eq!(
+            SHELL_BRIDGE_JS
+                .matches("new WebSocket(u.toString()")
+                .count(),
+            1,
+            "the bridge must have exactly one command-socket open site"
+        );
+        assert!(
+            command_socket_region().contains("new WebSocket(u.toString()"),
+            "the command-socket open site must be in the command-socket region"
+        );
+        assert_eq!(
+            SHELL_BRIDGE_JS
+                .matches("openCommandSocket(msg, u);")
+                .count(),
+            1,
+            "only the validated open handler may open a command socket"
         );
     }
 

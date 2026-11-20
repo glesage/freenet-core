@@ -15,9 +15,15 @@ function freenetBridge(authToken, userToken, hostedMode) {
   // reopens its WebSocket after the restart and the node rejects the now-stale
   // token with a 4401 close (the 4401 rides that reconnect, NOT the death of
   // the original socket, which just closes when the node goes down); the shell
-  // does not poll — it reacts to that close. The app never has to ASK for a
-  // reload (this replaces the old, spoofable message-body byte scan), but
+  // does not poll — it reacts to that close. The app never has to ASK for
+  // recovery (this replaces the old, spoofable message-body byte scan), but
   // recovery does depend on the app reconnecting its socket.
+  //
+  // Recovery is IN PLACE first: the shell renews its own credential and the
+  // app's next socket uses it, so the app's document (and whatever the user
+  // had typed into it) survives the restart. See the command-socket-recovery
+  // region below. A top-level reload of the shell is only the fallback, for
+  // when no usable credential can be obtained.
   //
   // recoveryReloadTriggered guards against more than one recovery reload from a
   // single document: location.replace navigates away, so any further 4401 closes
@@ -627,12 +633,12 @@ function freenetBridge(authToken, userToken, hostedMode) {
   }
   stripFreload();
 
-  // Re-fetch THIS shell HTML to mint a fresh auth token — the autonomous
-  // recovery a manual refresh performs, now driven by the node's trusted 4401
-  // close (see AUTH_TOKEN_INVALID_CLOSE_CODE) rather than any iframe request.
-  // Bounded fail-closed by reloadUrlCapDecision, and once-per-document by
-  // recoveryReloadTriggered. location.replace (not assign) leaves no dead
-  // history entry.
+  // The FALLBACK recovery: navigate to THIS shell again to mint a fresh auth
+  // token, as a manual refresh would. Reached only when the in-place renewal
+  // (renewCredential, below) could not produce a usable credential, or has
+  // used up its budget; it costs the app its document. Bounded fail-closed by
+  // reloadUrlCapDecision, and once-per-document by recoveryReloadTriggered.
+  // location.replace (not assign) leaves no dead history entry.
   function triggerRecoveryReload() {
     if (recoveryReloadTriggered) return;
     var decision = reloadUrlCapDecision(location.href, Date.now());
@@ -644,6 +650,322 @@ function freenetBridge(authToken, userToken, hostedMode) {
       location.reload();
     }
   }
+
+  // In-place recovery from a stale page credential.
+  //
+  // A node restart forgets every page token it issued, so the node refuses the
+  // app's next command socket with the trusted 4401 close. The shell then asks
+  // the node for a new credential the same way it got the first one — a GET of
+  // its own contract root, whose response carries the token in `Authorization`
+  // (render_shell_response in client_api.rs) — and uses it on the app's NEXT
+  // socket. Nothing navigates: the top-level document, the app's frame, its
+  // URL, history and the hosted user's identity all stay as they are. The node
+  // decides what the new credential may do exactly as it did for the old one;
+  // the shell only fetches a page it could already load.
+  //
+  // The app sees the refused socket open and then close, like any other lost
+  // connection, and reconnects by its own logic. Nothing it sent on the
+  // refused socket is replayed: the shell cannot know what was delivered.
+  //
+  // Bounds:
+  //   - one renewal at a time, and one per rejected credential: every socket
+  //     records the credential generation it was opened with, so sockets
+  //     refused together share a renewal and a late close for a credential
+  //     that has since been replaced does nothing;
+  //   - at most CREDENTIAL_RENEWAL_MAX renewals per window, so a node that
+  //     refuses the credentials it has just issued cannot make the shell
+  //     fetch forever;
+  //   - each renewal ends at CREDENTIAL_RENEWAL_TIMEOUT_MS.
+  // Past any of them the shell falls back to triggerRecoveryReload (itself
+  // capped). The credential lives only in this closure (`authToken`): it is
+  // never posted to the app frame and never logged.
+  //
+  // command-socket-recovery:BEGIN — extracted verbatim & unit-tested by
+  // shell_bridge_reload.test.mjs, which supplies every free name the region
+  // uses: authToken, userToken, contractPrefix, connections, iframe,
+  // sendToIframe, isTrustedStaleTokenClose, clampProxiedCloseCode,
+  // triggerRecoveryReload, and the globals location, WebSocket, fetch,
+  // AbortController, setTimeout, clearTimeout and Date. Add no other outer
+  // reference without adding it there.
+  var CREDENTIAL_RENEWAL_MAX = 3; // renewals per rolling window
+  var CREDENTIAL_RENEWAL_WINDOW_MS = 60000; // same window as the reload cap
+  var CREDENTIAL_RENEWAL_TIMEOUT_MS = 15000;
+  // Bumped each time `authToken` is replaced.
+  var credentialGeneration = 0;
+  // While a renewal is in flight: a promise of whether it replaced the
+  // credential. It never rejects.
+  var credentialRenewal = null;
+  // Start times of the renewals inside the current window.
+  var credentialRenewalTimes = [];
+
+  // The token in an `Authorization: Bearer <token>` response header, or null.
+  // The node's page tokens are base58 of 32 bytes (AuthToken::generate), so
+  // anything else is not a credential this shell should start presenting.
+  function parseBearerToken(header) {
+    if (typeof header !== 'string') return null;
+    var m = /^Bearer ([1-9A-HJ-NP-Za-km-z]{32,64})$/.exec(header);
+    return m ? m[1] : null;
+  }
+
+  // Ask the node for a fresh page credential. Resolves to the token, or to
+  // null when the node gave none (network error, error status, redirect, no
+  // or malformed header, timeout). The request goes to the canonical contract
+  // root, not the current sub-page: only the root issues a token to a
+  // non-document request. `redirect: 'error'` keeps the answer the node's own;
+  // `no-store` keeps a cache from replaying an old token. The body is the
+  // shell HTML and is discarded unread.
+  function fetchFreshCredential() {
+    return new Promise(function (resolve) {
+      var settled = false;
+      var timer = null;
+      var controller = null;
+      function finish(fresh) {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(fresh);
+      }
+      if (!contractPrefix) {
+        finish(null);
+        return;
+      }
+      try {
+        controller = new AbortController();
+      } catch (e) {}
+      timer = setTimeout(function () {
+        if (controller) {
+          try {
+            controller.abort();
+          } catch (e) {}
+        }
+        finish(null);
+      }, CREDENTIAL_RENEWAL_TIMEOUT_MS);
+      var request;
+      try {
+        request = fetch(contractPrefix, {
+          method: 'GET',
+          credentials: 'same-origin',
+          cache: 'no-store',
+          redirect: 'error',
+          signal: controller ? controller.signal : undefined,
+        });
+      } catch (e) {
+        finish(null);
+        return;
+      }
+      request.then(
+        function (response) {
+          var fresh = null;
+          try {
+            if (response.ok && !response.redirected) {
+              fresh = parseBearerToken(response.headers.get('Authorization'));
+            }
+            // Release the connection without reading the page.
+            if (response.body) response.body.cancel().catch(function () {});
+          } catch (e) {}
+          finish(fresh);
+        },
+        function () {
+          finish(null);
+        },
+      );
+    });
+  }
+
+  // Start a renewal of the current credential, or fall back to the top-level
+  // reload when the window's budget is spent. Callers ensure none is in flight.
+  function renewCredential() {
+    var now = Date.now();
+    credentialRenewalTimes = credentialRenewalTimes.filter(function (t) {
+      return t <= now && now - t < CREDENTIAL_RENEWAL_WINDOW_MS;
+    });
+    if (credentialRenewalTimes.length >= CREDENTIAL_RENEWAL_MAX) {
+      triggerRecoveryReload();
+      return;
+    }
+    credentialRenewalTimes.push(now);
+    credentialRenewal = fetchFreshCredential().then(function (fresh) {
+      credentialRenewal = null;
+      // The same token again is no renewal: the node has already refused it.
+      if (!fresh || fresh === authToken) {
+        triggerRecoveryReload();
+        return false;
+      }
+      authToken = fresh;
+      credentialGeneration++;
+      return true;
+    });
+  }
+
+  // The node refused, as stale, a socket opened with credential generation
+  // `socketGeneration`.
+  function onStaleTokenClose(socketGeneration) {
+    // A credential that has already been replaced: nothing left to recover.
+    if (socketGeneration !== credentialGeneration) return;
+    // Refused together with a socket whose renewal is already under way.
+    if (credentialRenewal) return;
+    renewCredential();
+  }
+
+  // Open the real socket for the app's socket `msg.id`, to the validated URL
+  // `u`, with the current credential.
+  function connectCommandSocket(msg, u) {
+    // Strip any caller-supplied credentials BEFORE we inject our own, so
+    // the sandboxed app can never choose its own auth/user identity by
+    // putting these params on the WebSocket URL it asks us to open. This
+    // matters most for `userToken`: the conditional `set` below is skipped
+    // when our minted token is undefined (localStorage disabled / private
+    // mode in hosted mode), and without this delete a caller-supplied
+    // `userToken` (from the app, or reflected via a deep-link into the WS
+    // URL) would survive and let the app pick its own per-user secret
+    // namespace. The app must NEVER influence the namespace — only the
+    // shell-minted token may reach the backend. `authToken` is deleted for
+    // symmetric defense-in-depth even though the unconditional `set` below
+    // already overrides any caller value.
+    u.searchParams.delete('authToken');
+    u.searchParams.delete('userToken');
+    // Inject auth token into the WebSocket URL
+    u.searchParams.set('authToken', authToken);
+    // Ask the node to report a stale page token with the 4401 close alone,
+    // without the serialized AUTH_TOKEN_INVALID error it otherwise sends
+    // first (see InvalidTokenReport in client_events/websocket.rs). The shell
+    // recovers from the close; the error would reach the app, and apps
+    // published before in-place recovery answer it by reloading themselves.
+    // This selects how a refusal is worded and grants nothing. A node that
+    // predates the option ignores it.
+    u.searchParams.set('invalidTokenReport', 'close');
+    // In hosted mode also present the durable per-user token so the node
+    // can scope a per-user delegate-secret namespace (P2 of #4381). The
+    // token is undefined in non-hosted mode, so the param is omitted (and,
+    // combined with the delete above, the URL carries no userToken at all).
+    // The `location.protocol === 'https:'` guard is a SECOND, independent
+    // REFUSE-PLAINTEXT-TOKEN barrier (the first is in SHELL_USER_TOKEN_JS,
+    // which never mints the token on an http page): two guards so a future
+    // refactor of either site can't reopen the plaintext-leak path. The
+    // shell is same-origin with the node, so `location.protocol` reflects
+    // whether the shell itself was served over TLS.
+    if (userToken && location.protocol === 'https:') {
+      u.searchParams.set('userToken', userToken);
+    }
+    // The credential this socket presents, so a refusal of it can be told
+    // from a refusal of one that has since been replaced.
+    var socketGeneration = credentialGeneration;
+    var ws = new WebSocket(u.toString(), msg.protocols || undefined);
+    ws.binaryType = 'arraybuffer';
+    connections.set(msg.id, ws);
+
+    ws.onopen = function () {
+      sendToIframe({ __freenet_ws__: true, type: 'open', id: msg.id });
+    };
+    ws.onmessage = function (e) {
+      var transfer = e.data instanceof ArrayBuffer ? [e.data] : [];
+      iframe.contentWindow.postMessage(
+        {
+          __freenet_ws__: true,
+          type: 'message',
+          id: msg.id,
+          data: e.data,
+        },
+        '*',
+        transfer,
+      );
+    };
+    ws.onclose = function (e) {
+      sendToIframe({
+        __freenet_ws__: true,
+        type: 'close',
+        id: msg.id,
+        code: e.code,
+        reason: e.reason,
+      });
+      if (connections.get(msg.id) === ws) connections.delete(msg.id);
+      // Trusted stale-token signal: the node closes a socket whose auth
+      // token is stale with code AUTH_TOKEN_INVALID_CLOSE_CODE (4401). Only
+      // a SERVER-initiated close carries it — closeCommandSocket marks
+      // iframe-requested closes with `_clientClosed` and clamps app-range
+      // codes, so a contract can't forge 4401 by asking the shell to close
+      // its own socket. On a genuine 4401 the shell renews its credential
+      // in place (bounded; the capped reload is the fallback) — no iframe
+      // request needed.
+      if (isTrustedStaleTokenClose(e.code, ws._clientClosed)) {
+        onStaleTokenClose(socketGeneration);
+      }
+    };
+    ws.onerror = function () {
+      sendToIframe({ __freenet_ws__: true, type: 'error', id: msg.id });
+      if (connections.get(msg.id) === ws) connections.delete(msg.id);
+    };
+  }
+
+  // The app asked for a socket (`msg`; `u` is its URL, already validated by
+  // the open handler). While a renewal is in flight the open waits for it
+  // rather than presenting a credential the node is known to refuse. A
+  // waiting open sits in `connections`, so it counts toward MAX_CONNECTIONS
+  // and is cancelled by anything that closes or clears that map.
+  function openCommandSocket(msg, u) {
+    var renewal = credentialRenewal;
+    if (!renewal) {
+      connectCommandSocket(msg, u);
+      return;
+    }
+    var waiting = {
+      _waiting: true,
+      _clientClosed: false,
+      readyState: 0, // CONNECTING: the send proxy drops writes to it
+      close: function () {
+        waiting._clientClosed = true;
+      },
+    };
+    connections.set(msg.id, waiting);
+    renewal.then(function (renewed) {
+      // Closed by the app, or dropped with the map, while it waited.
+      if (connections.get(msg.id) !== waiting) return;
+      connections.delete(msg.id);
+      if (!renewed) {
+        // No usable credential (the fallback reload has been asked for, and
+        // may have been refused by its cap). Fail this open as a connection
+        // that could not be made, so the app retries by its own backoff.
+        sendToIframe({ __freenet_ws__: true, type: 'error', id: msg.id });
+        sendToIframe({
+          __freenet_ws__: true,
+          type: 'close',
+          id: msg.id,
+          code: 1006,
+          reason: '',
+        });
+        return;
+      }
+      connectCommandSocket(msg, u);
+    });
+  }
+
+  // The app asked to close its socket `msg.id`.
+  function closeCommandSocket(msg) {
+    var ws = connections.get(msg.id);
+    if (!ws) return;
+    // Mark this as an iframe-requested close so the onclose handler above
+    // does NOT treat its code as the node's trusted 4401 stale-token
+    // signal. Also clamp any app-range (4000-4999) code the iframe asks
+    // for down to a normal close, so it can't even surface 4401 to
+    // onclose: two independent guards against the contract forging the
+    // recovery trigger by requesting a close.
+    ws._clientClosed = true;
+    if (ws._waiting) {
+      // Never connected: end it for the app here, since no socket will.
+      connections.delete(msg.id);
+      sendToIframe({
+        __freenet_ws__: true,
+        type: 'close',
+        id: msg.id,
+        code: 1006,
+        reason: '',
+      });
+      return;
+    }
+    ws.close(clampProxiedCloseCode(msg.code), msg.reason);
+    connections.delete(msg.id);
+  }
+  // command-socket-recovery:END
 
   function notifyStatusToIframe(status) {
     sendToIframe({
@@ -1510,79 +1832,10 @@ function freenetBridge(authToken, userToken, hostedMode) {
           sendToIframe({ __freenet_ws__: true, type: 'error', id: msg.id });
           return;
         }
-        // Strip any caller-supplied credentials BEFORE we inject our own, so
-        // the sandboxed app can never choose its own auth/user identity by
-        // putting these params on the WebSocket URL it asks us to open. This
-        // matters most for `userToken`: the conditional `set` below is skipped
-        // when our minted token is undefined (localStorage disabled / private
-        // mode in hosted mode), and without this delete a caller-supplied
-        // `userToken` (from the app, or reflected via a deep-link into the WS
-        // URL) would survive and let the app pick its own per-user secret
-        // namespace. The app must NEVER influence the namespace — only the
-        // shell-minted token may reach the backend. `authToken` is deleted for
-        // symmetric defense-in-depth even though the unconditional `set` below
-        // already overrides any caller value.
-        u.searchParams.delete('authToken');
-        u.searchParams.delete('userToken');
-        // Inject auth token into the WebSocket URL
-        u.searchParams.set('authToken', authToken);
-        // In hosted mode also present the durable per-user token so the node
-        // can scope a per-user delegate-secret namespace (P2 of #4381). The
-        // token is undefined in non-hosted mode, so the param is omitted (and,
-        // combined with the delete above, the URL carries no userToken at all).
-        // The `location.protocol === 'https:'` guard is a SECOND, independent
-        // REFUSE-PLAINTEXT-TOKEN barrier (the first is in SHELL_USER_TOKEN_JS,
-        // which never mints the token on an http page): two guards so a future
-        // refactor of either site can't reopen the plaintext-leak path. The
-        // shell is same-origin with the node, so `location.protocol` reflects
-        // whether the shell itself was served over TLS.
-        if (userToken && location.protocol === 'https:') {
-          u.searchParams.set('userToken', userToken);
-        }
-        var ws = new WebSocket(u.toString(), msg.protocols || undefined);
-        ws.binaryType = 'arraybuffer';
-        connections.set(msg.id, ws);
-
-        ws.onopen = function () {
-          sendToIframe({ __freenet_ws__: true, type: 'open', id: msg.id });
-        };
-        ws.onmessage = function (e) {
-          var transfer = e.data instanceof ArrayBuffer ? [e.data] : [];
-          iframe.contentWindow.postMessage(
-            {
-              __freenet_ws__: true,
-              type: 'message',
-              id: msg.id,
-              data: e.data,
-            },
-            '*',
-            transfer,
-          );
-        };
-        ws.onclose = function (e) {
-          sendToIframe({
-            __freenet_ws__: true,
-            type: 'close',
-            id: msg.id,
-            code: e.code,
-            reason: e.reason,
-          });
-          connections.delete(msg.id);
-          // Trusted stale-token signal: the node closes a socket whose auth
-          // token is stale with code AUTH_TOKEN_INVALID_CLOSE_CODE (4401). Only
-          // a SERVER-initiated close carries it — the close proxy below marks
-          // iframe-requested closes with `_clientClosed` and clamps app-range
-          // codes, so a contract can't forge 4401 by asking the shell to close
-          // its own socket. On a genuine 4401 the shell re-mints its token by
-          // reloading itself (bounded, fail-closed) — no iframe request needed.
-          if (isTrustedStaleTokenClose(e.code, ws._clientClosed)) {
-            triggerRecoveryReload();
-          }
-        };
-        ws.onerror = function () {
-          sendToIframe({ __freenet_ws__: true, type: 'error', id: msg.id });
-          connections.delete(msg.id);
-        };
+        // Credentials are injected, and the socket opened, by
+        // openCommandSocket (the command-socket-recovery region), which also
+        // owns recovery from a stale page credential.
+        openCommandSocket(msg, u);
         break;
       }
       case 'send': {
@@ -1593,18 +1846,7 @@ function freenetBridge(authToken, userToken, hostedMode) {
         break;
       }
       case 'close': {
-        var ws = connections.get(msg.id);
-        if (ws) {
-          // Mark this as an iframe-requested close so the onclose handler above
-          // does NOT treat its code as the node's trusted 4401 stale-token
-          // signal. Also clamp any app-range (4000-4999) code the iframe asks
-          // for down to a normal close, so it can't even surface 4401 to
-          // onclose: two independent guards against the contract forging the
-          // recovery trigger by requesting a close.
-          ws._clientClosed = true;
-          ws.close(clampProxiedCloseCode(msg.code), msg.reason);
-          connections.delete(msg.id);
-        }
+        closeCommandSocket(msg);
         break;
       }
     }

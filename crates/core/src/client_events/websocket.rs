@@ -35,6 +35,55 @@ pub const AUTH_TOKEN_INVALID_ERROR: &str = "AUTH_TOKEN_INVALID";
 /// range (4000-4999) and deliberately mirrors HTTP 401 Unauthorized.
 pub const AUTH_TOKEN_INVALID_CLOSE_CODE: u16 = 4401;
 
+/// Query-string option a connection sets to choose how a stale shell-page
+/// token is reported; see [`InvalidTokenReport`]. serde reads it as the
+/// camelCase name of `ConnectionInfo::invalid_token_report`; this spelling
+/// exists for the tests that tie that name to the shell bridge's literal
+/// (`stale_page_token_report_follows_the_connection_opt_in` connects with it,
+/// so a rename of the field fails there).
+#[cfg(test)]
+pub(crate) const INVALID_TOKEN_REPORT_QUERY: &str = "invalidTokenReport";
+
+/// The [`INVALID_TOKEN_REPORT_QUERY`] value that asks for
+/// [`InvalidTokenReport::CloseOnly`].
+pub(crate) const INVALID_TOKEN_REPORT_CLOSE_ONLY: &str = "close";
+
+/// How a connection asked to be told that its shell-page token is stale.
+///
+/// This selects the wording of one refusal and nothing else: the token is
+/// checked the same way, the connection is closed with the same trusted
+/// [`AUTH_TOKEN_INVALID_CLOSE_CODE`], and the same disconnect cleanup runs.
+/// It grants no authority, so it is safe for any client to set.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum InvalidTokenReport {
+    /// The serialized [`AUTH_TOKEN_INVALID_ERROR`], then the 4401 close. What
+    /// every client gets unless it asks otherwise.
+    #[default]
+    ErrorThenClose,
+    /// The 4401 close alone.
+    ///
+    /// The shell asks for this on the command sockets it opens for a framed
+    /// app (`shell_bridge.js`). It renews a stale page token in place on the
+    /// trusted close, without reloading the app. The serialized error is of no
+    /// use to it, and the framed app would receive it first: apps published
+    /// before in-place renewal answer `AUTH_TOKEN_INVALID` by reloading
+    /// themselves, which discards exactly the page the renewal keeps.
+    CloseOnly,
+}
+
+impl InvalidTokenReport {
+    /// The report a connection asked for with its
+    /// [`INVALID_TOKEN_REPORT_QUERY`] value. Anything but the one known value
+    /// is the default report, never an error: a value a later shell sends must
+    /// not turn into a refused upgrade on this node.
+    fn from_query(value: Option<&str>) -> Self {
+        match value {
+            Some(INVALID_TOKEN_REPORT_CLOSE_ONLY) => Self::CloseOnly,
+            Some(_) | None => Self::ErrorThenClose,
+        }
+    }
+}
+
 /// Error prefix sent before a [`AUTH_TOKEN_UNAVAILABLE_CLOSE_CODE`] close.
 pub const AUTH_TOKEN_UNAVAILABLE_ERROR: &str = "AUTH_TOKEN_UNAVAILABLE";
 
@@ -67,6 +116,10 @@ pub(crate) enum TokenCheck {
     Valid,
     /// A token that names nothing: stale shell-page token, revoked grant.
     Invalid,
+    /// [`TokenCheck::Invalid`] on a connection that asked for
+    /// [`InvalidTokenReport::CloseOnly`]: refused the same way, without the
+    /// serialized error before the close.
+    InvalidCloseOnly,
     /// A token that could not be checked right now; see
     /// [`AUTH_TOKEN_UNAVAILABLE_CLOSE_CODE`].
     Unavailable,
@@ -146,6 +199,16 @@ fn grant_outcome(lookup: GrantLookup) -> Result<LiveGrant, TokenCheck> {
         GrantLookup::Granted(grant) => Ok(grant),
         GrantLookup::Unavailable => Err(TokenCheck::Unavailable),
         GrantLookup::NotFound => Err(TokenCheck::GrantNotFound),
+    }
+}
+
+/// The refusal of a query-string token the node does not hold: a stale
+/// shell-page token, reported the way the connection asked. No other refusal
+/// depends on the connection's [`InvalidTokenReport`].
+fn stale_page_token(report: InvalidTokenReport) -> TokenCheck {
+    match report {
+        InvalidTokenReport::ErrorThenClose => TokenCheck::Invalid,
+        InvalidTokenReport::CloseOnly => TokenCheck::InvalidCloseOnly,
     }
 }
 
@@ -937,6 +1000,10 @@ struct ConnectionInfo {
     /// and moves it into the wrapper, so the token never exists as a separate
     /// un-zeroized owned copy.
     user_token: Option<Zeroizing<String>>,
+    /// How to report a stale shell-page token; see [`InvalidTokenReport`]. A
+    /// plain string, not an enum, so an unknown value is ignored instead of
+    /// failing the whole query (and with it the upgrade).
+    invalid_token_report: Option<String>,
 }
 
 /// Decide a connection's per-user secret namespace from the hosted-mode flag
@@ -1101,6 +1168,7 @@ async fn connection_info(
         encoding_protocol,
         streaming: _,
         user_token: user_token_q,
+        invalid_token_report: invalid_token_report_q,
     }): Query<ConnectionInfo>,
     Extension(allowed_hosts): Extension<crate::server::AllowedHosts>,
     Extension(allowed_source_cidrs): Extension<crate::server::AllowedSourceCidrs>,
@@ -1356,6 +1424,9 @@ async fn connection_info(
         .insert(AuthTokenFromHeader(token_from_header));
     req.extensions_mut().insert(user_context);
     req.extensions_mut().insert(connection_scope);
+    req.extensions_mut().insert(InvalidTokenReport::from_query(
+        invalid_token_report_q.as_deref(),
+    ));
     // `streaming` query parameter is accepted but ignored — streaming is now
     // always enabled for payloads exceeding CHUNK_THRESHOLD (512 KiB).
 
@@ -1397,6 +1468,10 @@ async fn websocket_commands(
     // WebSocket routes, so standalone test routers honour no grants.
     app_grants: Option<Extension<AppGrantState>>,
     token_from_header: Option<Extension<AuthTokenFromHeader>>,
+    // How the connection asked for a stale shell-page token to be reported.
+    // OPTIONAL like `token_from_header`: a router without `connection_info`
+    // reports as it always did.
+    invalid_token_report: Option<Extension<InvalidTokenReport>>,
     headers: axum::http::HeaderMap,
 ) -> Response {
     // A hosted node serves its client API only to a connection that presented
@@ -1428,6 +1503,9 @@ async fn websocket_commands(
     // app identity. Anything else skips the lookup entirely: no store read, no
     // live registration.
     let app_grants = app_grants.map(|Extension(g)| g);
+    let invalid_token_report = invalid_token_report
+        .map(|Extension(report)| report)
+        .unwrap_or_default();
     let grant_gate = match (
         grant_gate_kind(GrantGateInputs {
             has_grant_state: app_grants.is_some(),
@@ -1471,7 +1549,7 @@ async fn websocket_commands(
                         Err(check) => Err(check),
                     },
                     GrantGate::NotHere => Err(TokenCheck::NotUsableHere),
-                    GrantGate::NoGrants => Err(TokenCheck::Invalid),
+                    GrantGate::NoGrants => Err(stale_page_token(invalid_token_report)),
                 }
             };
             match grant {
@@ -1689,7 +1767,7 @@ async fn websocket_interface(
                  or never issued. A native client should request a new app grant.",
                 AUTH_TOKEN_INVALID_CLOSE_CODE,
             ),
-            TokenCheck::Invalid | TokenCheck::Valid => (
+            TokenCheck::Invalid | TokenCheck::InvalidCloseOnly | TokenCheck::Valid => (
                 AUTH_TOKEN_INVALID_ERROR,
                 "The auth token is no longer valid. This usually happens after a node restart. \
                  Please refresh the page to get a new token.",
@@ -1705,7 +1783,15 @@ async fn websocket_interface(
         // The send can fail when the client is already gone. That must not skip
         // the Disconnect below, or the node keeps this client's response
         // channel until exit, so the result is only propagated afterwards.
+        //
+        // A connection that asked for close-only reporting of a stale page
+        // token gets no serialized error: the close frame below is the whole
+        // report (see `InvalidTokenReport::CloseOnly`).
         let send_result: anyhow::Result<()> = async {
+            if token_check == TokenCheck::InvalidCloseOnly {
+                tracing::debug!(prefix, "Closing a connection with a stale page token");
+                return Ok(());
+            }
             let serialized_error = match encoding_protoc {
                 EncodingProtocol::Flatbuffers => error
                     .into_fbs_bytes()
@@ -1741,7 +1827,8 @@ async fn websocket_interface(
         // Close with the trusted application code (not a bare close) so the shell
         // can distinguish a stale-token rejection from any other disconnect and
         // recover autonomously — see AUTH_TOKEN_INVALID_CLOSE_CODE. The serialized
-        // error above is still sent first (unchanged) for clients that decode it.
+        // error above is still sent first (unchanged) for clients that decode it,
+        // unless the connection asked for the close alone.
         if let Err(e) = server_sink
             .send(Message::Close(Some(CloseFrame {
                 code: close_code,
@@ -3739,6 +3826,250 @@ mod tests {
             Some(AUTH_TOKEN_INVALID_CLOSE_CODE),
             "an invalid auth token must close the socket with the trusted 4401 code"
         );
+    }
+
+    /// How a refused token is reported, through the REAL client-API
+    /// composition (`serve_client_api_in_impl`, all layers, a real listener).
+    ///
+    /// The shell asks for close-only reporting on the command sockets it
+    /// proxies (`invalidTokenReport=close`): it renews a stale page token in
+    /// place on the trusted 4401 close, and the serialized `AUTH_TOKEN_INVALID`
+    /// error would reach the framed app first and make already-published apps
+    /// reload themselves. The option selects only how ONE refusal is presented:
+    /// a stale query-string page token. The close code, the disconnect cleanup,
+    /// every other refusal and every client that did not ask are unchanged.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stale_page_token_report_follows_the_connection_opt_in() {
+        use std::time::Duration;
+        use tokio_tungstenite::tungstenite::{Message as WsMessage, client::IntoClientRequest};
+
+        type Client = tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >;
+
+        /// What the node side saw of a connection.
+        #[derive(Debug, PartialEq, Eq)]
+        enum Seen {
+            Get,
+            Disconnect,
+        }
+
+        // Built from the constants the shell-bridge pin compares against the
+        // JS, so the query name serde reads cannot drift from either.
+        let opt_in = format!("&{INVALID_TOKEN_REPORT_QUERY}={INVALID_TOKEN_REPORT_CLOSE_ONLY}");
+        let opt_in = opt_in.as_str();
+        assert_eq!(opt_in, "&invalidTokenReport=close");
+        const STALE: &str = "a-page-token-the-node-no-longer-holds";
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let config = crate::config::WebsocketApiConfig {
+            address: std::net::Ipv4Addr::LOCALHOST.into(),
+            port,
+            ..Default::default()
+        };
+        let (gw, mut proxy) =
+            crate::server::serve_client_api_with_listener_for_unit_test(config, listener)
+                .await
+                .unwrap();
+        // Assign connection ids, as the node's client loop would, and report
+        // the requests that reach the node side.
+        let (seen_tx, mut seen) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Ok(req) = proxy.recv().await {
+                #[allow(
+                    clippy::wildcard_enum_match_arm,
+                    reason = "the test reports the two request kinds it sends or causes"
+                )]
+                let kind = match *req.request {
+                    ClientRequest::ContractOp(ContractRequest::Get { .. }) => Seen::Get,
+                    ClientRequest::Disconnect { .. } => Seen::Disconnect,
+                    _ => continue,
+                };
+                if seen_tx.send(kind).is_err() {
+                    // The test stopped listening; keep assigning ids.
+                    continue;
+                }
+            }
+        });
+
+        /// Open a client-API WebSocket with `query` appended to the URL and an
+        /// optional `Authorization: Bearer` token.
+        async fn connect(port: u16, query: &str, header_token: Option<&str>) -> Client {
+            let url =
+                format!("ws://127.0.0.1:{port}/v1/contract/command?encodingProtocol=native{query}");
+            let mut request = url.as_str().into_client_request().unwrap();
+            if let Some(token) = header_token {
+                request.headers_mut().insert(
+                    axum::http::header::AUTHORIZATION,
+                    format!("Bearer {token}").parse().unwrap(),
+                );
+            }
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                tokio_tungstenite::connect_async(request),
+            )
+            .await
+            .expect("connect timed out")
+            .expect("upgrade accepted")
+            .0
+        }
+
+        /// Every serialized error the node sent before its close frame, and
+        /// that close frame.
+        async fn refusal(client: &mut Client) -> (Vec<String>, Option<(u16, String)>) {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                let mut errors = Vec::new();
+                while let Some(frame) = client.next().await {
+                    #[allow(
+                        clippy::wildcard_enum_match_arm,
+                        reason = "only data and close frames matter here"
+                    )]
+                    match frame.expect("ws frame") {
+                        WsMessage::Binary(b) => {
+                            let response: Result<HostResponse, ClientError> =
+                                bincode::deserialize(&b).expect("a native response");
+                            errors.push(response.expect_err("a refusal").to_string());
+                        }
+                        WsMessage::Text(t) => errors.push(format!("unexpected text frame: {t}")),
+                        WsMessage::Close(Some(cf)) => {
+                            return (errors, Some((u16::from(cf.code), cf.reason.to_string())));
+                        }
+                        WsMessage::Close(None) => return (errors, None),
+                        _ => continue,
+                    }
+                }
+                (errors, None)
+            })
+            .await
+            .expect("timed out waiting for the close frame")
+        }
+
+        async fn next_seen(seen: &mut tokio::sync::mpsc::UnboundedReceiver<Seen>) -> Seen {
+            tokio::time::timeout(Duration::from_secs(10), seen.recv())
+                .await
+                .expect("timed out waiting for a request to reach the node")
+                .expect("the node side is still serving")
+        }
+
+        let stale_close = Some((
+            AUTH_TOKEN_INVALID_CLOSE_CODE,
+            AUTH_TOKEN_INVALID_ERROR.to_string(),
+        ));
+
+        // A client that did not ask: the serialized error, then the 4401 close.
+        let mut client = connect(port, &format!("&authToken={STALE}"), None).await;
+        let (errors, close) = refusal(&mut client).await;
+        assert_eq!(errors.len(), 1, "one serialized error: {errors:?}");
+        assert!(
+            errors[0].contains(AUTH_TOKEN_INVALID_ERROR),
+            "the default refusal still names the error: {errors:?}"
+        );
+        assert_eq!(close, stale_close);
+        assert_eq!(next_seen(&mut seen).await, Seen::Disconnect);
+
+        // An unknown value of the option is not an opt-in (and not a 400).
+        let mut client = connect(
+            port,
+            &format!("&authToken={STALE}&invalidTokenReport=later"),
+            None,
+        )
+        .await;
+        let (errors, close) = refusal(&mut client).await;
+        assert_eq!(errors.len(), 1, "an unknown value reports as before");
+        assert_eq!(close, stale_close);
+        assert_eq!(next_seen(&mut seen).await, Seen::Disconnect);
+
+        // The opt-in: the same trusted close and the same cleanup, with no
+        // serialized error before it.
+        let mut client = connect(port, &format!("&authToken={STALE}{opt_in}"), None).await;
+        let (errors, close) = refusal(&mut client).await;
+        assert_eq!(
+            errors,
+            Vec::<String>::new(),
+            "an opted-in stale page token is reported by the close frame alone"
+        );
+        assert_eq!(
+            close, stale_close,
+            "the opt-in keeps the trusted 4401 close"
+        );
+        assert_eq!(
+            next_seen(&mut seen).await,
+            Seen::Disconnect,
+            "the opt-in keeps the disconnect cleanup"
+        );
+
+        // The opt-in changes no other refusal. A header token with no grant
+        // store behind the router could not be checked: error, then 4503.
+        let mut client = connect(port, opt_in, Some("some-native-token")).await;
+        let (errors, close) = refusal(&mut client).await;
+        assert_eq!(
+            errors.len(),
+            1,
+            "unavailable is still explained: {errors:?}"
+        );
+        assert!(errors[0].contains(AUTH_TOKEN_UNAVAILABLE_ERROR));
+        assert_eq!(close.map(|c| c.0), Some(AUTH_TOKEN_UNAVAILABLE_CLOSE_CODE));
+        assert_eq!(next_seen(&mut seen).await, Seen::Disconnect);
+
+        // A header token this connection cannot use as a grant (it came
+        // through a proxy): error, then 4403.
+        let url =
+            format!("ws://127.0.0.1:{port}/v1/contract/command?encodingProtocol=native{opt_in}");
+        let mut request = url.as_str().into_client_request().unwrap();
+        request.headers_mut().insert(
+            axum::http::header::AUTHORIZATION,
+            "Bearer some-native-token".parse().unwrap(),
+        );
+        request
+            .headers_mut()
+            .insert("x-forwarded-for", "1.2.3.4".parse().unwrap());
+        let mut client = tokio_tungstenite::connect_async(request)
+            .await
+            .expect("upgrade accepted")
+            .0;
+        let (errors, close) = refusal(&mut client).await;
+        assert_eq!(errors.len(), 1, "unusable is still explained: {errors:?}");
+        assert!(errors[0].contains(AUTH_TOKEN_NOT_USABLE_HERE_ERROR));
+        assert_eq!(
+            close.map(|c| c.0),
+            Some(AUTH_TOKEN_NOT_USABLE_HERE_CLOSE_CODE)
+        );
+        assert_eq!(next_seen(&mut seen).await, Seen::Disconnect);
+
+        // A revoked or never-issued native grant: a native client reads the
+        // explanation, so it is still sent before the 4401.
+        let caps = crate::contract::delegate_capabilities::DelegateCapabilities::new(Arc::new(
+            crate::contract::delegate_capabilities::MemoryCapabilityStorage::default(),
+        ));
+        gw.app_grants().set_local_capabilities(caps);
+        let mut client = connect(port, opt_in, Some("a-grant-token-nobody-issued")).await;
+        let (errors, close) = refusal(&mut client).await;
+        assert_eq!(errors.len(), 1, "a missing grant is still explained");
+        assert!(
+            errors[0].contains("the grant was revoked or never issued"),
+            "refused as an unknown grant: {errors:?}"
+        );
+        assert_eq!(close, stale_close);
+        assert_eq!(next_seen(&mut seen).await, Seen::Disconnect);
+
+        // An opted-in connection that is NOT refused works as any other, and
+        // an ordinary close from the client still runs the cleanup.
+        let mut client = connect(port, opt_in, None).await;
+        let probe = bincode::serialize(&ClientRequest::ContractOp(ContractRequest::Get {
+            key: ContractInstanceId::new([7u8; 32]),
+            return_contract_code: false,
+            subscribe: false,
+            blocking_subscribe: false,
+        }))
+        .unwrap();
+        client
+            .send(WsMessage::Binary(probe.into()))
+            .await
+            .expect("send a request on the opted-in connection");
+        assert_eq!(next_seen(&mut seen).await, Seen::Get);
+        client.close(None).await.expect("close from the client");
+        assert_eq!(next_seen(&mut seen).await, Seen::Disconnect);
     }
 
     #[test]

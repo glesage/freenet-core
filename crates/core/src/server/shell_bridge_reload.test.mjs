@@ -8,6 +8,9 @@
 //     recovery reloads: the count lives in the `_freload` URL param (not
 //     writable by the contract, always present even with no sessionStorage), so
 //     a reload loop is bounded even in private/no-storage mode.
+//   - the `command-socket-recovery` region — on that trusted 4401 the shell
+//     first renews its credential in place (one renewal per rejected
+//     credential, bounded, cancellable); the reload above is its fallback.
 //
 // Same extract-verbatim-between-markers technique as
 // shell_bridge_notifications.test.mjs. Run via `npm test` in
@@ -344,6 +347,500 @@ const freloadStripDecision = new Function(
     'a same-contract frame path keeps the app query, __sandbox=1 and the hash',
     p === '/v1/contract/web/k/page?x=1&y=2&__sandbox=1#h',
   );
+}
+
+// 9. In-place recovery from a stale page credential (a node restart). On the
+//    node's trusted 4401 the shell renews its credential with a same-origin
+//    fetch of its own contract root and uses the fresh one on the app's NEXT
+//    command socket: no top-level navigation, so the app's document survives.
+//    The whole command-socket region runs here as shipped, with every free
+//    name it uses (the bridge's closure variables and the browser globals)
+//    supplied by this harness.
+{
+  const region = extractFrom(
+    'command-socket-recovery:BEGIN',
+    'command-socket-recovery:END',
+    'var CREDENTIAL_RENEWAL_MAX',
+  );
+  const FREE_NAMES = [
+    'authToken',
+    'userToken',
+    'contractPrefix',
+    'location',
+    'connections',
+    'iframe',
+    'sendToIframe',
+    'isTrustedStaleTokenClose',
+    'clampProxiedCloseCode',
+    'triggerRecoveryReload',
+    'WebSocket',
+    'fetch',
+    'AbortController',
+    'setTimeout',
+    'clearTimeout',
+    'Date',
+  ];
+  const build = new Function(
+    ...FREE_NAMES,
+    `${region}\nreturn { openCommandSocket, closeCommandSocket, parseBearerToken, ` +
+      'CREDENTIAL_RENEWAL_MAX, CREDENTIAL_RENEWAL_WINDOW_MS, CREDENTIAL_RENEWAL_TIMEOUT_MS };',
+  );
+
+  // Tokens shaped like the node's (base58 of 32 bytes).
+  const tok = (c) => c.repeat(44);
+  const T0 = tok('A');
+  const T1 = tok('B');
+  const T2 = tok('C');
+  const T3 = tok('D');
+  const PREFIX = '/v1/contract/web/KEY/';
+  const WS_URL = 'ws://node.test/v1/contract/command?encodingProtocol=native';
+
+  const flush = async () => {
+    for (let i = 0; i < 20; i++) await Promise.resolve();
+  };
+
+  function harness(opts = {}) {
+    const h = {
+      now: 1_000_000,
+      posted: [], // every message the shell sent to the app frame
+      sockets: [], // every physical WebSocket the shell constructed
+      fetches: [], // every renewal request
+      fallbacks: 0, // top-level recovery reloads asked for
+      aborted: 0,
+      bodiesCancelled: 0,
+      timers: [],
+      connections: new Map(),
+    };
+    class FakeWebSocket {
+      constructor(url, protocols) {
+        this.url = url;
+        this.protocols = protocols;
+        this.readyState = 0;
+        this.closeCalls = [];
+        h.sockets.push(this);
+      }
+      close(code, reason) {
+        this.closeCalls.push({ code, reason });
+        this.readyState = 2;
+      }
+      // Drivers: what the node (or the network) does to this socket.
+      accept() {
+        this.readyState = 1;
+        this.onopen({});
+      }
+      serverClose(code, reason = '') {
+        this.readyState = 3;
+        this.onclose({ code, reason });
+      }
+      networkFailure() {
+        this.onerror({});
+        this.serverClose(1006);
+      }
+    }
+    FakeWebSocket.OPEN = 1;
+    class FakeAbortController {
+      constructor() {
+        this.signal = { aborted: false };
+      }
+      abort() {
+        this.signal.aborted = true;
+        h.aborted++;
+      }
+    }
+    const post = (msg) => h.posted.push(msg);
+    h.api = build(
+      opts.authToken ?? T0,
+      opts.userToken,
+      'contractPrefix' in opts ? opts.contractPrefix : PREFIX,
+      { protocol: opts.protocol ?? 'http:' },
+      h.connections,
+      { contentWindow: { postMessage: post } },
+      post,
+      isTrustedStaleTokenClose,
+      clampProxiedCloseCode,
+      () => {
+        h.fallbacks++;
+      },
+      FakeWebSocket,
+      (url, init) =>
+        new Promise((resolve, reject) => h.fetches.push({ url, init, resolve, reject })),
+      FakeAbortController,
+      (fn, ms) => {
+        const t = { fn, at: h.now + ms, live: true };
+        h.timers.push(t);
+        return t;
+      },
+      (t) => {
+        if (t) t.live = false;
+      },
+      { now: () => h.now },
+    );
+    let ids = 0;
+    // The app asks for a socket (the open handler has validated the URL).
+    h.open = (url = WS_URL) => {
+      const id = `__fws_${++ids}`;
+      const before = h.sockets.length;
+      h.api.openCommandSocket({ id, url }, new URL(url));
+      return { id, ws: h.sockets.length > before ? h.sockets[before] : null };
+    };
+    h.close = (id, code, reason) => h.api.closeCommandSocket({ id, code, reason });
+    h.advance = (ms) => {
+      h.now += ms;
+      for (const t of h.timers.filter((x) => x.live && x.at <= h.now)) {
+        t.live = false;
+        t.fn();
+      }
+    };
+    h.response = (token, over = {}) => ({
+      ok: true,
+      status: 200,
+      redirected: false,
+      headers: {
+        get: (n) =>
+          n.toLowerCase() === 'authorization' && token !== null ? `Bearer ${token}` : null,
+      },
+      body: {
+        cancel: () => {
+          h.bodiesCancelled++;
+          return Promise.resolve();
+        },
+      },
+      ...over,
+    });
+    // Answer the n-th renewal request with a fresh token.
+    h.renew = async (n, token) => {
+      h.fetches[n].resolve(h.response(token));
+      await flush();
+    };
+    // One socket of the current credential, accepted then refused as stale.
+    h.rejectStale = async () => {
+      const s = h.open();
+      s.ws.accept();
+      s.ws.serverClose(4401, 'AUTH_TOKEN_INVALID');
+      await flush();
+      return s;
+    };
+    h.tokenOf = (ws) => new URL(ws.url).searchParams.get('authToken');
+    h.messagesFor = (id) => h.posted.filter((m) => m.id === id).map((m) => m.type);
+    return h;
+  }
+
+  // 9a. A successful renewal.
+  {
+    const h = harness();
+    const first = h.open();
+    check(
+      'a command socket carries the page credential and the close-only opt-in',
+      h.tokenOf(first.ws) === T0 &&
+        new URL(first.ws.url).searchParams.getAll('invalidTokenReport').join() === 'close' &&
+        new URL(first.ws.url).searchParams.get('encodingProtocol') === 'native',
+    );
+    first.ws.accept();
+    first.ws.serverClose(4401, 'AUTH_TOKEN_INVALID');
+    await flush();
+    check(
+      'the app sees the refused socket open and then close (its lifecycle is not hidden)',
+      h.messagesFor(first.id).join() === 'open,close' &&
+        h.posted.some((m) => m.type === 'close' && m.code === 4401),
+    );
+    const req = h.fetches[0];
+    check(
+      'a trusted 4401 starts ONE renewal of the contract root, and no navigation',
+      h.fetches.length === 1 && req.url === PREFIX && h.fallbacks === 0,
+    );
+    check(
+      'the renewal is a same-origin, uncached GET that rejects redirects and can be aborted',
+      req.init.method === 'GET' &&
+        req.init.credentials === 'same-origin' &&
+        req.init.cache === 'no-store' &&
+        req.init.redirect === 'error' &&
+        req.init.signal &&
+        req.init.signal.aborted === false,
+    );
+    await h.renew(0, T1);
+    const next = h.open();
+    check(
+      "the app's next socket uses the fresh credential",
+      next.ws !== null && h.tokenOf(next.ws) === T1,
+    );
+    check('the renewal response body is disposed of, not read', h.bodiesCancelled === 1);
+    check(
+      'the renewal timer is cleared once the response arrives',
+      h.timers.every((t) => !t.live),
+    );
+    check('a successful renewal never asks for the top-level reload', h.fallbacks === 0);
+    check(
+      'no credential reaches the app frame',
+      !JSON.stringify(h.posted).includes(T0) && !JSON.stringify(h.posted).includes(T1),
+    );
+    // The fresh credential works from here on: an ordinary close is ordinary.
+    next.ws.accept();
+    next.ws.serverClose(1000);
+    await flush();
+    check('a normal close afterwards starts nothing', h.fetches.length === 1 && h.fallbacks === 0);
+  }
+
+  // 9b. Simultaneous closes: one renewal, and opens asked for meanwhile wait.
+  {
+    const h = harness();
+    const a = h.open();
+    const b = h.open();
+    a.ws.accept();
+    b.ws.accept();
+    a.ws.serverClose(4401);
+    b.ws.serverClose(4401);
+    await flush();
+    check('two sockets refused at once start ONE renewal', h.fetches.length === 1);
+    const c = h.open();
+    const d = h.open();
+    check(
+      'an open asked for during the renewal waits for it (no socket with the stale credential)',
+      c.ws === null && d.ws === null && h.sockets.length === 2,
+    );
+    check(
+      'a waiting open holds its place in the connection limit',
+      h.connections.size === 2 && h.connections.has(c.id) && h.connections.has(d.id),
+    );
+    await h.renew(0, T1);
+    check(
+      'the waiting opens connect with the fresh credential once it arrives',
+      h.sockets.length === 4 && h.tokenOf(h.sockets[2]) === T1 && h.tokenOf(h.sockets[3]) === T1,
+    );
+    check(
+      'each waiting open is now its real socket in the connection map',
+      h.connections.get(c.id) === h.sockets[2] && h.connections.get(d.id) === h.sockets[3],
+    );
+    h.sockets[2].accept();
+    check('a socket that waited opens for the app as usual', h.messagesFor(c.id).join() === 'open');
+    check('one renewal, no reload', h.fetches.length === 1 && h.fallbacks === 0);
+  }
+
+  // 9c. A late close for a credential that has already been replaced.
+  {
+    const h = harness();
+    const slow = h.open(); // opened with the old credential, refused late
+    slow.ws.accept();
+    await h.rejectStale();
+    await h.renew(0, T1);
+    slow.ws.serverClose(4401);
+    await flush();
+    check(
+      'a late 4401 for the replaced credential starts no renewal and no reload',
+      h.fetches.length === 1 && h.fallbacks === 0,
+    );
+    check('...and leaves the fresh credential in place', h.tokenOf(h.open().ws) === T1);
+  }
+
+  // 9d. Opens cancelled while they wait.
+  {
+    const h = harness();
+    await h.rejectStale();
+    const c = h.open();
+    h.close(c.id, 1000, 'bye');
+    check(
+      'closing a waiting open ends it for the app and frees its slot',
+      h.messagesFor(c.id).join() === 'close' && !h.connections.has(c.id),
+    );
+    // The shell dropping every connection (an in-place navigation does this).
+    const e = h.open();
+    h.connections.forEach((ws) => ws.close());
+    h.connections.clear();
+    await h.renew(0, T1);
+    check(
+      'an open cancelled during the renewal never reaches the node',
+      h.sockets.length === 1 && h.messagesFor(c.id).join() === 'close',
+    );
+    check('...nor does one dropped with the connection map', h.messagesFor(e.id).length === 0);
+    check('the renewal itself still completed', h.tokenOf(h.open().ws) === T1);
+  }
+
+  // 9e. Ordinary network failure: the app's own reconnect/backoff path.
+  {
+    const h = harness();
+    let lifecycles = 0;
+    for (let i = 0; i < 5; i++) {
+      const s = h.open();
+      s.ws.networkFailure();
+      await flush();
+      if (h.messagesFor(s.id).join() === 'error,close') lifecycles++;
+    }
+    check('a failed connection reaches the app as error then close', lifecycles === 5);
+    check(
+      'five 1006 closes (node down) start no renewal and no reload',
+      h.fetches.length === 0 && h.fallbacks === 0 && h.connections.size === 0,
+    );
+    check(
+      'every reconnect still uses the original credential',
+      h.sockets.every((ws) => h.tokenOf(ws) === T0),
+    );
+  }
+
+  // 9f. A client-requested close can never start a renewal.
+  {
+    const h = harness();
+    const s = h.open();
+    s.ws.accept();
+    h.close(s.id, 4401, 'forged');
+    check(
+      'an app-range close code the app asks for is clamped',
+      s.ws.closeCalls.length === 1 && s.ws.closeCalls[0].code === 1000,
+    );
+    s.ws.serverClose(4401);
+    await flush();
+    check(
+      'a 4401 on a close the app asked for is not the trusted signal',
+      h.fetches.length === 0 && h.fallbacks === 0,
+    );
+  }
+
+  // 9g. Renewal that cannot produce a usable credential: the capped top-level
+  //     reload stays as the fallback, exactly once per failure.
+  {
+    const failing = [
+      ['a network error', (h) => h.fetches[0].reject(new TypeError('failed'))],
+      ['a 500', (h) => h.fetches[0].resolve(h.response(T1, { ok: false, status: 500 }))],
+      ['a redirected response', (h) => h.fetches[0].resolve(h.response(T1, { redirected: true }))],
+      ['no Authorization header', (h) => h.fetches[0].resolve(h.response(null))],
+      ['a malformed token', (h) => h.fetches[0].resolve(h.response('not a token!'))],
+      ['the same credential again', (h) => h.fetches[0].resolve(h.response(T0))],
+    ];
+    for (const [label, fail] of failing) {
+      const h = harness();
+      await h.rejectStale();
+      const waiting = h.open();
+      fail(h);
+      await flush();
+      check(
+        `${label}: falls back to the top-level reload once, keeps the old credential`,
+        h.fallbacks === 1 && h.fetches.length === 1,
+      );
+      check(
+        `${label}: an open that waited fails for the app without reaching the node`,
+        h.messagesFor(waiting.id).join() === 'error,close' &&
+          h.sockets.length === 1 &&
+          !h.connections.has(waiting.id),
+      );
+    }
+    // A stalled renewal is bounded by its timeout.
+    const h = harness();
+    await h.rejectStale();
+    h.advance(h.api.CREDENTIAL_RENEWAL_TIMEOUT_MS - 1);
+    await flush();
+    check('a renewal still inside its timeout is left alone', h.fallbacks === 0);
+    h.advance(1);
+    await flush();
+    check(
+      'a stalled renewal is aborted at its timeout and falls back once',
+      h.fallbacks === 1 && h.aborted === 1,
+    );
+    await h.renew(0, T1); // the stalled response arrives after all
+    check(
+      'a response arriving after the timeout installs nothing and reloads nothing more',
+      h.fallbacks === 1 && h.tokenOf(h.open().ws) === T0,
+    );
+    // No contract prefix (the shell could not tell which root is its own).
+    const n = harness({ contractPrefix: null });
+    await n.rejectStale();
+    check(
+      'a shell that does not know its contract root makes no request and falls back',
+      n.fetches.length === 0 && n.fallbacks === 1,
+    );
+  }
+
+  // 9h. Successive rejected credentials are bounded, not only simultaneous
+  //     sockets: a node that refuses every credential it has just issued.
+  {
+    const h = harness();
+    const MAX = h.api.CREDENTIAL_RENEWAL_MAX;
+    const fresh = [T1, T2, T3];
+    for (let i = 0; i < MAX; i++) {
+      await h.rejectStale();
+      await h.renew(i, fresh[i]);
+    }
+    check(`${MAX} renewals in one window are allowed`, h.fetches.length === MAX && h.fallbacks === 0);
+    await h.rejectStale();
+    check(
+      'the next rejection inside the window renews nothing and falls back to the capped reload',
+      h.fetches.length === MAX && h.fallbacks === 1,
+    );
+    // Once the window has passed, a genuine restart can recover in place again.
+    h.advance(h.api.CREDENTIAL_RENEWAL_WINDOW_MS);
+    await h.rejectStale();
+    check('a rejection after the window renews again', h.fetches.length === MAX + 1);
+    check(
+      'the renewal window is the reload cap window',
+      h.api.CREDENTIAL_RENEWAL_WINDOW_MS === 60_000 && MAX === 3,
+    );
+  }
+
+  // 9i. A second legitimate node restart later in the same tab.
+  {
+    const h = harness();
+    await h.rejectStale();
+    await h.renew(0, T1);
+    const live = h.open();
+    live.ws.accept();
+    h.advance(10 * 60_000);
+    live.ws.serverClose(1006); // the node goes down again
+    const down = h.open();
+    down.ws.networkFailure();
+    await flush();
+    check('the second outage itself starts nothing', h.fetches.length === 1);
+    await h.rejectStale(); // the node is back and refuses T1
+    check('the second restart starts a second renewal', h.fetches.length === 2);
+    await h.renew(1, T2);
+    check(
+      'the second restart recovers in place too',
+      h.tokenOf(h.open().ws) === T2 && h.fallbacks === 0,
+    );
+  }
+
+  // 9j. The app never chooses a credential or the report mode.
+  {
+    const h = harness();
+    const s = h.open(`${WS_URL}&authToken=evil&userToken=evil&invalidTokenReport=never`);
+    const p = new URL(s.ws.url).searchParams;
+    check(
+      'caller-supplied authToken, userToken and invalidTokenReport are replaced',
+      p.getAll('authToken').join() === T0 &&
+        p.get('userToken') === null &&
+        p.getAll('invalidTokenReport').join() === 'close',
+    );
+    const hosted = harness({ userToken: 'user-secret', protocol: 'https:' });
+    check(
+      'a hosted shell over https still presents its user token',
+      new URL(hosted.open().ws.url).searchParams.get('userToken') === 'user-secret',
+    );
+    const plain = harness({ userToken: 'user-secret', protocol: 'http:' });
+    check(
+      'the user token is still withheld over plain http',
+      new URL(plain.open().ws.url).searchParams.get('userToken') === null,
+    );
+  }
+
+  // 9k. Only a well-formed bearer header yields a credential.
+  {
+    const { parseBearerToken } = harness().api;
+    check('a base58 bearer token is accepted', parseBearerToken(`Bearer ${T1}`) === T1);
+    const accepted = [
+      null,
+      undefined,
+      '',
+      T1,
+      `bearer ${T1}`,
+      `Bearer  ${T1}`,
+      `Bearer ${T1} `,
+      `Bearer ${T1}, Bearer ${T2}`,
+      'Bearer short',
+      `Bearer ${'A'.repeat(200)}`,
+      `Bearer ${T1.slice(0, 43)}0`, // 0 is not in the base58 alphabet
+      `Basic ${T1}`,
+    ].filter((bad) => parseBearerToken(bad) !== null);
+    check(
+      `malformed Authorization headers yield no credential (accepted: ${JSON.stringify(accepted)})`,
+      accepted.length === 0,
+    );
+  }
 }
 
 if (failures > 0) {
