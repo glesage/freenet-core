@@ -8353,13 +8353,31 @@ mod tests {
                 "the renewal request must set {option}"
             );
         }
+        // Compared without whitespace: prettier decides the line breaks.
+        let squashed: String = region.split_whitespace().collect();
         assert!(
-            region.contains("parseBearerToken(response.headers.get('Authorization'))"),
+            squashed.contains("parseBearerToken(response.headers.get('Authorization')"),
             "the fresh token must come from the Authorization response header"
         );
         assert!(
-            region.contains("authToken = fresh;\n      credentialGeneration++;"),
+            squashed.contains("authToken=outcome.token;credentialGeneration++;"),
             "the fresh token must replace the credential the next socket presents"
+        );
+        // A node that is up but not ready (a restarted network peer answers
+        // 503 "Connecting to Freenet" until it has rejoined) must not cost the
+        // app its page: an error status is a retry, never a reload.
+        assert!(
+            squashed.contains("varoutcome={retry:true};try{if(response.ok&&!response.redirected){"),
+            "only a 2xx answer may be anything but a retry"
+        );
+        assert!(
+            squashed.contains("if(outcome.retry){credentialRetryAt=Date.now()+credentialRetryMs;")
+                && squashed.contains("returnfalse;}triggerRecoveryReload();returnfalse;});"),
+            "a retry outcome must back off and return before the reload fallback"
+        );
+        assert!(
+            region.contains("renewStaleCredential();\n    var renewal = credentialRenewal;"),
+            "the app reconnecting is what asks again after a backoff (no timers)"
         );
         // The 4401 close itself must not navigate: every reload call sits in
         // the renewal's failure branches (see the fallback pin below).
@@ -8380,15 +8398,18 @@ mod tests {
         );
     }
 
-    /// Pins the FALLBACK of the in-place renewal: when no usable credential
-    /// can be obtained, or the renewal budget is spent, the shell still
-    /// recovers the way it did before in-place renewal existed — a capped,
-    /// cache-busting top-level `location.replace` of itself.
+    /// Pins the FALLBACK of the in-place renewal: when the node answers 2xx
+    /// without a usable credential, or keeps refusing the credentials it has
+    /// just issued, the shell still recovers the way it did before in-place
+    /// renewal existed — a capped, cache-busting top-level
+    /// `location.replace` of itself. (An error status, a network error or a
+    /// timeout is a retry instead; see the in-place pin.)
     #[test]
     fn bridge_js_falls_back_to_the_capped_shell_reload() {
         let region = command_socket_region();
         // Reached from exactly two places, both in the renewal: a spent
-        // budget, and a renewal that produced no new credential.
+        // budget of successful renewals, and a 2xx that gave no new
+        // credential (anything that is not a token and not a retry).
         assert!(
             region.contains(
                 "if (credentialRenewalTimes.length >= CREDENTIAL_RENEWAL_MAX) {\n      \
@@ -8396,9 +8417,14 @@ mod tests {
             ),
             "a spent renewal budget must fall back to the capped reload"
         );
+        let squashed: String = region.split_whitespace().collect();
         assert!(
-            region
-                .contains("if (!fresh || fresh === authToken) {\n        triggerRecoveryReload();"),
+            squashed.contains("outcome=token?{token:token}:{reload:true};")
+                && squashed.contains("if(outcome.token&&outcome.token!==authToken){"),
+            "a 2xx without a usable or new credential must not count as a renewal"
+        );
+        assert!(
+            squashed.contains("returnfalse;}triggerRecoveryReload();returnfalse;});"),
             "a renewal without a new credential must fall back to the capped reload"
         );
         assert_eq!(

@@ -667,18 +667,30 @@ function freenetBridge(authToken, userToken, hostedMode) {
   // connection, and reconnects by its own logic. Nothing it sent on the
   // refused socket is replayed: the shell cannot know what was delivered.
   //
+  // A node that is up but not ready answers the contract root with an error
+  // status: a restarted network peer serves 503 "Connecting to Freenet" until
+  // it has rejoined, even for a contract it holds. A reload then would trade
+  // the app for that page, so it is never the answer to an error status, a
+  // network error or a timeout. The shell keeps the page, lets the app keep
+  // failing to connect, and asks again after a backoff, on the app's next
+  // attempt. The capped top-level reload remains only for answers a reload
+  // could fix: a 2xx without a usable token (a proxy that strips the header),
+  // or a node that keeps refusing the credentials it has just issued.
+  //
   // Bounds:
   //   - one renewal at a time, and one per rejected credential: every socket
   //     records the credential generation it was opened with, so sockets
   //     refused together share a renewal and a late close for a credential
   //     that has since been replaced does nothing;
-  //   - at most CREDENTIAL_RENEWAL_MAX renewals per window, so a node that
-  //     refuses the credentials it has just issued cannot make the shell
-  //     fetch forever;
+  //   - after a failed renewal, none before CREDENTIAL_RETRY_MIN_MS, doubling
+  //     to CREDENTIAL_RETRY_MAX_MS; and only when the app opens a socket or is
+  //     refused again, so an idle page asks nothing (no timers);
+  //   - at most CREDENTIAL_RENEWAL_MAX successful renewals per window, so a
+  //     node that refuses the credentials it has just issued falls back to
+  //     the capped reload instead of renewing forever;
   //   - each renewal ends at CREDENTIAL_RENEWAL_TIMEOUT_MS.
-  // Past any of them the shell falls back to triggerRecoveryReload (itself
-  // capped). The credential lives only in this closure (`authToken`): it is
-  // never posted to the app frame and never logged.
+  // The credential lives only in this closure (`authToken`): it is never
+  // posted to the app frame and never logged.
   //
   // command-socket-recovery:BEGIN — extracted verbatim & unit-tested by
   // shell_bridge_reload.test.mjs, which supplies every free name the region
@@ -687,16 +699,23 @@ function freenetBridge(authToken, userToken, hostedMode) {
   // triggerRecoveryReload, and the globals location, WebSocket, fetch,
   // AbortController, setTimeout, clearTimeout and Date. Add no other outer
   // reference without adding it there.
-  var CREDENTIAL_RENEWAL_MAX = 3; // renewals per rolling window
+  var CREDENTIAL_RENEWAL_MAX = 3; // successful renewals per rolling window
   var CREDENTIAL_RENEWAL_WINDOW_MS = 60000; // same window as the reload cap
   var CREDENTIAL_RENEWAL_TIMEOUT_MS = 15000;
+  var CREDENTIAL_RETRY_MIN_MS = 1000;
+  var CREDENTIAL_RETRY_MAX_MS = 30000;
   // Bumped each time `authToken` is replaced.
   var credentialGeneration = 0;
+  // The generation the node has refused as stale, or -1.
+  var staleGeneration = -1;
   // While a renewal is in flight: a promise of whether it replaced the
   // credential. It never rejects.
   var credentialRenewal = null;
-  // Start times of the renewals inside the current window.
+  // When the last successful renewals happened, inside the current window.
   var credentialRenewalTimes = [];
+  // After a failed renewal: no new one before this time, and the next wait.
+  var credentialRetryAt = 0;
+  var credentialRetryMs = CREDENTIAL_RETRY_MIN_MS;
 
   // The token in an `Authorization: Bearer <token>` response header, or null.
   // The node's page tokens are base58 of 32 bytes (AuthToken::generate), so
@@ -707,26 +726,30 @@ function freenetBridge(authToken, userToken, hostedMode) {
     return m ? m[1] : null;
   }
 
-  // Ask the node for a fresh page credential. Resolves to the token, or to
-  // null when the node gave none (network error, error status, redirect, no
-  // or malformed header, timeout). The request goes to the canonical contract
-  // root, not the current sub-page: only the root issues a token to a
-  // non-document request. `redirect: 'error'` keeps the answer the node's own;
-  // `no-store` keeps a cache from replaying an old token. The body is the
-  // shell HTML and is discarded unread.
+  // Ask the node for a fresh page credential. Resolves to one of:
+  //   { token }        a usable credential;
+  //   { retry: true }  the node could not answer usefully now (error status,
+  //                    network error, refused redirect, timeout): ask later;
+  //   { reload: true } a 2xx without a usable token, or no contract root to
+  //                    ask: only a reload of the shell can get one.
+  // The request goes to the canonical contract root, not the current
+  // sub-page: only the root issues a token to a non-document request.
+  // `redirect: 'error'` keeps the answer the node's own; `no-store` keeps a
+  // cache from replaying an old token. The body is the shell HTML (or the
+  // node's error page) and is discarded unread.
   function fetchFreshCredential() {
     return new Promise(function (resolve) {
       var settled = false;
       var timer = null;
       var controller = null;
-      function finish(fresh) {
+      function finish(outcome) {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
-        resolve(fresh);
+        resolve(outcome);
       }
       if (!contractPrefix) {
-        finish(null);
+        finish({ reload: true });
         return;
       }
       try {
@@ -738,7 +761,7 @@ function freenetBridge(authToken, userToken, hostedMode) {
             controller.abort();
           } catch (e) {}
         }
-        finish(null);
+        finish({ retry: true });
       }, CREDENTIAL_RENEWAL_TIMEOUT_MS);
       var request;
       try {
@@ -750,30 +773,34 @@ function freenetBridge(authToken, userToken, hostedMode) {
           signal: controller ? controller.signal : undefined,
         });
       } catch (e) {
-        finish(null);
+        finish({ retry: true });
         return;
       }
       request.then(
         function (response) {
-          var fresh = null;
+          var outcome = { retry: true };
           try {
             if (response.ok && !response.redirected) {
-              fresh = parseBearerToken(response.headers.get('Authorization'));
+              var token = parseBearerToken(
+                response.headers.get('Authorization'),
+              );
+              outcome = token ? { token: token } : { reload: true };
             }
             // Release the connection without reading the page.
             if (response.body) response.body.cancel().catch(function () {});
           } catch (e) {}
-          finish(fresh);
+          finish(outcome);
         },
         function () {
-          finish(null);
+          finish({ retry: true });
         },
       );
     });
   }
 
   // Start a renewal of the current credential, or fall back to the top-level
-  // reload when the window's budget is spent. Callers ensure none is in flight.
+  // reload when the window's budget of successful renewals is spent. Callers
+  // ensure none is in flight.
   function renewCredential() {
     var now = Date.now();
     credentialRenewalTimes = credentialRenewalTimes.filter(function (t) {
@@ -783,18 +810,39 @@ function freenetBridge(authToken, userToken, hostedMode) {
       triggerRecoveryReload();
       return;
     }
-    credentialRenewalTimes.push(now);
-    credentialRenewal = fetchFreshCredential().then(function (fresh) {
+    credentialRenewal = fetchFreshCredential().then(function (outcome) {
       credentialRenewal = null;
       // The same token again is no renewal: the node has already refused it.
-      if (!fresh || fresh === authToken) {
-        triggerRecoveryReload();
+      if (outcome.token && outcome.token !== authToken) {
+        authToken = outcome.token;
+        credentialGeneration++;
+        staleGeneration = -1;
+        credentialRenewalTimes.push(Date.now());
+        credentialRetryAt = 0;
+        credentialRetryMs = CREDENTIAL_RETRY_MIN_MS;
+        return true;
+      }
+      if (outcome.retry) {
+        credentialRetryAt = Date.now() + credentialRetryMs;
+        credentialRetryMs = Math.min(
+          credentialRetryMs * 2,
+          CREDENTIAL_RETRY_MAX_MS,
+        );
         return false;
       }
-      authToken = fresh;
-      credentialGeneration++;
-      return true;
+      triggerRecoveryReload();
+      return false;
     });
+  }
+
+  // Renew the refused credential now, unless a renewal is already in flight,
+  // the current credential has not been refused, or a failed renewal's
+  // backoff has not passed.
+  function renewStaleCredential() {
+    if (credentialRenewal) return;
+    if (staleGeneration !== credentialGeneration) return;
+    if (Date.now() < credentialRetryAt) return;
+    renewCredential();
   }
 
   // The node refused, as stale, a socket opened with credential generation
@@ -802,9 +850,8 @@ function freenetBridge(authToken, userToken, hostedMode) {
   function onStaleTokenClose(socketGeneration) {
     // A credential that has already been replaced: nothing left to recover.
     if (socketGeneration !== credentialGeneration) return;
-    // Refused together with a socket whose renewal is already under way.
-    if (credentialRenewal) return;
-    renewCredential();
+    staleGeneration = socketGeneration;
+    renewStaleCredential();
   }
 
   // Open the real socket for the app's socket `msg.id`, to the validated URL
@@ -898,11 +945,16 @@ function freenetBridge(authToken, userToken, hostedMode) {
   }
 
   // The app asked for a socket (`msg`; `u` is its URL, already validated by
-  // the open handler). While a renewal is in flight the open waits for it
-  // rather than presenting a credential the node is known to refuse. A
-  // waiting open sits in `connections`, so it counts toward MAX_CONNECTIONS
-  // and is cancelled by anything that closes or clears that map.
+  // the open handler). If the node has refused the current credential and a
+  // failed renewal's backoff has passed, the app reconnecting is the moment to
+  // ask again. While a renewal is in flight the open waits for it rather than
+  // presenting a credential the node is known to refuse. A waiting open sits
+  // in `connections`, so it counts toward MAX_CONNECTIONS and is cancelled by
+  // anything that closes or clears that map. During a backoff the open goes
+  // out with the refused credential, and the node's 4401 tells the app to try
+  // again later.
   function openCommandSocket(msg, u) {
+    renewStaleCredential();
     var renewal = credentialRenewal;
     if (!renewal) {
       connectCommandSocket(msg, u);
@@ -922,9 +974,10 @@ function freenetBridge(authToken, userToken, hostedMode) {
       if (connections.get(msg.id) !== waiting) return;
       connections.delete(msg.id);
       if (!renewed) {
-        // No usable credential (the fallback reload has been asked for, and
-        // may have been refused by its cap). Fail this open as a connection
-        // that could not be made, so the app retries by its own backoff.
+        // No usable credential: the node is not ready yet (the shell asks
+        // again later), or the fallback reload has been asked for (and may
+        // have been refused by its cap). Fail this open as a connection that
+        // could not be made, so the app retries by its own backoff.
         sendToIframe({ __freenet_ws__: true, type: 'error', id: msg.id });
         sendToIframe({
           __freenet_ws__: true,

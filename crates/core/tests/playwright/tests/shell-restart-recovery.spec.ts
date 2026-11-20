@@ -24,7 +24,9 @@ import {
 // own contract root (`/v{1,2}/contract/web/<key>/`), reads the fresh token from
 // the response's `Authorization: Bearer <token>` header, and uses it on the
 // app's next command socket. The documents, the iframe and the draft survive.
-// If the renewal fails, the existing capped `_freload` reload is the fallback.
+// A node that is not ready (an error status, as a rejoining peer's 503) is
+// asked again later, with the page kept. Only a 2xx without a usable token
+// falls back to the existing capped `_freload` reload.
 //
 // How the stale token is produced. The suite's node cannot be restarted, but a
 // restart only reaches the shell through one fact: the node now rejects the
@@ -582,62 +584,129 @@ test("two stale-token closes at once start one renewal and no navigation", async
   expect(renewalsSince(t, base), "still exactly one renewal").toHaveLength(1);
 });
 
-for (const failure of ["HTTP 500", "network error"] as const) {
-  test(`when the in-place renewal fails (${failure}), the shell falls back to the capped _freload reload`, async ({
+// A restarted network peer serves its contract root as 503 "Connecting to
+// Freenet" until it has rejoined, even for a contract it holds. A reload then
+// would swap the app for that page: the shell must keep the page, back off,
+// and renew on the app's next attempt once the node answers.
+for (const failure of ["HTTP 503", "network error"] as const) {
+  test(`a node that is not ready yet (${failure}) keeps the page, and the next attempt after it answers recovers in place`, async ({
     page,
   }) => {
-    await gotoShellWithStaleSockets(page, 1);
-    const { frame } = await appFrameOf(page);
+    const t = track(page);
+    // Two sockets carry the refused token: the first, and the app's retry
+    // during the backoff. The third goes out with whatever the shell holds.
+    const tokens = await gotoShellWithStaleSockets(page, 2);
+    const { frame, element } = await appFrameOf(page);
     await installApp(frame);
+    await frame.evaluate(() => {
+      (window as unknown as { __rrFrameMarker: string }).__rrFrameMarker = "kept";
+    });
 
-    // Fail the renewal for this page only. Navigations (the fallback reload
-    // itself) pass through.
-    let renewalAttempts = 0;
+    let notReady = true;
+    let refusedRenewals = 0;
     await page.route(
       (u) => u.pathname === shellPath(),
       async (route) => {
         const r = route.request();
-        if (!isRenewal({ url: r.url(), method: r.method(), navigation: r.isNavigationRequest() })) {
+        if (!notReady || !isRenewal({ url: r.url(), method: r.method(), navigation: r.isNavigationRequest() })) {
           return route.fallback();
         }
-        renewalAttempts++;
-        if (failure === "HTTP 500") {
-          return route.fulfill({ status: 500, contentType: "text/plain", body: "renewal refused by test" });
+        refusedRenewals++;
+        if (failure === "HTTP 503") {
+          return route.fulfill({
+            status: 503,
+            contentType: "text/html",
+            body: "<!doctype html><title>Connecting to Freenet</title>",
+          });
         }
         return route.abort("failed");
       },
     );
 
-    const reload = page.waitForRequest(
-      (r) =>
-        r.isNavigationRequest() &&
-        r.frame() === page.mainFrame() &&
-        new URL(r.url()).searchParams.has("_freload"),
-      { timeout: 20_000 },
-    );
+    const base = t.requests.length;
+    const socketsBase = t.commandSockets.length;
     await frame.evaluate(() =>
       (window as unknown as { __rrOpen: (l: string) => void }).__rrOpen("stale"),
     );
-    const req = await reload;
-    expect(new URL(req.url()).pathname, "the fallback reloads the shell itself").toBe(shellPath());
+    await expect
+      .poll(() => refusedRenewals, { message: "the shell must try to renew", timeout: 10_000, intervals: [20] })
+      .toBe(1);
 
-    // The reloaded shell (the node's own document, with a token it minted)
-    // brings the app back.
-    await expect(page.frameLocator("iframe#app").locator("#title")).toBeVisible();
-    // The reload was the FALLBACK: the shell tried the in-place renewal once
-    // first, and did not retry it before giving up on this document.
-    expect(renewalAttempts, "one renewal attempt before the fallback reload").toBe(1);
+    // Inside the backoff (1 s from the refused renewal) the app's retry is
+    // refused again, and asks nothing.
+    await frame.evaluate(() =>
+      (window as unknown as { __rrOpen: (l: string) => void }).__rrOpen("backoff"),
+    );
+    await expect
+      .poll(async () => closesWith4401(await appEvents(frame), "backoff"), {
+        message: "the retry during the backoff is refused with 4401",
+        timeout: 10_000,
+      })
+      .toBe(true);
+    expect(renewalsSince(t, base), "no renewal during the backoff").toHaveLength(1);
+    expect(closesWith4401(await appEvents(frame), "stale"), "the first socket was refused with 4401").toBe(true);
+    await page.waitForTimeout(SETTLE_MS);
+    assertNoDocumentLoad(t, base, `renewal answered ${failure}`);
+    expect(frame.isDetached(), "the app Frame was detached").toBe(false);
+    expect(await element.contentFrame()).toBe(frame);
+    expect(await frame.evaluate(() => (window as unknown as { __rrFrameMarker?: string }).__rrFrameMarker)).toBe("kept");
+
+    // The node is ready; past the backoff, the app's next attempt renews in
+    // place and connects with the fresh credential.
+    notReady = false;
+    await page.waitForTimeout(1_200);
+    await frame.evaluate(() =>
+      (window as unknown as { __rrOpen: (l: string) => void }).__rrOpen("after"),
+    );
+    await expectAuthenticated(page, frame, "after");
+    expect(renewalsSince(t, base), "one refused renewal, then one that worked").toHaveLength(2);
+    const sockets = t.commandSockets.slice(socketsBase);
+    expect(sockets.map((s) => s.authToken)).toEqual([tokens.stale, tokens.stale, sockets[2].authToken]);
+    expect(sockets[2].authToken).not.toBe(tokens.pageToken);
+    expect(await renewedToken(t.renewalResponses[t.renewalResponses.length - 1])).toBe(sockets[2].authToken);
+    assertNoDocumentLoad(t, base, `recovery after ${failure}`);
   });
 }
 
-// What this can and cannot catch. It goes red when the shell renews or reloads
-// on a close that is not the node's own 4401: a renewal on every close, or on
-// the abnormal 1006 the browser reports here. It does NOT, on its own, guard the
-// shell's `_clientClosed` mark and app-range code clamp: this node answers a
-// client's close(4401) by dropping the connection, so every engine reports 1006
-// rather than an echoed 4401, and removing that guard alone leaves this green
-// (checked in all three engines). shell_bridge_reload.test.mjs covers the guard
-// itself (isTrustedStaleTokenClose / clampProxiedCloseCode).
+// A 2xx without a usable credential (for instance a proxy that strips the
+// response header) is something a reload of the shell can fix: the capped
+// `_freload` reload stays as the fallback for it.
+test("a renewal answered 2xx without a token falls back to the capped _freload reload", async ({ page }) => {
+  await gotoShellWithStaleSockets(page, 1);
+  const { frame } = await appFrameOf(page);
+  await installApp(frame);
+
+  let renewalAttempts = 0;
+  await page.route(
+    (u) => u.pathname === shellPath(),
+    async (route) => {
+      const r = route.request();
+      if (!isRenewal({ url: r.url(), method: r.method(), navigation: r.isNavigationRequest() })) {
+        return route.fallback();
+      }
+      renewalAttempts++;
+      return route.fulfill({ status: 200, contentType: "text/html", body: "<!doctype html><title>shell</title>" });
+    },
+  );
+
+  const reload = page.waitForRequest(
+    (r) =>
+      r.isNavigationRequest() &&
+      r.frame() === page.mainFrame() &&
+      new URL(r.url()).searchParams.has("_freload"),
+    { timeout: 20_000 },
+  );
+  await frame.evaluate(() =>
+    (window as unknown as { __rrOpen: (l: string) => void }).__rrOpen("stale"),
+  );
+  const req = await reload;
+  expect(new URL(req.url()).pathname, "the fallback reloads the shell itself").toBe(shellPath());
+  // The reloaded shell (the node's own document, with a token it minted)
+  // brings the app back.
+  await expect(page.frameLocator("iframe#app").locator("#title")).toBeVisible();
+  expect(renewalAttempts, "one renewal attempt before the fallback reload").toBe(1);
+});
+
 test("an app-requested close(4401) is not a stale-token signal: no renewal, no reload", async ({ page }) => {
   const t = track(page);
   // A normal, valid shell: the socket opens, then the APP closes it with 4401.

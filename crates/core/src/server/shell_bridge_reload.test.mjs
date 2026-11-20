@@ -383,7 +383,8 @@ const freloadStripDecision = new Function(
   const build = new Function(
     ...FREE_NAMES,
     `${region}\nreturn { openCommandSocket, closeCommandSocket, parseBearerToken, ` +
-      'CREDENTIAL_RENEWAL_MAX, CREDENTIAL_RENEWAL_WINDOW_MS, CREDENTIAL_RENEWAL_TIMEOUT_MS };',
+      'CREDENTIAL_RENEWAL_MAX, CREDENTIAL_RENEWAL_WINDOW_MS, CREDENTIAL_RENEWAL_TIMEOUT_MS, ' +
+      'CREDENTIAL_RETRY_MIN_MS, CREDENTIAL_RETRY_MAX_MS };',
   );
 
   // Tokens shaped like the node's (base58 of 32 bytes).
@@ -693,18 +694,133 @@ const freloadStripDecision = new Function(
     );
   }
 
-  // 9g. Renewal that cannot produce a usable credential: the capped top-level
-  //     reload stays as the fallback, exactly once per failure.
+  // 9g. A node that is up but not ready (a restarted network peer answers its
+  //     contract root with 503 "Connecting to Freenet" until it has rejoined):
+  //     the page stays, and the shell asks again after a backoff, on the app's
+  //     next attempt. A reload would replace the app with the node's error page.
   {
-    const failing = [
-      ['a network error', (h) => h.fetches[0].reject(new TypeError('failed'))],
-      ['a 500', (h) => h.fetches[0].resolve(h.response(T1, { ok: false, status: 500 }))],
-      ['a redirected response', (h) => h.fetches[0].resolve(h.response(T1, { redirected: true }))],
+    const notReady = [
+      ['a 503', (h, n) => h.fetches[n].resolve(h.response(null, { ok: false, status: 503 }))],
+      ['a 500', (h, n) => h.fetches[n].resolve(h.response(T1, { ok: false, status: 500 }))],
+      ['a network error', (h, n) => h.fetches[n].reject(new TypeError('failed'))],
+      ['a redirected response', (h, n) => h.fetches[n].resolve(h.response(T1, { redirected: true }))],
+    ];
+    for (const [label, fail] of notReady) {
+      const h = harness();
+      await h.rejectStale();
+      const waiting = h.open();
+      fail(h, 0);
+      await flush();
+      check(`${label}: no reload, the old credential is kept`, h.fallbacks === 0 && h.fetches.length === 1);
+      check(
+        `${label}: an open that waited fails for the app without reaching the node`,
+        h.messagesFor(waiting.id).join() === 'error,close' &&
+          h.sockets.length === 1 &&
+          !h.connections.has(waiting.id),
+      );
+      // Inside the backoff: the app's reconnect and its 4401 ask nothing.
+      const early = h.open();
+      check(
+        `${label}: during the backoff an open goes out with the refused credential`,
+        early.ws !== null && h.tokenOf(early.ws) === T0 && h.fetches.length === 1,
+      );
+      early.ws.accept();
+      early.ws.serverClose(4401);
+      await flush();
+      check(`${label}: a refusal during the backoff starts no renewal`, h.fetches.length === 1);
+      // After it: the app's next open asks again, waits, and connects fresh.
+      h.advance(h.api.CREDENTIAL_RETRY_MIN_MS);
+      const later = h.open();
+      check(
+        `${label}: after the backoff the app's next open starts a renewal and waits for it`,
+        later.ws === null && h.fetches.length === 2,
+      );
+      await h.renew(1, T1);
+      check(
+        `${label}: once the node is ready the waiting open connects with the fresh credential`,
+        h.tokenOf(h.sockets[h.sockets.length - 1]) === T1 && h.fallbacks === 0,
+      );
+    }
+
+    // The backoff doubles while the node stays unready, up to its cap, and
+    // never turns into a reload.
+    {
+      const h = harness();
+      await h.rejectStale();
+      const waits = [];
+      for (let n = 0; n < 8; n++) {
+        h.fetches[n].resolve(h.response(null, { ok: false, status: 503 }));
+        await flush();
+        let waited = 0;
+        while (h.fetches.length === n + 1 && waited <= 60_000) {
+          h.advance(250);
+          waited += 250;
+          const s = h.open(); // the app keeps reconnecting
+          if (s.ws) s.ws.networkFailure();
+          await flush();
+        }
+        waits.push(waited);
+      }
+      check(
+        `the retry backoff doubles to its cap (${waits.join(', ')} ms)`,
+        waits[0] === h.api.CREDENTIAL_RETRY_MIN_MS &&
+          waits[1] === 2 * h.api.CREDENTIAL_RETRY_MIN_MS &&
+          waits.every((w, i) => i === 0 || w >= waits[i - 1]) &&
+          waits[waits.length - 1] === h.api.CREDENTIAL_RETRY_MAX_MS,
+      );
+      check('eight unready answers in a row reload nothing', h.fallbacks === 0);
+      await h.renew(8, T1);
+      check('the node becoming ready ends it', h.tokenOf(h.open().ws) === T1);
+      // ...and a later restart starts from the shortest wait again.
+      await h.rejectStale();
+      h.fetches[9].resolve(h.response(null, { ok: false, status: 503 }));
+      await flush();
+      h.advance(h.api.CREDENTIAL_RETRY_MIN_MS);
+      h.open();
+      check('a success resets the backoff', h.fetches.length === 11);
+    }
+
+    // An idle page asks nothing: retries follow the app, never a timer.
+    {
+      const h = harness();
+      await h.rejectStale();
+      h.fetches[0].resolve(h.response(null, { ok: false, status: 503 }));
+      await flush();
+      h.advance(10 * 60_000);
+      await flush();
+      check('no renewal without the app reconnecting', h.fetches.length === 1);
+    }
+
+    // A stalled renewal is bounded by its timeout, and is a retry too.
+    const h = harness();
+    await h.rejectStale();
+    h.advance(h.api.CREDENTIAL_RENEWAL_TIMEOUT_MS - 1);
+    await flush();
+    check('a renewal still inside its timeout is left alone', h.aborted === 0);
+    h.advance(1);
+    await flush();
+    check(
+      'a stalled renewal is aborted at its timeout, without a reload',
+      h.aborted === 1 && h.fallbacks === 0,
+    );
+    await h.renew(0, T1); // the stalled response arrives after all
+    check(
+      'a response arriving after the timeout installs nothing',
+      h.fallbacks === 0 && h.tokenOf(h.open().ws) === T0,
+    );
+  }
+
+  // 9g'. Answers only a reload can fix: the node answered 2xx but gave no
+  //      usable credential (a proxy that strips the header, a malformed or
+  //      repeated token), or the shell has no contract root to ask. The capped
+  //      top-level reload is the fallback, exactly once per failure.
+  {
+    const unusable = [
       ['no Authorization header', (h) => h.fetches[0].resolve(h.response(null))],
       ['a malformed token', (h) => h.fetches[0].resolve(h.response('not a token!'))],
       ['the same credential again', (h) => h.fetches[0].resolve(h.response(T0))],
     ];
-    for (const [label, fail] of failing) {
+    for (const [label, fail] of unusable) {
       const h = harness();
       await h.rejectStale();
       const waiting = h.open();
@@ -721,23 +837,6 @@ const freloadStripDecision = new Function(
           !h.connections.has(waiting.id),
       );
     }
-    // A stalled renewal is bounded by its timeout.
-    const h = harness();
-    await h.rejectStale();
-    h.advance(h.api.CREDENTIAL_RENEWAL_TIMEOUT_MS - 1);
-    await flush();
-    check('a renewal still inside its timeout is left alone', h.fallbacks === 0);
-    h.advance(1);
-    await flush();
-    check(
-      'a stalled renewal is aborted at its timeout and falls back once',
-      h.fallbacks === 1 && h.aborted === 1,
-    );
-    await h.renew(0, T1); // the stalled response arrives after all
-    check(
-      'a response arriving after the timeout installs nothing and reloads nothing more',
-      h.fallbacks === 1 && h.tokenOf(h.open().ws) === T0,
-    );
     // No contract prefix (the shell could not tell which root is its own).
     const n = harness({ contractPrefix: null });
     await n.rejectStale();
@@ -763,10 +862,16 @@ const freloadStripDecision = new Function(
       'the next rejection inside the window renews nothing and falls back to the capped reload',
       h.fetches.length === MAX && h.fallbacks === 1,
     );
-    // Once the window has passed, a genuine restart can recover in place again.
+    // Once the window has passed, the app's next open renews in place again
+    // (the credential is still the refused one, so the open waits for it).
     h.advance(h.api.CREDENTIAL_RENEWAL_WINDOW_MS);
-    await h.rejectStale();
-    check('a rejection after the window renews again', h.fetches.length === MAX + 1);
+    const after = h.open();
+    check(
+      'an open after the window renews again, and waits for it',
+      after.ws === null && h.fetches.length === MAX + 1,
+    );
+    await h.renew(MAX, tok('E'));
+    check('...and connects with that credential', h.tokenOf(h.sockets[h.sockets.length - 1]) === tok('E'));
     check(
       'the renewal window is the reload cap window',
       h.api.CREDENTIAL_RENEWAL_WINDOW_MS === 60_000 && MAX === 3,
