@@ -36,6 +36,7 @@
 //! [`TransportPublicKey`]: super::TransportPublicKey
 //! [`TimeSource`]: crate::simulation::TimeSource
 
+pub(crate) mod admission;
 pub(crate) mod breaker;
 pub(crate) mod budget;
 pub(crate) mod cid;
@@ -64,20 +65,21 @@ pub(in crate::transport) mod tests;
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
 
 use super::Socket;
 use super::crypto::{TransportKeypair, TransportPublicKey};
-use super::demux::{DemuxSocket, QuicSourcePermit};
+use super::demux::{DemuxSocket, QuicJoinerMark, QuicSourcePermit};
 use super::metrics::{QuicCloseCode, TRANSPORT_METRICS};
 use crate::config::GlobalExecutor;
 use crate::node::background_task_monitor::LateRegistrar;
 use crate::simulation::TimeSource;
 use identity::{PeerKey, QuicIdentity};
 use liveness::EndpointHealth;
+use upgrade::policy::{QuicJoinerPermit, QuicPathPermit, QuicPathPermits};
 
 pub(crate) use config::QuicSettings;
 pub(crate) use liveness::QuicAvailability;
@@ -85,12 +87,12 @@ pub(crate) use liveness::QuicAvailabilityWatch;
 
 /// Whether the node may use QUIC: the `transport-quic` config key.
 ///
-/// An unset key is [`QuicMode::default_mode`]: prefer on Linux, macOS and
-/// Windows, and off elsewhere, because the breaker reads no boot identity
-/// there and so cannot trip. The Windows breaker counts short runs that
-/// panicked in QUIC code instead of detecting crashes ([`breaker`]); it was
-/// confirmed on a real Windows machine before Windows defaulted to an endpoint
-/// (#6031). The default is decided when the value is read and
+/// An unset key is [`QuicMode::default_mode`]: prefer on every platform. Peers
+/// everywhere, gateways on Windows and gateways on a unix platform with no boot
+/// identity count short runs that panicked in QUIC code instead of detecting
+/// crashes ([`breaker`]); that rule was confirmed on a real Windows machine
+/// before Windows defaulted to an endpoint (#6031), and peers on unix moved
+/// to it in #6151. The default is decided when the value is read and
 /// never written to `config.toml`, so a later release can change it
 /// for every node that did not set the key, which is how a default-off
 /// release turns QUIC off. A value given with `--transport-quic` or
@@ -98,8 +100,8 @@ pub(crate) use liveness::QuicAvailabilityWatch;
 /// so a node that ever ran with one keeps it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuicMode {
-    /// No QUIC endpoint is built and no QUIC datagram is read. The default on
-    /// platforms other than Linux, macOS and Windows.
+    /// No QUIC endpoint is built and no QUIC datagram is read. Set explicitly;
+    /// no platform defaults to it.
     Off,
     /// The node builds a QUIC endpoint on its UDP port and upgrades a UDP
     /// session to a QUIC path that carries only control frames: all
@@ -115,7 +117,7 @@ pub enum QuicMode {
     /// Negotiates data on a path to a peer in the release's slice
     /// (`upgrade::slice`, the release's ramp from `QUIC_DATA_RAMP_START`), and sends
     /// its data on a path where both sides did. With no ramp start set it acts as
-    /// [`Self::Shadow`] on the wire. The default on Linux, macOS and Windows.
+    /// [`Self::Shadow`] on the wire. The default on every platform.
     Prefer,
 }
 
@@ -146,20 +148,17 @@ impl QuicMode {
     /// See [`QuicMode::Prefer`].
     pub const PREFER: &'static str = "prefer";
 
-    /// What an unset `transport-quic` means on this platform: prefer on Linux,
-    /// macOS and Windows, and off elsewhere, because the crash-loop breaker
-    /// cannot trip there. Windows joined once its breaker was confirmed on a
-    /// real Windows machine (#6031).
+    /// What an unset `transport-quic` means: prefer, on every platform. It was
+    /// off where the crash-loop breaker could not trip (anything but Linux,
+    /// macOS and Windows), because it needed a boot identity there. Peers now
+    /// count short runs that panicked in QUIC code on every platform (#6259),
+    /// and a gateway with no boot identity does the same
+    /// (`breaker::decides_by_short_runs`), so no platform runs QUIC without a
+    /// breaker. Windows joined first, once its breaker was confirmed on a real
+    /// Windows machine (#6031). A node that must stay off sets
+    /// `transport-quic = "off"`.
     pub const fn default_mode() -> Self {
-        if cfg!(any(
-            target_os = "linux",
-            target_os = "macos",
-            target_os = "windows"
-        )) {
-            Self::Prefer
-        } else {
-            Self::Off
-        }
+        Self::Prefer
     }
 
     /// The mode for a configured `transport-quic` value. Unset is
@@ -249,6 +248,14 @@ pub(crate) struct EndpointCore {
     /// The node's buffer budget, from which each data path's windows are set
     /// (`budget`).
     buffer_budget: Arc<budget::QuicBudget>,
+    /// Admission of native joins from sources nobody named, set on a gateway
+    /// by [`QuicEndpoint::enable_gateway_admission`] (dark: see
+    /// [`admission::GATEWAY_NATIVE_ADMISSION`]).
+    admission: Arc<OnceLock<GatewayAdmission>>,
+    /// The node's QUIC path permits, which admitted joiners are charged
+    /// against ([`QuicEndpoint::attach_joiner_cap`]). Until it is set, no
+    /// joiner is admitted.
+    joiner_cap: Arc<OnceLock<QuicPathPermits>>,
     /// Test hooks that inject faults into quinn's drivers.
     #[cfg(any(test, feature = "testing"))]
     faults: Arc<socket::SocketFaults>,
@@ -396,19 +403,33 @@ pub(crate) enum QuicAllowError {
 
 /// The demux socket's QUIC allow-set, without its socket type.
 trait QuicSources: Send + Sync {
+    /// Pass datagrams from sources not on the allow-set that can open a
+    /// connection to the endpoint ([`admission`]); whether it took effect.
+    fn enable_unknown_source_lane(&self) -> bool;
     fn allow(&self, addr: SocketAddr) -> Option<QuicSourcePermit>;
     fn allow_existing(&self, addr: SocketAddr) -> Option<QuicSourcePermit>;
+    /// [`Self::allow`] for an admitted native joiner: its datagrams share the
+    /// joiners' slots of the ingress queue until the mark is dropped.
+    fn allow_joiner(&self, addr: SocketAddr) -> Option<(QuicSourcePermit, QuicJoinerMark)>;
     /// Send one datagram outside quinn, without waiting (a native punch).
     fn try_send(&self, datagram: &[u8], to: SocketAddr) -> io::Result<usize>;
 }
 
 impl<S: Socket> QuicSources for DemuxSocket<S> {
+    fn enable_unknown_source_lane(&self) -> bool {
+        DemuxSocket::enable_unknown_source_lane(self)
+    }
+
     fn allow(&self, addr: SocketAddr) -> Option<QuicSourcePermit> {
         self.allow_quic_source(addr)
     }
 
     fn allow_existing(&self, addr: SocketAddr) -> Option<QuicSourcePermit> {
         self.allow_existing_quic_source(addr)
+    }
+
+    fn allow_joiner(&self, addr: SocketAddr) -> Option<(QuicSourcePermit, QuicJoinerMark)> {
+        self.allow_quic_joiner(addr)
     }
 
     fn try_send(&self, datagram: &[u8], to: SocketAddr) -> io::Result<usize> {
@@ -658,12 +679,52 @@ impl QuicEndpoint {
                 // Set by the closure, which ran: `endpoint` is built.
                 cap_holds: cap_holds.expect("the QUIC socket's cap holds"),
                 buffer_budget,
+                admission: Arc::default(),
+                joiner_cap: Arc::default(),
                 #[cfg(any(test, feature = "testing"))]
                 faults: faults.unwrap_or_default(),
                 #[cfg(any(test, feature = "testing"))]
                 clock: std::any::type_name::<T>(),
             },
         })
+    }
+
+    /// Admit native joins from sources nobody named ([`admission`]): the
+    /// demux passes their possible Initials to this endpoint, and the accept
+    /// loop decides each attempt on `time`. Only a gateway, and only when
+    /// [`admission::enabled_at`] says so; tests call it directly. Builds the
+    /// joiners' server configuration once ([`QuicIdentity::server_tls_proven`],
+    /// stateless, so one serves every join). Whether it took effect (once per
+    /// endpoint; not if that configuration cannot be built).
+    pub(crate) fn enable_gateway_admission<T: TimeSource>(&self, time: T) -> bool {
+        let tls = match self.identity.server_tls_proven() {
+            Ok(tls) => tls,
+            Err(error) => {
+                tracing::warn!(%error, "Could not build the TLS configuration for native joins; admission stays off");
+                return false;
+            }
+        };
+        let mut config = (*self.server).clone();
+        config.crypto = Arc::new(tls);
+        let gate = GatewayAdmission {
+            decisions: admission::Admission::new(move || time.now_nanos()),
+            config: Arc::new(config),
+        };
+        self.admission.set(gate).is_ok() && self.sources.enable_unknown_source_lane()
+    }
+
+    /// Charge admitted native joiners against `permits`, the node's QUIC
+    /// path permits (the connection cap): each joiner takes a handshake-phase
+    /// charge from its admission until it is promoted or released. Set once
+    /// by the hub that owns the permits; until then every joiner is ignored
+    /// (counted `joiner_cap_full`). Whether it took effect.
+    pub(crate) fn attach_joiner_cap(&self, permits: QuicPathPermits) -> bool {
+        self.joiner_cap.set(permits).is_ok()
+    }
+
+    /// Whether [`Self::enable_gateway_admission`] took effect.
+    pub(crate) fn gateway_admission_enabled(&self) -> bool {
+        self.admission.get().is_some()
     }
 
     /// Whether this endpoint is alive: `Up` until its driver dies, then
@@ -677,6 +738,15 @@ impl QuicEndpoint {
     #[cfg(any(test, feature = "testing"))]
     pub(crate) fn fail_driver(&self) {
         self.faults.fail_receive();
+    }
+
+    /// Panic in the socket adapter at the endpoint's next receive, caught as
+    /// any adapter panic is: the endpoint goes `Down` with the node still
+    /// running. Only the real binary built with `testing` calls it
+    /// (`connection_handler::fail_endpoint_from_env`).
+    #[cfg(feature = "testing")]
+    pub(crate) fn panic_adapter(&self) {
+        self.faults.panic_receive();
     }
 
     /// The hooks that inject faults into quinn's drivers (tests).
@@ -728,7 +798,7 @@ impl QuicEndpoint {
     pub(crate) fn spawn_accept_loop(
         &self,
         registrar: &LateRegistrar,
-        attempts: mpsc::Sender<QuicIncoming>,
+        attempts: mpsc::Sender<EndpointAttempt>,
     ) -> bool {
         if self
             .owner
@@ -746,7 +816,7 @@ impl QuicEndpoint {
         let handle = GlobalExecutor::spawn(async move {
             loop {
                 let incoming = tokio::select! {
-                    incoming = core.accept() => incoming,
+                    incoming = core.accept_attempt() => incoming,
                     _ = availability.not_up() => None,
                 };
                 let Some(incoming) = incoming else { break };
@@ -756,18 +826,18 @@ impl QuicEndpoint {
                         let count = full.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                         if count == 1 || count % 1024 == 0 {
                             tracing::warn!(
-                                remote = %incoming.incoming.remote_address(),
+                                remote = %incoming.source(),
                                 accept_queue_full = count,
                                 "QUIC accept queue full; ignoring the attempt"
                             );
                         }
-                        incoming.incoming.ignore();
+                        incoming.ignore();
                     }
                     Err(mpsc::error::TrySendError::Closed(incoming)) => {
                         tracing::warn!(
                             "QUIC accept loop: the attempt consumer is gone; no longer accepting"
                         );
-                        incoming.incoming.ignore();
+                        incoming.ignore();
                         break;
                     }
                 }
@@ -975,13 +1045,40 @@ impl EndpointCore {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn accept(&self) -> Option<QuicIncoming> {
         loop {
+            match self.accept_attempt().await? {
+                EndpointAttempt::Allowed(incoming) => return Some(incoming),
+                // Only an endpoint with gateway admission makes joiners, and
+                // only the accept loop reads those.
+                EndpointAttempt::Joiner(joiner) => joiner.ignore(),
+            }
+        }
+    }
+
+    /// The next attempt: from an allowed source as [`Self::accept`] gives
+    /// it, or, with gateway admission on, an admitted joiner from a source
+    /// nobody named ([`admission`]). The admission decision runs here,
+    /// synchronously: an attempt without a Retry token gets a Retry, one over
+    /// a limit is ignored, and an admitted one is accepted with the proven-key
+    /// verifier and its address put on the allow-set. `None` once the
+    /// endpoint is closed.
+    pub(crate) async fn accept_attempt(&self) -> Option<EndpointAttempt> {
+        loop {
             let incoming = self.endpoint.accept().await?;
             let remote = incoming.remote_address();
             // One step under the allow-set entry's lock, so a permit dropped
             // concurrently is not brought back.
             let Some(permit) = self.sources.allow_existing(remote) else {
-                tracing::debug!(%remote, "Ignoring a QUIC connection attempt from a source not allowed");
-                incoming.ignore();
+                match self.admission.get() {
+                    Some(admission) => {
+                        if let Some(joiner) = self.admit(admission, incoming) {
+                            return Some(EndpointAttempt::Joiner(joiner));
+                        }
+                    }
+                    None => {
+                        tracing::debug!(%remote, "Ignoring a QUIC connection attempt from a source not allowed");
+                        incoming.ignore();
+                    }
+                }
                 continue;
             };
             let Some((expected, alpn, hold)) = self.expected_clients.hold(permit.addr()) else {
@@ -999,7 +1096,7 @@ impl EndpointCore {
             };
             let mut config = (*self.server).clone();
             config.crypto = Arc::new(tls);
-            return Some(QuicIncoming {
+            return Some(EndpointAttempt::Allowed(QuicIncoming {
                 health: self.health.clone(),
                 incoming,
                 permit,
@@ -1008,8 +1105,220 @@ impl EndpointCore {
                 alpn,
                 hold,
                 cap_holds: Arc::new(self.cap_holds.like()),
-            });
+            }));
         }
+    }
+
+    /// Decide an attempt from a source nobody named, in order: Retry, the
+    /// per-address and global limits, the allow-set, the TLS configuration.
+    /// Every outcome is counted; `Some` only for an admitted joiner.
+    fn admit(&self, gate: &GatewayAdmission, incoming: quinn::Incoming) -> Option<JoinerIncoming> {
+        use crate::transport::metrics::GatewayAdmission as Outcome;
+        let remote = incoming.remote_address();
+        let ticket = match gate
+            .decisions
+            .decide(remote, incoming.remote_address_validated())
+        {
+            Ok(ticket) => ticket,
+            Err(refusal @ admission::Refusal::Retry) => {
+                super::TRANSPORT_METRICS.record_gateway_admission(refusal.outcome());
+                if let Err(refused) = incoming.retry() {
+                    // quinn refuses only an attempt that carries a token,
+                    // which reads as validated.
+                    refused.into_incoming().ignore();
+                }
+                return None;
+            }
+            Err(
+                refusal @ (admission::Refusal::ThrottledAddress
+                | admission::Refusal::ThrottledGlobal),
+            ) => {
+                super::TRANSPORT_METRICS.record_gateway_admission(refusal.outcome());
+                incoming.ignore();
+                return None;
+            }
+        };
+        super::TRANSPORT_METRICS.record_gateway_admission(Outcome::Admitted);
+        // Item 5: the joiner counts against the connection cap from here,
+        // at the handshake-phase charge. With no room (or no cap attached
+        // yet) the attempt is ignored and the admission given back (the
+        // ticket drops). The charge is released by dropping it: the
+        // handshake failing, the join window passing and the connection
+        // closing all end the future that holds it, and promotion hands it
+        // back as a path permit.
+        let Some(charge) = self
+            .joiner_cap
+            .get()
+            .and_then(QuicPathPermits::try_acquire_joiner)
+        else {
+            super::TRANSPORT_METRICS.record_gateway_admission(Outcome::JoinerCapFull);
+            incoming.ignore();
+            return None;
+        };
+        // The handshake's later datagrams are shorter than an Initial and
+        // take the established path, so the address goes on the allow-set
+        // now, held by the connection, and marked as a joiner so that all
+        // joiners share one bounded part of the ingress queue. A full set
+        // gives the admission and the charge back (both drop).
+        let Some((permit, mark)) = self.sources.allow_joiner(remote) else {
+            super::TRANSPORT_METRICS.record_gateway_admission(Outcome::AllowSetFull);
+            incoming.ignore();
+            return None;
+        };
+        Some(JoinerIncoming {
+            incoming,
+            permit,
+            charge: JoinerCharge { cap: charge, mark },
+            queued_at: None,
+            config: gate.config.clone(),
+            ticket,
+            health: self.health.clone(),
+            cap_holds: Arc::new(self.cap_holds.like()),
+        })
+    }
+}
+
+/// An endpoint's admission of native joins: the decisions, and the one
+/// server configuration every join is accepted with.
+struct GatewayAdmission {
+    decisions: Arc<admission::Admission>,
+    config: Arc<quinn::ServerConfig>,
+}
+
+/// What [`EndpointCore::accept_attempt`] gives.
+pub(crate) enum EndpointAttempt {
+    /// From an allowed source, with the key it was allowed with.
+    Allowed(QuicIncoming),
+    /// An admitted joiner from a source nobody named ([`admission`]).
+    Joiner(JoinerIncoming),
+}
+
+impl EndpointAttempt {
+    /// Drop the attempt without answering it.
+    pub(crate) fn ignore(self) {
+        match self {
+            Self::Allowed(incoming) => incoming.ignore(),
+            Self::Joiner(joiner) => joiner.ignore(),
+        }
+    }
+
+    /// The address the attempt came from (normalized).
+    pub(crate) fn source(&self) -> SocketAddr {
+        match self {
+            Self::Allowed(incoming) => incoming.source(),
+            Self::Joiner(joiner) => joiner.source(),
+        }
+    }
+}
+
+/// An admitted native join from a source nobody named: accepted with the
+/// proven-key verifier, offering the native ALPN only, its address on the
+/// allow-set while the attempt and then its connection live.
+pub(crate) struct JoinerIncoming {
+    incoming: quinn::Incoming,
+    permit: QuicSourcePermit,
+    /// What the joiner holds until it is promoted or released.
+    charge: JoinerCharge,
+    /// When the hub queued it for its join, nanoseconds on the hub's clock
+    /// ([`Self::stamp`]); the join window counts from here.
+    queued_at: Option<u64>,
+    config: Arc<quinn::ServerConfig>,
+    /// Given back if the attempt is dropped before its handshake starts.
+    ticket: admission::AdmissionTicket,
+    health: Arc<EndpointHealth>,
+    cap_holds: Arc<socket::CapHolds>,
+}
+
+/// What an admitted, unpromoted native joiner holds, from its admission until
+/// it is promoted or released: its charge against the node's connection cap
+/// at the handshake-phase rate, and its mark as a joiner in the ingress
+/// queue's accounting (`demux::QUIC_INGRESS_JOINER_DATAGRAMS`). Dropping it
+/// releases both: that is the handshake failing, the join window passing
+/// (the future holding it is dropped) and the connection closing.
+/// [`Self::promote`] re-charges at the full rate instead.
+#[must_use = "dropping the charge releases the joiner"]
+pub(crate) struct JoinerCharge {
+    cap: QuicJoinerPermit,
+    mark: QuicJoinerMark,
+}
+
+impl JoinerCharge {
+    /// The joiner becomes a normal connection: charged as a data path at the
+    /// full rate and counted as an established source from now on. If the
+    /// cap has no room for the full charge the joiner stays as it was.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn promote(self) -> Result<QuicPathPermit, Self> {
+        match self.cap.promote() {
+            Ok(path) => Ok(path),
+            Err(cap) => Err(Self {
+                cap,
+                mark: self.mark,
+            }),
+        }
+    }
+}
+
+/// Why an admitted join did not give a connection.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum JoinerError {
+    /// The handshake failed.
+    #[error("the handshake failed: {0}")]
+    Handshake(#[from] quinn::ConnectionError),
+    /// The handshake finished without a proven client key on the
+    /// connection (cannot happen with the proven-key verifier, which fails
+    /// the handshake instead).
+    #[error("the handshake gave no proven client key")]
+    Unproven,
+}
+
+impl JoinerIncoming {
+    /// Drop the attempt without answering it; its admission is given back.
+    pub(crate) fn ignore(self) {
+        self.incoming.ignore();
+    }
+
+    /// The address the attempt came from (normalized).
+    pub(crate) fn source(&self) -> SocketAddr {
+        self.permit.addr()
+    }
+
+    /// Record when the join was queued, on the clock `join_gateway` runs on,
+    /// so time spent waiting for a free join slot comes out of the join
+    /// window instead of extending the joiner's charge.
+    pub(crate) fn stamp(&mut self, now_nanos: u64) {
+        self.queued_at = Some(now_nanos);
+    }
+
+    /// When the join was queued ([`Self::stamp`]).
+    pub(crate) fn queued_at(&self) -> Option<u64> {
+        self.queued_at
+    }
+
+    /// Complete the handshake; the connection is bound to the key the client
+    /// proved. The admission is used from here on, whatever the handshake
+    /// does. On failure the permit and the joiner's charge are dropped with
+    /// it. The charge comes back with the connection, to be held until the
+    /// join ends or is promoted.
+    pub(crate) async fn establish(self) -> Result<(QuicConnection, JoinerCharge), JoinerError> {
+        self.ticket.keep();
+        let connecting =
+            socket::with_poller_holds(&self.cap_holds, || self.incoming.accept_with(self.config))?;
+        let connection = connecting.await?;
+        let Some(peer) = identity::proven_client_key(&connection) else {
+            connection.close(0u32.into(), b"");
+            return Err(JoinerError::Unproven);
+        };
+        Ok((
+            QuicConnection::new(
+                connection,
+                self.permit,
+                None,
+                peer,
+                self.health,
+                self.cap_holds,
+            ),
+            self.charge,
+        ))
     }
 }
 

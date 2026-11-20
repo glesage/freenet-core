@@ -74,11 +74,9 @@ impl NetworkStats {
 
     /// Returns the average latency added per delayed message.
     pub fn average_latency(&self) -> Duration {
-        if self.messages_delayed_delivered == 0 {
-            Duration::ZERO
-        } else {
-            Duration::from_nanos(self.total_latency_nanos / self.messages_delayed_delivered)
-        }
+        self.total_latency_nanos
+            .checked_div(self.messages_delayed_delivered)
+            .map_or(Duration::ZERO, Duration::from_nanos)
     }
 }
 
@@ -115,6 +113,12 @@ pub struct FaultInjectorState {
     /// each with the bytes it has let through so far. Kept here rather than in
     /// [`FaultConfig`], whose rules are values.
     pub quic_datagram_cuts: Vec<(crate::simulation::QuicDatagramCut, u64)>,
+    /// One-way delay added to every QUIC-class datagram
+    /// (`SimNetwork::delay_quic_datagrams`), if any.
+    pub quic_datagram_delay: Option<std::time::Duration>,
+    /// One-way delay added to every legacy UDP intro datagram, the packets
+    /// that open a UDP connection (`SimNetwork::delay_udp_intros`), if any.
+    pub udp_intro_delay: Option<std::time::Duration>,
 }
 
 impl FaultInjectorState {
@@ -129,6 +133,8 @@ impl FaultInjectorState {
             network_name: None,
             enforce_fault_drops: false,
             quic_datagram_cuts: Vec::new(),
+            quic_datagram_delay: None,
+            udp_intro_delay: None,
         }
     }
 

@@ -450,6 +450,32 @@ impl AddSubscriberOutcome {
     }
 }
 
+/// Most recently disconnected clients remembered by [`DisconnectedClients`].
+/// Far more than the requests that can be in flight for clients that have just
+/// gone; when it is full the oldest entry is forgotten.
+const MAX_REMEMBERED_DISCONNECTED_CLIENTS: usize = 65_536;
+
+/// Bounded FIFO set of client ids whose disconnect was swept.
+#[derive(Default)]
+struct DisconnectedClients {
+    order: std::collections::VecDeque<crate::client_events::ClientId>,
+    members: HashSet<crate::client_events::ClientId>,
+}
+
+impl DisconnectedClients {
+    fn insert(&mut self, client_id: crate::client_events::ClientId) {
+        if !self.members.insert(client_id) {
+            return;
+        }
+        self.order.push_back(client_id);
+        while self.order.len() > MAX_REMEMBERED_DISCONNECTED_CLIENTS {
+            if let Some(oldest) = self.order.pop_front() {
+                self.members.remove(&oldest);
+            }
+        }
+    }
+}
+
 /// Result of removing all subscriptions for a disconnected client.
 #[derive(Debug)]
 pub struct ClientDisconnectResult {
@@ -626,6 +652,12 @@ pub(crate) struct HostingManager {
     /// have to be mirrored into each reader, and the next reader added would
     /// silently miss it.
     client_subscriptions: DashMap<ContractInstanceId, LocalSubscribers>,
+
+    /// Clients whose `Disconnect` has already been swept. A request from such a
+    /// client can still be in flight (client requests run as independent
+    /// tasks), and without this record it would register its subscription
+    /// after the sweep and keep the slot forever (ANT-2026-VCHSBVO6).
+    disconnected_clients: parking_lot::Mutex<DisconnectedClients>,
 
     /// Unified hosting cache with byte-budget demand-ordered eviction ("fuel
     /// gauge") and TTL protection. This is the single source of truth for which
@@ -838,6 +870,7 @@ impl HostingManager {
         Self {
             active_subscriptions: Default::default(),
             client_subscriptions: DashMap::new(),
+            disconnected_clients: Default::default(),
             hosting_cache: RwLock::new(HostingCache::new(budget_bytes, time_source.clone())),
             demand_estimator: RwLock::new(ProximityPrior::new()),
             own_location: RwLock::new(None),
@@ -914,10 +947,40 @@ impl HostingManager {
     /// permanently skip reclamation after an UPDATE-then-evict. No-op when
     /// the entry is not currently cached. See
     /// `HostingCache::refresh_entry_generation`.
+    #[cfg(test)]
     pub(crate) fn refresh_cache_generation(&self, key: &ContractKey, new_gen: u64) {
         self.hosting_cache
             .write()
             .refresh_entry_generation(key, new_gen);
+    }
+
+    /// Refresh both the write generation and the size of `key`'s hosting-cache
+    /// entry under ONE write lock, so a concurrent reader never sees the new
+    /// generation with the old size. See `refresh_cache_generation` and
+    /// `refresh_cache_size`.
+    pub(crate) fn refresh_cache_after_write(
+        &self,
+        key: &ContractKey,
+        new_gen: u64,
+        size_bytes: u64,
+    ) {
+        let mut cache = self.hosting_cache.write();
+        cache.refresh_entry_generation(key, new_gen);
+        cache.refresh_entry_size(key, size_bytes);
+    }
+
+    /// Update the hosting-cache size of `key` to the state size just written.
+    /// Paired with `refresh_cache_generation` at every state-write chokepoint
+    /// so a contract that grows (or shrinks) through UPDATE is charged to the
+    /// hosting budget what is actually stored, not its PUT/GET-time size.
+    /// Byte accounting only: no recency stamp, and nothing is evicted here.
+    /// No-op when the entry is not currently cached. See
+    /// `HostingCache::refresh_entry_size`.
+    #[cfg(test)]
+    pub(crate) fn refresh_cache_size(&self, key: &ContractKey, size_bytes: u64) {
+        self.hosting_cache
+            .write()
+            .refresh_entry_size(key, size_bytes);
     }
 
     /// Set the storage reference for persisting hosting metadata.
@@ -1190,6 +1253,16 @@ impl HostingManager {
         if let Some(tracker) = self.disk_tracker.read().as_ref() {
             tracker.seed(state_rows);
         }
+    }
+
+    /// The size of `key`'s state at its last committed write, from the disk
+    /// tracker. `None` before the tracker is installed or when no write or
+    /// seed has recorded it.
+    pub(crate) fn committed_state_size(&self, key: &ContractKey) -> Option<u64> {
+        self.disk_tracker
+            .read()
+            .as_ref()
+            .and_then(|tracker| tracker.committed_state_size(key))
     }
 
     /// Apply a state-write delta to the disk tracker at a state-write chokepoint.
@@ -1858,11 +1931,25 @@ impl HostingManager {
         self.maybe_record_abandonment(contract);
     }
 
+    /// Whether `client_id`'s disconnect has been swept already, so a
+    /// subscription registered for it now would never be cleaned up.
+    pub fn is_client_disconnected(&self, client_id: crate::client_events::ClientId) -> bool {
+        self.disconnected_clients
+            .lock()
+            .members
+            .contains(&client_id)
+    }
+
     /// Remove a client from ALL its subscriptions (used when client disconnects).
     pub fn remove_client_from_all_subscriptions(
         &self,
         client_id: crate::client_events::ClientId,
     ) -> ClientDisconnectResult {
+        // Record the disconnect BEFORE sweeping. A registration that lands
+        // after the sweep checks this record (`is_client_disconnected`) and
+        // undoes itself; one that landed before it is found by the sweep.
+        self.disconnected_clients.lock().insert(client_id);
+
         let mut affected_contracts = Vec::new();
 
         // Find all contracts where this client is subscribed
@@ -4845,6 +4932,32 @@ mod tests {
         assert!(is_last2);
     }
 
+    /// ANT-2026-VCHSBVO6: the sweep records the client, and the record is a
+    /// bounded FIFO so a flood of connections cannot grow it without limit.
+    #[test]
+    fn sweep_records_the_client_and_the_record_is_bounded() {
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+        let first = crate::client_events::ClientId::next();
+        assert!(!manager.is_client_disconnected(first));
+        manager.remove_client_from_all_subscriptions(first);
+        assert!(manager.is_client_disconnected(first));
+
+        for _ in 0..MAX_REMEMBERED_DISCONNECTED_CLIENTS {
+            manager.remove_client_from_all_subscriptions(crate::client_events::ClientId::next());
+        }
+        assert!(
+            !manager.is_client_disconnected(first),
+            "the oldest record is forgotten once the bound is reached"
+        );
+        let last = crate::client_events::ClientId::next();
+        manager.remove_client_from_all_subscriptions(last);
+        assert!(manager.is_client_disconnected(last));
+        assert_eq!(
+            manager.disconnected_clients.lock().members.len(),
+            MAX_REMEMBERED_DISCONNECTED_CLIENTS
+        );
+    }
+
     #[test]
     fn test_hosting_cache_basic() {
         let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
@@ -6928,6 +7041,78 @@ mod tests {
             !manager.hosting_cache.read().contains(&key),
             "refresh must not insert a phantom entry for an absent contract"
         );
+    }
+
+    /// Without `refresh_cache_size`, a hosted contract whose state grows
+    /// through UPDATE stays charged the size `record_contract_access` was
+    /// given at PUT/GET time (the UPDATE paths must not call it: it stamps
+    /// recency). `current_bytes` then under-counts what is stored, the cache
+    /// never goes over budget, and the sweep that enforces the hosting budget
+    /// evicts nothing while UPDATEs fill the disk.
+    ///
+    /// The fix is to call `refresh_cache_size` paired with
+    /// `refresh_cache_generation` at every state-write chokepoint. This test
+    /// asserts the refresh re-charges the entries and that the next sweep
+    /// then sheds the overage.
+    #[test]
+    fn test_refresh_cache_size_charges_update_growth_to_budget() {
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+        {
+            let mut cache = manager.hosting_cache.write();
+            *cache = cache::HostingCache::new(
+                1000,
+                std::sync::Arc::new(crate::util::time_source::InstantTimeSrc::new()),
+            );
+        }
+
+        // Three contracts hosted with 1-byte states: far under budget.
+        let keys = [
+            make_contract_key(1),
+            make_contract_key(2),
+            make_contract_key(3),
+        ];
+        for key in keys {
+            manager.record_contract_access(key, 1, AccessType::Put, HostingCause::Other);
+        }
+        assert_eq!(manager.hosting_cache_stats().current_bytes, 3);
+
+        // Simulate one UPDATE per contract that grows its state to 600
+        // bytes. The refresh is byte accounting only: it evicts nothing.
+        for key in &keys {
+            manager.refresh_cache_size(key, 600);
+        }
+        let stats = manager.hosting_cache_stats();
+        assert_eq!(stats.current_bytes, 1800);
+        assert_eq!(stats.contract_count, 3);
+
+        // The sweep now sees the cache over budget and sheds down to it.
+        // Without the refresh `current_bytes` would still read 3 and nothing
+        // would be evicted.
+        let swept = manager.sweep_expired_hosting();
+        assert_eq!(
+            swept.expired.len(),
+            2,
+            "sweep must evict the contracts that UPDATE grew over budget"
+        );
+        let stats = manager.hosting_cache_stats();
+        assert_eq!(stats.current_bytes, 600);
+        assert_eq!(stats.contract_count, 1);
+    }
+
+    /// `refresh_cache_size` is a no-op when the entry is not in the cache:
+    /// a state write for a contract this node does not host must not insert
+    /// a phantom entry or charge bytes to the hosting budget.
+    #[test]
+    fn test_refresh_cache_size_is_noop_when_entry_absent() {
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+        let key = make_contract_key(99);
+
+        manager.refresh_cache_size(&key, 4096);
+        assert!(
+            !manager.hosting_cache.read().contains(&key),
+            "refresh must not insert a phantom entry for an absent contract"
+        );
+        assert_eq!(manager.hosting_cache_stats().current_bytes, 0);
     }
 
     /// `bump_state_generation` is monotonic and starts at 1 on first

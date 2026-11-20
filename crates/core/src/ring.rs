@@ -91,7 +91,7 @@ pub(crate) mod contract_exec_metrics;
 pub(crate) mod delta_incompat;
 /// Shadow-mode detector for repairs that never converge (see the module docs).
 pub(crate) mod futile_repair;
-pub(crate) use connection_manager::ConnectionManager;
+pub(crate) use connection_manager::{ConnectionManager, TransientRefusal, TransientTtlOutcome};
 // Nearest-neighbor ring lattice (successor+predecessor base edges).
 // `nn_lattice_active_for` is the full activation gate — the flag AND the
 // minimum-degree floor (`NN_LATTICE_MIN_MAX_CONNECTIONS`) — used by the
@@ -287,6 +287,8 @@ fn apply_bootstrap_churn_stats(
 ) {
     snapshot.bootstrap_transient_registered = Some(b.transient_registered);
     snapshot.bootstrap_transient_expired = Some(b.transient_expired);
+    snapshot.bootstrap_transient_source_refusals = Some(b.transient_source_refusals);
+    snapshot.bootstrap_transient_evictions = Some(b.transient_evictions);
     snapshot.bootstrap_promoted_to_ring = Some(b.promoted_to_ring);
     snapshot.bootstrap_time_to_min_connections_secs =
         b.time_to_min_connections.map(|d| d.as_secs_f64());
@@ -1301,7 +1303,7 @@ impl Ring {
         let my_distance = my_location.distance(contract_location);
 
         let connections = self.connection_manager.get_connections_by_location();
-        let neighbors = connections.iter().flat_map(|(_loc, conns)| {
+        let neighbors = connections.values().flat_map(|conns| {
             conns.iter().map(|conn| {
                 // A peer counts as a "closer routable neighbor" (so I'm NOT the
                 // root) only if a renewal could actually route to it. Match the
@@ -2369,6 +2371,7 @@ impl Ring {
             // `router_snapshot_json_includes_routing_attribution_counters`.
             snapshot.ring_connections = Some(cm.connection_count() as u64);
             snapshot.transient_connections = Some(cm.transient_count() as u64);
+            snapshot.transient_largest_source = Some(cm.transient_largest_source() as u64);
             snapshot.connections_to_gateways =
                 crate::node::network_status::connections_to_gateways();
             if let Some((gets, puts, subscribes, updates)) =
@@ -2378,6 +2381,21 @@ impl Ring {
                 snapshot.relayed_puts_total = Some(puts);
                 snapshot.relayed_subscribes_total = Some(subscribes);
                 snapshot.relayed_updates_total = Some(updates);
+            }
+
+            // Contract-handler admission refusals (ANT-2026-K0YQ8CG4).
+            {
+                use crate::contract::Lane;
+                snapshot.contract_lane_refused_client_total =
+                    Some(crate::contract::lane_refusals(Lane::Client));
+                snapshot.contract_lane_refused_relay_total =
+                    Some(crate::contract::lane_refusals(Lane::Relay));
+                snapshot.contract_lane_refused_background_total =
+                    Some(crate::contract::lane_refusals(Lane::Background));
+                let (refused, overload_not_found) =
+                    crate::operations::relay_admission::telemetry_counts();
+                snapshot.relay_admission_refused_total = Some(refused);
+                snapshot.relay_get_overload_not_found_total = Some(overload_not_found);
             }
 
             // Connect-event emission counters (firehose-retirement precursor).
@@ -5021,10 +5039,38 @@ impl Ring {
         self.hosting_manager.disk_usage_stats()
     }
 
+    /// The size of `contract`'s stored state at its last committed write, if
+    /// the disk tracker has recorded it. See
+    /// `HostingManager::committed_state_size`.
+    pub(crate) fn committed_state_size(&self, contract: &ContractKey) -> Option<u64> {
+        self.hosting_manager.committed_state_size(contract)
+    }
+
+    /// Whether a relayed UPDATE (or probe reconcile) may be merged into, and
+    /// persisted for, `key` here.
+    ///
+    /// A contract that is neither in the hosting cache nor in use (no
+    /// subscriber of any kind) is not hosted: an eviction has queued its bytes
+    /// for reclamation, or this node only still has them on disk. Merging a
+    /// relayed write into such a copy moves its state generation without
+    /// re-hosting it, and a remote peer decides when that happens, so the
+    /// bytes would stay on disk outside every budget (hosting invariants 1
+    /// and 3: a copy is served only while fresh in the update mesh, and the
+    /// demand ranking, not an UPDATE, decides what stays). Callers skip the
+    /// merge and, for a request, forward it toward the hosts instead.
+    pub(crate) fn may_merge_relayed_update(&self, key: &ContractKey) -> bool {
+        self.is_hosting_contract(key) || self.contract_in_use(key)
+    }
+
     pub(crate) fn commit_state_write(&self, contract: &ContractKey, state_size: usize) {
         let new_gen = self.hosting_manager.bump_state_generation(contract);
+        // Hosting-budget accounting: charge the hosted entry the size that was
+        // just stored. `host_contract` records a size on PUT/GET only, and the
+        // UPDATE paths must not call it (it stamps recency), so without this a
+        // contract that grows through UPDATE stays charged its PUT-time size
+        // and the byte-budget eviction never sees the growth.
         self.hosting_manager
-            .refresh_cache_generation(contract, new_gen);
+            .refresh_cache_after_write(contract, new_gen, state_size as u64);
         // Disk-usage accounting (#4683): maintain the aggregate on-disk state
         // total by signed delta (`new − previous_for_key`). Read by the
         // eviction floor and the admission gates since #4702. No-op until the
@@ -5173,6 +5219,12 @@ impl Ring {
     ) -> ClientDisconnectResult {
         self.hosting_manager
             .remove_client_from_all_subscriptions(client_id)
+    }
+
+    /// Whether `client_id`'s disconnect has already been swept, so a
+    /// subscription registered for it now would never be removed.
+    pub(crate) fn is_client_disconnected(&self, client_id: crate::client_events::ClientId) -> bool {
+        self.hosting_manager.is_client_disconnected(client_id)
     }
 
     /// Get all hosted contract keys from the hosting cache.
@@ -6151,6 +6203,12 @@ impl Ring {
             crate::transport::TRANSPORT_METRICS.connection_peer_bytes(peer.socket_addr()),
         );
         crate::node::network_status::record_peer_disconnected(peer.socket_addr());
+        // A connection kept outside the ring holds a slot in the transient
+        // budget for as long as it is open (`ConnectionManager::hold_transient`).
+        // Every path that closes a connection reaches this, so the slot is
+        // given back here, before the early return below for a connection the
+        // ring never held.
+        self.connection_manager.drop_transient(peer.socket_addr());
         let orphaned_transactions = self
             .live_tx_tracker
             .prune_transactions_from_peer(peer.socket_addr());
@@ -11309,6 +11367,54 @@ mod cost_pressure_seam_tests {
         );
     }
 
+    /// A state write must re-charge an already-hosted contract to the hosting
+    /// budget. Goes through the production funnel (`Ring::commit_state_write`,
+    /// the post-write step of every executor PUT/UPDATE chokepoint) and the
+    /// production sweep entry (`Ring::sweep_expired_hosting`). Without the
+    /// size refresh a contract hosted at 1 byte and grown by an UPDATE stays
+    /// charged 1 byte, the cache never goes over budget, and the sweep evicts
+    /// nothing however much state the UPDATEs stored.
+    #[tokio::test]
+    async fn commit_state_write_charges_update_growth_to_the_hosting_budget() {
+        let op_manager = attached_op_manager("commit-state-write-size").await;
+        let hosting = &op_manager.ring.hosting_manager;
+        let budget = hosting.hosting_cache_stats().budget_bytes;
+        let keys: Vec<_> = (0..3).map(wiring_key).collect();
+        for key in &keys {
+            hosting.record_contract_access(
+                *key,
+                1,
+                crate::ring::hosting::AccessType::Put,
+                crate::ring::hosting::HostingCause::Other,
+            );
+        }
+        assert_eq!(hosting.hosting_cache_stats().current_bytes, 3);
+
+        // One UPDATE per contract, each leaving a state of most of the budget.
+        let grown = budget / 2 + 1;
+        for key in &keys {
+            op_manager.ring.commit_state_write(key, grown as usize);
+        }
+        let stats = hosting.hosting_cache_stats();
+        assert_eq!(
+            stats.current_bytes,
+            3 * grown,
+            "every state write must charge the stored size to the hosting cache"
+        );
+        // Byte accounting only: the write itself evicts nothing.
+        assert_eq!(stats.contract_count, 3);
+
+        let swept = op_manager.ring.sweep_expired_hosting();
+        assert_eq!(
+            swept.expired.len(),
+            2,
+            "the sweep must shed the contracts that UPDATE grew over budget"
+        );
+        let stats = hosting.hosting_cache_stats();
+        assert_eq!(stats.current_bytes, grown);
+        assert!(stats.current_bytes <= stats.budget_bytes);
+    }
+
     fn wiring_peer() -> crate::ring::PeerKey {
         crate::ring::PeerKey::from(crate::transport::TransportKeypair::new().public().clone())
     }
@@ -11653,6 +11759,8 @@ mod cost_pressure_seam_tests {
             &BootstrapChurnStats {
                 transient_registered: 11,
                 transient_expired: 12,
+                transient_source_refusals: 22,
+                transient_evictions: 23,
                 promoted_to_ring: 13,
                 time_to_min_connections: Some(Duration::from_millis(14_500)),
                 time_to_first_ring_connection: Some(Duration::from_millis(2_345)),
@@ -11665,6 +11773,8 @@ mod cost_pressure_seam_tests {
         );
         assert_eq!(snapshot.bootstrap_transient_registered, Some(11));
         assert_eq!(snapshot.bootstrap_transient_expired, Some(12));
+        assert_eq!(snapshot.bootstrap_transient_source_refusals, Some(22));
+        assert_eq!(snapshot.bootstrap_transient_evictions, Some(23));
         assert_eq!(snapshot.bootstrap_promoted_to_ring, Some(13));
         assert_eq!(snapshot.bootstrap_time_to_min_connections_secs, Some(14.5));
         assert_eq!(snapshot.bootstrap_completed, Some(true));

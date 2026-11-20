@@ -371,7 +371,7 @@ impl Default for ConfigArgs {
                 ledbat_min_ssthresh: None, // Uses default from NetworkApiConfig
                 congestion_control: None,  // Default: fixedrate (set in NetworkApiConfig)
                 bbr_startup_rate: None,    // Uses default from BBR config
-                transport_quic: None,      // Default: prefer on Linux, macOS and Windows
+                transport_quic: None,      // Default: prefer on every platform
                 quic_max_paths: None,      // Default: the node's connection limit
                 quic_data_percent: None,   // Default: this release's share of pairs
                 quic_ignore_crash_breaker: None,
@@ -2543,7 +2543,9 @@ pub struct NetworkArgs {
     #[serde(rename = "transient-budget", skip_serializing_if = "Option::is_none")]
     pub transient_budget: Option<usize>,
 
-    /// Time (in seconds) before an unpromoted transient connection is dropped.
+    /// Time (in seconds) after which an unpromoted transient connection is counted
+    /// as expired. Its transport stays open, and its slot in the transient budget
+    /// is held until it is promoted or closed.
     #[arg(long, env = "TRANSIENT_TTL_SECS")]
     #[serde(rename = "transient-ttl-secs", skip_serializing_if = "Option::is_none")]
     pub transient_ttl_secs: Option<u64>,
@@ -2623,7 +2625,7 @@ pub struct NetworkArgs {
     pub bbr_startup_rate: Option<u64>,
 
     /// QUIC transport (#5940): `off`, `shadow` or `prefer`. Unset means
-    /// `prefer` on Linux, macOS and Windows, and `off` elsewhere.
+    /// `prefer` on every platform.
     ///
     /// `shadow` builds a QUIC endpoint on the network port and upgrades
     /// connections to peers that also run it to a QUIC path. The path carries
@@ -2681,11 +2683,16 @@ pub struct NetworkArgs {
 
     /// Run QUIC even when the crash-loop breaker would keep it off.
     ///
-    /// On unix, if a run with QUIC enabled ends abnormally, the node starts
-    /// with QUIC off for 24 hours. On Windows the same happens after three
-    /// short runs in a row that each panicked in QUIC code. Set this to run
-    /// QUIC anyway. A start with this set erases the trip: removing it later
-    /// does not bring the 24 hours back. Default: false.
+    /// After two short runs in a row that each panicked in QUIC code, a
+    /// peer starts with QUIC off for 24 hours. A gateway on Linux or macOS does so
+    /// when a run with QUIC enabled ends abnormally, and a gateway on
+    /// Windows, or on any platform with no boot identity, after three such
+    /// short runs, in both cases for 15
+    /// minutes, doubling on repeat trips up to 4 hours (a gateway whose
+    /// service unit sets FREENET_SUPERVISED=1 restarts itself at the end).
+    /// Set this to run QUIC anyway. A start with this
+    /// set erases the trip: removing it later does not bring the cooldown
+    /// back. Default: false.
     ///
     /// Works as a bare flag after the subcommand: `--quic-ignore-crash-breaker`
     /// turns it on, `--quic-ignore-crash-breaker=false` turns it off. Before
@@ -2949,7 +2956,9 @@ pub struct NetworkApiConfig {
     #[serde(default = "default_transient_budget", rename = "transient-budget")]
     pub transient_budget: usize,
 
-    /// Time (in seconds) before an unpromoted transient connection is dropped.
+    /// Time (in seconds) after which an unpromoted transient connection is counted
+    /// as expired. Its transport stays open, and its slot in the transient budget
+    /// is held until it is promoted or closed.
     #[serde(default = "default_transient_ttl_secs", rename = "transient-ttl-secs")]
     pub transient_ttl_secs: u64,
 
@@ -3010,7 +3019,7 @@ pub struct NetworkApiConfig {
     pub bbr_startup_rate: Option<u64>,
 
     /// QUIC transport (#5940): `off`, `shadow` or `prefer`; unset reads as
-    /// `QuicMode::default_mode` (prefer on Linux, macOS and Windows). Kept as written, so a value from a later release
+    /// `QuicMode::default_mode` (prefer on every platform). Kept as written, so a value from a later release
     /// round-trips; see [`Self::quic_settings`] for how it is read.
     #[serde(
         default,
@@ -5564,6 +5573,17 @@ impl GlobalRng {
         THREAD_INDEX.with(|idx| idx.set(Some(0)));
     }
 
+    /// Give the current thread index `idx`, as if it were the `idx`-th
+    /// thread to ask. Only for a fresh thread that has not asked yet: a
+    /// thread-local derived from the index (the nonce counter, or a seeded or
+    /// reset stream-id counter) is initialized on first use and does not see a
+    /// later change. Unseeded threads draw stream ids from a process-wide
+    /// counter that does not read it.
+    #[cfg(test)]
+    pub(crate) fn pin_thread_index_for_test(idx: u64) {
+        THREAD_INDEX.with(|c| c.set(Some(idx)));
+    }
+
     /// Clears the simulation seed, reverting to system RNG.
     pub fn clear_seed() {
         THREAD_SEED.with(|s| s.set(None));
@@ -5577,6 +5597,11 @@ impl GlobalRng {
     ///
     /// Each thread gets a unique index from the global `THREAD_INDEX_COUNTER`.
     /// This is used by thread-local ID counters to compute non-overlapping offset blocks.
+    ///
+    /// Indices are never reused, so a long-running node's index keeps growing
+    /// with every thread it creates (tens of thousands within days). Any
+    /// `idx * block` arithmetic must be wide enough or wrap safely, and must
+    /// not reach bits that carry meaning (#6143).
     pub fn thread_index() -> u64 {
         THREAD_INDEX.with(|c| match c.get() {
             Some(idx) => idx,
@@ -7733,8 +7758,8 @@ shutdown-drain-secs = 42
         assert_seeded_values_bound(&cfg);
     }
 
-    /// An unset `transport-quic` is prefer on Linux, macOS and Windows; Windows
-    /// joined once its crash-loop breaker was confirmed on a real Windows
+    /// An unset `transport-quic` is prefer on every platform; Windows
+    /// joined first, once its crash-loop breaker was confirmed on a real Windows
     /// machine (#6031). The lib tests do not compile on Windows, so
     /// `tests/quic_breaker_windows.rs` pins the Windows half through the real
     /// binary. The default is not written into the config, so a default-off

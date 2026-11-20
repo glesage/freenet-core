@@ -435,7 +435,7 @@ pub(super) async fn bind_udp_listener<S: Socket>(
         });
     let quic_endpoint = quic_settings.as_ref().and_then(|settings| {
         let socket = socket.clone();
-        match quic_virtual_time {
+        match quic_virtual_time.clone() {
             // Building the endpoint draws quinn's RNG seed from `GlobalRng`.
             // A side stream (named by the bind address) keeps that draw out
             // of the run's main stream, so an endpoint that is bound and idle
@@ -456,6 +456,33 @@ pub(super) async fn bind_udp_listener<S: Socket>(
         }
     });
 
+    // Gateway admission of native joins from sources nobody named (#5940
+    // A7b), on the endpoint's clock. Dark: `admission::enabled_at` is false on
+    // every node until phase B (a test can turn it on for one listener), and
+    // with it off the only additions are an idle queue and its poll, one
+    // atomic load per datagram from a source not on the allow-set, and
+    // counters that stay 0.
+    if let Some(endpoint) = &quic_endpoint {
+        if super::quic::admission::enabled_at(is_gateway, bind_addr) {
+            let enabled = match quic_virtual_time {
+                Some(time) => endpoint.enable_gateway_admission(time),
+                None => endpoint.enable_gateway_admission(RealTime::new()),
+            };
+            tracing::info!(enabled, "QUIC gateway admission of native joins");
+        }
+    }
+
+    // Test builds only: kill the endpoint after the delay this variable
+    // names, through a caught socket adapter panic, so a real-process test can
+    // drive the node's reaction to endpoint death
+    // (`tests/graceful_shutdown_exit_code.rs`). `testing` is not a release
+    // feature: the release workflows build `-p freenet` without it. A
+    // workspace-wide build does get it, because fdev enables it, so such a
+    // binary obeys this variable too; nothing sets it outside the tests.
+    #[cfg(feature = "testing")]
+    if let Some(endpoint) = &quic_endpoint {
+        fail_endpoint_from_env(endpoint);
+    }
     if let (Some(_), Some(settings)) = (&quic_endpoint, &quic_settings) {
         super::TRANSPORT_METRICS.set_quic_flow_control_window_bytes(settings.window_bytes());
     }
@@ -495,6 +522,7 @@ fn build_quic_upgrades(
     local_key: TransportPublicKey,
     socket_addr: SocketAddr,
     time_source: &RealTime,
+    native_rate: super::quic::config::QuicRateLimit,
 ) -> Option<Arc<super::quic::upgrade::driver::QuicUpgrades>> {
     use super::quic::upgrade::driver::{PathClock, QuicUpgrades};
     let (endpoint, policy, _registrar) = (endpoint?, policy?, registrar?);
@@ -532,6 +560,7 @@ fn build_quic_upgrades(
         policy,
         local_key,
         path_clock,
+        native_rate,
         #[cfg(any(test, feature = "testing"))]
         trace,
     ))
@@ -568,24 +597,193 @@ pub(crate) async fn open_udp_transport<S: Socket>(
         outbound.quic_availability().get() == super::quic::liveness::QuicAvailability::Up,
         task_registrar.as_ref(),
     );
-    Ok(udp_transport_handle(outbound, inbound, listen_task))
+    // A supervised gateway exits for its supervisor to restart it when that
+    // restores QUIC (#5940): its endpoint died, or the crash-breaker
+    // cooldown that kept QUIC off for this run ended. With no UDP to fall
+    // back to (#6151) a supervised peer exits for an endpoint death too.
+    // Every other node keeps running over UDP.
+    let restart = gateway_quic_restart(
+        super::quic::liveness::restarts_for_quic(is_gateway),
+        super::quic::liveness::gateway_quic_restarts(is_gateway),
+        super::quic::liveness::gateway_supervisor_unverified(),
+        outbound.quic_availability(),
+        super::quic::breaker::quic_restore_at(),
+        std::time::SystemTime::now(),
+    );
+    Ok(udp_transport_handle(
+        outbound,
+        inbound,
+        listen_task,
+        restart,
+    ))
+}
+
+/// The variable [`fail_endpoint_from_env`] reads: seconds after the bind.
+#[cfg(feature = "testing")]
+const TEST_QUIC_ENDPOINT_DOWN_ENV: &str = "FREENET_TEST_QUIC_ENDPOINT_DOWN_AFTER_SECS";
+
+/// Kill `endpoint` [`TEST_QUIC_ENDPOINT_DOWN_ENV`] seconds from now, if set.
+#[cfg(feature = "testing")]
+fn fail_endpoint_from_env(endpoint: &super::quic::QuicEndpoint) {
+    let Some(secs) = std::env::var(TEST_QUIC_ENDPOINT_DOWN_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+    else {
+        return;
+    };
+    tracing::warn!(secs, "Test build: the QUIC endpoint will be failed");
+    let endpoint = endpoint.clone();
+    drop(GlobalExecutor::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(secs)).await;
+        endpoint.panic_adapter();
+    }));
+}
+
+/// The least time a gateway runs before it restarts at the end of a
+/// crash-breaker cooldown. Longer than the binary's startup update-check
+/// jitter (up to 60 s, `bin/freenet.rs`), so that check has run before the
+/// exit; the binary pins the ordering in a test. The exit code is 42 at any
+/// uptime (`node::p2p_impl::listener_exit_code`).
+#[doc(hidden)]
+pub const QUIC_RESTORE_MIN_UPTIME: Duration = Duration::from_secs(90);
+
+/// When a gateway exits to restore QUIC.
+#[derive(Debug, Default)]
+pub(crate) struct GatewayQuicRestartWatch {
+    /// The endpoint whose death ends the run.
+    pub endpoint: Option<super::quic::liveness::QuicAvailabilityWatch>,
+    /// How long until the breaker cooldown that kept QUIC off ends.
+    pub restore_after: Option<Duration>,
+}
+
+/// What the listener of this node watches to restore QUIC. `enabled` is the
+/// binary's switch (`liveness::gateway_quic_restarts`), `unverified` whether
+/// the binary runs under systemd without its own unit's marker
+/// (`liveness::gateway_supervisor_unverified`), `restore_at` the end of a
+/// cooldown that keeps QUIC off for this run (`breaker::quic_restore_at`).
+/// `None` for a peer and for a gateway without the switch, which logs a WARN
+/// when its supervisor is unverified and an ERROR when its QUIC stays off
+/// until it restarts. The endpoint is watched when it is up, and when it is
+/// already down at open (a death between the bind and here).
+fn gateway_quic_restart(
+    is_gateway: bool,
+    enabled: bool,
+    unverified: bool,
+    availability: super::quic::liveness::QuicAvailabilityWatch,
+    restore_at: Option<std::time::SystemTime>,
+    now: std::time::SystemTime,
+) -> Option<GatewayQuicRestartWatch> {
+    use super::quic::liveness::QuicAvailability;
+    if !is_gateway {
+        return None;
+    }
+    if !enabled && unverified {
+        tracing::warn!(
+            "This node runs under systemd, but its unit does not set FREENET_SUPERVISED=1, \
+             so it does not restart itself to restore QUIC: if its QUIC endpoint dies or a \
+             crash-breaker cooldown keeps QUIC off, it keeps running until it is restarted, \
+             over UDP while UDP exists and with no transport once it is gone. Set FREENET_SUPERVISED=1 in the unit if it restarts the node on exit \
+             code 42 (units written by `freenet service install` do)"
+        );
+    }
+    if !enabled {
+        if let Some(at) = restore_at {
+            tracing::error!(
+                cooldown_end = %chrono::DateTime::<chrono::Utc>::from(at).to_rfc3339(),
+                "QUIC is off on this gateway until it restarts: the crash-breaker cooldown \
+                 ends at the time shown, but this gateway is not run with \
+                 FREENET_SUPERVISED=1, so it does not restart itself. Restart it after that time \
+                 to turn QUIC back on"
+            );
+        }
+        return None;
+    }
+    let endpoint = matches!(
+        availability.get(),
+        QuicAvailability::Up | QuicAvailability::Down
+    )
+    .then_some(availability);
+    let restore_after = restore_at.map(|at| {
+        at.duration_since(now)
+            .unwrap_or(Duration::ZERO)
+            .max(QUIC_RESTORE_MIN_UPTIME)
+    });
+    (endpoint.is_some() || restore_after.is_some()).then_some(GatewayQuicRestartWatch {
+        endpoint,
+        restore_after,
+    })
 }
 
 /// Assemble the handle from the UDP transport's parts. Outbound connect and
 /// expected-inbound registration share one expected-IP set: the tracker is a
-/// view of the connector's set.
+/// view of the connector's set. With `restart`, the listener also ends when
+/// the gateway should restart to restore QUIC ([`listener_liveness`]).
 pub(crate) fn udp_transport_handle<S: Socket>(
     outbound: OutboundConnectionHandler<S>,
     inbound: InboundConnectionHandler<S>,
     listen_task: tokio::task::JoinHandle<TransportError>,
+    restart: Option<GatewayQuicRestartWatch>,
 ) -> super::TransportHandle {
     super::TransportHandle {
         quic_endpoint: outbound.quic_availability().get()
             != super::quic::liveness::QuicAvailability::Disabled,
+        quic_availability: outbound.quic_availability(),
         expected_inbound: Arc::new(outbound.expected_inbound_tracker()),
         connector: Arc::new(outbound),
         acceptor: Box::new(inbound),
-        listener: Box::pin(async move { super::ListenerExit::from_join(listen_task.await) }),
+        listener: Box::pin(listener_liveness(
+            listen_task,
+            restart,
+            super::quic::breaker::note_endpoint_down_exit,
+        )),
+    }
+}
+
+/// The transport's listener liveness: the listen task's end, or, with
+/// `restart`, the death of the watched QUIC endpoint
+/// ([`super::ListenerExit::QuicEndpointDown`]) or the end of the breaker
+/// cooldown ([`super::ListenerExit::QuicCooldownEnded`]), whichever comes
+/// first. A death ends it only once `record` noted it in the crash-loop
+/// breaker's marker (`breaker::note_endpoint_down_exit`), so the next start
+/// can count it; a death that cannot be noted leaves the node running.
+async fn listener_liveness(
+    mut listen_task: tokio::task::JoinHandle<TransportError>,
+    restart: Option<GatewayQuicRestartWatch>,
+    record: fn(std::time::SystemTime) -> bool,
+) -> super::ListenerExit {
+    let Some(GatewayQuicRestartWatch {
+        endpoint,
+        restore_after,
+    }) = restart
+    else {
+        return super::ListenerExit::from_join(listen_task.await);
+    };
+    // Resolves when the endpoint died and the exit is recorded in the
+    // crash-breaker marker. Unrecorded (the breaker overridden, or no marker
+    // to write), the next start could not count the exit, and a death that
+    // repeats at every start would restart the node without bound, so the
+    // node keeps running over UDP instead. `record` logs which case it is.
+    let died = async move {
+        match endpoint {
+            Some(availability) => availability.died().await,
+            None => std::future::pending().await,
+        }
+        if record(std::time::SystemTime::now()) {
+            return;
+        }
+        std::future::pending::<()>().await
+    };
+    let cooled = async move {
+        match restore_after {
+            // Only the binary enables this, so the clock is real here.
+            Some(after) => tokio::time::sleep(after).await,
+            None => std::future::pending().await,
+        }
+    };
+    crate::deterministic_select! {
+        ended = &mut listen_task => super::ListenerExit::from_join(ended),
+        () = died => super::ListenerExit::QuicEndpointDown,
+        () = cooled => super::ListenerExit::QuicCooldownEnded,
     }
 }
 
@@ -791,6 +989,7 @@ impl<S: Socket> OutboundConnectionHandler<S> {
             local_key,
             socket_addr,
             &time_source,
+            super::quic::config::QuicRateLimit::new(bandwidth_limit, global_bandwidth.clone()),
         );
         // With upgrades the router takes the queue; without them the listener
         // holds it, so the accept loop still has a live consumer.
@@ -1002,6 +1201,21 @@ impl<S: Socket> super::OutboundConnector for OutboundConnectionHandler<S> {
                 result.map(|conn| Box::new(conn) as Box<dyn super::PeerConnectionApi>)
             }));
             pending
+        })
+    }
+
+    fn connect_native(&self, dial: super::NativeDial) -> super::boundary::NativeConnectFuture<'_> {
+        let upgrades = self.upgrade_site.upgrades();
+        Box::pin(async move {
+            let Some(upgrades) = upgrades else {
+                super::TRANSPORT_METRICS
+                    .record_connect_native_setup(super::NativeSetupOutcome::Unavailable);
+                return Err(super::NativeSetupOutcome::Unavailable);
+            };
+            upgrades
+                .setup_native(dial)
+                .await
+                .map(|conn| Box::new(conn) as Box<dyn super::PeerConnectionApi>)
         })
     }
 }
@@ -1295,7 +1509,7 @@ struct UdpPacketsListener<S = UdpSocket, T: TimeSource = RealTime> {
     /// upgrades to route them to (`_quic_upgrades`): nothing allows a peer then,
     /// so no attempt is handed on. Each queued attempt would keep quinn's endpoint
     /// alive until drained or dropped.
-    _quic_attempts: Option<mpsc::Receiver<super::quic::QuicIncoming>>,
+    _quic_attempts: Option<mpsc::Receiver<super::quic::EndpointAttempt>>,
     /// The node's upgrades. Holds an endpoint share, and every connection holds
     /// these while it lives; the router and `upgrade_site` hold them weakly.
     _quic_upgrades: Option<Arc<super::quic::upgrade::driver::QuicUpgrades>>,
@@ -1702,6 +1916,10 @@ impl<S, T: TimeSource> ConnectionStateManager<S, T> {
     }
 
     /// Mark connection as closed. Only established connections enter the grace period.
+    #[allow(
+        clippy::collapsible_match,
+        reason = "the suggested match guard would move `result_sender` out of the pattern"
+    )]
     fn mark_closed(&mut self, addr: &SocketAddr) {
         match self.states.remove(addr) {
             Some(ConnectionState::Established { .. }) => {

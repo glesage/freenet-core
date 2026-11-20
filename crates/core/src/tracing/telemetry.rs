@@ -541,7 +541,7 @@ fn priority_for_event_type(event_type: &str) -> EventPriority {
 /// final `other` row, so the exported cardinality never depends on what a
 /// producer names its event. A non-zero `other` means an event type is
 /// missing from this list.
-pub(crate) const KNOWN_EVENT_TYPES: [&str; 75] = [
+pub(crate) const KNOWN_EVENT_TYPES: [&str; 78] = [
     // `event_kind_to_string`, in its order.
     "connect_start",
     "connect_connected",
@@ -618,6 +618,9 @@ pub(crate) const KNOWN_EVENT_TYPES: [&str; 75] = [
     "stranded_recovery",
     crate::ring::FLAG_TELEMETRY_EVENT,
     "join_versions",
+    "auto_update_state",
+    "quic_breaker_start",
+    "native_setup_outcome",
     // Must stay last.
     "other",
 ];
@@ -2687,6 +2690,7 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     expected_bytes,
                     direction,
                     tx_id,
+                    transport,
                     timestamp,
                 } => {
                     serde_json::json!({
@@ -2696,6 +2700,7 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                         "expected_bytes": expected_bytes,
                         "direction": format!("{:?}", direction),
                         "tx_id": tx_id.as_ref().map(|t| t.to_string()),
+                        "transport": transport.label(),
                         "timestamp": timestamp,
                     })
                 }
@@ -2715,6 +2720,7 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     min_rtt_ms,
                     peak_flightsize_bytes,
                     direction,
+                    transport,
                     timestamp,
                 } => {
                     serde_json::json!({
@@ -2734,6 +2740,7 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                         "min_rtt_ms": min_rtt_ms,
                         "peak_flightsize_bytes": peak_flightsize_bytes,
                         "direction": format!("{:?}", direction),
+                        "transport": transport.label(),
                         "timestamp": timestamp,
                     })
                 }
@@ -2744,6 +2751,7 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     reason,
                     elapsed_ms,
                     direction,
+                    transport,
                     timestamp,
                 } => {
                     serde_json::json!({
@@ -2754,6 +2762,7 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                         "reason": reason,
                         "elapsed_ms": elapsed_ms,
                         "direction": format!("{:?}", direction),
+                        "transport": transport.label(),
                         "timestamp": timestamp,
                     })
                 }
@@ -3092,6 +3101,42 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 serde_json::json!(snapshot.connect_native_decision_over_cap),
             );
             m.insert(
+                "connect_native_demotions".into(),
+                serde_json::json!(snapshot.connect_native_demotions),
+            );
+            m.insert(
+                "connect_native_rescued_by_udp_joiner".into(),
+                serde_json::json!(snapshot.connect_native_rescued_by_udp_joiner),
+            );
+            m.insert(
+                "connect_native_rescued_by_udp_acceptor".into(),
+                serde_json::json!(snapshot.connect_native_rescued_by_udp_acceptor),
+            );
+            m.insert(
+                "connect_native_fallback_connected_joiner".into(),
+                serde_json::json!(snapshot.connect_native_fallback_connected_joiner),
+            );
+            m.insert(
+                "connect_native_fallback_connected_acceptor".into(),
+                serde_json::json!(snapshot.connect_native_fallback_connected_acceptor),
+            );
+            m.insert(
+                "connect_native_both_dials_connected_udp_first".into(),
+                serde_json::json!(snapshot.connect_native_both_dials_connected_udp_first),
+            );
+            m.insert(
+                "connect_native_both_dials_connected_native_first".into(),
+                serde_json::json!(snapshot.connect_native_both_dials_connected_native_first),
+            );
+            m.insert(
+                "connect_native_survivor_swapped".into(),
+                serde_json::json!(snapshot.connect_native_survivor_swapped),
+            );
+            m.insert(
+                "connect_native_survivor_udp_dropped".into(),
+                serde_json::json!(snapshot.connect_native_survivor_udp_dropped),
+            );
+            m.insert(
                 "connect_native_offer_level".into(),
                 serde_json::json!(snapshot.connect_native_offer_level),
             );
@@ -3149,7 +3194,8 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
             );
             {
                 use crate::transport::metrics::{
-                    QuicCloseCode, QuicFallback, QuicPathAge, QuicUpgradeOutcome,
+                    NativeSetupOutcome, QuicCloseCode, QuicFallback, QuicPathAge,
+                    QuicUpgradeOutcome,
                 };
                 for (i, count) in snapshot.quic_close_received.iter().enumerate() {
                     let label = QuicCloseCode::ALL
@@ -3178,6 +3224,24 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 for (age, count) in QuicPathAge::ALL.iter().zip(snapshot.quic_path_age_at_close) {
                     m.insert(
                         format!("quic_path_age_at_close_{}", age.label()),
+                        count.into(),
+                    );
+                }
+                for (outcome, count) in NativeSetupOutcome::ALL
+                    .iter()
+                    .zip(snapshot.connect_native_setup)
+                {
+                    m.insert(
+                        format!("connect_native_setup_{}", outcome.label()),
+                        count.into(),
+                    );
+                }
+                for (outcome, count) in crate::transport::metrics::GatewayAdmission::ALL
+                    .iter()
+                    .zip(snapshot.quic_gateway_admission)
+                {
+                    m.insert(
+                        format!("quic_gateway_admission_{}", outcome.label()),
                         count.into(),
                     );
                 }
@@ -4199,6 +4263,10 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     ),
                     ("ring_connections", snapshot.ring_connections),
                     ("transient_connections", snapshot.transient_connections),
+                    (
+                        "transient_largest_source",
+                        snapshot.transient_largest_source,
+                    ),
                     ("connections_to_gateways", snapshot.connections_to_gateways),
                     ("relayed_gets_total", snapshot.relayed_gets_total),
                     ("relayed_puts_total", snapshot.relayed_puts_total),
@@ -4207,6 +4275,26 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                         snapshot.relayed_subscribes_total,
                     ),
                     ("relayed_updates_total", snapshot.relayed_updates_total),
+                    (
+                        "contract_lane_refused_client_total",
+                        snapshot.contract_lane_refused_client_total,
+                    ),
+                    (
+                        "contract_lane_refused_relay_total",
+                        snapshot.contract_lane_refused_relay_total,
+                    ),
+                    (
+                        "contract_lane_refused_background_total",
+                        snapshot.contract_lane_refused_background_total,
+                    ),
+                    (
+                        "relay_admission_refused_total",
+                        snapshot.relay_admission_refused_total,
+                    ),
+                    (
+                        "relay_get_overload_not_found_total",
+                        snapshot.relay_get_overload_not_found_total,
+                    ),
                     ("connect_accepts_emitted", snapshot.connect_accepts_emitted),
                     ("connect_rejects_emitted", snapshot.connect_rejects_emitted),
                     (
@@ -4224,6 +4312,14 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     (
                         "bootstrap_transient_expired",
                         snapshot.bootstrap_transient_expired,
+                    ),
+                    (
+                        "bootstrap_transient_source_refusals",
+                        snapshot.bootstrap_transient_source_refusals,
+                    ),
+                    (
+                        "bootstrap_transient_evictions",
+                        snapshot.bootstrap_transient_evictions,
                     ),
                     (
                         "bootstrap_promoted_to_ring",
@@ -4625,11 +4721,17 @@ mod tests {
         // = 147: measured 15342, still within this limit. Raised by #6001 for
         // the 149 counters of `tel_t` and `tel`: measured 18629. Raised for
         // the 4 `recv_ap` counters (already-applied skips): measured 18725.
-        const MAX_WORST_CASE_JSON_BYTES: usize = 18_816;
+        // Raised by #6151 for the `quic_breaker_start` row of `tel_t` (2
+        // counters, 42 bytes at u64::MAX): measured 18857. At #6151 the busy
+        // JSON block measured 6789, the empty one 2479, and the busy OTLP
+        // marginal 6865, all within their budgets.
+        const MAX_WORST_CASE_JSON_BYTES: usize = 19_072;
         // Raised from 2_048 by #5647 for the same 7 new counters, about 2 bytes
         // each in an all-zero block (a digit and a comma): measured 2057.
         // Raised again by #6001 for `tel_t` and `tel`: measured 2515.
-        const MAX_EMPTY_OTLP_MARGINAL_BYTES: usize = 2_560;
+        // Raised by #6151 for the `quic_breaker_start` row of `tel_t`
+        // (measured 2555 with that row, 5 bytes under the old 2_560).
+        const MAX_EMPTY_OTLP_MARGINAL_BYTES: usize = 2_816;
         // Raised from 5_120 (2026-08-07) to admit `ms_size` + `ms_unt_age`,
         // the two counters added for #5153. The budget exists to force this
         // arithmetic, not to forbid growth, so here it is:
@@ -4662,8 +4764,10 @@ mod tests {
         // MAX_WORST_CASE_JSON_BYTES (147 bytes at u64::MAX): measured 15414.
         // Raised by #6001 for `tel_t` and `tel`: measured 18703. Raised for the
         // `join_versions` row of `tel_t` (2 counters, 44 bytes at u64::MAX):
-        // measured 18845.
-        const MAX_WORST_OTLP_MARGINAL_BYTES: usize = 18_944;
+        // measured 18845. Raised by #6151 for the `quic_breaker_start` row
+        // (2 counters at u64::MAX): measured 18933, 11 bytes under the old
+        // 18_944.
+        const MAX_WORST_OTLP_MARGINAL_BYTES: usize = 19_200;
         const MAX_NULL_OTLP_MARGINAL_BYTES: usize = 64;
 
         let diagnostic = |value| crate::router::NetworkEfficiencyV1 {
@@ -5343,20 +5447,32 @@ mod tests {
             .expect("construct RouterSnapshotInfo for test");
         info.ring_connections = Some(21);
         info.transient_connections = Some(22);
+        info.transient_largest_source = Some(28);
         info.connections_to_gateways = Some(23);
         info.relayed_gets_total = Some(24);
         info.relayed_puts_total = Some(25);
         info.relayed_subscribes_total = Some(26);
         info.relayed_updates_total = Some(27);
+        info.contract_lane_refused_client_total = Some(28);
+        info.contract_lane_refused_relay_total = Some(29);
+        info.contract_lane_refused_background_total = Some(30);
+        info.relay_admission_refused_total = Some(31);
+        info.relay_get_overload_not_found_total = Some(32);
         let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
         for (key, want) in [
             ("ring_connections", 21),
             ("transient_connections", 22),
+            ("transient_largest_source", 28),
             ("connections_to_gateways", 23),
             ("relayed_gets_total", 24),
             ("relayed_puts_total", 25),
             ("relayed_subscribes_total", 26),
             ("relayed_updates_total", 27),
+            ("contract_lane_refused_client_total", 28),
+            ("contract_lane_refused_relay_total", 29),
+            ("contract_lane_refused_background_total", 30),
+            ("relay_admission_refused_total", 31),
+            ("relay_get_overload_not_found_total", 32),
         ] {
             assert_eq!(json[key], want, "{key} must reach the OTLP body");
         }
@@ -5388,6 +5504,8 @@ mod tests {
             .expect("construct RouterSnapshotInfo for test");
         info.bootstrap_transient_registered = Some(10);
         info.bootstrap_transient_expired = Some(9);
+        info.bootstrap_transient_source_refusals = Some(13);
+        info.bootstrap_transient_evictions = Some(14);
         info.bootstrap_promoted_to_ring = Some(1);
         info.bootstrap_time_to_min_connections_secs = Some(12.5);
         info.bootstrap_completed = Some(true);
@@ -5400,6 +5518,8 @@ mod tests {
         let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
         assert_eq!(json["bootstrap_transient_registered"], 10);
         assert_eq!(json["bootstrap_transient_expired"], 9);
+        assert_eq!(json["bootstrap_transient_source_refusals"], 13);
+        assert_eq!(json["bootstrap_transient_evictions"], 14);
         assert_eq!(json["bootstrap_promoted_to_ring"], 1);
         assert_eq!(json["bootstrap_time_to_min_connections_secs"], 12.5);
         assert_eq!(json["bootstrap_completed"], true);
@@ -6261,6 +6381,7 @@ mod tests {
             reason: "cwnd wait timeout".to_string(),
             elapsed_ms: 3000,
             direction: crate::tracing::TransferDirection::Send,
+            transport: crate::tracing::TransferTransport::Udp,
             timestamp: 1_700_000_000_000,
         });
         assert_eq!(event.event_type, "transfer_failed");
@@ -6269,6 +6390,59 @@ mod tests {
             "transfer events must be attributed to the emitting node's \
              own peer id (#4345)"
         );
+    }
+
+    /// `transfer_started`, `transfer_failed` and `transfer_completed` say which
+    /// transport carries the transfer, as `transport`: `udp` or `quic`.
+    #[test]
+    fn transfer_events_carry_their_transport() {
+        use crate::tracing::{TransferDirection, TransferEvent, TransferTransport};
+        let addr: std::net::SocketAddr = "127.0.0.1:31337".parse().unwrap();
+        for transport in [TransferTransport::Udp, TransferTransport::Quic] {
+            let failed = event_kind_to_json(&EventKind::Transfer(TransferEvent::Failed {
+                stream_id: 1,
+                peer_addr: addr,
+                bytes_transferred: 0,
+                reason: String::new(),
+                elapsed_ms: 0,
+                direction: TransferDirection::Send,
+                transport,
+                timestamp: 0,
+            }));
+            let completed = event_kind_to_json(&EventKind::Transfer(TransferEvent::Completed {
+                stream_id: 1,
+                peer_addr: addr,
+                bytes_transferred: 0,
+                elapsed_ms: 0,
+                avg_throughput_bps: 0,
+                peak_cwnd_bytes: None,
+                final_cwnd_bytes: None,
+                slowdowns_triggered: None,
+                final_srtt_ms: None,
+                final_ssthresh_bytes: None,
+                min_ssthresh_floor_bytes: None,
+                total_timeouts: None,
+                min_rtt_ms: None,
+                peak_flightsize_bytes: None,
+                direction: TransferDirection::Send,
+                transport,
+                timestamp: 0,
+            }));
+            let started = event_kind_to_json(&EventKind::Transfer(TransferEvent::Started {
+                stream_id: 1,
+                peer_addr: addr,
+                expected_bytes: 0,
+                direction: TransferDirection::Send,
+                tx_id: None,
+                transport,
+                timestamp: 0,
+            }));
+            for json in [started, failed, completed] {
+                assert_eq!(json["transport"], serde_json::json!(transport.label()));
+            }
+        }
+        assert_eq!(TransferTransport::Udp.label(), "udp");
+        assert_eq!(TransferTransport::Quic.label(), "quic");
     }
 
     #[test]
@@ -7338,7 +7512,7 @@ mod tests {
         // Exact count of call sites with a literal event type (production and
         // test). A new producer changes it: bump it deliberately after giving
         // the event its own `KNOWN_EVENT_TYPES` row.
-        const EXPECTED_LITERAL_STANDALONE_CALLS: usize = 17;
+        const EXPECTED_LITERAL_STANDALONE_CALLS: usize = 20;
         assert_eq!(
             literal_names.len(),
             EXPECTED_LITERAL_STANDALONE_CALLS,
@@ -7810,7 +7984,7 @@ mod tests {
         // The QUIC families are arrays in the snapshot and one key per label in
         // the event.
         use crate::transport::metrics::{
-            QuicCloseCode, QuicFallback, QuicPathAge, QuicUpgradeOutcome,
+            NativeSetupOutcome, QuicCloseCode, QuicFallback, QuicPathAge, QuicUpgradeOutcome,
         };
         for family in [
             "quic_close_received",
@@ -7819,6 +7993,8 @@ mod tests {
             "quic_churned_fallback",
             "quic_carried_fallback",
             "quic_path_age_at_close",
+            "connect_native_setup",
+            "quic_gateway_admission",
         ] {
             assert!(expected.remove(family), "{family} is in the snapshot");
         }
@@ -7853,6 +8029,16 @@ mod tests {
             QuicPathAge::ALL
                 .iter()
                 .map(|age| format!("quic_path_age_at_close_{}", age.label())),
+        );
+        expected.extend(
+            NativeSetupOutcome::ALL
+                .iter()
+                .map(|outcome| format!("connect_native_setup_{}", outcome.label())),
+        );
+        expected.extend(
+            crate::transport::metrics::GatewayAdmission::ALL
+                .iter()
+                .map(|outcome| format!("quic_gateway_admission_{}", outcome.label())),
         );
         let actual: std::collections::BTreeSet<String> = event_kind_to_json(
             &super::super::EventKind::TransportSnapshot(Box::new(snapshot)),
@@ -7928,8 +8114,13 @@ mod tests {
         data.carried_dark_episodes = (1087..1095).collect();
         data.ramp_share_pct = 1086;
         data.ack_wait_expired = (1095..1098).collect();
-        data.stall_closes = (1098..1103).collect();
-        data.stall_would_close = (1103..1108).collect();
+        data.stall_closes = (1098..1104).collect();
+        data.stall_would_close = (1115..1121).collect();
+        data.pipe_source = (1108..1112).collect();
+        data.pipe_dropped = (1112..1115).collect();
+        data.late_end = (1121..1124).collect();
+        data.path_srtt = (1124..1131).collect();
+        data.path_tx_bps = (1131..1137).collect();
         let want: std::collections::BTreeMap<String, u64> =
             snapshot.quic_data.keys().into_iter().collect();
         assert!(want.values().all(|value| *value != 0));
@@ -8117,6 +8308,7 @@ mod tests {
     fn transport_snapshot_json_carries_conn_identity_values() {
         let snapshot = crate::transport::metrics::TransportSnapshot {
             conn_identity_set_dialed: 61,
+            conn_identity_set_proven: 761,
             conn_identity_expected_inbound_bound: 62,
             conn_identity_expected_inbound_unbound: 80,
             conn_identity_set_connect_request: 63,
@@ -8150,6 +8342,7 @@ mod tests {
         )));
         for (key, expected) in [
             ("conn_identity_set_dialed", 61),
+            ("conn_identity_set_proven", 761),
             ("conn_identity_expected_inbound_bound", 62),
             ("conn_identity_expected_inbound_unbound", 80),
             ("conn_identity_set_connect_request", 63),
@@ -8240,7 +8433,7 @@ mod tests {
     #[test]
     fn transport_snapshot_json_carries_quic_upgrade_telemetry() {
         use crate::transport::metrics::{
-            QuicCloseCode, QuicFallback, QuicPathAge, QuicUpgradeOutcome,
+            NativeSetupOutcome, QuicCloseCode, QuicFallback, QuicPathAge, QuicUpgradeOutcome,
         };
         let mut snapshot = crate::transport::metrics::TransportSnapshot::default();
         let mut next = 0u64;
@@ -8256,6 +8449,8 @@ mod tests {
         fill(&mut snapshot.quic_churned_fallback);
         fill(&mut snapshot.quic_carried_fallback);
         fill(&mut snapshot.quic_path_age_at_close);
+        fill(&mut snapshot.connect_native_setup);
+        fill(&mut snapshot.quic_gateway_admission);
         snapshot.quic_establish_ms_p50 = Some(901);
         snapshot.quic_establish_ms_p90 = Some(902);
         snapshot.quic_establish_samples = 903;
@@ -8287,6 +8482,18 @@ mod tests {
         for (age, count) in QuicPathAge::ALL.iter().zip(snapshot.quic_path_age_at_close) {
             expected.push((format!("quic_path_age_at_close_{}", age.label()), count));
         }
+        for (outcome, count) in NativeSetupOutcome::ALL
+            .iter()
+            .zip(snapshot.connect_native_setup)
+        {
+            expected.push((format!("connect_native_setup_{}", outcome.label()), count));
+        }
+        for (outcome, count) in crate::transport::metrics::GatewayAdmission::ALL
+            .iter()
+            .zip(snapshot.quic_gateway_admission)
+        {
+            expected.push((format!("quic_gateway_admission_{}", outcome.label()), count));
+        }
         for (key, value) in [
             ("quic_establish_ms_p50", 901),
             ("quic_establish_ms_p90", 902),
@@ -8304,6 +8511,8 @@ mod tests {
                 + QuicUpgradeOutcome::COUNT
                 + 3 * QuicFallback::COUNT
                 + QuicPathAge::COUNT
+                + NativeSetupOutcome::COUNT
+                + crate::transport::metrics::GatewayAdmission::COUNT
                 + 6
         );
         for (key, value) in expected {

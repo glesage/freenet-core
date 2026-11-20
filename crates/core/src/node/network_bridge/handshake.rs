@@ -46,6 +46,12 @@ pub(crate) enum Event {
         peer: PeerKeyLocation,
         connection: Box<dyn PeerConnectionApi>,
         transient: bool,
+        /// The transport dialled: a native connection's key was proven in its
+        /// handshake.
+        transport: crate::operations::connect::native::DialTransport,
+        /// Who asked for the dial. Only a joiner's native successes reset
+        /// its demotion streak, as only its failures count toward it.
+        origin: crate::transport::NatAttemptOrigin,
     },
     /// An outbound connection attempt failed.
     OutboundFailed {
@@ -53,6 +59,14 @@ pub(crate) enum Event {
         peer: PeerKeyLocation,
         error: ConnectionError,
         transient: bool,
+        /// The transport dialled: a native failure is followed by a UDP dial,
+        /// so it records no backoff.
+        transport: crate::operations::connect::native::DialTransport,
+        /// How a native setup ended; `None` for a UDP dial.
+        native_outcome: Option<crate::transport::NativeSetupOutcome>,
+        /// Who asked for the dial. Only a joiner's native failures count
+        /// toward demotion.
+        origin: crate::transport::NatAttemptOrigin,
     },
 }
 
@@ -76,24 +90,34 @@ impl std::fmt::Debug for Event {
                 peer,
                 connection,
                 transient,
+                transport,
+                origin,
             } => f
                 .debug_struct("OutboundEstablished")
                 .field("transaction", transaction)
                 .field("peer", peer)
                 .field("remote_addr", &connection.remote_addr())
                 .field("transient", transient)
+                .field("transport", transport)
+                .field("origin", origin)
                 .finish(),
             Event::OutboundFailed {
                 transaction,
                 peer,
                 error,
                 transient,
+                transport,
+                native_outcome,
+                origin,
             } => f
                 .debug_struct("OutboundFailed")
                 .field("transaction", transaction)
                 .field("peer", peer)
                 .field("error", error)
                 .field("transient", transient)
+                .field("transport", transport)
+                .field("native_outcome", native_outcome)
+                .field("origin", origin)
                 .finish(),
         }
     }
@@ -119,6 +143,8 @@ pub(crate) enum Command {
         transient: bool,
         /// Why this dial is made (telemetry only).
         origin: crate::transport::NatAttemptOrigin,
+        /// Which transport to dial (`Native` from the connect op only).
+        transport: crate::operations::connect::native::DialTransport,
     },
     /// Register expectation for an inbound connection from `addr`, which the
     /// connect op is dialling under `peer_key`. A matched connection is
@@ -378,8 +404,8 @@ async fn run_driver(
         select! {
             _ = sweep_timer.tick() => expected_inbound.sweep(),
             command = commands_rx.recv() => match command {
-                Some(Command::Connect { peer, transaction, transient, origin }) => {
-                    spawn_outbound(outbound.clone(), events_tx.clone(), peer, transaction, transient, origin, peer_ready.clone());
+                Some(Command::Connect { peer, transaction, transient, origin, transport }) => {
+                    spawn_outbound(outbound.clone(), events_tx.clone(), OutboundDial { peer, transaction, transient, origin, transport }, peer_ready.clone());
                 }
                 Some(Command::ExpectInbound { addr, peer_key, transaction, transient }) => {
                     expected_inbound.register(addr, peer_key, transaction, transient);
@@ -492,25 +518,23 @@ async fn run_driver(
     }
 }
 
-fn spawn_outbound(
-    outbound: Arc<dyn OutboundConnector>,
-    events_tx: mpsc::Sender<Event>,
+/// One outbound connect the driver was asked for (`Command::Connect`).
+struct OutboundDial {
     peer: PeerKeyLocation,
     transaction: Transaction,
     transient: bool,
     origin: crate::transport::NatAttemptOrigin,
+    transport: crate::operations::connect::native::DialTransport,
+}
+
+fn spawn_outbound(
+    outbound: Arc<dyn OutboundConnector>,
+    events_tx: mpsc::Sender<Event>,
+    dial: OutboundDial,
     peer_ready: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) {
     GlobalExecutor::spawn(async move {
-        let event = connect_outbound(
-            &*outbound,
-            peer,
-            transaction,
-            transient,
-            origin,
-            peer_ready.as_deref(),
-        )
-        .await;
+        let event = connect_outbound(&*outbound, dial, peer_ready.as_deref()).await;
 
         // channel-safety: ok — this runs in a detached per-connection task
         // (GlobalExecutor::spawn), NOT on the event loop or the run_driver
@@ -532,21 +556,45 @@ const OUTBOUND_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// emits. Sets `peer_ready` only on success.
 async fn connect_outbound(
     outbound: &dyn OutboundConnector,
-    peer: PeerKeyLocation,
-    transaction: Transaction,
-    transient: bool,
-    origin: crate::transport::NatAttemptOrigin,
+    dial: OutboundDial,
     peer_ready: Option<&std::sync::atomic::AtomicBool>,
 ) -> Event {
+    let OutboundDial {
+        peer,
+        transaction,
+        transient,
+        origin,
+        transport,
+    } = dial;
     let addr = peer
         .socket_addr()
         .expect("Connect requires known peer address");
-    let connect_future = outbound.connect(peer.pub_key.clone(), addr, origin).await;
-    let result: Result<Box<dyn PeerConnectionApi>, ConnectionError> =
-        match tokio::time::timeout(OUTBOUND_CONNECT_TIMEOUT, connect_future).await {
-            Ok(res) => res.map_err(|err| err.into()),
-            Err(_) => Err(ConnectionError::Timeout),
-        };
+    let mut native_outcome = None;
+    let result: Result<Box<dyn PeerConnectionApi>, ConnectionError> = match transport {
+        crate::operations::connect::native::DialTransport::Udp => {
+            let connect_future = outbound.connect(peer.pub_key.clone(), addr, origin).await;
+            match tokio::time::timeout(OUTBOUND_CONNECT_TIMEOUT, connect_future).await {
+                Ok(res) => res.map_err(|err| err.into()),
+                Err(_) => Err(ConnectionError::Timeout),
+            }
+        }
+        crate::operations::connect::native::DialTransport::Native { deadline } => {
+            let dial = crate::transport::NativeDial {
+                addr,
+                key: peer.pub_key.clone(),
+                is_gateway: matches!(origin, crate::transport::NatAttemptOrigin::Gateway),
+                // What is left of the dial's deadline now, as the setup starts.
+                within: deadline.saturating_duration_since(tokio::time::Instant::now()),
+            };
+            // Not a transport failure for the address: the connect op falls
+            // back to a UDP dial at its fallback time, which decides that.
+            outbound.connect_native(dial).await.map_err(|outcome| {
+                tracing::debug!(%addr, label = outcome.label(), "native dial gave no connection");
+                native_outcome = Some(outcome);
+                ConnectionError::FailedConnectOp
+            })
+        }
+    };
 
     // Only mark peer as ready after a successful connection
     if result.is_ok() {
@@ -561,12 +609,17 @@ async fn connect_outbound(
             peer,
             connection,
             transient,
+            transport,
+            origin,
         },
         Err(error) => Event::OutboundFailed {
             transaction,
             peer,
             error,
             transient,
+            transport,
+            native_outcome,
+            origin,
         },
     }
 }
@@ -670,6 +723,7 @@ mod tests {
             enqueue: Duration::ZERO,
             handshake: Handshake::Succeeds,
             origins: Default::default(),
+            native_dials: Default::default(),
         });
         let driver = GlobalExecutor::spawn(run_driver(
             Box::new(ChannelAcceptor(conn_rx)),
@@ -685,6 +739,7 @@ mod tests {
                 transaction: Transaction::new::<ConnectMsg>(),
                 transient: false,
                 origin: crate::transport::NatAttemptOrigin::Gateway,
+                transport: crate::operations::connect::native::DialTransport::Udp,
             })
             .await
             .unwrap();
@@ -715,6 +770,7 @@ mod tests {
                 enqueue: Duration::ZERO,
                 handshake: Handshake::Hangs,
                 origins: Default::default(),
+                native_dials: Default::default(),
             }),
             cmd_rx,
             event_tx,
@@ -809,6 +865,8 @@ mod tests {
         handshake: Handshake,
         /// The origin each `connect` was called with.
         origins: parking_lot::Mutex<Vec<crate::transport::NatAttemptOrigin>>,
+        /// Each native dial `connect_native` was called with.
+        native_dials: parking_lot::Mutex<Vec<crate::transport::NativeDial>>,
     }
 
     impl OutboundConnector for ScriptedConnector {
@@ -840,6 +898,14 @@ mod tests {
                 pending
             })
         }
+
+        fn connect_native(
+            &self,
+            dial: crate::transport::NativeDial,
+        ) -> crate::transport::NativeConnectFuture<'_> {
+            self.native_dials.lock().push(dial);
+            Box::pin(async { Err(crate::transport::NativeSetupOutcome::Unavailable) })
+        }
     }
 
     struct ConnectRun {
@@ -863,6 +929,7 @@ mod tests {
             enqueue,
             handshake,
             origins: Default::default(),
+            native_dials: Default::default(),
         };
         let ready = std::sync::atomic::AtomicBool::new(false);
         let peer = make_peer(4200);
@@ -870,10 +937,13 @@ mod tests {
         let start = tokio::time::Instant::now();
         let event = connect_outbound(
             &connector,
-            peer.clone(),
-            transaction,
-            true,
-            RUN_ORIGIN,
+            super::OutboundDial {
+                peer: peer.clone(),
+                transaction,
+                transient: true,
+                origin: RUN_ORIGIN,
+                transport: crate::operations::connect::native::DialTransport::Udp,
+            },
             Some(&ready),
         )
         .await;
@@ -887,6 +957,40 @@ mod tests {
         }
     }
 
+    /// A native dial hands the setup what is left of its deadline when the
+    /// setup starts (10.2 items 11 and 12): the time the dial took to get
+    /// here comes out of the window.
+    #[tokio::test(start_paused = true)]
+    async fn a_native_dial_hands_the_setup_what_is_left_of_its_deadline() {
+        let connector = ScriptedConnector {
+            enqueue: Duration::ZERO,
+            handshake: Handshake::Succeeds,
+            origins: Default::default(),
+            native_dials: Default::default(),
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(7);
+        // The dial waited 2 s on its way to the transport.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let peer = make_peer(4201);
+        let event = connect_outbound(
+            &connector,
+            super::OutboundDial {
+                peer: peer.clone(),
+                transaction: Transaction::new::<ConnectMsg>(),
+                transient: false,
+                origin: crate::transport::NatAttemptOrigin::ConnectJoiner,
+                transport: crate::operations::connect::native::DialTransport::Native { deadline },
+            },
+            None,
+        )
+        .await;
+        assert!(matches!(event, Event::OutboundFailed { .. }));
+        let dials = connector.native_dials.lock();
+        assert_eq!(dials.len(), 1, "one native dial");
+        assert_eq!(dials[0].within, Duration::from_secs(5));
+        assert_eq!(Some(dials[0].addr), peer.socket_addr());
+    }
+
     /// A completed handshake becomes `OutboundEstablished` carrying the peer,
     /// transaction and transient flag, and marks the peer ready.
     #[tokio::test(start_paused = true)]
@@ -897,6 +1001,8 @@ mod tests {
             peer,
             connection,
             transient,
+            transport: _,
+            origin,
         } = run.event
         else {
             panic!("expected OutboundEstablished, got {:?}", run.event);
@@ -906,6 +1012,7 @@ mod tests {
         assert_eq!(connection.remote_addr(), run.peer.socket_addr().unwrap());
         assert!(transient);
         assert!(run.ready, "a successful connect marks the peer ready");
+        assert_eq!(origin, RUN_ORIGIN, "the event carries the dial's origin");
         assert_eq!(
             run.origins,
             vec![RUN_ORIGIN],
@@ -923,6 +1030,9 @@ mod tests {
             peer,
             error,
             transient,
+            transport: _,
+            native_outcome: _,
+            origin: _,
         } = run.event
         else {
             panic!("expected OutboundFailed, got {:?}", run.event);
@@ -1033,6 +1143,7 @@ mod tests {
                 enqueue: Duration::ZERO,
                 handshake: Handshake::Hangs,
                 origins: Default::default(),
+                native_dials: Default::default(),
             }),
             cmd_rx,
             event_tx,

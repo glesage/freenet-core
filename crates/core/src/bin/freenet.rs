@@ -258,10 +258,33 @@ async fn run_network(config: Config) -> anyhow::Result<()> {
     // update-check task so an operator opt-out (#4690) can park it.
     let disable_auto_update = config.disable_auto_update;
 
-    // The QUIC crash-loop breaker (#5940): if a run with QUIC enabled ended
-    // abnormally, QUIC stays off for a cooldown. Enabled here, before the node
+    // The updater's state as of this start, for the `auto_update_state`
+    // telemetry event (#5975). Recorded before the node is built, which is
+    // where the event is sent.
+    if let Some(dir) = commands::auto_update::state_dir() {
+        freenet::set_auto_update_state(commands::auto_update::update_state_summary_at(
+            &dir,
+            std::time::SystemTime::now(),
+            auto_update_is_disabled(build_info::GIT_DIRTY, disable_auto_update),
+        ));
+    }
+
+    // The QUIC crash-loop breaker (#5940): if runs with QUIC enabled keep
+    // ending in a QUIC fault, QUIC stays off for a cooldown. Enabled here, before the node
     // is built, because only this binary marks its clean exits (see `main`).
     freenet::enable_quic_crash_breaker();
+
+    // #5940: a gateway exits through the fatal listener path, for its
+    // supervisor to restart it, when that restores QUIC: its QUIC endpoint
+    // died, or a crash-breaker cooldown that kept QUIC off for the run ended.
+    // Only under our own unit's marker: a gateway started by hand, or by a
+    // systemd unit that may not restart it, would stay down, so it keeps
+    // running over UDP instead. Peers never exit for this.
+    match gateway_quic_restarts(commands::auto_update::supervisor_status()) {
+        GatewayQuicRestarts::Enabled => freenet::enable_gateway_quic_restarts(),
+        GatewayQuicRestarts::OffUnverified => freenet::note_gateway_supervisor_unverified(),
+        GatewayQuicRestarts::Off => {}
+    }
 
     let node_config = NodeConfig::new(config)
         .await
@@ -386,9 +409,13 @@ async fn run_network_node_with_signals(
     let commit_probation_task = {
         let version = build_info::VERSION.to_string();
         GlobalExecutor::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(
-                commands::rollback::COMMIT_HEALTHY_UPTIME_SECS,
-            ))
+            // #6151: a start the QUIC crash-loop breaker backed off does not
+            // count the wait, with the transport closed, as healthy uptime:
+            // the window starts again once the transport can open.
+            wait_for_healthy_window(
+                std::time::Duration::from_secs(commands::rollback::COMMIT_HEALTHY_UPTIME_SECS),
+                freenet::wait_for_quic_transport_open,
+            )
             .await;
             // `spawn_blocking`, not a direct call: `commit_probation` does
             // synchronous filesystem work (`read_to_string`, `remove_file`) and
@@ -607,7 +634,13 @@ async fn run_network_node_with_signals(
                 "Startup update check skipped: {reason}. Run `freenet update` to update now."
             );
         }
-        let startup_jitter_secs = freenet::config::GlobalRng::random_u64() % 60;
+        // #6151: a node the crash-loop breaker found in a QUIC crash loop,
+        // with no UDP to fall back to, checks within seconds: it is broken, and a
+        // fixed release is what ends the loop. The claim below still applies.
+        let startup_jitter_secs = startup_update_jitter_secs(
+            freenet::quic_crash_loop_update_now(),
+            freenet::config::GlobalRng::random_u64(),
+        );
         // `startup_check_ran` is true only if the claim, made after the
         // jitter, allowed the check.
         let (startup_check_ran, latest) = match startup_attempt {
@@ -1238,6 +1271,70 @@ async fn run_network_node_with_signals(
     }
 
     result
+}
+
+/// The startup update check waits a random 0 to this many seconds first
+/// (thundering-herd jitter). A gateway's QUIC restore restart waits longer
+/// (`freenet::QUIC_RESTORE_MIN_UPTIME`).
+const STARTUP_UPDATE_JITTER_MAX_SECS: u64 = 60;
+
+/// Whether a gateway may exit to restore QUIC (#5940).
+#[derive(Debug, PartialEq, Eq)]
+enum GatewayQuicRestarts {
+    /// Our own unit's marker (`FREENET_SUPERVISED`): it restarts the node.
+    Enabled,
+    /// systemd without our marker: it may not restart the node (a
+    /// `systemd-run` command, `Restart=no`), so off, with a WARN.
+    OffUnverified,
+    /// No supervisor.
+    Off,
+}
+
+/// Only a supervisor known to restart the node turns gateway restarts on.
+fn gateway_quic_restarts(status: commands::auto_update::SupervisorStatus) -> GatewayQuicRestarts {
+    use commands::auto_update::SupervisorStatus;
+    match status {
+        SupervisorStatus::Supervised => GatewayQuicRestarts::Enabled,
+        SupervisorStatus::SupervisedUnverified => GatewayQuicRestarts::OffUnverified,
+        SupervisorStatus::Unsupervised => GatewayQuicRestarts::Off,
+    }
+}
+
+/// Sleep `window`, then, if `wait_for_open` had to wait for the transport to
+/// open (a QUIC crash-loop backoff, #6151), sleep a whole `window` again, until
+/// it has not. The update probation commits after this, so the backoff's wait
+/// with the transport closed never counts as healthy uptime.
+// No upper bound on purpose: if a backoff flag were ever left pending, this
+// keeps the rollback armed rather than committing a probation for a node whose
+// transport never opened, which is the failure the wait exists to prevent.
+async fn wait_for_healthy_window<Fut: std::future::Future<Output = bool>>(
+    window: std::time::Duration,
+    wait_for_open: impl Fn() -> Fut,
+) {
+    loop {
+        tokio::time::sleep(window).await;
+        if !wait_for_open().await {
+            break;
+        }
+    }
+}
+
+/// The startup update check's jitter when the QUIC crash-loop breaker found
+/// this start in a crash loop with no UDP to fall back to (#6151): short, so
+/// the check is still prompt, but a fleet that crashes together does not send
+/// its checks to GitHub at the same second (peers behind one NAT share its
+/// unauthenticated rate limit).
+const CRASH_LOOP_UPDATE_JITTER_MAX_SECS: u64 = 5;
+
+/// The startup update check's jitter: under [`CRASH_LOOP_UPDATE_JITTER_MAX_SECS`]
+/// when the QUIC crash-loop breaker found this start in a crash loop with no
+/// UDP to fall back to (#6151), otherwise `random` reduced to under [`STARTUP_UPDATE_JITTER_MAX_SECS`].
+fn startup_update_jitter_secs(crash_loop: bool, random: u64) -> u64 {
+    if crash_loop {
+        random % CRASH_LOOP_UPDATE_JITTER_MAX_SECS
+    } else {
+        random % STARTUP_UPDATE_JITTER_MAX_SECS
+    }
 }
 
 /// Whether a finished run (after [`finish_run`]) ended cleanly for the QUIC
@@ -2020,6 +2117,227 @@ fn main() {
 mod tests {
     #[cfg(target_os = "linux")]
     use super::parse_listening_inode;
+
+    /// #5940: only our own unit's marker turns gateway restarts on; systemd
+    /// alone (`INVOCATION_ID`) leaves them off, with a WARN.
+    #[test]
+    fn gateway_quic_restarts_need_our_supervisor_marker() {
+        use super::commands::auto_update::SupervisorStatus;
+        use super::{GatewayQuicRestarts, gateway_quic_restarts};
+        assert_eq!(
+            gateway_quic_restarts(SupervisorStatus::Supervised),
+            GatewayQuicRestarts::Enabled
+        );
+        assert_eq!(
+            gateway_quic_restarts(SupervisorStatus::SupervisedUnverified),
+            GatewayQuicRestarts::OffUnverified
+        );
+        assert_eq!(
+            gateway_quic_restarts(SupervisorStatus::Unsupervised),
+            GatewayQuicRestarts::Off
+        );
+    }
+
+    /// #6151: the startup update check skips its jitter only in a QUIC crash
+    /// loop with no UDP to fall back to, and the update task takes its jitter
+    /// from that decision.
+    #[test]
+    fn a_crash_loop_checks_for_an_update_at_once() {
+        assert_eq!(super::startup_update_jitter_secs(true, 0), 0);
+        assert_eq!(super::startup_update_jitter_secs(true, 3), 3);
+        assert_eq!(super::startup_update_jitter_secs(true, 5), 0);
+        assert!(super::startup_update_jitter_secs(true, u64::MAX) < 5);
+        assert_eq!(super::startup_update_jitter_secs(false, 59), 59);
+        assert_eq!(
+            super::startup_update_jitter_secs(false, 60 + 7),
+            7,
+            "under the cap"
+        );
+        let src = include_str!("freenet.rs");
+        let task = fn_body(src, "async fn run_network_node_with_signals(");
+        let squeezed: String = task.split_whitespace().collect();
+        assert!(
+            squeezed.contains(
+                "letstartup_jitter_secs=startup_update_jitter_secs(freenet::quic_crash_loop_update_now(),freenet::config::GlobalRng::random_u64(),);"
+            ),
+            "the startup check takes its jitter from the crash-loop decision"
+        );
+    }
+
+    /// #6151: the breaker and the post-update crash-loop rollback are ordered,
+    /// with and without UDP, and both orders are asserted whatever
+    /// `UDP_FALLBACK` is, so flipping it cannot make this vacuous. Each run the
+    /// breaker counts ended in a crash the rollback also counts (a release
+    /// whose crashes are all QUIC panics; the rollback also counts unrelated
+    /// crashes, which the breaker does not, so one of those lets the rollback
+    /// act first).
+    ///
+    /// With UDP, a peer's breaker trips, and the peer falls back to UDP,
+    /// while the rollback's count is still short of its threshold: the start
+    /// that trips runs with QUIC off, so it adds no QUIC crash.
+    ///
+    /// With no UDP, the rollback acts first: the run that makes the breaker
+    /// back off ends in the crash that brings the rollback's count to its
+    /// threshold, and that happens before the next start, which is where
+    /// the backoff begins. A rollback is then the better outcome than a longer
+    /// wait. If the breaker needed fewer short runs than the rollback needs
+    /// crashes, the backoff would come first and this fails.
+    #[test]
+    fn the_breaker_and_the_crash_loop_rollback_are_ordered_with_and_without_udp() {
+        let with_udp = freenet::quic_breaker_short_runs_to_trip(false, true);
+        assert!(with_udp >= 1);
+        assert!(
+            !crate::commands::rollback::should_rollback(with_udp),
+            "the rollback would act at {with_udp} crashes, no later than the peer breaker"
+        );
+        for is_gateway in [false, true] {
+            let without_udp = freenet::quic_breaker_short_runs_to_trip(is_gateway, false);
+            assert!(
+                crate::commands::rollback::should_rollback(without_udp),
+                "with no UDP the backoff (gateway: {is_gateway}) begins after {without_udp} \
+                 crashes, but the rollback needs {}: the backoff would come first",
+                crate::commands::rollback::ROLLBACK_CRASH_THRESHOLD
+            );
+        }
+        assert!(crate::commands::rollback::should_rollback(
+            crate::commands::rollback::ROLLBACK_CRASH_THRESHOLD
+        ));
+    }
+
+    /// #6151: the update probation does not commit while a crash-loop backoff
+    /// holds the transport closed, and commits one window after it opens.
+    /// Counting the wait as healthy uptime would clear the probation marker
+    /// (and with it any rollback that is retrying, see
+    /// `commands::rollback`'s `a_rollback_that_could_not_run_is_retried_by_a_later_crash`).
+    #[tokio::test(start_paused = true)]
+    async fn a_backed_off_start_does_not_commit_the_probation_until_the_transport_opens() {
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+        let window = std::time::Duration::from_secs(60);
+        let committed = std::sync::Arc::new(AtomicBool::new(false));
+        let waits = std::sync::Arc::new(AtomicU32::new(0));
+        let backoff_over = std::sync::Arc::new(tokio::sync::Notify::new());
+        // The backoff wait: the first call waits (as the transport's 60 s
+        // wait does) for `backoff_over`, later calls find nothing pending.
+        let task = {
+            let (committed, waits, backoff_over) =
+                (committed.clone(), waits.clone(), backoff_over.clone());
+            tokio::spawn(async move {
+                super::wait_for_healthy_window(window, || {
+                    let (waits, backoff_over) = (waits.clone(), backoff_over.clone());
+                    async move {
+                        if waits.fetch_add(1, Ordering::SeqCst) == 0 {
+                            backoff_over.notified().await;
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                })
+                .await;
+                committed.store(true, Ordering::SeqCst);
+            })
+        };
+        // Far past the window, with the backoff still running.
+        tokio::time::sleep(window * 10).await;
+        assert!(
+            !committed.load(Ordering::SeqCst),
+            "the backoff's wait counted as healthy uptime"
+        );
+        backoff_over.notify_one();
+        tokio::time::sleep(window - std::time::Duration::from_secs(1)).await;
+        assert!(
+            !committed.load(Ordering::SeqCst),
+            "the window did not start again at the end of the wait"
+        );
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        task.await.unwrap();
+        assert!(committed.load(Ordering::SeqCst));
+        // A start with no backoff commits after one window, as before.
+        let start = tokio::time::Instant::now();
+        super::wait_for_healthy_window(window, || async { false }).await;
+        assert_eq!(start.elapsed(), window);
+    }
+
+    /// The commit task waits through `wait_for_healthy_window` and the
+    /// library's transport-open signal; reverting it to a bare sleep, which
+    /// counts a backoff's wait as uptime, fails this.
+    #[test]
+    fn the_probation_commit_task_waits_for_the_transport() {
+        let src = include_str!("freenet.rs");
+        let task = fn_body(src, "async fn run_network_node_with_signals(");
+        let squeezed: String = task.split_whitespace().collect();
+        assert!(
+            squeezed.contains(
+                "wait_for_healthy_window(std::time::Duration::from_secs(commands::rollback::COMMIT_HEALTHY_UPTIME_SECS),freenet::wait_for_quic_transport_open,).await;"
+            ),
+            "the probation commit must not run while the transport is closed"
+        );
+    }
+
+    /// #5940: a gateway's restarts to restore QUIC stay under the start
+    /// limit of the units `freenet service install` writes, which counts
+    /// every start, exit 42 included, and the first start too. In any window
+    /// of that length the starts are at most: one start, the free restarts
+    /// after the first `ENDPOINT_DOWN_EXITS_TO_TRIP - 1` endpoint deaths, the
+    /// start the next death trips, and one cooldown-end restart. Only one
+    /// fits: every gateway cooldown is longer than the window, and the
+    /// `QUIC_RESTORE_MIN_UPTIME` floor shortens only the wait for a cooldown
+    /// already nearly over when the node started.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gateway_quic_restarts_stay_under_the_unit_start_limit() {
+        let units = [
+            super::commands::service::generate_user_service_file(
+                std::path::Path::new("/usr/bin/freenet"),
+                std::path::Path::new("/tmp/logs"),
+            ),
+            super::commands::service::generate_system_service_file(
+                std::path::Path::new("/usr/bin/freenet"),
+                std::path::Path::new("/tmp/logs"),
+                "freenet",
+                std::path::Path::new("/home/freenet"),
+            ),
+        ];
+        for unit in units {
+            let value = |key: &str| -> u64 {
+                unit.lines()
+                    .find_map(|line| line.strip_prefix(key)?.strip_prefix('='))
+                    .unwrap_or_else(|| panic!("{key} in the unit"))
+                    .trim()
+                    .parse()
+                    .unwrap()
+            };
+            let burst = value("StartLimitBurst");
+            let interval = value("StartLimitIntervalSec");
+            assert!(unit.contains("Environment=FREENET_SUPERVISED=1"));
+            assert!(
+                freenet::GATEWAY_QUIC_BREAKER_COOLDOWN.as_secs() > interval,
+                "one cooldown-end restart per window"
+            );
+            let initial_start = 1;
+            let free_restarts = freenet::ENDPOINT_DOWN_EXITS_TO_TRIP as u64 - 1;
+            let tripping_start = 1;
+            let cooldown_end_restarts = 1;
+            let worst_starts =
+                initial_start + free_restarts + tripping_start + cooldown_end_restarts;
+            assert!(
+                worst_starts < burst,
+                "{worst_starts} restarts in {interval} s against a limit of {burst}"
+            );
+        }
+    }
+
+    /// #5940: a gateway's restart at the end of a breaker cooldown comes at
+    /// least `QUIC_RESTORE_MIN_UPTIME` after the start, which must be later
+    /// than the startup update check, so the restart never pre-empts it.
+    #[test]
+    fn the_quic_restore_floor_follows_the_startup_update_check() {
+        assert!(
+            freenet::QUIC_RESTORE_MIN_UPTIME
+                > std::time::Duration::from_secs(super::STARTUP_UPDATE_JITTER_MAX_SECS + 20),
+            "the floor leaves time for the check after the longest jitter"
+        );
+    }
 
     /// #5227 truth table for the process exit code. The end-to-end proof is
     /// `tests/graceful_shutdown_exit_code.rs` (it asserts the real process's
@@ -3107,6 +3425,31 @@ mod tests {
             .map(|line| line.split_once("//").map(|(code, _)| code).unwrap_or(line))
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// #5975: `run_network` records the updater's state BEFORE the node is
+    /// built, because the node sends it as the `auto_update_state` event while
+    /// it is built. Deleting the call, or moving it after `.build(`, silently
+    /// ends the report.
+    #[test]
+    fn run_network_records_the_update_state_before_building_the_node() {
+        let src = strip_line_comments(include_str!("freenet.rs"));
+        let body = fn_body(&src, "async fn run_network(");
+        let record = body
+            .find("freenet::set_auto_update_state(")
+            .expect("run_network no longer records the auto-update state (#5975)");
+        let build = body
+            .find(".build(clients)")
+            .expect("could not locate the node build in run_network");
+        assert!(
+            record < build,
+            "the auto-update state must be recorded before the node is built (#5975)"
+        );
+        let call = &body[record..build];
+        assert!(
+            call.contains("update_state_summary_at("),
+            "the recorded value must be the updater's summary (#5975)"
+        );
     }
 
     /// Source-scrape pin for issue #4580: the exit-42 handler in `main()` MUST

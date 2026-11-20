@@ -29,13 +29,25 @@ mod node;
 pub use node::{
     EventLoopExitReason, Node, ShutdownHandle, enable_abort_on_fatal_listener_exit,
     enable_abort_on_redb_poison, enable_fast_crash_exit_code, listener_exit_is_graceful,
-    run_local_node, run_local_node_with_listener, run_network_node,
+    run_local_node, run_local_node_with_listener, run_network_node, set_auto_update_state,
+};
+#[doc(hidden)]
+pub use transport::connection_handler::QUIC_RESTORE_MIN_UPTIME;
+#[doc(hidden)]
+pub use transport::quic::breaker::{
+    ENDPOINT_DOWN_EXITS_TO_TRIP, GATEWAY_QUIC_BREAKER_COOLDOWN, PEER_SHORT_RUNS_TO_TRIP_WITH_UDP,
+    UDP_FALLBACK as QUIC_BREAKER_UDP_FALLBACK,
+    short_runs_to_trip as quic_breaker_short_runs_to_trip,
 };
 pub use transport::quic::breaker::{
     STOP_NOTE_ENV_VAR as QUIC_BREAKER_STOP_NOTE_ENV_VAR,
     STOP_NOTE_FILE as QUIC_BREAKER_STOP_NOTE_FILE, enable_quic_crash_breaker,
-    quic_breaker_clean_exit, quic_breaker_signals_ready,
+    quic_breaker_clean_exit, quic_breaker_signals_ready, quic_crash_loop_update_now,
     record_deliberate_stop as record_quic_breaker_deliberate_stop,
+    wait_for_transport_open as wait_for_quic_transport_open,
+};
+pub use transport::quic::liveness::{
+    enable_gateway_quic_restarts, note_gateway_supervisor_unverified,
 };
 
 /// Network operation/transaction state machines.
@@ -78,6 +90,13 @@ pub mod simulation;
 #[cfg(test)]
 #[path = "../build/git_watch.rs"]
 mod build_git_watch;
+
+/// `build.rs`'s choice of commit and dirty flag, including the
+/// `.cargo_vcs_info.json` of a crates.io package, tested here for the same
+/// reason.
+#[cfg(test)]
+#[path = "../build/vcs_info.rs"]
+mod build_vcs_info;
 
 /// Pin the process-start anchor used by the bootstrap-latency metric
 /// (`freenet.bootstrap.time_to_min_connections_seconds`, issue #4787).
@@ -152,6 +171,20 @@ pub mod dev_tool {
                 .collect()
         }
     }
+    /// Simulation hook for ANT-2026-K0YQ8CG4: make chosen nodes' contract
+    /// handlers refuse every relay query, as a full relay lane does.
+    /// Process-global: a test that uses it must run in its own process.
+    #[cfg(any(test, feature = "testing"))]
+    pub mod sim_relay_overload {
+        /// Treat the node at `addr` as having a full relay lane.
+        pub fn saturate(addr: std::net::SocketAddr) {
+            crate::operations::relay_admission::sim_overload::saturate(addr);
+        }
+        /// Undo every `saturate`.
+        pub fn clear() {
+            crate::operations::relay_admission::sim_overload::clear();
+        }
+    }
     pub use crate::config::{
         Config, GlobalTestMetrics, KEK_SIZE, KekBackend, KekBackendKind, KekError, Secrets,
         ensure_kek_loaded, load_from_backend, read_backend_marker, replace_backend_marker,
@@ -175,6 +208,7 @@ pub mod dev_tool {
     };
     pub use flatbuffers;
     pub use message::Transaction;
+    pub use node::testing_impl::SimNat;
     pub use node::{
         InitPeerNode, NetworkStats, NodeConfig, PeerId,
         testing_impl::{
@@ -188,6 +222,7 @@ pub mod dev_tool {
         },
     };
     pub use ring::Location;
+    pub use transport::nat_model::NatFiltering;
     pub use transport::{TransportKeypair, TransportPublicKey};
 
     // Nearest-neighbor ring lattice (successor+predecessor base edges). Always

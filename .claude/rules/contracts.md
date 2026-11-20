@@ -147,17 +147,29 @@ migration is done.
 
 ### WASM Call Modes
 
-All three guest entry points share ONE body, `call_typed_blocking` in
-`engine/wasmtime_engine.rs`. Delegates ran "sync, on the calling thread" until
-#5480; they no longer do, and nothing should reintroduce a per-entry-point copy.
+All guest entry points, including the allocator export and instance setup
+(module start function and `__frnt_set_id`), run under the wall-clock backstop
+and panic capture: on a blocking-pool thread (a plain thread on a
+`current_thread` runtime), with a host-side panic returned as an `Err`. The
+typed calls share ONE body, `call_typed_blocking` in
+`engine/wasmtime_engine.rs`; instance setup runs as one job of its own, whose
+wall-clock bound allows each of its two entries its own budget. Nothing should
+reintroduce a per-entry-point copy or an inline guest call.
 
 ```
 call_3i64()               — delegates
 call_2i64_blocking()      — contracts
 call_3i64_blocking()      — contracts
-        ↓ all three
-call_typed_blocking()     — spawn_blocking + wall-clock backstop + panic capture
+initiate_buffer()         — allocator export, contracts and delegates
+        ↓ all four
+call_typed_blocking()     — execute_wasm_blocking
+
+create_instance()         — module start function + __frnt_set_id
+        ↓ one job
+execute_wasm_blocking_within() — wall-clock backstop + panic capture
 ```
+
+`call_void` is the one inline entry left, and only a test calls it.
 
 Two consequences for anything touching the delegate path:
 
@@ -168,16 +180,10 @@ Two consequences for anything touching the delegate path:
   different facts (`native_api::LIVE_DELEGATE_GUESTS`).
 - **During `process()`, delegate host functions run on a blocking-pool thread**,
   so they find their env through a thread-local installed on THAT thread by
-  `GuestDelegateInstance`, not on the caller's.
-
-  Scope that to `process()` and no further. Buffer setup and instantiation —
-  `initiate_buffer`, `call_void`, `instantiate_and_init` — still enter the guest
-  with `block_on_async(func.call_async(...))` INLINE on the calling thread, with
-  no `execute_wasm_blocking` and no `GuestDelegateInstance`. That is why
-  `exec_inbound_with_env` still sets `CURRENT_DELEGATE_INSTANCE` on the calling
-  thread at all, as `DelegateEnvGuard`'s rustdoc explains. "Nothing
-  delegate-related runs on the calling thread" is false and would produce a wrong
-  call about exactly those paths.
+  `GuestDelegateInstance`, not on the caller's. The allocator export gets no
+  `GuestDelegateInstance` (it is called with `delegate_instance: None`), so a
+  delegate's allocator cannot reach the delegate host functions. It has no use
+  for them.
 
 The pins `every_guest_entry_is_preceded_by_arm_epoch_deadline` and
 `blocking_paths_arm_epoch_inside_the_closure` enforce the single-body structure.
@@ -214,19 +220,25 @@ Host functions (callable from WASM):
 
 CRITICAL — Memory pointer refresh (#3248):
   Every func_wrap / func_wrap_async registration in wasmtime_engine.rs
-  MUST call refresh_mem_addr_from_caller(&mut caller, id) BEFORE
+  MUST call refresh_mem_addr_from_caller(&mut caller) BEFORE
   delegating to native_api. WASM memory.grow can relocate linear memory,
   invalidating the cached base pointer in MEM_ADDR. Without the refresh,
   host functions use a stale pointer and read/write garbage data.
 
-  For functions that take an explicit `id` parameter, pass it directly.
-  For delegate functions that use thread-local state, read the instance
-  ID from CURRENT_DELEGATE_INSTANCE.
+CRITICAL — The instance is the CALLER, never a guest argument:
+  MEM_ADDR, CONTRACT_IO and DELEGATE_ENV are process-global maps keyed by
+  instance id. A host function resolves its instance from
+  HostState::calling_instance, which arm_epoch_deadline records at every
+  guest entry; refresh_mem_addr_from_caller returns it. The id parameter
+  that some host functions still take is part of the guest ABI and is
+  IGNORED (`_guest_id`). Never key a lookup by a guest-supplied id.
+  Delegate functions go through delegate_caller(&mut caller), which also
+  refuses a CURRENT_DELEGATE_INSTANCE that is not the calling instance.
 
 Pattern (registration in wasmtime_engine.rs):
   linker.func_wrap("namespace", "name",
-      |mut caller: Caller<'_, HostState>, id: i64, ptr: i64, len: i32| {
-          refresh_mem_addr_from_caller(&mut caller, id);
+      |mut caller: Caller<'_, HostState>, _guest_id: i64, ptr: i64, len: i32| {
+          let id = refresh_mem_addr_from_caller(&mut caller);
           native_api::module::host_function(id, ptr, len)
       },
   )

@@ -284,9 +284,21 @@ struct ProgressState {
     /// loop arms; zero before ([`SendProgress::ack_wait_left`]).
     ack_wait_deadline: AtomicU64,
     /// The backlog ahead of the end when it was sent, in nanoseconds
-    /// ([`SendProgress::mark_finished_behind`]).
+    /// ([`SendProgress::mark_finished_behind`]), raised when it is read again
+    /// at the ack wait's end ([`LaterBacklog`]).
     backlog_wait: AtomicU64,
+    /// Reads the backlog again, counting the streamed sends started since
+    /// the end was sent ([`SendProgress::mark_finished_after`]).
+    later_backlog: std::sync::OnceLock<LaterBacklog>,
+    /// The backlog was read again ([`LaterBacklog`]); it is read once.
+    later_read: AtomicBool,
 }
+
+/// The backlog ahead of a stream's end read again, once, when its ack wait
+/// first runs out: the bytes that can go before its last byte, counting the
+/// streamed sends started since the end, and nothing once the connection has
+/// wholly acknowledged that many data-stream bytes since (`path::later_backlog`).
+pub(crate) type LaterBacklog = Arc<dyn Fn() -> Duration + Send + Sync>;
 
 impl SendProgress {
     /// For a send with no deadline, which reads no clock. Tests only.
@@ -309,6 +321,8 @@ impl SendProgress {
             ack_wait_due: AtomicU64::new(0),
             ack_wait_deadline: AtomicU64::new(0),
             backlog_wait: AtomicU64::new(0),
+            later_backlog: std::sync::OnceLock::new(),
+            later_read: AtomicBool::new(false),
         }))
     }
 
@@ -331,6 +345,8 @@ impl SendProgress {
             ack_wait_due: AtomicU64::new(0),
             ack_wait_deadline: AtomicU64::new(0),
             backlog_wait: AtomicU64::new(0),
+            later_backlog: std::sync::OnceLock::new(),
+            later_read: AtomicBool::new(false),
         }))
     }
 
@@ -438,6 +454,20 @@ impl SendProgress {
     /// ahead of the stream's end may take to go out, which extends its ack
     /// wait ([`SendDeadlines::ack_wait`]) to at least that, within its total.
     pub(super) fn mark_finished_behind(&self, backlog: Duration) {
+        self.mark_finished_after(backlog, None);
+    }
+
+    /// [`Self::mark_finished_behind`], with `later`, which reads the backlog
+    /// again at the ack wait's end: streamed sends started after the end
+    /// share the link with what is left of the stream, so its end may need
+    /// longer than the backlog read now. The wait is then extended to what
+    /// `later` reads, within its total, before it is judged to have run out.
+    /// `later` is read once, when the wait first runs out, so the extension
+    /// is bounded by what was started by then.
+    pub(super) fn mark_finished_after(&self, backlog: Duration, later: Option<LaterBacklog>) {
+        if let Some(later) = later {
+            let _first = self.0.later_backlog.set(later);
+        }
         self.0.backlog_wait.store(nanos(backlog), Ordering::Release);
         self.0.finished_at.store((self.0.now)(), Ordering::Release);
         self.0.stage.store(STAGE_FINISHED, Ordering::Release);
@@ -894,7 +924,23 @@ where
                 .store(deadline, Ordering::Release);
         }
         let wait = Duration::from_nanos(deadline.saturating_sub(time.now_nanos()));
+        // `biased`: which arm is polled first decides whether `source_wait`
+        // is registered before `send` notifies it, and without it tokio draws
+        // that order from an RNG a simulation's seed does not set, so one seed
+        // ran differently twice. A fixed order draws nothing from `GlobalRng`
+        // either, so a seed's stream is what it was. This holds for upgrade
+        // paths as well as native ones. The one behaviour it fixes: when the
+        // send and the deadline are ready in the same poll, the send wins,
+        // where tokio picked either. That is the right answer: the send has
+        // finished, so its outcome is the send's, and reading it as a
+        // timeout would report a delivered message as lost and could count
+        // the path quiet. No arm can starve another: `send` ends the loop
+        // when ready; the timer is polled before `source_wait`, so a source
+        // that notifies on every iteration cannot hold off the deadline
+        // check; and `source_wait` only re-arms the loop, which recomputes
+        // the deadline.
         tokio::select! {
+            biased;
             result = &mut send => {
                 // A refusal returns an error only to end the send, which then
                 // ends as a deadline would at that stage. It leaves no
@@ -904,7 +950,6 @@ where
                 }
                 return outcome(result, &progress);
             }
-            () = progress.0.source_wait.notified() => {}
             () = time.sleep_cancelable(wait) => {
                 let now = time.now_nanos();
                 // Only the gap of an open stream reads the connection.
@@ -914,6 +959,24 @@ where
                     watch.observe(now);
                 }
                 if now >= progress.deadline(&deadlines, started, until(&watch)) {
+                    // The ack wait ran out: read its backlog again, with the
+                    // streamed sends started since the end. If they moved
+                    // its deadline past now, wait on (`mark_finished_after`).
+                    // Read once: the wait it gives is judged, so a path that
+                    // keeps starting sends cannot keep extending it.
+                    if progress.stage() == STAGE_FINISHED
+                        && deadlines.ack_wait_covers_backlog
+                        && !progress.0.later_read.swap(true, Ordering::AcqRel)
+                        && let Some(later) = progress.0.later_backlog.get()
+                    {
+                        let backlog = nanos(later());
+                        if backlog > progress.0.backlog_wait.load(Ordering::Acquire) {
+                            progress.0.backlog_wait.store(backlog, Ordering::Release);
+                            if now < progress.deadline(&deadlines, started, until(&watch)) {
+                                continue;
+                            }
+                        }
+                    }
                     if progress.stage() == STAGE_OPENED
                         && let Some(watch) = watch.as_ref()
                     {
@@ -932,6 +995,7 @@ where
                     return progress.timed_out();
                 }
             }
+            () = progress.0.source_wait.notified() => {}
         }
     }
 }

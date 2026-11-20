@@ -571,6 +571,14 @@ async fn drive_client_update(
                 value: updated_value,
             });
 
+            // Record our own request as relayed here, so a routing cycle that
+            // brings it back to this node ends here instead of being relayed
+            // once more (#3911). The return value is irrelevant: `client_tx`
+            // is fresh.
+            let _ = op_manager
+                .recent_relay_update_requests
+                .first_sighting(client_tx, op_manager.ring.time_source.now());
+
             // Fire-and-forget send to target peer.
             let mut ctx = op_manager.op_ctx(client_tx);
             ctx.send_fire_and_forget(target_addr, msg).await?;
@@ -675,6 +683,9 @@ fn deliver_outcome(op_manager: &OpManager, client_tx: Transaction, outcome: Driv
 //   3. No `ForwardingAck` → never had one.
 //   4. Per-node dedup gate (`active_relay_update_txs`) drops
 //      duplicate inbound Requests for an in-flight tx.
+//   5. `RequestUpdate*` carries no HTL, so a relay also remembers each
+//      request tx it relayed for at least `recent_requests::RETENTION`
+//      and drops one that returns, which ends a routing cycle (#3911).
 //
 // Migrated wire variants:
 //   - `UpdateMsg::RequestUpdate` (non-streaming relay arm).
@@ -706,11 +717,15 @@ pub(crate) async fn start_relay_request_update(
     #[cfg(any(test, feature = "testing"))]
     RELAY_UPDATE_DRIVER_CALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
-    // Note: the Phase 2 per-(sender, contract) rate limit is applied
-    // UPSTREAM at the wire dispatch site in `node.rs` so the same
-    // gate covers all four UPDATE wire variants (RequestUpdate,
-    // BroadcastTo, RequestUpdateStreaming, BroadcastToStreaming)
-    // uniformly. Rejected messages never reach this driver.
+    // Note: the per-(sender, contract) rate limit is applied at the wire
+    // dispatch site in `node.rs`, before this driver, with a separate budget
+    // per `UpdateClass`: the two `RequestUpdate*` opcodes share the Request
+    // class and the four `BroadcastTo*` opcodes the Broadcast class.
+    // Rejected messages never reach this driver.
+
+    if request_already_relayed(&op_manager, incoming_tx, &key, sender_addr) {
+        return Ok(());
+    }
 
     if !op_manager.active_relay_update_txs.insert(incoming_tx) {
         RELAY_UPDATE_DEDUP_REJECTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -723,6 +738,14 @@ pub(crate) async fn start_relay_request_update(
         );
         return Ok(());
     }
+
+    // Relay driver permit (ANT-2026-K0YQ8CG4), held by the guard until the
+    // driver exits. See `admit_relay_update` for what a refusal does.
+    let Some(driver_permit) =
+        admit_relay_update(&op_manager, incoming_tx, &key, sender_addr, false).await
+    else {
+        return Ok(());
+    };
 
     // Routing/hosting attribution (Group C): count this as a genuine relayed
     // UPDATE (past the dedup gate — a deduped duplicate is not a relay).
@@ -747,6 +770,7 @@ pub(crate) async fn start_relay_request_update(
     let guard = RelayUpdateInflightGuard {
         op_manager: op_manager.clone(),
         incoming_tx,
+        _driver_permit: driver_permit,
     };
 
     GlobalExecutor::spawn(run_relay_request_update(
@@ -896,6 +920,14 @@ pub(crate) async fn start_relay_broadcast_to(
         return Ok(());
     }
 
+    // Relay driver permit (ANT-2026-K0YQ8CG4), held by the guard until the
+    // driver exits. See `admit_relay_update` for what a refusal does.
+    let Some(driver_permit) =
+        admit_relay_update(&op_manager, incoming_tx, &key, sender_addr, true).await
+    else {
+        return Ok(());
+    };
+
     // NOT counted in `relayed_updates_total`: BroadcastTo is update-mesh
     // fan-out to interested co-hosts, not a relayed UPDATE *request* toward the
     // key. Counting fan-out here would conflate relay volume with fan-out
@@ -916,6 +948,7 @@ pub(crate) async fn start_relay_broadcast_to(
     let guard = RelayUpdateInflightGuard {
         op_manager: op_manager.clone(),
         incoming_tx,
+        _driver_permit: driver_permit,
     };
 
     GlobalExecutor::spawn(run_relay_broadcast_to(
@@ -931,6 +964,91 @@ pub(crate) async fn start_relay_broadcast_to(
     Ok(())
 }
 
+/// Take a relay driver permit for an inbound UPDATE from `sender_addr`
+/// (ANT-2026-K0YQ8CG4): the per-source and node-wide bound every relay driver
+/// takes. `None` when refused; the dedup entry is undone.
+///
+/// A refused BROADCAST needs a repair, for the reason written out at the
+/// rate-limiter drop in `node.rs`: its sender already treats the change as
+/// delivered. So it goes into the same throttled `ResyncRequest` repair,
+/// behind the same gate (only for a contract this node holds). A refused
+/// `RequestUpdate*` is not repaired, as at the rate limiter: UPDATE is
+/// fire-and-forget, and the write reaches the mesh through the originator's
+/// own apply and fan-out.
+async fn admit_relay_update(
+    op_manager: &Arc<OpManager>,
+    incoming_tx: Transaction,
+    key: &ContractKey,
+    sender_addr: SocketAddr,
+    broadcast: bool,
+) -> Option<crate::operations::relay_admission::RelayDriverPermit> {
+    match op_manager
+        .relay_driver_admission
+        .try_admit_logged(sender_addr, "update")
+    {
+        Ok(permit) => Some(permit),
+        Err(_refusal) => {
+            op_manager.active_relay_update_txs.remove(&incoming_tx);
+            if broadcast && op_manager.ring.should_summarize_or_broadcast(key) {
+                send_dropped_broadcast_resync_request(
+                    op_manager,
+                    *key,
+                    sender_addr,
+                    incoming_tx,
+                    DroppedBroadcastReason::RelayAdmission,
+                )
+                .await;
+            }
+            None
+        }
+    }
+}
+
+/// Loop bound for routed UPDATE requests (#3911, ANT-2026-B9HNLA3P).
+///
+/// Returns `true`, and the caller drops the message, when this node has
+/// already relayed a `RequestUpdate*` with this transaction id. The wire
+/// variants carry no hops-to-live, so this node-local record is what ends a
+/// request circling peers that do not host its contract. It must be checked
+/// before `active_relay_update_txs`, whose entry is gone by the time a cycle
+/// brings the request back. See [`super::recent_requests`].
+fn request_already_relayed(
+    op_manager: &OpManager,
+    incoming_tx: Transaction,
+    key: &ContractKey,
+    sender_addr: SocketAddr,
+) -> bool {
+    let now = op_manager.ring.time_source.now();
+    if op_manager
+        .recent_relay_update_requests
+        .first_sighting(incoming_tx, now)
+    {
+        return false;
+    }
+    let returned = op_manager.recent_relay_update_requests.returned_total();
+    // Release-visible, but logarithmic in the drop count so a sustained
+    // stream of returning requests does not become a log flood.
+    if returned.is_power_of_two() {
+        tracing::info!(
+            tx = %incoming_tx,
+            %key,
+            %sender_addr,
+            returned_total = returned,
+            phase = "relay_update_request_returned",
+            "UPDATE relay: request already relayed by this node, dropping"
+        );
+    } else {
+        tracing::debug!(
+            tx = %incoming_tx,
+            %key,
+            %sender_addr,
+            phase = "relay_update_request_returned",
+            "UPDATE relay: request already relayed by this node, dropping"
+        );
+    }
+    true
+}
+
 /// RAII guard that decrements `RELAY_UPDATE_INFLIGHT`, bumps
 /// `RELAY_UPDATE_COMPLETED_TOTAL`, and removes the driver's
 /// `incoming_tx` from `active_relay_update_txs` on drop. Mirrors GET's
@@ -938,6 +1056,8 @@ pub(crate) async fn start_relay_broadcast_to(
 struct RelayUpdateInflightGuard {
     op_manager: Arc<OpManager>,
     incoming_tx: Transaction,
+    /// Relay driver permit (ANT-2026-K0YQ8CG4), released with the guard.
+    _driver_permit: crate::operations::relay_admission::RelayDriverPermit,
 }
 
 impl Drop for RelayUpdateInflightGuard {
@@ -1084,7 +1204,7 @@ async fn drive_relay_request_update(
         _ => None,
     };
 
-    if state_before.is_some() {
+    if state_before.is_some() && op_manager.ring.may_merge_relayed_update(&key) {
         // ── Local apply path ──────────────────────────────────────────────
         let hash_before = state_before.as_ref().map(state_hash_full);
 
@@ -1273,6 +1393,9 @@ pub(crate) enum DroppedBroadcastReason {
     /// Refused by the per-contract merge budget in `node.rs` before any
     /// driver ran (#6190).
     MergeBudget,
+    /// Refused by the relay driver admission (`relay_admission`,
+    /// ANT-2026-K0YQ8CG4) before any driver ran.
+    RelayAdmission,
 }
 
 impl DroppedBroadcastReason {
@@ -1283,6 +1406,7 @@ impl DroppedBroadcastReason {
             DroppedBroadcastReason::QueueFull => "queue_full",
             DroppedBroadcastReason::RateLimited => "rate_limited",
             DroppedBroadcastReason::MergeBudget => "merge_budget",
+            DroppedBroadcastReason::RelayAdmission => "relay_admission",
         }
     }
 }
@@ -1911,6 +2035,15 @@ async fn drive_relay_broadcast_to(
 ) -> Result<(), OpError> {
     let self_location = op_manager.ring.connection_manager.own_location();
 
+    if !op_manager.ring.may_merge_relayed_update(&key) {
+        count_receiver_skip(
+            op_manager,
+            &key,
+            super::propagation_stats::PropagationEvent::RxNotHosted,
+        );
+        return Ok(());
+    }
+
     // ── Step 1: update sender's cached summary ────────────────────────────
     // Empty bytes mean the sender could not summarize itself, NOT that its
     // summary is empty — see `seed_sender_summary_from_broadcast`.
@@ -2451,6 +2584,10 @@ pub(crate) async fn start_relay_request_update_streaming(
     #[cfg(any(test, feature = "testing"))]
     RELAY_UPDATE_STREAMING_DRIVER_CALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
+    if request_already_relayed(&op_manager, incoming_tx, &key, sender_addr) {
+        return Ok(());
+    }
+
     if !op_manager.active_relay_update_txs.insert(incoming_tx) {
         RELAY_UPDATE_DEDUP_REJECTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         tracing::debug!(
@@ -2462,6 +2599,14 @@ pub(crate) async fn start_relay_request_update_streaming(
         );
         return Ok(());
     }
+
+    // Relay driver permit (ANT-2026-K0YQ8CG4), held by the guard until the
+    // driver exits. See `admit_relay_update` for what a refusal does.
+    let Some(driver_permit) =
+        admit_relay_update(&op_manager, incoming_tx, &key, sender_addr, false).await
+    else {
+        return Ok(());
+    };
 
     // Routing/hosting attribution (Group C): count this as a genuine relayed
     // UPDATE, mirroring the non-streaming `start_relay_request_update`.
@@ -2488,6 +2633,7 @@ pub(crate) async fn start_relay_request_update_streaming(
     let guard = RelayUpdateStreamingInflightGuard {
         op_manager: op_manager.clone(),
         incoming_tx,
+        _driver_permit: driver_permit,
     };
 
     GlobalExecutor::spawn(run_relay_request_update_streaming(
@@ -2531,6 +2677,14 @@ pub(crate) async fn start_relay_broadcast_to_streaming(
         return Ok(());
     }
 
+    // Relay driver permit (ANT-2026-K0YQ8CG4), held by the guard until the
+    // driver exits. See `admit_relay_update` for what a refusal does.
+    let Some(driver_permit) =
+        admit_relay_update(&op_manager, incoming_tx, &key, sender_addr, true).await
+    else {
+        return Ok(());
+    };
+
     // NOT counted in `relayed_updates_total` (see `start_relay_broadcast_to`):
     // BroadcastToStreaming is update-mesh fan-out, not a relayed request.
 
@@ -2549,6 +2703,7 @@ pub(crate) async fn start_relay_broadcast_to_streaming(
     let guard = RelayUpdateStreamingInflightGuard {
         op_manager: op_manager.clone(),
         incoming_tx,
+        _driver_permit: driver_permit,
     };
 
     GlobalExecutor::spawn(run_relay_broadcast_to_streaming(
@@ -2570,6 +2725,8 @@ pub(crate) async fn start_relay_broadcast_to_streaming(
 struct RelayUpdateStreamingInflightGuard {
     op_manager: Arc<OpManager>,
     incoming_tx: Transaction,
+    /// Relay driver permit (ANT-2026-K0YQ8CG4), released with the guard.
+    _driver_permit: crate::operations::relay_admission::RelayDriverPermit,
 }
 
 impl Drop for RelayUpdateStreamingInflightGuard {
@@ -2765,6 +2922,26 @@ async fn drive_relay_request_update_streaming(
         value,
     } = payload;
 
+    if !op_manager.ring.may_merge_relayed_update(&key) {
+        tracing::debug!(
+            tx = %incoming_tx,
+            %key,
+            "UPDATE relay (driver streaming): RequestUpdateStreaming not merged, \
+             contract is not hosted here; forwarding"
+        );
+        // The non-streaming driver sees the gate refuse as well and takes its
+        // forward path.
+        return drive_relay_request_update(
+            op_manager,
+            incoming_tx,
+            key,
+            related_contracts,
+            value,
+            sender_addr,
+        )
+        .await;
+    }
+
     // Step 4: apply update. BroadcastStateChange propagates automatically.
     let UpdateExecution {
         value: updated_value,
@@ -2948,6 +3125,14 @@ async fn apply_streaming_broadcast(
     sender_addr: SocketAddr,
     covered: crate::ring::broadcast_coverage::CoveredPeers,
 ) -> Result<(), OpError> {
+    if !op_manager.ring.may_merge_relayed_update(&key) {
+        count_receiver_skip(
+            op_manager,
+            &key,
+            super::propagation_stats::PropagationEvent::RxNotHosted,
+        );
+        return Ok(());
+    }
     let mut receiver_terminal = op_manager
         .payload_mix
         .receiver_terminal_guard(false, state_bytes.len());
@@ -4418,6 +4603,7 @@ mod tests {
             ContractInstanceId::new([7u8; 32]),
             CodeHash::new([8u8; 32]),
         );
+        host_for_test(&op_manager, key);
         let sender_addr: SocketAddr = "127.0.0.1:12100".parse().unwrap();
 
         // First broadcast delta → dropped queue-full → MUST emit a ResyncRequest.
@@ -4494,6 +4680,7 @@ mod tests {
             ContractInstanceId::new([9u8; 32]),
             CodeHash::new([10u8; 32]),
         );
+        host_for_test(&op_manager, key);
         let sender_addr: SocketAddr = "127.0.0.1:12200".parse().unwrap();
 
         // First streaming full-state → dropped queue-full → MUST emit a ResyncRequest.
@@ -4629,8 +4816,63 @@ mod tests {
             op_manager
                 .payload_mix
                 .propagation_event_for_test(Ev::RxDedup),
-            3,
-            "telemetry still counts every received skip"
+            2,
+            "a broadcast for a contract this node does not host is skipped before the \
+             dedup cache (counted as RxNotHosted), so only the two hosted keys' repeats \
+             are counted here"
+        );
+        // The two unhosted broadcasts are counted as their own event, node-wide
+        // only (no per-contract entry for a contract this node does not host).
+        assert_eq!(
+            op_manager
+                .payload_mix
+                .propagation_event_for_test(Ev::RxNotHosted),
+            2,
+            "a skipped broadcast for an unhosted contract must be counted"
+        );
+        assert_eq!(events.get(Ev::RxNotHosted), 0, "{events:?}");
+    }
+
+    /// The streaming receive path declines a broadcast for a contract this
+    /// node does not host: it counts `RxNotHosted` and returns before the
+    /// dedup cache, the sender-summary seeding and the merge.
+    #[tokio::test]
+    async fn streaming_broadcast_for_an_unhosted_contract_is_counted_and_not_merged() {
+        use crate::operations::update::propagation_stats::PropagationEvent as Ev;
+
+        let (op_manager, _notification_rx, _guard) =
+            build_queue_full_test_node("rx-not-hosted-streaming").await;
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([21u8; 32]),
+            CodeHash::new([22u8; 32]),
+        );
+        let state = vec![4u8, 5, 6];
+        let result: Result<(), OpError> = apply_streaming_broadcast(
+            &op_manager,
+            Transaction::new::<UpdateMsg>(),
+            key,
+            state.clone(),
+            Vec::new(),
+            "127.0.0.1:12301".parse().unwrap(),
+            crate::ring::broadcast_coverage::CoveredPeers::empty(),
+        )
+        .await;
+        assert!(result.is_ok(), "{result:?}");
+        let mix = &op_manager.payload_mix;
+        assert_eq!(mix.propagation_event_for_test(Ev::RxNotHosted), 1);
+        for other in [Ev::RxDedup, Ev::RxAlreadyApplied, Ev::RxBackoff] {
+            assert_eq!(mix.propagation_event_for_test(other), 0, "{other:?}");
+        }
+        // The skip returned before the dedup cache: the same payload is still
+        // unseen, which it would not be had the merge path run.
+        assert!(
+            !op_manager.broadcast_dedup_cache.check_and_insert(
+                &key,
+                &state,
+                false,
+                op_manager.interest_manager.now(),
+            ),
+            "a declined broadcast must not reach the dedup cache or the merge"
         );
     }
 
@@ -4904,6 +5146,7 @@ mod tests {
             ContractInstanceId::new([41u8; 32]),
             CodeHash::new([42u8; 32]),
         );
+        host_for_test(&op_manager, key);
         let sender_addr: SocketAddr = "127.0.0.1:12300".parse().unwrap();
         let set = &op_manager.ring.applied_payloads;
 
@@ -5323,6 +5566,7 @@ mod tests {
             ContractInstanceId::new([81u8; 32]),
             CodeHash::new([82u8; 32]),
         );
+        host_for_test(&op_manager, key);
         let sender_addr: SocketAddr = "127.0.0.1:13300".parse().unwrap();
 
         let r = drive_relay_broadcast_to(
@@ -5354,6 +5598,7 @@ mod tests {
             ContractInstanceId::new([83u8; 32]),
             CodeHash::new([84u8; 32]),
         );
+        host_for_test(&qf_manager, qf_key);
         let qf_sender: SocketAddr = "127.0.0.1:13400".parse().unwrap();
 
         let qf = drive_relay_broadcast_to(
@@ -5402,6 +5647,7 @@ mod tests {
             ContractInstanceId::new([21u8; 32]),
             CodeHash::new([22u8; 32]),
         );
+        host_for_test(&op_manager, key);
         let sender: SocketAddr = "127.0.0.1:12200".parse().unwrap();
 
         // Three consecutive delta failures (distinct bytes so none is a dedup
@@ -5471,6 +5717,7 @@ mod tests {
             ContractInstanceId::new([31u8; 32]),
             CodeHash::new([32u8; 32]),
         );
+        host_for_test(&op_manager, key);
         let sender: SocketAddr = "127.0.0.1:12300".parse().unwrap();
 
         // Two delta failures (count = 2, below the trip threshold).
@@ -5566,6 +5813,7 @@ mod tests {
             ContractInstanceId::new([41u8; 32]),
             CodeHash::new([42u8; 32]),
         );
+        host_for_test(&op_manager, key);
         let sender_a: SocketAddr = "127.0.0.1:12400".parse().unwrap();
         let sender_b: SocketAddr = "127.0.0.1:12500".parse().unwrap();
 
@@ -5652,6 +5900,7 @@ mod tests {
             ContractInstanceId::new([51u8; 32]),
             CodeHash::new([52u8; 32]),
         );
+        host_for_test(&op_manager, key);
         let sender: SocketAddr = "127.0.0.1:12600".parse().unwrap();
 
         // Five consecutive queue-full delta failures (well past the N=3 Invalid
@@ -5707,6 +5956,7 @@ mod tests {
             ContractInstanceId::new([71u8; 32]),
             CodeHash::new([72u8; 32]),
         );
+        host_for_test(&op_manager, key);
         // Six DISTINCT senders (each clears its own per-sender throttle) each send
         // a distinct-payload queue-full delta for the SAME contract.
         let sender_count = 6u16;
@@ -5950,6 +6200,7 @@ mod tests {
             ContractInstanceId::new([83u8; 32]),
             CodeHash::new([84u8; 32]),
         );
+        host_for_test(&op_manager, key);
         let sender_a: SocketAddr = "127.0.0.1:13300".parse().unwrap();
         let sender_b: SocketAddr = "127.0.0.1:13400".parse().unwrap();
 
@@ -6453,6 +6704,7 @@ mod tests {
             ContractInstanceId::new([9u8; 32]),
             CodeHash::new([10u8; 32]),
         );
+        host_for_test(&op_manager, key);
         let sender_addr: SocketAddr = "127.0.0.1:12300".parse().unwrap();
 
         // One queue-full drop → immediate ResyncRequest + a spawned trailing
@@ -6538,6 +6790,7 @@ mod tests {
             ContractInstanceId::new([17u8; 32]),
             CodeHash::new([18u8; 32]),
         );
+        host_for_test(&op_manager, key);
         let sender_addr: SocketAddr = "127.0.0.1:12700".parse().unwrap();
 
         let r1 = drive_relay_broadcast_to(
@@ -6615,6 +6868,7 @@ mod tests {
             ContractInstanceId::new([19u8; 32]),
             CodeHash::new([20u8; 32]),
         );
+        host_for_test(&op_manager, key);
         let sender_addr: SocketAddr = "127.0.0.1:12800".parse().unwrap();
 
         let r1 = drive_relay_broadcast_to(
@@ -6704,6 +6958,7 @@ mod tests {
             ContractInstanceId::new([11u8; 32]),
             CodeHash::new([12u8; 32]),
         );
+        host_for_test(&op_manager, key);
         let sender_addr: SocketAddr = "127.0.0.1:12400".parse().unwrap();
 
         let r1 = drive_relay_broadcast_to(
@@ -7586,6 +7841,57 @@ mod tests {
         panic!("unterminated fn body for {signature_prefix}");
     }
 
+    /// ANT-2026-K0YQ8CG4: every relay UPDATE driver takes a relay driver
+    /// permit after its dedup gate and holds it in its guard; a refused
+    /// broadcast of a held contract is repaired, a refused request is not.
+    ///
+    /// FALSIFY: drop the `admit_relay_update` call from any start function,
+    /// pass `false` for a broadcast, or drop the repair.
+    #[test]
+    fn relay_update_drivers_take_a_driver_permit() {
+        let src = production_source(include_str!("op_ctx_task.rs"));
+        for (sig, broadcast) in [
+            ("pub(crate) async fn start_relay_request_update(", "false"),
+            ("pub(crate) async fn start_relay_broadcast_to(", "true"),
+            (
+                "pub(crate) async fn start_relay_request_update_streaming(",
+                "false",
+            ),
+            (
+                "pub(crate) async fn start_relay_broadcast_to_streaming(",
+                "true",
+            ),
+        ] {
+            let body = extract_fn_body(src, sig);
+            let dedup = body
+                .find("active_relay_update_txs.insert(incoming_tx)")
+                .unwrap_or_else(|| panic!("{sig} has a dedup gate"));
+            let admit = body
+                .find("admit_relay_update(")
+                .unwrap_or_else(|| panic!("{sig} must take a relay driver permit"));
+            assert!(dedup < admit, "{sig}: a duplicate must take no slot");
+            assert!(
+                body[admit..].starts_with(&format!(
+                    "admit_relay_update(&op_manager, incoming_tx, &key, sender_addr, {broadcast})"
+                )),
+                "{sig}: broadcast = {broadcast}"
+            );
+            assert!(
+                body.contains("_driver_permit: driver_permit,"),
+                "{sig}: the guard holds the permit"
+            );
+        }
+        let admit = extract_fn_body(src, "async fn admit_relay_update(");
+        assert!(admit.contains("active_relay_update_txs.remove(&incoming_tx)"));
+        let repair = admit
+            .find("send_dropped_broadcast_resync_request(")
+            .expect("a refused broadcast is repaired");
+        let gate = admit
+            .find("if broadcast && op_manager.ring.should_summarize_or_broadcast(key)")
+            .expect("only a broadcast of a held contract");
+        assert!(gate < repair);
+    }
+
     /// Issue #4828: `record_update_received` must be recorded by BOTH
     /// broadcast-apply paths, not just the streaming one. Before #4828 the
     /// sole call site in the crate sat in the streaming path, but
@@ -8075,5 +8381,375 @@ mod tests {
             Some(StateSummary::from(vec![0u8])),
             "a single zero byte is a real summary, not an absent one"
         );
+    }
+}
+
+/// #3911 / ANT-2026-B9HNLA3P: a `RequestUpdate` that comes back to a relay it
+/// already passed through must not be forwarded again. Drives the real
+/// `start_relay_request_update` against a stubbed event loop.
+#[cfg(test)]
+mod relay_request_loop_tests {
+    use super::*;
+    use crate::operations::route_attempt::driver_test_support::op_manager_with_peers_and_store;
+    use std::time::Duration;
+
+    type Forwards = Arc<parking_lot::Mutex<Vec<(Transaction, Option<SocketAddr>)>>>;
+
+    /// Every forwarded `RequestUpdate` the relay handed to the event loop.
+    fn record_forwards(
+        mut rx: tokio::sync::mpsc::Receiver<crate::node::OpExecutionPayload>,
+    ) -> Forwards {
+        let sent = Forwards::default();
+        let log = sent.clone();
+        tokio::spawn(async move {
+            while let Some((_reply, msg, target)) = rx.recv().await {
+                if let NetMessage::V1(crate::message::NetMessageV1::Update(
+                    UpdateMsg::RequestUpdate { id, .. },
+                )) = msg
+                {
+                    log.lock().push((id, target));
+                }
+            }
+        });
+        sent
+    }
+
+    fn unhosted_key() -> ContractKey {
+        ContractKey::from_id_and_code(
+            freenet_stdlib::prelude::ContractInstanceId::new([0x39; 32]),
+            freenet_stdlib::prelude::CodeHash::new([0x11; 32]),
+        )
+    }
+
+    async fn relay(op_manager: &Arc<OpManager>, tx: Transaction, from: SocketAddr) {
+        start_relay_request_update(
+            op_manager.clone(),
+            tx,
+            unhosted_key(),
+            RelatedContracts::default(),
+            WrappedState::new(vec![1, 2, 3]),
+            from,
+        )
+        .await
+        .expect("dispatch");
+        // Let the spawned driver finish, so its in-flight entry is released
+        // as it is in production before a cycle brings the request back.
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// ANT-2026-C5XJZSLS: state on disk for a contract that is neither hosted
+    /// nor in use (evicted, reclamation pending) must not be merged into by a
+    /// relayed UPDATE: a remote peer decides when one arrives, and the write
+    /// would keep the bytes on disk outside every budget. The request is
+    /// forwarded toward the hosts instead.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn an_update_to_an_evicted_unhosted_contract_is_forwarded_not_merged() {
+        let (op_manager, rx, peers, _guards, store) =
+            op_manager_with_peers_and_store("update-evicted-no-merge", 2).await;
+        let sent = record_forwards(rx);
+        let from = peers[0].socket_addr().expect("addr");
+        *store.lock() = Some((unhosted_key(), WrappedState::new(vec![9; 16])));
+        assert!(!op_manager.ring.is_hosting_contract(&unhosted_key()));
+        assert!(!op_manager.ring.contract_in_use(&unhosted_key()));
+
+        relay(&op_manager, Transaction::new::<UpdateMsg>(), from).await;
+
+        assert_eq!(
+            sent.lock().len(),
+            1,
+            "the request must be forwarded, not merged into the evicted copy"
+        );
+    }
+
+    /// The other side of the rule: a hosted contract IS merged into, so the
+    /// request is handled locally and not forwarded. (The stub handler leaves
+    /// the merge unanswered; the driver logs the failure and forwards nothing.)
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn an_update_to_a_hosted_contract_is_merged_locally() {
+        let (op_manager, rx, peers, _guards, store) =
+            op_manager_with_peers_and_store("update-hosted-merges", 2).await;
+        let sent = record_forwards(rx);
+        let from = peers[0].socket_addr().expect("addr");
+        *store.lock() = Some((unhosted_key(), WrappedState::new(vec![9; 16])));
+        op_manager.ring.host_contract(
+            unhosted_key(),
+            16,
+            crate::ring::AccessType::Put,
+            crate::ring::HostingCause::Other,
+        );
+        assert!(op_manager.ring.is_hosting_contract(&unhosted_key()));
+
+        relay(&op_manager, Transaction::new::<UpdateMsg>(), from).await;
+
+        assert!(
+            sent.lock().is_empty(),
+            "a hosted contract takes the local apply path, not the forward path"
+        );
+    }
+
+    /// `src` with comments and the contents of string literals blanked, so a
+    /// needle can only match code that compiles. A commented-out call, a call
+    /// quoted in a doc, and a pin's own string literals all vanish. (Raw
+    /// strings and char literals are not special-cased; none occur in the
+    /// functions pinned here.)
+    fn blank_comments_and_literals(src: &str) -> String {
+        let b = src.as_bytes();
+        let mut out = String::with_capacity(src.len());
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] == b'/' && b.get(i + 1) == Some(&b'/') {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            } else if b[i] == b'/' && b.get(i + 1) == Some(&b'*') {
+                let mut depth = 0;
+                while i < b.len() {
+                    if b[i] == b'/' && b.get(i + 1) == Some(&b'*') {
+                        depth += 1;
+                        i += 2;
+                    } else if b[i] == b'*' && b.get(i + 1) == Some(&b'/') {
+                        depth -= 1;
+                        i += 2;
+                        if depth == 0 {
+                            break;
+                        }
+                    } else {
+                        if b[i] == b'\n' {
+                            out.push('\n');
+                        }
+                        i += 1;
+                    }
+                }
+            } else if b[i] == b'"' {
+                out.push('"');
+                i += 1;
+                while i < b.len() && b[i] != b'"' {
+                    if b[i] == b'\\' {
+                        i += 1;
+                    }
+                    if b.get(i) == Some(&b'\n') {
+                        out.push('\n');
+                    }
+                    i += 1;
+                }
+                out.push('"');
+                i += 1;
+            } else {
+                out.push(b[i] as char);
+                i += 1;
+            }
+        }
+        out
+    }
+
+    /// Code (comments and string literals blanked) of the one top-level
+    /// production `fn <name>(` in `src`, from its signature to its closing
+    /// brace at column 0. Panics unless exactly one such function exists
+    /// above the file's test module, so a rename, a move into the test
+    /// module, or a second function of the same name fails loudly instead of
+    /// matching the pin's own string literals.
+    fn pinned_fn_body(src: &str, name: &str) -> String {
+        let test_mod = src
+            .find("\n#[cfg(test)]\nmod tests")
+            .expect("the file has a test module");
+        let production = blank_comments_and_literals(&src[..test_mod]);
+        let needle = format!("fn {name}(");
+        let found: Vec<usize> = production
+            .match_indices(&needle)
+            .map(|(at, _)| at)
+            .filter(|&at| {
+                let line_start = production[..at].rfind('\n').map_or(0, |n| n + 1);
+                let prefix = &production[line_start..at];
+                !prefix.starts_with(char::is_whitespace)
+                    && prefix
+                        .split_whitespace()
+                        .all(|w| w == "async" || w == "pub" || w.starts_with("pub("))
+            })
+            .collect();
+        assert_eq!(
+            found.len(),
+            1,
+            "expected exactly one top-level production `fn {name}(`"
+        );
+        let rest = &production[found[0]..];
+        let end = rest
+            .find("\n}\n")
+            .unwrap_or_else(|| panic!("`fn {name}` has no closing brace at column 0"));
+        rest[..end].to_string()
+    }
+
+    /// Byte offset of the first `call` in `body`, which is already code only.
+    fn call_at(body: &str, call: &str, what: &str) -> usize {
+        body.find(call)
+            .unwrap_or_else(|| panic!("{what}: no `{call}` in code (commented out or renamed?)"))
+    }
+
+    /// Every driver that merges a relayed write into the local copy must ask
+    /// `may_merge_relayed_update`, as an `if` condition, before EVERY call
+    /// that reaches the merge (anything named `update_contract(`), so renaming
+    /// a wrapper cannot slip past: a merge call with no gate before it in the
+    /// same driver fails.
+    #[test]
+    fn every_relay_merge_site_checks_may_merge_relayed_update() {
+        let update_src = include_str!("op_ctx_task.rs");
+        let put_src = include_str!("../put/op_ctx_task.rs");
+        for (src, name) in [
+            (update_src, "drive_relay_request_update"),
+            (update_src, "drive_relay_broadcast_to"),
+            (update_src, "drive_relay_request_update_streaming"),
+            (update_src, "apply_streaming_broadcast"),
+            (put_src, "drive_relay_probe_reconcile"),
+        ] {
+            let body = pinned_fn_body(src, name);
+            let gate = call_at(&body, "may_merge_relayed_update(", name);
+            let line_start = body[..gate].rfind('\n').map_or(0, |n| n + 1);
+            let line_end = body[gate..].find('\n').map_or(body.len(), |n| gate + n);
+            let condition = body[line_start..line_end].trim();
+            // The gate must sit in an `if` whose condition is an `&&` chain:
+            // an `||` or a literal term (`if false && gate(..)`, `if x || gate(..)`)
+            // lets the merge run without the gate deciding. The gate term is
+            // exactly `[!]<path>.may_merge_relayed_update(<args>)`.
+            let chain = condition
+                .strip_prefix("if ")
+                .unwrap_or_else(|| panic!("{name}: gate line is not an `if`: `{condition}`"));
+            let chain = chain.strip_suffix('{').unwrap_or(chain).trim();
+            assert!(
+                !chain.contains("||"),
+                "{name}: `||` in gate condition `{condition}`"
+            );
+            let gate_terms: Vec<&str> = chain
+                .split("&&")
+                .map(str::trim)
+                .inspect(|term| {
+                    assert!(
+                        !matches!(*term, "false" | "true" | "0" | "1"),
+                        "{name}: literal term in gate condition `{condition}`"
+                    );
+                })
+                .filter(|term| term.contains("may_merge_relayed_update("))
+                .collect();
+            assert_eq!(gate_terms.len(), 1, "{name}: gate term in `{condition}`");
+            let term = gate_terms[0].trim_start_matches('!').trim_start();
+            let (path, args) = term
+                .split_once("may_merge_relayed_update(")
+                .expect("term contains the gate call");
+            assert!(
+                path.chars()
+                    .all(|c| c.is_alphanumeric() || "_.".contains(c))
+                    && args.ends_with(')')
+                    && !args.contains('('),
+                "{name}: the gate term must be exactly the gate call, found `{term}`"
+            );
+            let mut merges = 0;
+            for (at, _) in body.match_indices("update_contract(") {
+                merges += 1;
+                assert!(
+                    gate < at,
+                    "{name}: a merge call at byte {at} is not preceded by the gate"
+                );
+            }
+            assert!(
+                merges > 0,
+                "{name} no longer calls update_contract(; re-anchor"
+            );
+        }
+    }
+
+    /// A streamed `RequestUpdate` this node declines to merge is forwarded
+    /// toward the hosts, like the non-streaming request.
+    #[test]
+    fn declined_streaming_request_update_is_forwarded() {
+        let body = pinned_fn_body(
+            include_str!("op_ctx_task.rs"),
+            "drive_relay_request_update_streaming",
+        );
+        let gate = call_at(&body, "may_merge_relayed_update(", "gate");
+        let forward = call_at(&body, "drive_relay_request_update(", "forward");
+        let merge = call_at(&body, "update_contract(", "merge");
+        assert!(gate < forward && forward < merge);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_request_returning_around_a_cycle_is_not_forwarded_again() {
+        let (op_manager, rx, peers, _guards, _store) =
+            op_manager_with_peers_and_store("update-loop-3911", 3).await;
+        let sent = record_forwards(rx);
+        let a = peers[0].socket_addr().expect("addr");
+        let c = peers[2].socket_addr().expect("addr");
+        let tx = Transaction::new::<UpdateMsg>();
+
+        relay(&op_manager, tx, a).await;
+        assert_eq!(
+            sent.lock().len(),
+            1,
+            "precondition: an unhosted contract's request is forwarded once"
+        );
+        assert!(
+            !op_manager.active_relay_update_txs.contains(&tx),
+            "precondition: the driver has exited and released its in-flight entry"
+        );
+
+        // The same request arrives again from another neighbour, as it does
+        // when the forward went round A -> B -> C -> A.
+        relay(&op_manager, tx, c).await;
+        let forwards = sent.lock().clone();
+        assert_eq!(
+            forwards.len(),
+            1,
+            "a request this node already relayed must be dropped, or a cycle of \
+             relays forwards it forever: {forwards:?}"
+        );
+        assert_eq!(op_manager.recent_relay_update_requests.returned_total(), 1);
+
+        // A different request is still relayed.
+        relay(&op_manager, Transaction::new::<UpdateMsg>(), c).await;
+        assert_eq!(sent.lock().len(), 2);
+    }
+
+    /// The streaming variant shares the same record: a `RequestUpdateStreaming`
+    /// whose tx this node already relayed starts no second driver, even after
+    /// the first driver has exited.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_streaming_request_returning_around_a_cycle_starts_no_driver() {
+        let (op_manager, rx, peers, _guards, _store) =
+            op_manager_with_peers_and_store("update-streaming-loop-3911", 3).await;
+        let _sent = record_forwards(rx);
+        let a = peers[0].socket_addr().expect("addr");
+        let c = peers[2].socket_addr().expect("addr");
+        let tx = Transaction::new::<UpdateMsg>();
+
+        let announce = |from: SocketAddr| {
+            start_relay_request_update_streaming(
+                op_manager.clone(),
+                tx,
+                unhosted_key(),
+                crate::transport::peer_connection::StreamId::next(),
+                4096,
+                from,
+            )
+        };
+
+        announce(a).await.expect("dispatch");
+        assert!(
+            op_manager.active_relay_update_txs.contains(&tx),
+            "precondition: the first announcement starts a driver"
+        );
+        // No stream ever arrives: the driver gives up and exits.
+        tokio::time::sleep(Duration::from_secs(180)).await;
+        assert!(
+            !op_manager.active_relay_update_txs.contains(&tx),
+            "precondition: the first driver has exited"
+        );
+
+        announce(c).await.expect("dispatch");
+        // A started driver would still be waiting for its stream here.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(
+            !op_manager.active_relay_update_txs.contains(&tx),
+            "a streaming request this node already relayed must start no driver"
+        );
+        assert_eq!(op_manager.recent_relay_update_requests.returned_total(), 1);
     }
 }

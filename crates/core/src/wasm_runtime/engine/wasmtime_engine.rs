@@ -140,6 +140,14 @@
 //! ```
 //!
 //! We wrap with `block_on_async()` to maintain a synchronous interface for callers.
+//!
+//! That `block_on_async` call runs inside a job passed to
+//! `execute_wasm_blocking` / `execute_wasm_blocking_within`, not on the
+//! caller's thread: every production guest entry (the typed calls through
+//! `call_typed_blocking`, the allocator export, and instance setup in
+//! `create_instance`) runs off the calling thread under the wall-clock
+//! backstop, with a host-side panic returned as an error. `call_void`, used
+//! only by tests, is the exception.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -728,7 +736,19 @@ fn epoch_deadline_ticks(max_execution_seconds: f64) -> u64 {
 /// backedges and function entries. A blocking HOST-function call in progress is
 /// never cut off mid-flight; the trap can only fire once control returns to
 /// guest code. So a slow host call completes normally.
-fn arm_epoch_deadline(store: &mut Store<HostState>, ticks: u64) {
+///
+/// It also records which instance the guest entry is for
+/// ([`HostState::calling_instance`]). That is done here, rather than in a
+/// separate call, so that every guest entry is forced to state it: the
+/// argument is not optional, and every guest entry is already pinned to be
+/// preceded by this call (`every_guest_entry_is_preceded_by_arm_epoch_deadline`).
+/// Pass `None` only where no guest code is about to run (store creation).
+fn arm_epoch_deadline(
+    store: &mut Store<HostState>,
+    ticks: u64,
+    calling_instance: Option<native_api::InstanceId>,
+) {
+    store.data_mut().calling_instance = calling_instance;
     store.set_epoch_deadline(ticks);
     store.epoch_deadline_trap();
     // Piggyback a cheap dead-ticker health check on this already-per-call site.
@@ -743,8 +763,9 @@ pub(crate) struct WasmtimeEngine {
     /// Taken during blocking operations, restored after. Recreated on timeout/panic
     /// or when `lifetime_instances` exceeds `STORE_REFRESH_THRESHOLD`.
     store: Option<Store<HostState>>,
-    /// Linker pre-configured with all host functions.
-    linker: Linker<HostState>,
+    /// Linker pre-configured with all host functions. Shared (`Arc`) so the
+    /// blocking job that instantiates a module can own a handle to it.
+    linker: Arc<Linker<HostState>>,
     /// Map of instance ID to wasmtime Instance.
     instances: HashMap<i64, Instance>,
     /// Maximum execution time in seconds.
@@ -803,12 +824,28 @@ pub(crate) struct WasmtimeEngine {
 /// Host state for wasmtime Store, implementing ResourceLimiter for memory limits.
 pub(crate) struct HostState {
     memory_limit_bytes: usize,
+    /// The instance whose guest code this store is running, set by
+    /// [`arm_epoch_deadline`] at every guest entry. Host functions resolve
+    /// their instance from here and NEVER from a guest-supplied argument:
+    /// `MEM_ADDR` and `CONTRACT_IO` are process-global, so an id taken from
+    /// the guest would let one instance act on another's records.
+    ///
+    /// This relies on a store running ONE guest call at a time, with no host
+    /// function entering guest code again on the same store: then the last
+    /// entry is the caller. Both hold today (the store is `&mut`, or moved into
+    /// the blocking closure, for the whole call; no host function calls a
+    /// guest). A host function that re-entered a guest would have to restore
+    /// this value afterwards. A timed-out guest that keeps running on an
+    /// abandoned thread keeps its own store, so its value stays its own.
+    /// `None` until the first entry.
+    calling_instance: Option<native_api::InstanceId>,
 }
 
 impl HostState {
     fn new(memory_limit_pages: u32) -> Self {
         Self {
             memory_limit_bytes: memory_limit_pages as usize * WASM_PAGE_SIZE,
+            calling_instance: None,
         }
     }
 }
@@ -882,7 +919,7 @@ impl WasmEngine for WasmtimeEngine {
         }
         // Arm the initial deadline + select trap behavior; every guest call
         // re-arms it (see `arm_epoch_deadline`).
-        arm_epoch_deadline(&mut store, epoch_deadline_ticks);
+        arm_epoch_deadline(&mut store, epoch_deadline_ticks, None);
 
         // Host memory sharing is not yet implemented in the wasmtime backend.
         // Fail explicitly rather than silently degrading.
@@ -897,7 +934,7 @@ impl WasmEngine for WasmtimeEngine {
         Ok(Self {
             engine,
             store: Some(store),
-            linker,
+            linker: Arc::new(linker),
             instances: HashMap::new(),
             max_execution_seconds: config.max_execution_seconds,
             enabled_metering,
@@ -986,32 +1023,60 @@ impl WasmEngine for WasmtimeEngine {
         }
 
         // The guest-entry half (instantiate + __frnt_set_id + ensure_memory) is
-        // factored out so we can RECOVER THE STORE on ANY guest-entry
-        // timeout/error before returning (#4864 round-9 item 2). Previously an
-        // epoch interrupt during __frnt_set_id returned via `?` AFTER the module
-        // was instantiated but BEFORE `instances.insert` / `lifetime_instances += 1`,
-        // so the store-refresh accounting never counted it: wasmtime's Store arena
-        // retained the dropped instance's allocation, and repeated init timeouts
-        // across fresh contract ids accumulated untracked arena memory that never
-        // triggered a count-based refresh.
+        // factored out so the store is REPLACED on ANY guest-entry failure
+        // before returning (#4864 round-9 item 2). A failure after the module
+        // was instantiated leaves its allocation in the store's arena without an
+        // `instances` entry or a `lifetime_instances` count, so nothing else
+        // would ever trigger a refresh that reclaims it.
         let epoch_ticks = self.epoch_deadline_ticks;
-        let store = self
+        let mut store = self
             .store
-            .as_mut()
+            .take()
             .ok_or_else(|| WasmError::Other(anyhow::anyhow!("engine store not available")))?;
-        let instance = match Self::instantiate_and_init(
-            store,
-            &self.linker,
-            module,
-            id,
-            req_bytes,
-            epoch_ticks,
-        ) {
+        let linker = Arc::clone(&self.linker);
+        let module = module.clone();
+
+        // A module's start function and `__frnt_set_id` are guest code, so they
+        // run off the calling thread under the wall-clock backstop, with a
+        // host-side panic captured as an error, like every other guest entry
+        // (see `call_typed_blocking`). They run as ONE job, and each gets its
+        // own freshly armed epoch budget, so the wall-clock bound allows
+        // `INSTANCE_SETUP_GUEST_ENTRIES` budgets (see `WallBounds::for_entries`).
+        let result = execute_wasm_blocking_within(
+            move || {
+                let instance = Self::instantiate_and_init(
+                    &mut store,
+                    &linker,
+                    &module,
+                    id,
+                    req_bytes,
+                    epoch_ticks,
+                );
+                (Ok(instance), store)
+            },
+            WallBounds::for_entries(self.max_execution_seconds, INSTANCE_SETUP_GUEST_ENTRIES),
+            self.max_execution_seconds,
+        );
+        let outcome = match result {
+            BlockingResult::Ok(Ok(instance), store) => {
+                self.store = Some(store);
+                Ok(instance)
+            }
+            BlockingResult::Ok(Err(e), _failed_store) => Err(e),
+            // The job classifies its own errors, so it never returns this.
+            BlockingResult::WasmError(e, _failed_store) => {
+                Err(WasmError::Instantiation(e.to_string()))
+            }
+            BlockingResult::Timeout => Err(WasmError::Timeout),
+            BlockingResult::QueuedTimeout => Err(WasmError::SchedulerOverloaded),
+            BlockingResult::Panic(e) => Err(WasmError::Other(e)),
+        };
+        let instance = match outcome {
             Ok(instance) => instance,
             Err(e) => {
-                // The `store` borrow above ends with `match`, so recover_store
-                // (which reborrows &mut self) is free to replace the store and
-                // drop the failed instance's arena residue.
+                // The failed store came back with the instance's arena residue
+                // in it, or did not come back at all (the job was abandoned, or
+                // panicked). Either way the engine needs a fresh one.
                 self.recover_store();
                 return Err(e);
             }
@@ -1102,23 +1167,26 @@ impl WasmEngine for WasmtimeEngine {
     }
 
     fn initiate_buffer(&mut self, handle: &InstanceHandle, size: u32) -> Result<i64, WasmError> {
-        let store = self
-            .store
-            .as_mut()
-            .ok_or_else(|| WasmError::Other(anyhow::anyhow!("engine store not available")))?;
-        let instance = self
-            .instances
-            .get(&handle.id)
-            .ok_or_else(|| WasmError::Other(anyhow::anyhow!("instance {} not found", handle.id)))?;
-        let func = instance
-            .get_typed_func::<u32, i64>(&mut *store, "__frnt__initiate_buffer")
-            .map_err(|e| WasmError::Export(e.to_string()))?;
-        arm_epoch_deadline(store, self.epoch_deadline_ticks);
-        // CRITICAL: Must use call_async() because async_support(true) is enabled
-        // An epoch interrupt here (a runaway allocator) is classified as a
-        // timeout, not a generic Runtime error (#4864 review).
-        block_on_async(func.call_async(&mut *store, size))
-            .map_err(|e| classify_guest_entry_error(e, |e| WasmError::Runtime(e.to_string())))
+        // The allocator export is guest code like any other entry point, and
+        // runs before every one of them, so it goes through the same blocking
+        // helper: off the calling thread, under the wall-clock backstop, with
+        // a host-side panic captured as an error.
+        //
+        // `None`, for a delegate's allocator too: an allocator has no business
+        // with the delegate host functions, so it gets no `DelegateCallEnv`
+        // access, and there is no env for an allocator abandoned by the
+        // wall-clock backstop to outlive.
+        //
+        // Errors are classified as an allocator's always were: an epoch
+        // interrupt is `Timeout`, anything else is `Runtime`, with no error-level
+        // log per guest trap (`classify_allocator_error`).
+        self.call_typed_blocking(
+            handle,
+            "__frnt__initiate_buffer",
+            size,
+            None,
+            classify_allocator_error,
+        )
     }
 
     fn call_void(&mut self, handle: &InstanceHandle, name: &str) -> Result<(), WasmError> {
@@ -1135,7 +1203,7 @@ impl WasmEngine for WasmtimeEngine {
         let func = instance
             .get_typed_func::<(), ()>(&mut *store, name)
             .map_err(|e| WasmError::Export(e.to_string()))?;
-        arm_epoch_deadline(store, epoch_ticks);
+        arm_epoch_deadline(store, epoch_ticks, Some(handle.id));
         // Use call_async because async_support(true) is enabled in the engine Config
         block_on_async(func.call_async(&mut *store, ()))
             .map_err(|e| classify_runtime_error(enabled_metering, store, e))
@@ -1156,7 +1224,13 @@ impl WasmEngine for WasmtimeEngine {
         // it with no preemption at all) and no panic capture. `Some(handle.id)`
         // carries the delegate instance id onto the thread that runs the guest —
         // see `GuestDelegateInstance`.
-        self.call_typed_blocking(handle, name, (a, b, c), Some(handle.id))
+        self.call_typed_blocking(
+            handle,
+            name,
+            (a, b, c),
+            Some(handle.id),
+            classify_runtime_error,
+        )
     }
 
     fn call_2i64_blocking(
@@ -1166,7 +1240,7 @@ impl WasmEngine for WasmtimeEngine {
         a: i64,
         b: i64,
     ) -> Result<i64, WasmError> {
-        self.call_typed_blocking(handle, name, (a, b), None)
+        self.call_typed_blocking(handle, name, (a, b), None, classify_runtime_error)
     }
 
     fn call_3i64_blocking(
@@ -1177,12 +1251,12 @@ impl WasmEngine for WasmtimeEngine {
         b: i64,
         c: i64,
     ) -> Result<i64, WasmError> {
-        self.call_typed_blocking(handle, name, (a, b, c), None)
+        self.call_typed_blocking(handle, name, (a, b, c), None, classify_runtime_error)
     }
 }
 
-/// Refresh the cached MEM_ADDR entry for an instance using the current memory
-/// from the wasmtime `Caller`.
+/// Refresh the cached MEM_ADDR entry for the CALLING instance using the
+/// current memory from the wasmtime `Caller`, and return that instance's id.
 ///
 /// WASM linear memory can be relocated by `memory.grow`. The initial pointer
 /// stored in `MEM_ADDR` at instance creation may become stale. This function
@@ -1191,17 +1265,24 @@ impl WasmEngine for WasmtimeEngine {
 ///
 /// Called at the start of every host function to ensure `native_api` functions
 /// see the correct memory base pointer.
-fn refresh_mem_addr_from_caller(caller: &mut Caller<'_, HostState>, instance_id: i64) {
-    if instance_id < 0 {
-        return;
-    }
+///
+/// The instance is the one the store recorded at guest entry
+/// ([`HostState::calling_instance`]). There is deliberately no id parameter:
+/// this function writes the entry it refreshes, so an id from anywhere else
+/// (a guest argument, a thread-local) could point the write at another
+/// instance's record. Returns -1 when no guest entry has been recorded.
+fn refresh_mem_addr_from_caller(caller: &mut Caller<'_, HostState>) -> native_api::InstanceId {
+    let Some(instance_id) = caller.data().calling_instance else {
+        return -1;
+    };
     let Some(memory) = caller.get_export("memory").and_then(|e| e.into_memory()) else {
-        tracing::warn!(
+        // Guest-triggerable (a module with no memory export), so not a warning.
+        tracing::debug!(
             instance_id,
             "refresh_mem_addr: no 'memory' export found — \
              stale pointer will persist until next successful refresh"
         );
-        return;
+        return instance_id;
     };
     let data = memory.data(&*caller);
     let new_ptr = data.as_ptr() as i64;
@@ -1220,12 +1301,41 @@ fn refresh_mem_addr_from_caller(caller: &mut Caller<'_, HostState>, instance_id:
             info.mem_size = new_size;
         }
     } else {
-        tracing::warn!(
+        // Expected while the instance is being created (a start function or
+        // `__frnt_set_id` runs before `RunningInstance::new` records it), and
+        // guest-triggerable, so not a warning.
+        tracing::debug!(
             instance_id,
-            "refresh_mem_addr: no MEM_ADDR entry for instance — \
-             native_api calls will fail"
+            "refresh_mem_addr: no MEM_ADDR entry for instance yet"
         );
     }
+    instance_id
+}
+
+/// Resolve the delegate instance for a delegate host function.
+///
+/// Delegate host functions find their `DELEGATE_ENV` through the
+/// `CURRENT_DELEGATE_INSTANCE` thread-local, which is per THREAD, while the
+/// guest making the call is per STORE. When they disagree (a guest entered on
+/// a thread that still carries some delegate's id), the call is refused with
+/// `ERR_NOT_IN_PROCESS`, so it can neither reach that delegate's env nor have
+/// `native_api` resolve that delegate's memory record. Returns `Err` with the
+/// code to hand back to the guest.
+///
+/// Every production delegate entry installs the thread-local on the thread that
+/// runs the guest (`GuestDelegateInstance`), and every other entry leaves it at
+/// -1 there. So a disagreement needs an entry that runs a guest on a thread
+/// carrying another delegate's id. The only such entry today is the inline
+/// `call_void`, which only tests use; this check keeps any future inline entry
+/// from opening one.
+fn delegate_caller(caller: &mut Caller<'_, HostState>) -> Result<(), i32> {
+    let calling = refresh_mem_addr_from_caller(caller);
+    let thread_delegate = native_api::CURRENT_DELEGATE_INSTANCE.with(|c| c.get());
+    // -1 is "not in process()"; `native_api` reports that itself, unchanged.
+    if thread_delegate != -1 && thread_delegate != calling {
+        return Err(native_api::error_codes::ERR_NOT_IN_PROCESS);
+    }
+    Ok(())
 }
 
 impl WasmtimeEngine {
@@ -1251,17 +1361,23 @@ impl WasmtimeEngine {
     /// delegates here and that the epoch arm lives inside this closure.
     ///
     /// `delegate_instance` is `Some(handle.id)` for a delegate `process()` call
-    /// and `None` for a contract. Delegate host functions locate their
+    /// and `None` for a contract, and for the allocator export of either (see
+    /// `initiate_buffer`). Delegate host functions locate their
     /// `native_api::DelegateCallEnv` through the `CURRENT_DELEGATE_INSTANCE`
     /// THREAD-LOCAL, so a guest running on a blocking-pool thread needs that id
     /// installed on the thread that actually executes it — see
     /// [`GuestDelegateInstance`].
+    ///
+    /// `classify` maps a guest error (a trap, an epoch interrupt) to a
+    /// [`WasmError`]: [`classify_runtime_error`] for contract and delegate
+    /// entry points, [`classify_allocator_error`] for the allocator export.
     fn call_typed_blocking<P>(
         &mut self,
         handle: &InstanceHandle,
         name: &str,
         args: P,
         delegate_instance: Option<i64>,
+        classify: GuestErrorClassifier,
     ) -> Result<i64, WasmError>
     where
         // `Sync` is REQUIRED and is not an over-claim, despite this change
@@ -1308,6 +1424,7 @@ impl WasmtimeEngine {
         // runaway synchronous guest. Capture the tick budget by value since the
         // closure can't borrow `self`.
         let epoch_ticks = self.epoch_deadline_ticks;
+        let calling_instance = handle.id;
 
         // Registered HERE, on the calling thread, not inside the closure: see
         // `native_api::LIVE_DELEGATE_GUESTS`. Registering inside would leave a
@@ -1327,7 +1444,7 @@ impl WasmtimeEngine {
                 // every exit path (including a panic), so a reused blocking-pool
                 // thread never carries a stale delegate id into the next job.
                 let _delegate = delegate_instance.map(GuestDelegateInstance::install);
-                arm_epoch_deadline(&mut store, epoch_ticks);
+                arm_epoch_deadline(&mut store, epoch_ticks, Some(calling_instance));
                 // Use call_async because async_support(true) is enabled in the engine Config
                 let r = block_on_async(func.call_async(&mut store, args));
                 (r, store)
@@ -1341,7 +1458,7 @@ impl WasmtimeEngine {
                 Ok(value)
             }
             BlockingResult::WasmError(err, mut store) => {
-                let wasm_err = classify_runtime_error(enabled_metering, &mut store, err);
+                let wasm_err = classify(enabled_metering, &mut store, err);
                 self.store = Some(store);
                 Err(wasm_err)
             }
@@ -1438,7 +1555,7 @@ impl WasmtimeEngine {
         if enabled_metering {
             store.set_fuel(max_fuel).map_err(|e| anyhow::anyhow!(e))?;
         }
-        arm_epoch_deadline(&mut store, epoch_deadline_ticks);
+        arm_epoch_deadline(&mut store, epoch_deadline_ticks, None);
 
         if host_mem {
             return Err(anyhow::anyhow!(
@@ -1452,7 +1569,7 @@ impl WasmtimeEngine {
         Ok(Self {
             engine: backend,
             store: Some(store),
-            linker,
+            linker: Arc::new(linker),
             instances: HashMap::new(),
             max_execution_seconds: config.max_execution_seconds,
             enabled_metering,
@@ -1643,8 +1760,9 @@ impl WasmtimeEngine {
     /// Instantiate `module`, run its `__frnt_set_id`, and ensure request memory —
     /// the guest-entry half of [`create_instance`], factored out so the caller can
     /// RECOVER THE STORE on any guest-entry timeout/error before returning (#4864
-    /// round-9 item 2). Every guest entry here is immediately preceded by its own
-    /// `arm_epoch_deadline` (pinned by
+    /// round-9 item 2), and so it can run as ONE job under
+    /// [`execute_wasm_blocking`]. Every guest entry here is immediately preceded
+    /// by its own `arm_epoch_deadline` (pinned by
     /// `every_guest_entry_is_preceded_by_arm_epoch_deadline`, which now scrapes
     /// this method).
     fn instantiate_and_init(
@@ -1658,7 +1776,7 @@ impl WasmtimeEngine {
         // Arm the epoch deadline before instantiation runs any guest start
         // function (#4861); the store is reused across calls so a stale deadline
         // would otherwise trap here.
-        arm_epoch_deadline(store, epoch_deadline_ticks);
+        arm_epoch_deadline(store, epoch_deadline_ticks, Some(id));
 
         // Instantiate the module using the pre-configured linker.
         // CRITICAL: Must use instantiate_async() because async_support(true) is enabled.
@@ -1682,13 +1800,12 @@ impl WasmtimeEngine {
             // ran near the budget would leave set_id ~zero ticks and trap it
             // spuriously.
             //
-            // Adversarial ceiling (#4864 round-5 item 10): giving set_id a FRESH
-            // budget is correct per-call, but it means create_instance's worst-case
-            // GUEST CPU is ~2x max_execution_seconds (a start function running just
-            // under budget, then set_id running a fresh full budget). That is
-            // bounded at EXACTLY 2 guest entries — the pin enumerates every guest
-            // entry here, so the factor cannot silently grow.
-            arm_epoch_deadline(store, epoch_deadline_ticks);
+            // Ceiling (#4864 round-5 item 10): with a fresh budget per entry,
+            // create_instance's worst-case guest time is
+            // `INSTANCE_SETUP_GUEST_ENTRIES` (2) x max_execution_seconds, and the
+            // wall-clock bound `create_instance` passes is sized to match. Adding
+            // a third guest entry here means raising that constant too.
+            arm_epoch_deadline(store, epoch_deadline_ticks, Some(id));
             block_on_async(typed_func.call_async(&mut *store, id)).map_err(|e| {
                 classify_guest_entry_error(e, |e| WasmError::Runtime(e.to_string()))
             })?;
@@ -1730,7 +1847,7 @@ impl WasmtimeEngine {
         // Re-arm the epoch deadline on the fresh store; every guest call re-arms
         // again, but arming here keeps the invariant "a live store always has a
         // future deadline" (an un-armed epoch store traps immediately).
-        arm_epoch_deadline(&mut store, self.epoch_deadline_ticks);
+        arm_epoch_deadline(&mut store, self.epoch_deadline_ticks, None);
         self.instances.clear();
         self.store = Some(store);
         self.lifetime_instances = 0;
@@ -1876,6 +1993,11 @@ impl WasmtimeEngine {
         // All host functions refresh the cached MEM_ADDR entry via the Caller
         // before calling into native_api. This prevents stale memory base
         // pointers after WASM memory.grow relocates linear memory (#3248).
+        //
+        // The instance a host function acts on is the CALLING instance
+        // (`HostState::calling_instance`), returned by the refresh. An id
+        // parameter in a signature below is part of the guest ABI and is
+        // ignored: never key a lookup by a guest-supplied id.
         // =====================================================================
 
         // Log namespace
@@ -1883,8 +2005,10 @@ impl WasmtimeEngine {
             .func_wrap(
                 "freenet_log",
                 "__frnt__logger__info",
-                |mut caller: Caller<'_, HostState>, id: i64, ptr: i64, len: i32| {
-                    refresh_mem_addr_from_caller(&mut caller, id);
+                // The guest's id argument is part of the ABI and ignored; see
+                // `HostState::calling_instance`.
+                |mut caller: Caller<'_, HostState>, _guest_id: i64, ptr: i64, len: i32| {
+                    let id = refresh_mem_addr_from_caller(&mut caller);
                     native_api::log::info(id, ptr, len);
                 },
             )
@@ -1895,8 +2019,8 @@ impl WasmtimeEngine {
             .func_wrap(
                 "freenet_rand",
                 "__frnt__rand__rand_bytes",
-                |mut caller: Caller<'_, HostState>, id: i64, ptr: i64, len: u32| {
-                    refresh_mem_addr_from_caller(&mut caller, id);
+                |mut caller: Caller<'_, HostState>, _guest_id: i64, ptr: i64, len: u32| {
+                    let id = refresh_mem_addr_from_caller(&mut caller);
                     native_api::rand::rand_bytes(id, ptr, len);
                 },
             )
@@ -1918,22 +2042,26 @@ impl WasmtimeEngine {
             .func_wrap(
                 crate::conformance::HOST_CLOCK_NAMESPACE,
                 crate::conformance::HOST_CLOCK_IMPORT,
-                |mut caller: Caller<'_, HostState>, id: i64, ptr: i64| {
-                    refresh_mem_addr_from_caller(&mut caller, id);
+                |mut caller: Caller<'_, HostState>, _guest_id: i64, ptr: i64| {
+                    let id = refresh_mem_addr_from_caller(&mut caller);
                     native_api::time::utc_now(id, ptr);
                 },
             )
             .map_err(|e| WasmError::Other(anyhow::anyhow!(e)))?;
 
         // Delegate context namespace (synchronous)
-        // These use the thread-local CURRENT_DELEGATE_INSTANCE for the instance ID.
+        // These use the thread-local CURRENT_DELEGATE_INSTANCE for the instance ID,
+        // after `delegate_caller` has checked it is the calling instance. Every
+        // `freenet_delegate_*` registration must go through `delegate_caller`
+        // (pinned by `every_delegate_host_function_checks_the_calling_instance`).
         linker
             .func_wrap(
                 "freenet_delegate_ctx",
                 "__frnt__delegate__ctx_len",
                 |mut caller: Caller<'_, HostState>| {
-                    let id = native_api::CURRENT_DELEGATE_INSTANCE.with(|c| c.get());
-                    refresh_mem_addr_from_caller(&mut caller, id);
+                    if let Err(code) = delegate_caller(&mut caller) {
+                        return code;
+                    }
                     native_api::delegate_context::context_len()
                 },
             )
@@ -1944,8 +2072,9 @@ impl WasmtimeEngine {
                 "freenet_delegate_ctx",
                 "__frnt__delegate__ctx_read",
                 |mut caller: Caller<'_, HostState>, ptr: i64, len: i32| {
-                    let id = native_api::CURRENT_DELEGATE_INSTANCE.with(|c| c.get());
-                    refresh_mem_addr_from_caller(&mut caller, id);
+                    if let Err(code) = delegate_caller(&mut caller) {
+                        return code;
+                    }
                     native_api::delegate_context::context_read(ptr, len)
                 },
             )
@@ -1956,8 +2085,9 @@ impl WasmtimeEngine {
                 "freenet_delegate_ctx",
                 "__frnt__delegate__ctx_write",
                 |mut caller: Caller<'_, HostState>, ptr: i64, len: i32| {
-                    let id = native_api::CURRENT_DELEGATE_INSTANCE.with(|c| c.get());
-                    refresh_mem_addr_from_caller(&mut caller, id);
+                    if let Err(code) = delegate_caller(&mut caller) {
+                        return code;
+                    }
                     native_api::delegate_context::context_write(ptr, len)
                 },
             )
@@ -1973,8 +2103,9 @@ impl WasmtimeEngine {
                  key_len: i32,
                  out_ptr: i64,
                  out_len: i32| {
-                    let id = native_api::CURRENT_DELEGATE_INSTANCE.with(|c| c.get());
-                    refresh_mem_addr_from_caller(&mut caller, id);
+                    if let Err(code) = delegate_caller(&mut caller) {
+                        return code;
+                    }
                     native_api::delegate_secrets::get_secret(key_ptr, key_len, out_ptr, out_len)
                 },
             )
@@ -1985,8 +2116,9 @@ impl WasmtimeEngine {
                 "freenet_delegate_secrets",
                 "__frnt__delegate__get_secret_len",
                 |mut caller: Caller<'_, HostState>, key_ptr: i64, key_len: i32| {
-                    let id = native_api::CURRENT_DELEGATE_INSTANCE.with(|c| c.get());
-                    refresh_mem_addr_from_caller(&mut caller, id);
+                    if let Err(code) = delegate_caller(&mut caller) {
+                        return code;
+                    }
                     native_api::delegate_secrets::get_secret_len(key_ptr, key_len)
                 },
             )
@@ -2001,8 +2133,9 @@ impl WasmtimeEngine {
                  key_len: i32,
                  val_ptr: i64,
                  val_len: i32| {
-                    let id = native_api::CURRENT_DELEGATE_INSTANCE.with(|c| c.get());
-                    refresh_mem_addr_from_caller(&mut caller, id);
+                    if let Err(code) = delegate_caller(&mut caller) {
+                        return code;
+                    }
                     native_api::delegate_secrets::set_secret(key_ptr, key_len, val_ptr, val_len)
                 },
             )
@@ -2013,8 +2146,9 @@ impl WasmtimeEngine {
                 "freenet_delegate_secrets",
                 "__frnt__delegate__has_secret",
                 |mut caller: Caller<'_, HostState>, key_ptr: i64, key_len: i32| {
-                    let id = native_api::CURRENT_DELEGATE_INSTANCE.with(|c| c.get());
-                    refresh_mem_addr_from_caller(&mut caller, id);
+                    if let Err(code) = delegate_caller(&mut caller) {
+                        return code;
+                    }
                     native_api::delegate_secrets::has_secret(key_ptr, key_len)
                 },
             )
@@ -2025,8 +2159,9 @@ impl WasmtimeEngine {
                 "freenet_delegate_secrets",
                 "__frnt__delegate__remove_secret",
                 |mut caller: Caller<'_, HostState>, key_ptr: i64, key_len: i32| {
-                    let id = native_api::CURRENT_DELEGATE_INSTANCE.with(|c| c.get());
-                    refresh_mem_addr_from_caller(&mut caller, id);
+                    if let Err(code) = delegate_caller(&mut caller) {
+                        return code;
+                    }
                     native_api::delegate_secrets::remove_secret(key_ptr, key_len)
                 },
             )
@@ -2037,8 +2172,9 @@ impl WasmtimeEngine {
                 "freenet_delegate_secrets",
                 "__frnt__delegate__list_secrets_len",
                 |mut caller: Caller<'_, HostState>, prefix_ptr: i64, prefix_len: i32| {
-                    let id = native_api::CURRENT_DELEGATE_INSTANCE.with(|c| c.get());
-                    refresh_mem_addr_from_caller(&mut caller, id);
+                    if let Err(code) = delegate_caller(&mut caller) {
+                        return code;
+                    }
                     native_api::delegate_secrets::list_secrets_len(prefix_ptr, prefix_len)
                 },
             )
@@ -2053,8 +2189,9 @@ impl WasmtimeEngine {
                  prefix_len: i32,
                  out_ptr: i64,
                  out_len: i32| {
-                    let id = native_api::CURRENT_DELEGATE_INSTANCE.with(|c| c.get());
-                    refresh_mem_addr_from_caller(&mut caller, id);
+                    if let Err(code) = delegate_caller(&mut caller) {
+                        return code;
+                    }
                     native_api::delegate_secrets::list_secrets(
                         prefix_ptr, prefix_len, out_ptr, out_len,
                     )
@@ -2086,8 +2223,9 @@ impl WasmtimeEngine {
                  out_ptr: i64,
                  out_len: i64|
                  -> i64 {
-                    let id = native_api::CURRENT_DELEGATE_INSTANCE.with(|c| c.get());
-                    refresh_mem_addr_from_caller(&mut caller, id);
+                    if let Err(code) = delegate_caller(&mut caller) {
+                        return i64::from(code);
+                    }
                     native_api::delegate_contracts::local_contract_state_impl(
                         id_ptr, id_len, out_ptr, out_len,
                     )
@@ -2100,8 +2238,9 @@ impl WasmtimeEngine {
                 "freenet_delegate_contracts",
                 "__frnt__delegate__get_contract_state_len",
                 |mut caller: Caller<'_, HostState>, id_ptr: i64, id_len: i32| -> i64 {
-                    let id = native_api::CURRENT_DELEGATE_INSTANCE.with(|c| c.get());
-                    refresh_mem_addr_from_caller(&mut caller, id);
+                    if let Err(code) = delegate_caller(&mut caller) {
+                        return i64::from(code);
+                    }
                     native_api::delegate_contracts::local_contract_state_len_impl(id_ptr, id_len)
                 },
             )
@@ -2136,9 +2275,11 @@ impl WasmtimeEngine {
                     out_key_ptr,
                     out_hash_ptr,
                 ): (i64, i64, i64, i64, i64, i64, i64, i64)| {
-                    let id = native_api::CURRENT_DELEGATE_INSTANCE.with(|c| c.get());
-                    refresh_mem_addr_from_caller(&mut caller, id);
+                    let refused = delegate_caller(&mut caller).err();
                     Box::new(async move {
+                        if let Some(code) = refused {
+                            return code;
+                        }
                         native_api::delegate_management::create_delegate_impl(
                             wasm_ptr,
                             wasm_len,
@@ -2160,10 +2301,10 @@ impl WasmtimeEngine {
                 "freenet_contract_io",
                 "__frnt__fill_buffer",
                 |mut caller: Caller<'_, HostState>,
-                 id: i64,
+                 _guest_id: i64,
                  buf_ptr: i64|
                  -> wasmtime::Result<u32> {
-                    refresh_mem_addr_from_caller(&mut caller, id);
+                    let id = refresh_mem_addr_from_caller(&mut caller);
                     // A builder that no longer lies in guest memory traps the
                     // guest instead of reporting EOF, which would silently
                     // truncate the input the contract is reading.
@@ -2205,14 +2346,12 @@ fn is_epoch_interrupt(error: &WasmtimeError) -> bool {
         .is_some_and(|t| matches!(t, wasmtime::Trap::Interrupt))
 }
 
-/// Map an error from a GUEST-ENTRY call — instantiation (module start
-/// function), `__frnt_set_id`, or `__frnt__initiate_buffer` — to a
+/// Map an error from a setup or allocator guest entry — instantiation (module
+/// start function), `__frnt_set_id`, or `__frnt__initiate_buffer` — to a
 /// [`WasmError`], routing an epoch-deadline interrupt to [`WasmError::Timeout`]
-/// (#4864 review). Without this, a runaway guest during the init/allocator phase
-/// would surface as `Instantiation`/`Runtime` — neither `is_wasm_timeout` (wrong
-/// merge-backoff cooldown class) nor even `is_contract_exec_rejection` (not
-/// recorded at all). Non-interrupt errors keep their original category via
-/// `otherwise`, preserving the existing error text.
+/// (#4864 review), so it is recognised by `is_wasm_timeout` and recorded by
+/// `is_contract_exec_rejection` like any other guest timeout. Non-interrupt
+/// errors keep their own category via `otherwise`, with their original text.
 fn classify_guest_entry_error(
     error: WasmtimeError,
     otherwise: impl FnOnce(WasmtimeError) -> WasmError,
@@ -2222,6 +2361,23 @@ fn classify_guest_entry_error(
         return WasmError::Timeout;
     }
     otherwise(error)
+}
+
+/// How [`WasmtimeEngine::call_typed_blocking`] maps a guest error to a
+/// [`WasmError`]. Arguments: whether metering is on, the store the guest ran
+/// on, and the error.
+type GuestErrorClassifier = fn(bool, &mut Store<HostState>, WasmtimeError) -> WasmError;
+
+/// Classify an error from the allocator export `__frnt__initiate_buffer`: an
+/// epoch interrupt is [`WasmError::Timeout`], anything else is
+/// [`WasmError::Runtime`]. No error-level log, since a guest trap here is the
+/// guest's failure and not a node fault; the caller reports it.
+fn classify_allocator_error(
+    _enabled_metering: bool,
+    _store: &mut Store<HostState>,
+    error: WasmtimeError,
+) -> WasmError {
+    classify_guest_entry_error(error, |e| WasmError::Runtime(e.to_string()))
 }
 
 /// Classify a wasmtime Error, checking fuel status.
@@ -2323,10 +2479,12 @@ impl Drop for LiveGuestRegistration {
 // Blocking execution with timeout
 // =============================================================================
 
-type WasmResult = (Result<i64, WasmtimeError>, Store<HostState>);
+/// What a blocking job hands back: the guest entry's result (`i64` for every
+/// typed call; instance creation returns its own type) and the store it ran on.
+type WasmResult<T = i64> = (Result<T, WasmtimeError>, Store<HostState>);
 
-enum BlockingResult {
-    Ok(i64, Store<HostState>),
+enum BlockingResult<T = i64> {
+    Ok(T, Store<HostState>),
     WasmError(WasmtimeError, Store<HostState>),
     /// Wall-clock deadline fired while the guest was RUNNING (`started == true`)
     /// — a real, contract-intrinsic timeout backing up the epoch trap. The
@@ -2356,6 +2514,11 @@ enum WallVerdict {
     /// fault; must not be charged to the contract.
     QueuedTooLong,
 }
+
+/// Guest entries `instantiate_and_init` makes, each with its own freshly armed
+/// epoch budget: the module start function and `__frnt_set_id`. The wall-clock
+/// bound for instance setup allows this many budgets.
+const INSTANCE_SETUP_GUEST_ENTRIES: u32 = 2;
 
 /// Extra wall-clock time the backstop allows a RUNNING guest past the end of
 /// the epoch-trap window, so a live ticker's trap normally lands first.
@@ -2400,12 +2563,25 @@ impl WallBounds {
     /// that every race; this bound makes the trap win instead, as the comments
     /// around `arm_epoch_deadline` always described.
     fn for_budget(max_execution_seconds: f64) -> Self {
+        Self::for_entries(max_execution_seconds, 1)
+    }
+
+    /// The bounds for a job that runs `entries` guest entries in sequence,
+    /// each with its own freshly armed `max_execution_seconds` epoch budget
+    /// (instance setup: the module start function, then `__frnt_set_id`).
+    /// `queue` is the same as for one entry; `guest` allows each entry its
+    /// full per-entry window, so a job whose entries each stay within budget
+    /// is never cut off by the backstop.
+    fn for_entries(max_execution_seconds: f64, entries: u32) -> Self {
         let queue = Duration::from_secs_f64(max_execution_seconds);
         let ticks = u32::try_from(epoch_deadline_ticks(max_execution_seconds)).unwrap_or(u32::MAX);
         let epoch_window = EPOCH_TICK_PERIOD.saturating_mul(ticks);
         Self {
             queue,
-            guest: queue.max(epoch_window).saturating_add(WALL_BACKSTOP_MARGIN),
+            guest: queue
+                .max(epoch_window)
+                .saturating_mul(entries.max(1))
+                .saturating_add(WALL_BACKSTOP_MARGIN),
         }
     }
 }
@@ -2479,9 +2655,9 @@ fn time_to_next_wall_bound(
 }
 
 /// Outcome of [`wait_for_guest`].
-enum GuestWait {
+enum GuestWait<T = i64> {
     /// The job ran to completion and sent its result.
-    Done(WasmResult),
+    Done(WasmResult<T>),
     /// The job ended without sending a result: it panicked, or it was dropped
     /// unrun (runtime shutdown). The caller joins the job to find out which.
     Ended,
@@ -2504,12 +2680,12 @@ enum GuestWait {
 /// re-arms for the guest bound, so a late start still gets its full budget.
 /// When a bound passes at the same moment the result lands, the result wins,
 /// as it did when the old loop checked `is_finished()` before the deadline.
-fn wait_for_guest(
-    rx: &std::sync::mpsc::Receiver<WasmResult>,
+fn wait_for_guest<T>(
+    rx: &std::sync::mpsc::Receiver<WasmResult<T>>,
     start: std::time::Instant,
     bounds: WallBounds,
     read_started_at: &dyn Fn() -> Option<Duration>,
-) -> GuestWait {
+) -> GuestWait<T> {
     use std::sync::mpsc::{RecvTimeoutError, TryRecvError};
     loop {
         let started_at = read_started_at();
@@ -2535,14 +2711,34 @@ fn wait_for_guest(
     }
 }
 
-fn execute_wasm_blocking<F>(f: F, max_execution_seconds: f64) -> BlockingResult
+/// Run a job that makes ONE guest entry under the wall-clock backstop for
+/// `max_execution_seconds` of budget. See [`execute_wasm_blocking_within`].
+fn execute_wasm_blocking<T, F>(f: F, max_execution_seconds: f64) -> BlockingResult<T>
 where
-    F: FnOnce() -> WasmResult + Send + 'static,
+    T: Send + 'static,
+    F: FnOnce() -> WasmResult<T> + Send + 'static,
 {
-    // Bounds the queue wait (before the guest starts) and the guest's own run
-    // time (after it starts), SEPARATELY — see `WallBounds` and
-    // `classify_wall_timeout`.
-    let bounds = WallBounds::for_budget(max_execution_seconds);
+    execute_wasm_blocking_within(
+        f,
+        WallBounds::for_budget(max_execution_seconds),
+        max_execution_seconds,
+    )
+}
+
+/// Run `f` off the calling thread under `bounds`, which limit the queue wait
+/// (before the guest starts) and the guest's own run time (after it starts)
+/// SEPARATELY — see `WallBounds` and `classify_wall_timeout`. A panic in `f`
+/// is returned as [`BlockingResult::Panic`]. `max_execution_seconds` is only
+/// reported in the timeout logs.
+fn execute_wasm_blocking_within<T, F>(
+    f: F,
+    bounds: WallBounds,
+    max_execution_seconds: f64,
+) -> BlockingResult<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> WasmResult<T> + Send + 'static,
+{
     let start = std::time::Instant::now();
 
     // #4864 round-6/7: distinguish a guest that RAN and blew its budget (a real,
@@ -2569,7 +2765,7 @@ where
     // moment it finishes. Capacity 1 and exactly one send, so the send never
     // blocks. A job that panics, or is dropped unrun, drops `result_tx` without
     // sending, which the waiter sees as a disconnect.
-    let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<WasmResult>(1);
+    let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<WasmResult<T>>(1);
     let job = move || {
         // Record started_at BEFORE flipping `started`, so a waiter that
         // observes started==true (SeqCst) is guaranteed to read a valid
@@ -2832,7 +3028,7 @@ mod tests {
         let mut store = Store::new(&engine, HostState::new(DEFAULT_MAX_MEMORY_PAGES));
         store.limiter(|s| s);
         // Short deadline (2 ticks ≈ 200ms) so the test is fast; trap-on-deadline.
-        arm_epoch_deadline(&mut store, 2);
+        arm_epoch_deadline(&mut store, 2, None);
 
         let instance = block_on_async(Linker::new(&engine).instantiate_async(&mut store, &module))
             .expect("instantiation must succeed");
@@ -3060,6 +3256,399 @@ mod tests {
             matches!(err, WasmError::Other(_)),
             "a captured panic must surface as WasmError::Other, got {err:?}"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // The allocator export and instance setup (module start function,
+    // `__frnt_set_id`) are guest code too, and need the same three safeguards
+    // as the entry points above. The runtime calls the allocator before every
+    // contract and delegate entry point, and instance setup before that.
+    // ---------------------------------------------------------------------
+
+    /// How long `freenet_test.nap` blocks the thread that calls it.
+    const NAP: Duration = Duration::from_secs(1);
+
+    /// A linker with two test imports: `freenet_test.nap`, which blocks the
+    /// calling thread for [`NAP`] (a stand-in for any slow host function), and
+    /// `freenet_test.boom`, which panics (a stand-in for any host-side panic).
+    fn test_host_linker(engine: &Engine) -> Linker<HostState> {
+        // Named fns for the reason given in `delegate_entry_captures_host_panic`.
+        fn nap(_: Caller<'_, HostState>) {
+            std::thread::sleep(NAP)
+        }
+        fn boom(_: Caller<'_, HostState>) {
+            panic!("deliberate host-function panic (allocator / instance-setup test)");
+        }
+        let mut linker: Linker<HostState> = Linker::new(engine);
+        linker
+            .func_wrap("freenet_test", "nap", nap)
+            .expect("registering nap must succeed");
+        linker
+            .func_wrap("freenet_test", "boom", boom)
+            .expect("registering boom must succeed");
+        linker
+    }
+
+    /// An engine whose linker is [`test_host_linker`], under `max_secs` of wall
+    /// clock and `epoch_ticks` of epoch budget.
+    fn engine_with_test_host(max_secs: f64, epoch_ticks: u64) -> WasmtimeEngine {
+        let config = RuntimeConfig {
+            enable_metering: false,
+            ..RuntimeConfig::default()
+        };
+        let mut engine = WasmtimeEngine::new(&config, false).expect("engine must build");
+        engine.max_execution_seconds = max_secs;
+        engine.epoch_deadline_ticks = epoch_ticks;
+        engine.linker = test_host_linker(&engine.engine).into();
+        engine
+    }
+
+    /// Instantiate `wat` straight into the engine's store under `id`, so
+    /// `initiate_buffer` finds it without going through `create_instance`.
+    fn insert_raw_instance(engine: &mut WasmtimeEngine, id: i64, wat: &str) {
+        let store = engine.store.as_mut().expect("engine store present");
+        let eng = store.engine().clone();
+        let module = Module::new(&eng, wat.as_bytes()).expect("WAT must compile");
+        let instance =
+            block_on_async(test_host_linker(&eng).instantiate_async(&mut *store, &module))
+                .expect("instantiation must succeed");
+        engine.instances.insert(id, instance);
+    }
+
+    /// After a guest entry failed, the engine must still create and drop an
+    /// instance: the store must have been recovered, not left with the
+    /// abandoned or panicked job. Runs under a 5s budget, so a blocking pool
+    /// still busy with an abandoned guest from a short-budget test cannot turn
+    /// this check into a queue or guest timeout.
+    fn assert_engine_still_usable(engine: &mut WasmtimeEngine, after: &str) {
+        engine.max_execution_seconds = 5.0;
+        engine.epoch_deadline_ticks = epoch_deadline_ticks(5.0);
+        let module = engine.compile(SIMPLE_WASM).expect("compile");
+        let handle = engine
+            .create_instance(&module, 1024)
+            .unwrap_or_else(|e| panic!("the engine must be usable after {after}: {e}"));
+        engine.drop_instance(&handle);
+    }
+
+    /// Allocator export making three slow host calls.
+    const ALLOCATOR_SLOW_HOST_CALLS_WAT: &str = r#"
+        (module
+          (import "freenet_test" "nap" (func $nap))
+          (import "freenet_test" "boom" (func $boom))
+          (func (export "__frnt__initiate_buffer") (param i32) (result i64)
+            (call $nap)
+            (call $nap)
+            (call $nap)
+            (i64.const 0)))
+    "#;
+
+    /// Allocator export that never returns.
+    const ALLOCATOR_SPIN_WAT: &str = r#"
+        (module
+          (import "freenet_test" "nap" (func $nap))
+          (import "freenet_test" "boom" (func $boom))
+          (func (export "__frnt__initiate_buffer") (param i32) (result i64)
+            (loop (br 0))
+            (i64.const 0)))
+    "#;
+
+    /// Allocator export that calls a panicking host function.
+    const ALLOCATOR_HOST_PANIC_WAT: &str = r#"
+        (module
+          (import "freenet_test" "nap" (func $nap))
+          (import "freenet_test" "boom" (func $boom))
+          (func (export "__frnt__initiate_buffer") (param i32) (result i64)
+            (call $boom)
+            (i64.const 0)))
+    "#;
+
+    /// Asserts the allocator export returns `WasmError::Timeout` within 2s
+    /// when the guest runs for 3s against a 0.2s budget, and that the engine
+    /// is usable afterwards.
+    #[test]
+    fn allocator_entry_has_wall_clock_backstop() {
+        run_abandoning_guest_test(|| {
+            let mut engine = engine_with_test_host(0.2, epoch_deadline_ticks(0.2));
+            const ID: i64 = i64::MAX - 54810;
+            insert_raw_instance(&mut engine, ID, ALLOCATOR_SLOW_HOST_CALLS_WAT);
+
+            let start = std::time::Instant::now();
+            let result = engine.initiate_buffer(&InstanceHandle { id: ID }, 16);
+            let elapsed = start.elapsed();
+
+            assert!(
+                matches!(result, Err(WasmError::Timeout)),
+                "`initiate_buffer`: a guest past its budget must surface as \
+                 WasmError::Timeout, got {result:?} after {elapsed:?}"
+            );
+            assert!(
+                elapsed < NAP * 2,
+                "`initiate_buffer` took {elapsed:?}: the wall-clock backstop did not fire"
+            );
+            assert_engine_still_usable(&mut engine, "an allocator timeout");
+        });
+    }
+
+    /// Asserts the allocator export returns `WasmError::Timeout` within 5s for
+    /// a spinning guest under a 0.5s wall clock and ~10s of epoch budget, so
+    /// the return comes from the wall-clock backstop (the #4864 dead-ticker
+    /// case), and that the engine is usable afterwards.
+    #[test]
+    fn allocator_entry_has_wall_clock_backstop_when_epoch_cannot_fire() {
+        run_abandoning_guest_test(|| {
+            let mut engine = engine_with_test_host(0.5, 100);
+            const ID: i64 = i64::MAX - 54811;
+            insert_raw_instance(&mut engine, ID, ALLOCATOR_SPIN_WAT);
+
+            let start = std::time::Instant::now();
+            let result = engine.initiate_buffer(&InstanceHandle { id: ID }, 16);
+            let elapsed = start.elapsed();
+
+            assert!(
+                matches!(result, Err(WasmError::Timeout)),
+                "`initiate_buffer`: a spinning allocator must surface as \
+                 WasmError::Timeout, got {result:?} after {elapsed:?}"
+            );
+            assert!(
+                elapsed < Duration::from_secs(5),
+                "`initiate_buffer` took {elapsed:?}: the 0.5s wall-clock backstop did \
+                 not fire, and the ~10s epoch budget is too far out to have returned this"
+            );
+            assert_engine_still_usable(&mut engine, "an allocator timeout");
+        });
+    }
+
+    /// Asserts a host-function panic inside the allocator export is returned
+    /// as `WasmError::Other`, and that the engine is usable afterwards.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn allocator_entry_captures_host_panic() {
+        let mut engine = engine_with_test_host(5.0, epoch_deadline_ticks(5.0));
+        const ID: i64 = i64::MAX - 54812;
+        insert_raw_instance(&mut engine, ID, ALLOCATOR_HOST_PANIC_WAT);
+
+        let err = engine
+            .initiate_buffer(&InstanceHandle { id: ID }, 16)
+            .expect_err("a host panic must be returned as an Err");
+        assert!(
+            matches!(err, WasmError::Other(_)),
+            "a captured panic must surface as WasmError::Other, got {err:?}"
+        );
+        assert_engine_still_usable(&mut engine, "a captured allocator panic");
+    }
+
+    /// Module START function making the same three slow host calls.
+    const START_SLOW_HOST_CALLS_WAT: &str = r#"
+        (module
+          (import "freenet_test" "nap" (func $nap))
+          (memory (export "memory") 1)
+          (func $start
+            (call $nap)
+            (call $nap)
+            (call $nap))
+          (start $start))
+    "#;
+
+    /// Module START function that calls a panicking host function.
+    const START_HOST_PANIC_WAT: &str = r#"
+        (module
+          (import "freenet_test" "boom" (func $boom))
+          (memory (export "memory") 1)
+          (start $boom))
+    "#;
+
+    /// `__frnt_set_id` that calls a panicking host function.
+    const SET_ID_HOST_PANIC_WAT: &str = r#"
+        (module
+          (import "freenet_test" "boom" (func $boom))
+          (memory (export "memory") 1)
+          (func (export "__frnt_set_id") (param i64)
+            (call $boom)))
+    "#;
+
+    /// `__frnt_set_id` making the same three slow host calls.
+    const SET_ID_SLOW_HOST_CALLS_WAT: &str = r#"
+        (module
+          (import "freenet_test" "nap" (func $nap))
+          (memory (export "memory") 1)
+          (func (export "__frnt_set_id") (param i64)
+            (call $nap)
+            (call $nap)
+            (call $nap)))
+    "#;
+
+    /// Drive `create_instance` on `wat` and return the error, failing if it
+    /// succeeded.
+    fn create_instance_err(engine: &mut WasmtimeEngine, wat: &str) -> (WasmError, Duration) {
+        let module = engine.compile(wat.as_bytes()).expect("WAT must compile");
+        let start = std::time::Instant::now();
+        let result = engine.create_instance(&module, 0);
+        let elapsed = start.elapsed();
+        // `InstanceHandle` is not Debug, so match rather than `expect_err`.
+        match result {
+            Err(e) => (e, elapsed),
+            Ok(_) => panic!("instance setup must fail here, but succeeded after {elapsed:?}"),
+        }
+    }
+
+    /// Asserts `create_instance` returns `WasmError::Timeout` within 2s when
+    /// the module start function, or `__frnt_set_id`, runs for 3s against a
+    /// 0.2s budget, and that the engine is usable afterwards.
+    #[test]
+    fn instance_setup_has_wall_clock_backstop() {
+        run_abandoning_guest_test(|| {
+            for (entry, wat) in [
+                ("start function", START_SLOW_HOST_CALLS_WAT),
+                ("__frnt_set_id", SET_ID_SLOW_HOST_CALLS_WAT),
+            ] {
+                let mut engine = engine_with_test_host(0.2, epoch_deadline_ticks(0.2));
+                let (err, elapsed) = create_instance_err(&mut engine, wat);
+                assert!(
+                    matches!(err, WasmError::Timeout),
+                    "{entry}: a guest past its budget must surface as \
+                     WasmError::Timeout, got {err:?} after {elapsed:?}"
+                );
+                assert!(
+                    elapsed < NAP * 2,
+                    "{entry}: `create_instance` took {elapsed:?}: the wall-clock \
+                     backstop did not fire"
+                );
+                assert_engine_still_usable(&mut engine, &format!("a {entry} timeout"));
+            }
+        });
+    }
+
+    /// Asserts `create_instance` returns `WasmError::Timeout` within 5s for a
+    /// spinning start function under a 0.5s wall clock and ~10s of epoch
+    /// budget (the #4864 dead-ticker case), and that the engine is usable
+    /// afterwards.
+    #[test]
+    fn instance_setup_has_wall_clock_backstop_when_epoch_cannot_fire() {
+        run_abandoning_guest_test(|| {
+            let mut engine = engine_with_test_host(0.5, 100);
+            let (err, elapsed) = create_instance_err(&mut engine, START_LOOP_WAT);
+            assert!(
+                matches!(err, WasmError::Timeout),
+                "a spinning start function must surface as WasmError::Timeout, \
+                 got {err:?} after {elapsed:?}"
+            );
+            assert!(
+                elapsed < Duration::from_secs(5),
+                "`create_instance` took {elapsed:?}: the 0.5s wall-clock backstop did \
+                 not fire, and the ~10s epoch budget is too far out to have returned this"
+            );
+            assert_engine_still_usable(&mut engine, "a start-function timeout");
+        });
+    }
+
+    /// Allocator export that traps.
+    const ALLOCATOR_TRAP_WAT: &str = r#"
+        (module
+          (func (export "__frnt__initiate_buffer") (param i32) (result i64)
+            unreachable))
+    "#;
+
+    /// Module start function that traps.
+    const START_TRAP_WAT: &str = r#"
+        (module
+          (memory (export "memory") 1)
+          (func $start unreachable)
+          (start $start))
+    "#;
+
+    /// `__frnt_set_id` that traps.
+    const SET_ID_TRAP_WAT: &str = r#"
+        (module
+          (memory (export "memory") 1)
+          (func (export "__frnt_set_id") (param i64)
+            unreachable))
+    "#;
+
+    /// Asserts a trap in the allocator export is returned as
+    /// `WasmError::Runtime` (not `Timeout`, and not `OutOfGas`), and that the
+    /// engine is usable afterwards.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn allocator_entry_trap_is_a_runtime_error() {
+        let mut engine = engine_with_test_host(5.0, epoch_deadline_ticks(5.0));
+        const ID: i64 = i64::MAX - 54813;
+        insert_raw_instance(&mut engine, ID, ALLOCATOR_TRAP_WAT);
+
+        let err = engine
+            .initiate_buffer(&InstanceHandle { id: ID }, 16)
+            .expect_err("a trapping allocator must return an Err");
+        assert!(
+            matches!(err, WasmError::Runtime(_)),
+            "an allocator trap must be WasmError::Runtime, got {err:?}"
+        );
+        assert_engine_still_usable(&mut engine, "an allocator trap");
+    }
+
+    /// Asserts a trap during instance setup is returned with its setup
+    /// category (`Instantiation` for the start function, `Runtime` for
+    /// `__frnt_set_id`), and that the engine is usable afterwards.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn instance_setup_trap_keeps_its_error_category() {
+        let mut engine = engine_with_test_host(5.0, epoch_deadline_ticks(5.0));
+        let (err, _) = create_instance_err(&mut engine, START_TRAP_WAT);
+        assert!(
+            matches!(err, WasmError::Instantiation(_)),
+            "a start-function trap must be WasmError::Instantiation, got {err:?}"
+        );
+        assert_engine_still_usable(&mut engine, "a start-function trap");
+
+        let (err, _) = create_instance_err(&mut engine, SET_ID_TRAP_WAT);
+        assert!(
+            matches!(err, WasmError::Runtime(_)),
+            "a __frnt_set_id trap must be WasmError::Runtime, got {err:?}"
+        );
+        assert_engine_still_usable(&mut engine, "a __frnt_set_id trap");
+    }
+
+    /// Start function and `__frnt_set_id` that each make one slow host call.
+    const SETUP_ONE_NAP_EACH_WAT: &str = r#"
+        (module
+          (import "freenet_test" "nap" (func $nap))
+          (memory (export "memory") 1)
+          (func $start (call $nap))
+          (func (export "__frnt_set_id") (param i64) (call $nap))
+          (start $start))
+    "#;
+
+    /// Asserts instance setup succeeds when the start function and
+    /// `__frnt_set_id` each use 0.6 of the budget (1s each against a budget of
+    /// 1/0.6 s): each setup entry has its own budget, so the wall-clock bound
+    /// for setup must allow both.
+    #[test]
+    fn instance_setup_allows_each_entry_its_own_budget() {
+        run_abandoning_guest_test(|| {
+            let budget = NAP.as_secs_f64() / 0.6;
+            let mut engine = engine_with_test_host(budget, epoch_deadline_ticks(budget));
+            let module = engine
+                .compile(SETUP_ONE_NAP_EACH_WAT.as_bytes())
+                .expect("WAT must compile");
+            match engine.create_instance(&module, 0) {
+                Ok(handle) => engine.drop_instance(&handle),
+                Err(e) => panic!("two setup entries each within budget must succeed, got {e:?}"),
+            }
+        });
+    }
+
+    /// Asserts a host-function panic during instance setup, in the module
+    /// start function or in `__frnt_set_id`, is returned as `WasmError::Other`,
+    /// and that the engine is usable afterwards.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn instance_setup_captures_host_panic() {
+        for (entry, wat) in [
+            ("start function", START_HOST_PANIC_WAT),
+            ("__frnt_set_id", SET_ID_HOST_PANIC_WAT),
+        ] {
+            let mut engine = engine_with_test_host(5.0, epoch_deadline_ticks(5.0));
+            let (err, _) = create_instance_err(&mut engine, wat);
+            assert!(
+                matches!(err, WasmError::Other(_)),
+                "{entry}: a captured panic must surface as WasmError::Other, got {err:?}"
+            );
+            assert_engine_still_usable(&mut engine, &format!("a captured {entry} panic"));
+        }
     }
 
     /// #4864 review (fix 3): `epoch_deadline_ticks` = `ceil(secs / 100ms) + 1`,
@@ -3320,7 +3909,6 @@ mod tests {
             // instantiate_and_init so the store can be recovered on a guest-entry
             // timeout; scrape the new home of those entries.
             "fn instantiate_and_init(",
-            "fn initiate_buffer(",
             "fn call_void(",
             // #5480: the single shared body for all three contract/delegate
             // entry points.
@@ -3329,6 +3917,9 @@ mod tests {
 
         // The public entry points, which must NOT enter the guest themselves.
         const DELEGATING_ENTRY_FNS: &[&str] = &[
+            // The allocator export runs before every entry point below, so it
+            // needs the same safeguards they have.
+            "fn initiate_buffer(",
             "fn call_3i64(",
             "fn call_2i64_blocking(",
             "fn call_3i64_blocking(",
@@ -4264,8 +4855,8 @@ mod tests {
     fn execute_wasm_blocking_gates_block_in_place_on_multithread() {
         let src = include_str!("wasmtime_engine.rs");
         let after = src
-            .split_once("fn execute_wasm_blocking")
-            .expect("execute_wasm_blocking must exist")
+            .split_once("fn execute_wasm_blocking_within<")
+            .expect("execute_wasm_blocking_within must exist")
             .1;
         let body = after.split_once("\nfn ").map(|(b, _)| b).unwrap_or(after);
         assert!(
@@ -5683,5 +6274,608 @@ mod tests {
         for h in &handles {
             engine.drop_instance(h);
         }
+    }
+
+    // =====================================================================
+    // Host functions act on the CALLING instance, whatever id the guest
+    // passes. `MEM_ADDR` and `CONTRACT_IO` are process-global, so a host
+    // function that trusted a guest-supplied instance id would let one
+    // instance act on another's records.
+    //
+    // Instances are created so that the store's most recent guest entry is
+    // NOT the instance under test, wherever that matters: a guest entry that
+    // forgot to record its instance would then act on the other one, and the
+    // assertions on the other instance's record and memory catch it.
+    // =====================================================================
+
+    /// A module that forwards a guest-supplied instance id to every host
+    /// function that takes one. The data segment places a valid buffer
+    /// builder at offset 0 (data `[64, 80)`, read counter at 128, write
+    /// counter at 136), so a fill call that resolved to THIS memory would
+    /// succeed and be observable. Host writes go to `[256, 264)` (`rand_as`),
+    /// `[272, 288)` (`now_as`), `[320, 328)` (`__frnt__initiate_buffer`) and
+    /// `[384, 392)` (`void_rand`); all are zero until written.
+    const NAMES_OTHER_INSTANCE_WAT: &str = r#"
+    (module
+      (import "freenet_log" "__frnt__logger__info"
+        (func $log (param i64 i64 i32)))
+      (import "freenet_rand" "__frnt__rand__rand_bytes"
+        (func $rand (param i64 i64 i32)))
+      (import "freenet_time" "__frnt__time__utc_now"
+        (func $now (param i64 i64)))
+      (import "freenet_contract_io" "__frnt__fill_buffer"
+        (func $fill (param i64 i64) (result i32)))
+      (memory (export "memory") 1)
+      (data (i32.const 0)
+        "\40\00\00\00\00\00\00\00\10\00\00\00\00\00\00\00\80\00\00\00\00\00\00\00\88\00\00\00\00\00\00\00")
+      (global $instance_id (mut i64) (i64.const -1))
+      (func (export "__frnt_set_id") (param i64)
+        local.get 0
+        global.set $instance_id)
+      (func (export "__frnt__initiate_buffer") (param i32) (result i64)
+        i64.const -1
+        i64.const 320
+        i32.const 8
+        call $rand
+        i64.const 0)
+      (func (export "void_rand")
+        i64.const -1
+        i64.const 384
+        i32.const 8
+        call $rand)
+      (func (export "log_as") (param i64 i64) (result i64)
+        local.get 0
+        i64.const 256
+        i32.const 0
+        call $log
+        i64.const 0)
+      (func (export "rand_as") (param i64 i64) (result i64)
+        local.get 0
+        i64.const 256
+        i32.const 8
+        call $rand
+        i64.const 0)
+      (func (export "now_as") (param i64 i64) (result i64)
+        local.get 0
+        i64.const 272
+        call $now
+        i64.const 0)
+      (func (export "fill_as") (param i64 i64) (result i64)
+        local.get 0
+        local.get 1
+        call $fill
+        i64.extend_i32_u))
+    "#;
+
+    /// Record a `MEM_ADDR` entry for `handle` the way `RunningInstance::new`
+    /// does in production, and return the recorded `(start_ptr, mem_size)`.
+    fn record_mem_addr(engine: &mut WasmtimeEngine, handle: &InstanceHandle) -> (i64, usize) {
+        use crate::wasm_runtime::runtime::{InstanceInfo, Key};
+        use freenet_stdlib::prelude::ContractInstanceId;
+        let (ptr, size) = engine.memory_info(handle).unwrap();
+        MEM_ADDR.insert(
+            handle.id,
+            InstanceInfo::new(
+                ptr as i64,
+                size,
+                Key::Contract(ContractInstanceId::new([0u8; 32])),
+            ),
+        );
+        (ptr as i64, size)
+    }
+
+    fn mem_addr_of(id: i64) -> (i64, usize) {
+        let info = MEM_ADDR.get(&id).expect("MEM_ADDR entry");
+        (info.start_ptr, info.mem_size)
+    }
+
+    /// Copy `len` bytes at `offset` out of `handle`'s linear memory.
+    fn guest_bytes(
+        engine: &mut WasmtimeEngine,
+        handle: &InstanceHandle,
+        offset: usize,
+        len: usize,
+    ) -> Vec<u8> {
+        let (ptr, size) = engine.memory_info(handle).unwrap();
+        assert!(offset + len <= size);
+        // SAFETY: `ptr` is the live base of the instance's linear memory, the
+        // range is inside it (checked above), and no guest code is running.
+        unsafe { std::slice::from_raw_parts(ptr.add(offset), len).to_vec() }
+    }
+
+    /// Two live instances; the caller passes the OTHER one's id to each host
+    /// function that takes an id. The host must act on the caller: the other
+    /// instance's memory record and memory are left alone, and `rand`/`now`
+    /// write into the caller's memory.
+    #[test]
+    fn host_functions_ignore_an_instance_id_naming_another_instance() {
+        let config = RuntimeConfig::default();
+        let mut engine = WasmtimeEngine::new(&config, false).unwrap();
+        let module = engine.compile(NAMES_OTHER_INSTANCE_WAT.as_bytes()).unwrap();
+        // Caller first, victim last: the store's last guest entry is the
+        // victim's, so the caller's own entry has to record the caller.
+        let caller = engine.create_instance(&module, 1024).unwrap();
+        let victim = engine.create_instance(&module, 1024).unwrap();
+        let caller_mem = record_mem_addr(&mut engine, &caller);
+        let victim_mem = record_mem_addr(&mut engine, &victim);
+        assert_ne!(
+            victim_mem.0, caller_mem.0,
+            "test setup: the two instances must have distinct memories"
+        );
+
+        for export in ["log_as", "rand_as", "now_as"] {
+            let r = engine.call_2i64_blocking(&caller, export, victim.id, 0);
+            assert!(r.is_ok(), "{export} failed: {r:?}");
+            assert_eq!(
+                mem_addr_of(victim.id),
+                victim_mem,
+                "{export}: a call made by instance {} naming instance {} rewrote \
+                 the named instance's memory record",
+                caller.id,
+                victim.id
+            );
+            assert_eq!(mem_addr_of(caller.id), caller_mem);
+            // Each writing export has its own region, so one export's write
+            // cannot stand in for another's.
+            let written = match export {
+                "rand_as" => Some(256),
+                "now_as" => Some(272),
+                _ => None,
+            };
+            if let Some(offset) = written {
+                assert_ne!(
+                    guest_bytes(&mut engine, &caller, offset, 8),
+                    vec![0; 8],
+                    "{export}: nothing was written into the calling instance"
+                );
+            }
+            assert_eq!(
+                guest_bytes(&mut engine, &victim, 256, 32),
+                vec![0; 32],
+                "{export}: the host wrote into the named instance's memory"
+            );
+        }
+
+        engine.drop_instance(&caller);
+        engine.drop_instance(&victim);
+    }
+
+    /// Two live instances; the victim has pending streamed input. The caller
+    /// asks for a refill naming the victim's id and the same buffer offset.
+    /// Nothing may be delivered and the victim's input must stay where it
+    /// was. Positive control: the caller's OWN pending input is delivered.
+    #[test]
+    fn fill_buffer_ignores_an_instance_id_naming_another_instance() {
+        use crate::wasm_runtime::native_api::{CONTRACT_IO, PendingContractData};
+
+        let config = RuntimeConfig::default();
+        let mut engine = WasmtimeEngine::new(&config, false).unwrap();
+        let module = engine.compile(NAMES_OTHER_INSTANCE_WAT.as_bytes()).unwrap();
+        let caller = engine.create_instance(&module, 1024).unwrap();
+        let victim = engine.create_instance(&module, 1024).unwrap();
+        record_mem_addr(&mut engine, &caller);
+        let victim_mem = record_mem_addr(&mut engine, &victim);
+        CONTRACT_IO.insert(
+            (victim.id, 0),
+            PendingContractData {
+                data: vec![0xA5; 64],
+                cursor: 0,
+            },
+        );
+
+        let delivered = engine.call_2i64_blocking(&caller, "fill_as", victim.id, 0);
+        let cursor = CONTRACT_IO
+            .remove(&(victim.id, 0))
+            .map(|(_, p)| p.cursor)
+            .expect("victim's pending input entry");
+
+        assert_eq!(
+            delivered.ok(),
+            Some(0),
+            "a refill requested by instance {} naming instance {} delivered data",
+            caller.id,
+            victim.id
+        );
+        assert_eq!(cursor, 0, "the named instance's pending input was consumed");
+        assert_eq!(mem_addr_of(victim.id), victim_mem);
+
+        // Positive control: the same call delivers the caller's own input,
+        // whatever id it passes, so the builder in the data segment is valid
+        // and a zero above means "refused", not "could never deliver".
+        CONTRACT_IO.insert(
+            (caller.id, 0),
+            PendingContractData {
+                data: vec![0x5A; 64],
+                cursor: 0,
+            },
+        );
+        let own = engine.call_2i64_blocking(&caller, "fill_as", victim.id, 0);
+        CONTRACT_IO.remove(&(caller.id, 0));
+        assert_eq!(
+            own.ok(),
+            Some(16),
+            "the caller's own input was not delivered"
+        );
+        assert_eq!(guest_bytes(&mut engine, &caller, 64, 16), vec![0x5A; 16]);
+
+        engine.drop_instance(&caller);
+        engine.drop_instance(&victim);
+    }
+
+    /// A refill for an instance whose memory record is gone (a guest still
+    /// running after its `RunningInstance` was dropped) traps the guest; it
+    /// must not panic the host.
+    #[test]
+    fn fill_buffer_without_a_memory_record_traps_instead_of_panicking() {
+        use crate::wasm_runtime::native_api::{CONTRACT_IO, PendingContractData};
+
+        let config = RuntimeConfig::default();
+        let mut engine = WasmtimeEngine::new(&config, false).unwrap();
+        let module = engine.compile(NAMES_OTHER_INSTANCE_WAT.as_bytes()).unwrap();
+        let caller = engine.create_instance(&module, 1024).unwrap();
+        // Deliberately no MEM_ADDR record.
+        CONTRACT_IO.insert(
+            (caller.id, 0),
+            PendingContractData {
+                data: vec![0xA5; 64],
+                cursor: 0,
+            },
+        );
+        let r = engine.call_2i64_blocking(&caller, "fill_as", caller.id, 0);
+        CONTRACT_IO.remove(&(caller.id, 0));
+        // A guest trap is `WasmError::Runtime` and leaves the store intact. A
+        // host panic is caught by `execute_wasm_blocking` as
+        // `WasmError::Other` and replaces the store, which drops every
+        // instance, so the follow-up call below would find none.
+        let err = r.expect_err("the refill must fail");
+        assert!(
+            matches!(err, WasmError::Runtime(_)),
+            "expected a guest trap, got: {err:?}"
+        );
+        engine
+            .call_2i64_blocking(&caller, "rand_as", 0, 0)
+            .expect("the store must survive a trap; a host panic would have replaced it");
+        engine.drop_instance(&caller);
+    }
+
+    /// Start functions run inside `create_instance`, before
+    /// `RunningInstance::new` records the instance. Their host calls find no
+    /// record and must be refused without a host panic. Instance setup captures
+    /// a host panic as an `Err`, so a panic here fails the `.expect` below.
+    #[test]
+    fn start_function_host_calls_before_the_instance_is_recorded_do_not_panic() {
+        let config = RuntimeConfig::default();
+        let mut engine = WasmtimeEngine::new(&config, false).unwrap();
+        let start_wat = r#"
+        (module
+          (import "freenet_log" "__frnt__logger__info"
+            (func $log (param i64 i64 i32)))
+          (import "freenet_rand" "__frnt__rand__rand_bytes"
+            (func $rand (param i64 i64 i32)))
+          (import "freenet_time" "__frnt__time__utc_now"
+            (func $now (param i64 i64)))
+          (memory (export "memory") 1)
+          (func $start
+            i64.const 9223372036854775800
+            i64.const 0
+            i32.const 0
+            call $log
+            i64.const 9223372036854775800
+            i64.const 0
+            i32.const 8
+            call $rand
+            i64.const 9223372036854775800
+            i64.const 0
+            call $now)
+          (start $start))
+        "#;
+        let module = engine.compile(start_wat.as_bytes()).unwrap();
+        let handle = engine
+            .create_instance(&module, 1024)
+            .expect("a start function's host calls must not fail instantiation");
+        engine.drop_instance(&handle);
+    }
+
+    /// Every guest entry records ITS instance: instantiation (start
+    /// function), `call_void` and `initiate_buffer`. `call_typed_blocking` is
+    /// covered by the tests above. Before each entry the store's last guest
+    /// entry was a DIFFERENT instance, so an entry that failed to record its
+    /// own would act on that one: its memory record would be rewritten.
+    #[test]
+    fn every_guest_entry_records_its_own_instance() {
+        let config = RuntimeConfig::default();
+        let mut engine = WasmtimeEngine::new(&config, false).unwrap();
+        let module = engine.compile(NAMES_OTHER_INSTANCE_WAT.as_bytes()).unwrap();
+        let a = engine.create_instance(&module, 1024).unwrap();
+        let a_mem = record_mem_addr(&mut engine, &a);
+
+        // Instantiation: the start function calls rand while the store's
+        // last entry was `a`'s.
+        let start_wat = r#"
+        (module
+          (import "freenet_rand" "__frnt__rand__rand_bytes"
+            (func $rand (param i64 i64 i32)))
+          (memory (export "memory") 1)
+          (func $start
+            i64.const 0
+            i64.const 0
+            i32.const 8
+            call $rand)
+          (start $start))
+        "#;
+        let start_module = engine.compile(start_wat.as_bytes()).unwrap();
+        let s = engine.create_instance(&start_module, 1024).unwrap();
+        assert_eq!(
+            mem_addr_of(a.id),
+            a_mem,
+            "instantiation acted on the previously entered instance"
+        );
+        engine.drop_instance(&s);
+
+        // `__frnt_set_id`, the second guest entry inside instantiation. The
+        // first arm in `instantiate_and_init` has already recorded the new
+        // instance, so this catches an arm before `__frnt_set_id` that records
+        // ANOTHER instance, not a missing one (a missing re-arm is harmless
+        // here; that every entry is armed at all is pinned by
+        // `every_guest_entry_is_preceded_by_arm_epoch_deadline`).
+        let set_id_wat = r#"
+        (module
+          (import "freenet_rand" "__frnt__rand__rand_bytes"
+            (func $rand (param i64 i64 i32)))
+          (memory (export "memory") 1)
+          (func (export "__frnt_set_id") (param i64)
+            i64.const 0
+            i64.const 0
+            i32.const 8
+            call $rand))
+        "#;
+        let set_id_module = engine.compile(set_id_wat.as_bytes()).unwrap();
+        let s = engine.create_instance(&set_id_module, 1024).unwrap();
+        assert_eq!(
+            mem_addr_of(a.id),
+            a_mem,
+            "__frnt_set_id acted on the previously entered instance"
+        );
+        engine.drop_instance(&s);
+
+        let b = engine.create_instance(&module, 1024).unwrap();
+        let b_mem = record_mem_addr(&mut engine, &b);
+
+        // call_void on `a`; last entry was `b`'s instantiation.
+        engine.call_void(&a, "void_rand").unwrap();
+        assert_ne!(guest_bytes(&mut engine, &a, 384, 8), vec![0; 8]);
+        assert_eq!(guest_bytes(&mut engine, &b, 384, 8), vec![0; 8]);
+        assert_eq!(
+            mem_addr_of(b.id),
+            b_mem,
+            "call_void acted on another instance"
+        );
+
+        // initiate_buffer on `b`; last entry was `a`'s call_void.
+        engine.initiate_buffer(&b, 0).unwrap();
+        assert_ne!(guest_bytes(&mut engine, &b, 320, 8), vec![0; 8]);
+        assert_eq!(guest_bytes(&mut engine, &a, 320, 8), vec![0; 8]);
+        assert_eq!(
+            mem_addr_of(a.id),
+            a_mem,
+            "initiate_buffer acted on another instance"
+        );
+
+        engine.drop_instance(&a);
+        engine.drop_instance(&b);
+    }
+
+    /// The delegate host functions find their instance through
+    /// `CURRENT_DELEGATE_INSTANCE`, a thread-local. If that thread-local names
+    /// a different instance from the one the store is running (a guest entered
+    /// inline on a thread that still carries a delegate's id), the call must be
+    /// refused rather than served from the named delegate's env.
+    ///
+    /// The env below has a 5-byte context, so `ctx_len` returns 5 when it is
+    /// served from it and `ERR_NOT_IN_PROCESS` (-1) when refused.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delegate_host_functions_refuse_a_thread_local_naming_another_instance() {
+        use crate::contract::storages::Storage;
+        use crate::wasm_runtime::native_api::{
+            DELEGATE_ENV, DelegateCallEnv, DelegateEnvSlot, error_codes, new_delegate_counter,
+            new_inherited_origins,
+        };
+        use crate::wasm_runtime::{ContractStore, DelegateStore, SecretsStore};
+        use freenet_stdlib::prelude::{CodeHash, DelegateKey};
+
+        struct Cleanup(i64);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                native_api::CURRENT_DELEGATE_INSTANCE.with(|c| c.set(-1));
+                DELEGATE_ENV.remove(&self.0);
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let db = Storage::new(temp.path()).await.unwrap();
+        let contract_store =
+            ContractStore::new(temp.path().join("contracts"), 10_000_000, db.clone()).unwrap();
+        let mut delegate_store =
+            DelegateStore::new(temp.path().join("delegates"), 10_000, db.clone()).unwrap();
+        let mut secret_store =
+            SecretsStore::new(temp.path().join("secrets"), Default::default(), db).unwrap();
+
+        let config = RuntimeConfig::default();
+        let mut engine = WasmtimeEngine::new(&config, false).unwrap();
+        let wat = r#"
+        (module
+          (import "freenet_delegate_ctx" "__frnt__delegate__ctx_len"
+            (func $ctx_len (result i32)))
+          (memory (export "memory") 1)
+          (func (export "ctx_len_as") (param i64 i64 i64) (result i64)
+            call $ctx_len
+            i64.extend_i32_s)
+          (func (export "void_ctx_len")
+            i32.const 0
+            call $ctx_len
+            i32.store))
+        "#;
+        let module = engine.compile(wat.as_bytes()).unwrap();
+        let victim = engine.create_instance(&module, 1024).unwrap();
+        let victim_mem = record_mem_addr(&mut engine, &victim);
+
+        // SAFETY: the env holds raw pointers to the stores above. It is
+        // removed from DELEGATE_ENV by `_cleanup`, declared after the stores,
+        // so it drops (and removes the env) first.
+        let env = unsafe {
+            DelegateCallEnv::new(
+                vec![7; 5],
+                &mut secret_store,
+                &contract_store,
+                None,
+                DelegateKey::new([0u8; 32], CodeHash::new([0u8; 32])),
+                &mut delegate_store,
+                0,
+                vec![],
+                None,
+                new_delegate_counter(),
+                new_inherited_origins(),
+            )
+        };
+        let _cleanup = Cleanup(victim.id);
+        DELEGATE_ENV.insert(victim.id, DelegateEnvSlot::new(env));
+
+        // Positive control: the delegate's own call (thread-local and calling
+        // instance both `victim`, as `call_3i64` sets them) is served.
+        let own = engine.call_3i64(&victim, "ctx_len_as", 0, 0, 0).unwrap();
+        assert_eq!(own, 5, "a delegate's own call was not served from its env");
+
+        // Mismatch: `call_void` runs the guest inline on THIS thread, so the
+        // thread-local set here is the one the host function sees, while the
+        // calling instance is `other`. (Instance setup and the typed calls run
+        // the guest on another thread, where this thread-local is not visible,
+        // so they cannot drive this case.) Unrefused, `ctx_len` would be served
+        // from `victim`'s env and return 5.
+        let other = engine.create_instance(&module, 1024).unwrap();
+        native_api::CURRENT_DELEGATE_INSTANCE.with(|c| c.set(victim.id));
+        let r = engine.call_void(&other, "void_ctx_len");
+        native_api::CURRENT_DELEGATE_INSTANCE.with(|c| c.set(-1));
+        r.unwrap();
+
+        let stored = guest_bytes(&mut engine, &other, 0, 4);
+        let ctx_len = i32::from_le_bytes([stored[0], stored[1], stored[2], stored[3]]);
+        assert_eq!(
+            ctx_len,
+            error_codes::ERR_NOT_IN_PROCESS,
+            "a guest whose thread carried another instance's delegate id was \
+             served from that instance's env"
+        );
+        assert_eq!(mem_addr_of(victim.id), victim_mem);
+
+        engine.drop_instance(&other);
+        engine.drop_instance(&victim);
+    }
+
+    /// Source pin: every delegate host function goes through `delegate_caller`,
+    /// and every other host function takes its instance from
+    /// `refresh_mem_addr_from_caller`. The behavioural test above exercises one
+    /// delegate function (`ctx_len`); this covers the rest, including the
+    /// i64-returning and async registrations.
+    ///
+    /// It checks that each delegate registration RETURNS the refusal, not
+    /// merely that it calls `delegate_caller`, and that every other
+    /// registration passes the calling instance's id on to `native_api`.
+    ///
+    /// FALSIFY: delete the `delegate_caller` check from any one
+    /// `freenet_delegate_*` registration, or replace its `return` with
+    /// `return 0;`, or pass `_guest_id` to a `native_api` call; this test
+    /// fails naming the function.
+    #[test]
+    fn every_delegate_host_function_checks_the_calling_instance() {
+        let src = include_str!("wasmtime_engine.rs");
+        let body = scrape_body(src, "fn register_host_functions(");
+        // Code only: drop `//` comments, whole-line and trailing, so prose
+        // cannot satisfy a needle. (No string literal in these registrations
+        // contains `//`.)
+        let code_lines = |block: &str| -> String {
+            block
+                .lines()
+                .map(|l| l.split_once("//").map_or(l, |(code, _)| code).trim_end())
+                .filter(|l| !l.trim().is_empty())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        // The line after `needle` must hand the refusal code back to the guest.
+        let refusal_returned = |code: &str, needle: &str, then: &str| -> bool {
+            code.split_once(needle).is_some_and(|(_, rest)| {
+                rest.lines()
+                    .nth(1)
+                    .is_some_and(|l| l.trim_start().starts_with(then))
+            })
+        };
+
+        let mut delegate_fns = 0;
+        let mut other_fns = 0;
+        // Each registration starts at `.func_wrap(` or `.func_wrap_async(`.
+        for block in body.split(".func_wrap").skip(1) {
+            let code = code_lines(block);
+            let name = code
+                .split('"')
+                .find(|s| s.starts_with("__frnt"))
+                .unwrap_or("<unnamed>")
+                .to_string();
+            if code.contains("\"freenet_delegate_") {
+                delegate_fns += 1;
+                // Sync form: `if let Err(code) = delegate_caller(..) {` then
+                // `return ..code..`. Async form: the result is taken before
+                // the future and returned at the top of it.
+                let sync = refusal_returned(
+                    &code,
+                    "if let Err(code) = delegate_caller(&mut caller) {",
+                    "return code;",
+                ) || refusal_returned(
+                    &code,
+                    "if let Err(code) = delegate_caller(&mut caller) {",
+                    "return i64::from(code);",
+                );
+                let async_form = code.contains("let refused = delegate_caller(&mut caller).err();")
+                    && refusal_returned(&code, "if let Some(code) = refused {", "return code;");
+                assert!(
+                    sync || async_form,
+                    "delegate host function {name} does not refuse, via \
+                     `delegate_caller`, a thread-local delegate id that is not the \
+                     calling instance"
+                );
+            } else {
+                other_fns += 1;
+                assert!(
+                    code.contains("let id = refresh_mem_addr_from_caller(&mut caller);"),
+                    "host function {name} does not take its instance from \
+                     `refresh_mem_addr_from_caller`"
+                );
+                // ...and hands THAT id to every native_api call, not the guest's.
+                let calls: Vec<&str> = code.split("native_api::").skip(1).collect();
+                let passes_id = !calls.is_empty()
+                    && calls.iter().all(|call| {
+                        call.split_once('(')
+                            .is_some_and(|(_, args)| args.trim_start().starts_with("id,"))
+                    });
+                assert!(
+                    passes_id,
+                    "host function {name} does not pass the calling instance's id \
+                     to native_api"
+                );
+                assert!(
+                    !code.contains("CURRENT_DELEGATE_INSTANCE"),
+                    "host function {name} reads the delegate thread-local directly"
+                );
+            }
+        }
+        // Structural anchors, counted independently of the needles above.
+        let delegate_namespaces = code_lines(body).matches("\"freenet_delegate_").count();
+        assert_eq!(delegate_fns, delegate_namespaces);
+        assert!(
+            delegate_fns >= 13,
+            "found only {delegate_fns} delegate host functions"
+        );
+        assert!(
+            other_fns >= 4,
+            "found only {other_fns} other host functions"
+        );
     }
 }

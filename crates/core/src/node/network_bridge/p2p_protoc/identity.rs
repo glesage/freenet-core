@@ -54,6 +54,10 @@ pub(super) enum IdentitySource {
     /// had none. Also any key bound after waiting for another connection to
     /// release it, whatever started the wait.
     Claimed,
+    /// The key a QUIC-native connection's peer proved in the TLS handshake
+    /// (the handshake is pinned to the key the node dialled or accepted), so
+    /// it is neither only dialled nor only claimed.
+    Proven,
 }
 
 /// A binding that was not made because another connection held the key. It
@@ -184,6 +188,23 @@ pub(super) enum BindOutcome {
 /// count too, stamped at the path's next 2 s watch tick.
 pub(super) const HOLD_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
 
+// The survivor rule treats a native connection silent for HOLD_WINDOW as
+// gone; with keepalives at KEEPALIVE_INTERVAL that takes at least two lost
+// keepalives in a row, not one.
+const _: () = assert!(
+    HOLD_WINDOW.as_nanos() >= 2 * crate::transport::quic::config::KEEPALIVE_INTERVAL.as_nanos()
+);
+
+/// Whether `entry`'s transport received an authenticated packet within
+/// [`HOLD_WINDOW`]. A transport that does not report receipt (a test double)
+/// counts as heard from.
+pub(super) fn heard_from_recently(entry: &ConnectionEntry) -> bool {
+    entry
+        .receipt
+        .as_ref()
+        .is_none_or(|stamp| stamp.since_last_receipt() <= HOLD_WINDOW)
+}
+
 /// The connection, other than `exclude`, bound to `key`, and whether it was
 /// heard from within [`HOLD_WINDOW`]. A connection whose transport does not
 /// report receipt (a test double) counts as heard from.
@@ -192,12 +213,7 @@ pub(super) fn key_holder(
     exclude: Option<SocketAddr>,
     key: &TransportPublicKey,
 ) -> Option<(SocketAddr, bool)> {
-    let live = |entry: &ConnectionEntry| {
-        entry
-            .receipt
-            .as_ref()
-            .is_none_or(|stamp| stamp.since_last_receipt() <= HOLD_WINDOW)
-    };
+    let live = heard_from_recently;
     let mut quiet = None;
     for (addr, entry) in connections {
         if Some(*addr) == exclude || entry.identity.key() != Some(key) {
@@ -488,6 +504,8 @@ mod tests {
                     created_at: now,
                     link_use: super::super::zombie_sweep::LinkUseStamp::new(now),
                     remote_version: None,
+                    native: false,
+                    frame_seen: true,
                 },
             );
         }

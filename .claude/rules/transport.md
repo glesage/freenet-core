@@ -496,11 +496,19 @@ inbound session key (`handshake_unauthenticated_dropped`), QUIC endpoint deaths
 (`quic_endpoint_down`), panics the QUIC socket adapter caught
 (`quic_adapter_panicked`, once per endpoint; the process keeps running
 and no breaker state is left), QUIC crash-loop breaker trips at startup
-(`quic_breaker_trips`, on unix counted for any abnormal end of a QUIC-enabled
-run, not only a QUIC fault, and on Windows for three runs in a row that ended
+(`quic_breaker_trips`; for every peer, a gateway on Windows and a gateway on a
+unix platform with no boot identity (anything but Linux and macOS), counted for
+runs in a row (two on a peer while UDP exists, so that when a release's
+crashes are all QUIC panics it trips before the post-update rollback's three
+crashes, which count any crash; three on a gateway) that ended
 within ten minutes after recording a panic in QUIC code (quinn, quinn-proto or
-transport/quic, by panic location), each starting within 24 h of the one before;
-see `quic/breaker.rs`) and whether the breaker keeps QUIC
+transport/quic, by panic location), each starting within 24 h of the one before,
+and for a gateway on Linux or macOS for any abnormal end of a QUIC-enabled run,
+not only a QUIC fault;
+a trip keeps QUIC off for 24 h on a peer and 15 min on a gateway (`BreakerRole`),
+doubling on repeat trips up to 4 h, and a gateway run with FREENET_SUPERVISED=1
+restarts itself at the cooldown's end; see
+`quic/breaker.rs`) and whether the breaker keeps QUIC
 off in this process (`quic_breaker_suppressed`, a state that is never reset and
 is not activity by itself) and the endpoint's state (`quic_endpoint`: `up`, or
 `off_config`, `off_platform`, `off_abort`, `off_bind`, `off_breaker`, or `died`;
@@ -512,8 +520,33 @@ offer and decision (`connect_native_offered_{zero,nonzero}` built as joiner,
 `connect_native_decided_{native,udp}` made as acceptor for an offered request,
 `connect_native_decision_{without_offer,native_unsupported}` for a `Native`
 decision a joiner could not use, `connect_native_decision_over_cap` for one
-dropped unanswered past the per-CONNECT cap on refused acceptors, and the last
-offer as states
+dropped unanswered past the per-CONNECT cap on refused acceptors,
+`connect_native_setup_<label>` for how each native setup ended (one per
+`NativeSetupOutcome`), `connect_native_demotions` for each time the node
+turned its own native connects off,
+`connect_native_rescued_by_udp_{joiner,acceptor}` for each UDP dial that
+connected after a native setup that failed ON THE PATH (timed out,
+handshake failed, Hello lost: `counts_toward_demotion`; R5: a connection a
+node without UDP would not have made). A local refusal (punch budget,
+setups full, too late) is not a rescue, on either side: the native outcome
+reaches the connect op as `ConnectResult`'s error (`Err(Some(outcome))`,
+`Err(None)` for UDP and local failures) and both sides test it with
+`op_ctx_task::native_path_failed`.
+`connect_native_fallback_connected_{joiner,acceptor}` counts every UDP dial
+that connected after ANY failed native setup (path failure, local refusal,
+Hello mismatch): the joins a node without UDP would lose. Phase D's gate
+reads the SUM of the joiner and acceptor sides of THIS counter: each side
+counts the UDP dial of its own that connected, and whichever dial makes the
+connection first counts it and the other counts nothing (in
+test_quic_native_symmetric_nat_pairs_fail_and_nodes_still_join the joiner
+side is 0 and the acceptor side 3, so neither alone is the figure; that test
+counts from the run's own wire trace, since the process-wide counters are
+shared by every sim in a plain `cargo test` process). It does not
+read the rescue counter, which is only the path-failure
+subset, `connect_native_both_dials_connected_{udp,native}_first`
+for a native dial and the UDP dial beside it that both connected (the native
+one kept), `connect_native_survivor_{swapped,udp_dropped}` for each
+survivor-rule decision, and the last offer as states
 `connect_native_offer_{level,percent,ready}`; see
 `operations/connect/native.rs`) and the shadow-mode upgrade
 telemetry (below, "Upgrade telemetry"). Each label set is declared once in a
@@ -595,8 +628,9 @@ most 67 labels whatever a peer sends (35 while the floor shares this
 series), held in fixed arrays. No keys,
 no addresses; in `gateway_joins` a count of 1 to 4 is reported as `"<5"`, and
 zero counts are omitted in both maps. Transport `legacy_intro` is today's UDP
-handshake; `native` is reserved for QUIC-native joins, which do not exist yet,
-and is never counted. It is not a `KnownShadowRollup`: its admission and drop
+handshake; `native` is a QUIC-native join, counted by a gateway when its
+native dial gives a connection (zero in production until native connects
+are on). It is not a `KnownShadowRollup`: its admission and drop
 counts are in the per-type `tel_t` row like any other event.
 
 ### Dashboard bandwidth sampler (#5152)
@@ -1019,6 +1053,15 @@ Token reservation:
     giving it back if the fragment is not sent; see "Node-wide egress cap"
 ```
 
+### WHEN admitting native joiners at a gateway (#5940, A7b; dark behind `GATEWAY_NATIVE_ADMISSION`)
+
+- **A joiner is charged against the node's QUIC path cap from its admission.** `JoinerIncoming` holds a `JoinerCharge` (a `QuicJoinerPermit` from `QuicPathPermits::try_acquire_joiner`, plus a `QuicJoinerMark`). Dropping it releases both, which covers every exit: the handshake failing, the 8 s window passing (the `establish` future is dropped), the connection closing (end of `join_gateway`) and an ignored attempt. `JoinerCharge::promote` re-charges at the full path rate (`QuicJoinerPermit::promote`, one atomic step; on no room the joiner keeps its charge). Do not add a parallel joiner counter: paths and joiners take from ONE unit total in `QuicPathPermits` (`config::PATH_PERMIT_UNITS` for a path, `config::JOINER_PERMIT_UNITS` for the handshake-phase charge, `config::QUIC_HANDSHAKE_PHASE_CHARGE_BYTES`).
+- **Joiners together hold at most 1/`JOINER_SHARE_DIVISOR` (a quarter) of the cap's units**, so established peers' path upgrades always keep the rest; refused joiners are ignored as when the cap is full. **The join window counts from the hub queueing the join** (`JoinerIncoming::stamp`, read by `join_gateway`), so waiting for a join slot does not extend the hold. Promotion moves the `Arc` to the path permit (`QuicJoinerPermit` holds an `Option`); never `mem::forget` it.
+- **The cap is attached by the hub** (`QuicUpgrades::new` calls `attach_joiner_cap`). Until then every admitted attempt is ignored (`joiner_cap_full`): a missing cap fails closed.
+- **Order in `EndpointCore::admit`**: Retry, per-address, global, THEN the cap charge, THEN the allow-set. A refusal at any step drops the `AdmissionTicket` (refund) and the charge. Pinned by `with_admission_off_no_joiner_is_charged`.
+- **Unpromoted joiners share one slice of the established ingress queue** (`demux::QUIC_INGRESS_JOINER_DATAGRAMS`, 64 of 1024), not a per-source share and not per-IP keying (QUIC-NATIVE-CONNECT 10.2 item 23, decided in A7b PR 6): one host on many ports cannot take more than 64 slots, and established peers keep the rest. A joiner never uses the quiet reserve. The slot is recorded per datagram (`QuicDatagram::joiner_slot`) so promotion or release cannot leak it. Overflow counts `quic_gateway_admission_joiner_share_full` and `quic_ingress_source_full`.
+- **Never `std::mem::forget` a charge or a mark.** A leaked charge shrinks the cap for the life of the process.
+
 ## Backoff, Jitter, and Recovery Rules
 
 ### WHEN implementing retry/backoff
@@ -1114,7 +1157,8 @@ datagrams with their source. The listener stays the ONLY reader of the UDP
 socket and fills the queue with `try_reserve`, never a waiting send, so a slow
 endpoint costs dropped QUIC datagrams and never stalls the listener. Only
 sources on the allow-set (`allow_quic_source`, normalized addresses) are
-queued; the rest are dropped, so a prober gets no QUIC reply. One source
+queued; the rest are dropped, so a prober gets no QUIC reply (except on a
+gateway with native admission on, below). One source
 holds at most QUIC_INGRESS_PER_SOURCE_DATAGRAMS (a quarter) of the queue, so
 one allowed or spoofed-allowed source cannot starve the other connections.
 The trade-off: a lone bulk peer, with no other connection competing, still
@@ -1134,6 +1178,9 @@ allowed addresses can fill the reserve; the queue then holds 1024, as
 without it. Limitation: the reserve helps only while most sources are busy;
 with about 256 or more connections each holding a few datagrams, most
 traffic counts as quiet and the queue behaves close to a plain FIFO.
+Unpromoted native joiners (gateway admission on) hold one separate slice,
+`QUIC_INGRESS_JOINER_DATAGRAMS` (64) in all, instead of the per-source share,
+and never use the quiet reserve.
 `allow_quic_source` returns a QuicSourcePermit: the address stays allowed
 while a permit for it is alive, and the set holds at most
 QUIC_ALLOWED_SOURCES_MAX addresses (past it, `allow_quic_source` refuses; a
@@ -1153,6 +1200,54 @@ endpoint enables the ingress through `with_quic_ingress`, which disables it
 again (allow-set emptied and closed) if the endpoint cannot be built, so a
 failed `shadow`/`prefer` bind leaves the socket as with QUIC off.
 
+Gateway admission of native joins (`quic/admission.rs`, #5940 A7b). DARK:
+`admission::GATEWAY_NATIVE_ADMISSION` is false, and `bind_udp_listener` calls
+`QuicEndpoint::enable_gateway_admission` only inside
+`admission::enabled_at(is_gateway, bind_addr)` (pinned across every source
+file of the crate by `the_node_enables_admission_only_behind_the_switch`; a
+test can turn it on for one listener with `admission::force_on_for_test`).
+Off, a node behaves as before; what it still carries is an idle second
+ingress queue (128 slots) and its poll in the endpoint's receive, one atomic
+load per QUIC datagram from a source not on the allow-set, and the
+`quic_gateway_admission_*` counters at 0. The switch's doc names what turning
+it on waits for (phase B; joiners inside the connection cap are done, A7b PR 6). When on, the
+demux gets an unknown-source lane (`enable_unknown_source_lane`): a
+QUIC-class datagram from a source not on the allow-set is queued on a
+separate queue of `UNKNOWN_SOURCE_QUEUE_DATAGRAMS` (128, in
+`QUIC_INGRESS_QUEUE_BYTES`) only if it can open a connection
+(`admission::unknown_source_datagram`: long header, at least 1200 bytes, a
+known version, and the Initial packet type), and counted as `forwarded`;
+anything else stays `not_allowed`. The endpoint reads the established queue
+first and the unknown-source queue only when it is empty.
+`EndpointCore::accept_attempt` decides each attempt from a source not on the
+allow-set, in order: no Retry token yet → Retry; an address admitted within
+the last second → ignored; the node-wide rate (50 a second) spent → ignored;
+otherwise admitted, recorded against both limits as an `AdmissionTicket`;
+then the joiner is charged against the node's QUIC path cap at the
+handshake-phase rate (`QuicPathPermits::try_acquire_joiner`; no room, joiners
+already at a quarter of the cap, or no cap attached yet → ignored,
+`joiner_cap_full`); then the address is put on the allow-set, marked as a
+joiner (`allow_joiner`), for the attempt and then the
+connection (the handshake's later, shorter datagrams take the established
+path), and the attempt is accepted with one server configuration built at
+enable (`server_tls_proven`). A ticket dropped before the join's handshake
+starts gives the admission back (`refunded`): the allow-set full, the attempt
+dropped on a full accept or join queue, the node stopping. The attempt router
+hands each admitted join to one registered task, `quic_gateway_joins`
+(`driver::run_gateway_joins`, a 64-join queue, at most 512 joins at once),
+which runs each join (`driver::join_gateway`) as a future of its own:
+handshake, the client's key read from the connection (`proven_client_key`),
+the native Hello exchange, all within `NATIVE_WINDOW`. A join that panics is
+counted and the task goes on. Until phase B hands the connection to the node,
+a join that gets that far is closed (`node_dropped_peer`). Each outcome is
+counted under `quic_gateway_admission_*`: queued, queue_full, short_header,
+runt, unknown_version, not_initial, retried, throttled_address,
+throttled_global, allow_set_full, admitted, refunded, join_queue_full,
+handshake_failed, unproven, hello_failed, joined, join_panicked,
+joiner_cap_full, joiner_share_full. Joiners are inside the connection cap and
+share one bounded slice of the ingress queue (section "WHEN admitting native
+joiners at a gateway").
+
 Socket-health signal: the listener reads through `Socket::recv_classified`,
 which `DemuxSocket` answers with `Datagram` for a legacy datagram and
 `Diverted` for one it consumed. The listener calls
@@ -1168,26 +1263,30 @@ it must not wait unless it is a pacing point.
 #### QUIC endpoint (`transport/quic.rs`, #5940 step c2)
 
 `transport-quic` (config key: `off`, `shadow` or `prefer`; unset is
-`QuicMode::default_mode`, prefer on Linux, macOS and Windows and off
-elsewhere, since the breaker cannot trip without a boot identity) decides whether `bind_udp_listener` builds a quinn endpoint over the DemuxSocket.
+`QuicMode::default_mode`, prefer on every platform: the breaker needs no boot
+identity, because peers and a gateway without one count short runs) decides whether `bind_udp_listener` builds a quinn endpoint over the DemuxSocket.
 `prefer` negotiates data with the share of pairs the ramp gives at the time ("Data
 slice" below; `upgrade::policy::log_startup` reports the share at INFO once per
 node, and each band the ramp enters is logged at INFO), and a pair with both bits
 sends its data on the path ("QUIC send route" below). The tree sets the ramp
-start for 0.2.158 (#6224), so `prefer` nodes, every Linux, macOS and Windows node
+start for 0.2.158 (#6224), so `prefer` nodes, every node on any platform
 that did not set the key, carry data with the ramp's share, and 0.2.158's release
 notes say so. With no ramp start (the emergency-stop build) and no
 `quic-data-percent` the share is 0, and `prefer` differs from `shadow` only by the
 bit, which stays 0. Off: no endpoint, no QUIC ingress, nothing
 changes, except that `off` set in the config is deprecated and logs a WARN at
 startup (`upgrade::policy::log_startup`); the endpoint state telemetry reports it
-as `off_config`. Windows has the same default since its crash-loop breaker was
-confirmed on a real Windows machine (#6031). The default is
+as `off_config`. Windows had the default first, once its crash-loop breaker was
+confirmed on a real Windows machine (#6031); every other platform (in practice
+Android and FreeBSD, self-built) has it since a gateway there with no boot
+identity decides by short runs too (`breaker::decides_by_short_runs`).
+`off_platform` is kept for telemetry stability and no build reports it. The default is
 read, never written to config.toml: a node that did not set the key follows the
 release it runs, so a default-off release is the kill switch for QUIC as a
 whole. Stopping only the data ramp is smaller: `QUIC_DATA_RAMP_START = None`
-with the defaults back to 0.2.156's, shadow on Linux and macOS and off on
-Windows (RELEASING.md, "Emergency stop"), which keeps Linux and macOS
+with the default mode back to 0.2.156's shape, shadow on Linux and macOS and
+off on every other platform (RELEASING.md, "Emergency stop": the release edits
+`QuicMode::default_mode` and the test `the_default_mode_is_prefer`), which keeps Linux and macOS
 endpoints and shadow paths up. Neither reaches
 a node that ever ran with `--transport-quic` or `FREENET_TRANSPORT_QUIC`: those
 are saved to config.toml like any setting (the Step 1 gateways are such nodes). Shadow or prefer: the endpoint is built
@@ -1481,7 +1580,7 @@ a test passes its own; tests read their own, never the global).
   quic_data_send_<short|large_short|stream|pipe>_<sent|maybe_delivered|
   not_opened_udp|failed_udp|dropped>; quic_data_event_<short_overflow_udp|
   data_refused|stalled_closed|udp_send_failed|suspect_entered|suspect_left|
-  pacer_refused|ack_wait_released|stream_limit_full>; quic_data_stop_<code> (stops a
+  pacer_refused|ack_wait_released|stream_limit_full|native_worker_panicked>; quic_data_stop_<code> (stops a
   peer sent to data sends); quic_inbound_<QuicInboundOutcome> (every receive
   outcome, refusals by frame kind as short_refused_budget and
   stream_refused_budget); quic_enabled_data_paths; quic_live_data_paths (a gauge of
@@ -1515,7 +1614,12 @@ a test passes its own; tests read their own, never the global).
   both are recorded in one record_path_loss call under the one loss lock, the
   exception the bug-prevention rule on a metric re-derived at the call site
   allows (as for broadcast_payload_mix). The single keys are not under quic_carrying_, which the two carrying
-  families share. Packets in flight at close are dropped by quinn, not declared
+  families share.
+  Two more gauges of live paths, moved at each watch tick under the same lock and
+  left by the window's drop: quic_srtt_<bucket> (quinn's PathStats::rtt) and
+  quic_tx_bps_<bucket> (UDP payload bits per second over the last tick), every
+  bucket uploaded at 0; both are one tick's reading, so they describe the fleet's
+  distribution, not a path's throughput. Packets in flight at close are dropped by quinn, not declared
   lost, so a final bucket can understate the loss at the end. The rate is quinn's lost over
   sent (quinn-proto 0.11.19), not a measurement of the link: sent counts every
   packet quinn built, acknowledgement-only ones included; lost counts quinn's
@@ -1540,13 +1644,25 @@ a test passes its own; tests read their own, never the global).
   level in the period, and the highest count a reset in the period took a path
   to). They are for the fixed charge, which takes quinn's stopped map at
   SEND_ABORT_LIMIT x QUIC_STOPPED_ENTRY_BYTES until field data justifies less.
+  quic_pipe_source_<quic_fed_sent|quic_fed_dropped|udp_fed_sent|
+  udp_fed_dropped>: pipes that ended sent or dropped, by what fed the
+  inbound stream (each pair sums to quic_data_send_pipe_<result>), and
+  quic_pipe_dropped_<source_error|source_stall_timeout|own_path>: the
+  dropped ones by cause (quic_send::pipe_drop_cause). transfer_failed and
+  transfer_completed events carry `transport`: udp or quic.
   quic_ack_wait_expired_<stream|short|control>: ack-wait expiries that
   counted as strikes (path::StrikeCheck), by kind; expected 0 on honest
   paths. quic_stall_close_<not_acknowledging|dark|credit_starved|
-  stream_credit_withheld|ack_waits_expired>: paths the acknowledgement
+  stream_credit_withheld|ack_waits_expired|late_ends>: paths the acknowledgement
   watch closed, by why (recycle::Stall). quic_stall_would_close_<same
-  labels>: times a rule that only observes would have closed a path; only
-  ack_waits_expired observes today (recycle::ACK_WAITS_EXPIRED_CLOSES).
+  labels>: times a rule that only observes would have closed a path:
+  ack_waits_expired and dark, each on paths with a UDP session
+  (recycle::ACK_WAITS_EXPIRED_CLOSES_WITH_UDP, DARK_CLOSES_WITH_UDP), and
+  late_ends on every path (recycle::LATE_ENDS_CLOSE).
+  quic_late_end_<stream|short|control>: sends whose end was acknowledged
+  late, or not at all, though the peer had wholly acknowledged enough
+  data-stream bytes since the end to have carried it (path::LateEndCheck),
+  by kind; expected 0 on honest paths.
   quic_dark_episode_<recovered_lt_5s|lt_10s|lt_30s|lt_120s|recovered_ge_120s|
   unrecovered|cap_held|closed_at_window>: dark episodes (recycle::AckWatch:
   packets outstanding, nothing acknowledged, nothing heard) by how they ended;
@@ -1656,8 +1772,10 @@ rule that stops upgrades: `Mode` (off), `Breaker`, `NoPaths`
 (`quic-max-paths` = 0) or `Endpoint(availability)` (not `Up`); `allowed()` is
 true when none does. `admit()` returns a `QuicPathPermit` or
 `PathRefusal::{Disabled(cause), Busy}`; `Ok` does not prove the endpoint is
-still up. `QuicPathPermits` holds at most `quic-max-paths` paths, released on
-drop.
+still up. `QuicPathPermits` holds at most `quic-max-paths` paths and, on a gateway
+with admission on, native joiners, together in memory units (a path
+`PATH_PERMIT_UNITS`, a joiner `JOINER_PERMIT_UNITS`, joiners at most a quarter
+of the total); each permit is released on drop.
 
 `quic-max-paths` is stored as text (`lenient_count`), like `transport-quic`,
 so any value loads: an integer or string is kept as written, a bool or float
@@ -1925,7 +2043,8 @@ config value per node (off unless set, whatever the node default: the
 harness writes `off` into every node's config; an unknown value panics;
 tests that start nodes outside SimNetwork, in `crates/core/tests` and through
 freenet-test-network, get the platform default on purpose, as production does,
-except where a restart after SIGKILL would trip the breaker), and the
+except where a restart after SIGKILL would trip a gateway's breaker on Linux or macOS; a
+peer's short-run rule does not count a SIGKILL), and the
 endpoint runs on the network's VirtualTime (`get_socket_virtual_time`;
 RealTime in production, pinned by
 `the_transport_endpoint_runs_on_virtual_time_only_in_simulation`). Its
@@ -1983,7 +2102,10 @@ every rate), endpoint-down, panics and breaker trips, RSS against
 `quic_paths_active`, CPU and egress, and NAT success, connections and transfers.
 From the first release with the Windows default, the release watch also reads
 Windows separately: `quic_adapter_panicked` and `quic_breaker_trips` by version
-against the previous release, and peers with `quic_breaker_suppressed`. A
+against the previous release, and peers with `quic_breaker_suppressed`. Since
+unix peers moved to the short-run rule (#6151), it also reads
+`quic_breaker_start` by version: trips with their `quic_panic_at`, and on unix
+peers how often `legacy_verdict` and `verdict` disagree. A
 Windows QUIC panic in the field is read (location, version) before the next
 release goes out.
 
@@ -1993,7 +2115,8 @@ release goes out.
 - Step 1: nova gateways and framework in shadow for 24-48 h. The 24 h gateway
   A/B runs only if something looks odd. Rollback: set the key to off and restart.
 - Step 2: shadow on by default on Linux and macOS, then Windows once its
-  breaker was confirmed on a real machine (`QuicMode::default_mode`). Gate: at least 95% upgrade
+  breaker was confirmed on a real machine, then every other platform once no
+  platform lacked a breaker (`QuicMode::default_mode`). Gate: at least 95% upgrade
   success by `established_as_offerer / accepted`; fewer than 1 fallback per
   path-day excluding endpoint and restart causes; memory within the measured
   terms (about 0.3 to 0.5 MiB per idle path). An abort spike stops the step.
@@ -2018,7 +2141,7 @@ release goes out.
   data, not loosened.
 - Rollback at any step is a release through auto-update's 0-4 h stagger: for
   the data ramp, no ramp and 0.2.156's defaults (shadow on Linux and macOS, off
-  on Windows); default-off when QUIC itself is at fault. Per-path fallback to UDP and the breaker work without a release. A
+  on every other platform, including Windows); default-off when QUIC itself is at fault. Per-path fallback to UDP and the breaker work without a release. A
   node in a broken state may not self-update.
 
 Simulation scenarios (`tests/simulation_integration.rs`, `test_quic_*`): two
@@ -2083,7 +2206,9 @@ no extra message, no exporter proof.
     off nothing is sent. Counters (conn_identity_*): transport_key_sent
     (handed to the connection's task), transport_key_undelivered (not handed
     over within the 1 s fallback; not re-sent), transport_key_set / _same
-    (the transport took it), and promotion_key_mismatch (promoted under a key
+    (the transport took it), set_proven (a QUIC-native connection's key,
+    proven in its handshake, bound as IdentitySource::Proven), and
+    promotion_key_mismatch (promoted under a key
     that is not the bound one; nothing sent) and transport_key_refused (the
     transport holds another key and keeps it), which must stay at 0 (the
     simulation tripwire and test_quic_prefer_forms_a_mesh_of_the_same_peers_as_quic_off
@@ -2095,6 +2220,21 @@ no extra message, no exporter proof.
     never as "any key". An inbound transport's key is the key the node
     bound from the peer's claim, not one the transport authenticated; the
     QUIC handshake is what checks it.
+  → A client nobody named (a gateway admitting a native join, A7b; called
+    only from the gateway admission path, which is dark): ProvenClientKey takes the key the client
+    presents instead of pinning one. peer_key_presented accepts only an
+    exact Ed25519 SPKI (prefix + 32 bytes) with sign bit 0, no chain, a key
+    PeerKey::of accepts, in its canonical encoding; the signature must be
+    Ed25519 under that key (scheme and bytes checked before ring). The
+    verifier keeps no state, so one server_tls_proven configuration serves
+    any number of handshakes; the identity is read after the handshake from
+    the connection's peer_identity() (proven_client_key, which parses it
+    with peer_key_presented again), so it belongs to that connection and a
+    completed handshake. Read it only on a fully established connection,
+    never one from Connecting::into_0rtt(): rustls records the client's
+    certificate before the client's Finished. server_tls_proven offers
+    freenet-quic/2 only. It proves possession of the key's secret, nothing
+    more.
 Tests: conversion vs curve25519-dalek 5 (random keys, bit 255 set, u = -1),
 signer key == verifier key over many keypairs with both natural sign bits,
 signatures verified by ed25519-dalek and refused with any bit flipped,
@@ -2105,13 +2245,14 @@ either side, and a man in the middle with its own key on either leg.
 
 #### QUIC-native setup (`quic/native/`, #5940 QUIC-native connect, A4)
 
-Built and tested, and unreachable by construction: `setup::connect_native`,
-`setup::accept_native` and the endpoint's native side (`native/endpoint.rs`:
-`allow_native_peer`, `dial_native`, `send_punch`) are
-`pub(in crate::transport::quic::native)`, and registering a native waiter is
-private to `setup`. Nothing outside `quic/native` can call them; A5 widens
-them in a visible diff. The connect op also gates on
-`operations::connect::native::NATIVE_DIAL_READY` (pinned false).
+`setup::connect_native` and `setup::accept_native` are
+`pub(in crate::transport)`, called only by the upgrades hub's
+`QuicUpgrades::setup_native` (A5b, below); the endpoint's native side
+(`native/endpoint.rs`: `allow_native_peer`, `dial_native`, `send_punch`)
+stays `pub(in crate::transport::quic::native)`, and registering a native
+waiter is private to `setup`. In production nothing asks for a setup: the
+connect op gates on `operations::connect::native::NATIVE_DIAL_READY` (pinned
+false) and `QUIC_NATIVE_PERCENT` (0).
 
 ```
 ALPN per attempt: an address allowed with allow_native_peer is accepted with
@@ -2121,7 +2262,9 @@ ALPN per attempt: an address allowed with allow_native_peer is accepted with
 Router: an attempt from a native-allowed address goes only to
   native::waiters (QuicUpgrades::dispatch), never to an upgrade session. The
   only production registration is in accept_native. Handing an attempt over
-  marks the waiter busy until its InFlight guard drops; others are ignored.
+  counts it against the waiter (up to MAX_IN_FLIGHT, 2: a client's first
+  attempt and its overlapping second) until its InFlight guard drops;
+  further ones are ignored.
   An attempt without a Retry token gets a Retry first (one more round trip
   in the window).
 Hello (native/hello.rs, frozen layout) is exchanged on one uni stream each
@@ -2134,29 +2277,35 @@ Punches (native/punch.rs): byte 0x03 + 8 GlobalRng bytes, sent on the
   250 ms, at most 32 per setup (288 B). A client also sends at most 12
   padded Initials (quinn sends two probes per timeout: 9 in 8 s and a
   close; a Retry does not reset the probe count, so one more after a Retry,
-  11 of 12), so a client setup is charged 14688 B and a server
-  setup 288 B, before anything is sent. PunchBudget: 64 KiB per destination
+  11 of 12), so a client setup is charged 14688 B per attempt (twice, 29376 B,
+  when it starts its overlapping second attempt) and a server setup 288 B,
+  each charge before anything is sent. PunchBudget: 64 KiB per destination
   per minute (an IPv4 address, or an IPv6 /64), and 1 MiB per minute for the
   node (provisional); 4096 destinations remembered, and a new one replaces
   the least recently charged only once that one has refilled (else
   refused, PunchRefusal::Table), so forgetting never gives bytes back early.
-  The silent-peer test checks a client sends no more than it was charged.
+  The silent-peer test checks a client sends no more than it was charged
+  (twice CLIENT_BYTES_PER_DIAL, as its second attempt starts).
 Setup (native/setup.rs): one window, 8 s cut to the caller's deadline, not
   started with less than 4 s left; punching, the handshake and the Hello
-  exchange all inside it. The budget is charged after the checks that fail
+  exchange all inside it. The server waits 4 s more
+  (SERVER_WINDOW_ALLOWANCE), so a client that starts late still finds it. The budget is charged after the checks that fail
   without sending (window, key, waiter, allow). Roles by key order are the
   caller's decision.
 Not decided here (A5): fairness between the requesters that steer setups,
-  for both budgets. A requester steering about 4 client setups a minute at
-  one destination empties that destination's budget, blocking native setups
-  to every peer behind it; steering about 71 a minute empties the node
-  budget, blocking native setups to every destination. Both must be fair
-  before UDP is removed.
+  for both budgets. A client setup that overlaps (a silent or lossy
+  destination) is charged CLIENT_BYTES_PER_DIAL twice, 29376 B, so a
+  requester steering about 2 such setups a minute at one destination empties
+  that destination's budget (PUNCH_BUDGET_BYTES, 64 KiB; about 4 a minute
+  when each setup takes one attempt), blocking native setups to every peer
+  behind it; steering about 35 a minute (about 71 with one attempt each)
+  empties the node budget (NODE_PUNCH_BUDGET_BYTES, 1 MiB), blocking native
+  setups to every destination. Both must be fair before UDP is removed.
 ```
 
 Native connection (`peer_connection/native_connection.rs`, A5a): the
-`PeerConnectionApi` over a native connection, built by nothing in production
-until A5b wires the connect op.
+`PeerConnectionApi` over a native connection, built by
+`QuicUpgrades::setup_native` once a native setup gives a connection.
 
 ```
 Path: QuicPathLimits::NATIVE (DEFAULT with udp_fallback off) and data
@@ -2182,14 +2331,207 @@ End reasons (close_reason after recv fails): quinn's idle TimedOut is
   (QuicCloser::close_for: Stalled, NotAcknowledging, SendAborts,
   PeerOverBudget, RefusedData, PeerRefusedData, ReceiveTaskPanicked), first
   cause wins; a
-  local close with none is ClosedLocally, the peer's close ClosedByPeer, and
-  any other end Lost. The disconnect label is QuicPathEnd::label.
+  local close with none is ClosedLocally, the peer's close (application or
+  transport level) ClosedByPeer, and any other end Lost. The disconnect label is QuicPathEnd::label.
 Pacing: the bandwidth limit paces its data with a LimitPacer on the path's
-  clock, as an upgrade session's does.
+  clock, as an upgrade session's does, except that a message the pacer
+  refuses is dropped (no UDP to send it on) and nothing is charged as
+  fallback debt. A native connection counts in the node's shared bandwidth
+  pool (GlobalBandwidthManager) while it lives, as a UDP connection does, so
+  its share of the total limit shrinks with the connection count.
 Drop: closes with NODE_DROPPED_PEER at once (send tasks hold the path) and
   cancels its unclaimed inbound streams, as PeerConnection's drop does.
 send_bytes_observed is always Unobserved: no message is a stream it reports.
-The route worker runs under report_panics (task_panicked).
+A route worker panic is counted on the path and node-wide as
+  quic_data_event_native_worker_panicked, then raised again (an upgrade's
+  worker counts as quic_upgrade_task_panicked).
+The transient-send warn in peer_connection_listener is throttled per
+  connection (1st, 2nd, 4th ... failure, with the count), since a backed-up
+  short queue refuses every send with SendQueueFull.
+```
+
+Native connect (`operations/connect/native.rs`, `quic/upgrade/driver/native.rs`,
+A5b): the connect op asks for a native connection when the acceptor decides
+`Native`. Off in production (gates above); a simulation turns it on per node
+with `SimNetwork::with_native_connect` / `with_node_native_connect`
+(`NodeConfig::native_connect_override`).
+
+```
+Readiness: NativeConnectState, one per node in the ConnectionManager. Ready
+  when dialling is on (NATIVE_DIAL_READY, or the override), this node's own
+  QUIC endpoint is up (its QuicAvailabilityWatch from TransportHandle, read
+  per node: the process-wide quic_endpoint metric is shared by simulated
+  nodes) and the node is not demoted. The relay's decision and the joiner's
+  offer both read it.
+Dial: NodeEvent::ConnectPeer and HandshakeCommand::Connect carry a
+  DialTransport. A native dial registers no UDP expectation and runs
+  OutboundConnector::connect_native -> QuicUpgrades::setup_native: the
+  higher key is the server (accept_native), the lower the client
+  (connect_native); one PunchBudget per node shared by both roles; at most
+  NATIVE_SETUPS_MAX (64, lowered to the connection limit) setups at once,
+  refused at once past that (setups_full). Each end is counted once as
+  connect_native_setup_<label> by an exhaustive match on the setup error.
+Joiner: joiner_response_action gives Native when it offered and can still
+  dial. Acceptor: dispatch_expect_connection_from takes the response's
+  decision; every accept site passes it (source-scrape pin).
+Fallback: a failed native setup is followed by today's UDP dial to the same
+  peer (joiner: before anything counts the acceptor failed; acceptor:
+  expectation plus dial). Both sides start it NATIVE_FALLBACK_AFTER (12 s,
+  the server's window) after their own reference, never earlier: the
+  acceptor's decision, the joiner's receipt of the response. Both setups
+  have ended by then, and the references are the response's travel time
+  apart, so the two hole punches (NAT_TRAVERSAL_DEADLINE, 3 s each) overlap.
+  Falling back as each setup ended would not: the client's window ends 4 s
+  before the server's (behind port-restricted NATs every peer fallback then
+  misses, test_quic_native_blocked_pairs_connect_over_udp_behind_nats).
+  The joiner plans each dial (op_ctx_task.rs plan_acceptor_dial): a native
+  dial carries an absolute deadline, the common fallback time
+  (DialTransport::Native { deadline }), and the setup takes what is left of
+  it when it starts, so time spent reaching the transport comes out of the
+  window. It dials native only while at least NATIVE_MIN_WINDOW_LEFT (4 s)
+  of the ACCEPTOR's window is left, by the acceptor's role
+  (native_setup_window: 8 s as client, 12 s as server, from the response's
+  arrival); otherwise it dials UDP at the fallback time with no native
+  attempt, which could only time out (a demotion strike). A UDP dial waiting
+  for its fallback time holds no dial slot: the queue moves on at once, so
+  a joiner with a connection can briefly have two dials in flight (the next
+  acceptor's and a fallback). A UDP dial asked for while a native dial to
+  the same address is pending (another CONNECT's) runs BESIDE it
+  (EventListenerState::udp_beside_native): not merged into it, which failed
+  it with the native dial, and not held back, which punched late. An
+  outcome answers only its own transport's callbacks, except that a kept
+  connection answers both dials' requesters, since all asked for a
+  connection to that peer (never answered Ok without a kept connection).
+  SURVIVOR RULE (design note 10.2 item 18): when a node holds, or is handed,
+  a native and a UDP connection to one peer key, it keeps the native one,
+  whichever came first and whether the UDP one was dialled or arrived
+  inbound (matched key looked up by key, else the address:
+  native_holds_peer), as long as the native entry is LIVE (heard from within
+  identity::HOLD_WINDOW, 30 s). A quiet native entry (peer restarted, NAT
+  rebound) does not hold the peer: the UDP connection takes the ordinary
+  replace, or it would be refused until the 120 s QUIC idle timeout. Both
+  ends apply the rule, so they normally agree with no message. Residual:
+  each end judges liveness on its OWN receipt stamp, so a UDP connection
+  arriving just as one end's native connection crosses HOLD_WINDOW can be
+  kept at one end and dropped at the other; that needs the native
+  connection silent for about two keepalive intervals (HOLD_WINDOW >= 2 x
+  KEEPALIVE_INTERVAL is a const assert in identity.rs), so about two lost
+  keepalives. Rare; a gate before native is enabled (design note 10.2 item
+  18). Native only wins once it has carried a frame from the peer (option
+  (b), #6294): each native connection sends one probe when it starts
+  (send_native_probe) and its listener reports its first decoded message once
+  (ConnEvent::NativeFirstFrame), because only one end may have finished the
+  native setup. Native second: kept beside the UDP entry (hold_native,
+  P2pConnManager::held_native, one per address, a newer one replaces it) and
+  swapped in on its first frame by promote_held_native, which replaces only
+  the transport (sender, connection id, receipt, remote version) and keeps
+  identity, ring membership, transient status, ReadyState, connected-since
+  and health (no promotion, prune or budget call). UDP second: dropped if the
+  native entry has already carried a frame; otherwise it becomes the entry
+  in place (swap_udp_in_beside_native) and the native connection is held,
+  the same way. A held native connection is dropped after HELD_NATIVE_WINDOW
+  (15 s, the event loop wakes for it) with no frame, when it closes, or with
+  its entry (remove_connection); a frame after the deadline does not
+  promote. If the UDP entry closes while a native one is held for the same
+  key, the native one becomes the entry (the peer may have promoted it and
+  dropped UDP). A holder at another address keeps the drop. A native dial
+  onto an entry bound to ANOTHER key takes the ordinary replace (the entry is
+  stale). Two UDP connections keep the old later-replaces-earlier behaviour.
+  record_success runs before any
+  keep/swap/drop. A dropped UDP dial's requesters are answered with the
+  native holder's address, and an unused reservation at the dial's own
+  address is released. Counted: connect_native_survivor_{swapped,udp_dropped}
+  (swapped is counted at promotion, not at arrival),
+  connect_native_both_dials_connected_{udp,native}_first (beside pair only).
+  One-sided native setups (one end connected, the other's setup failed;
+  10.2 item 20) are NOT counted locally: no counter at one end can see them
+  (a "native won then closed soon" counter was tried in #6255 and both
+  missed them and counted unrelated closes). They are measured by joining
+  both ends' setup outcomes by the CONNECT transaction (in simulation, the
+  native wire trace's native_setup_pairs).
+  A UDP dial beside a native one that fails while the native dial is
+  pending neither backs off (a 30 s backoff would refuse the native dial's
+  own fallback) nor marks anything; once the native dial has ended without
+  a connection it takes the ordinary failure path, backoff included. A
+  native failure marks
+  no failed address and records no peer backoff, so the fallback is not
+  refused. Until UDP is removed a failed native setup never costs the join
+  (test_quic_native_failed_setups_fall_back_to_udp, which also checks that
+  each failure is followed by a UDP dial from that node to that peer).
+  The server waits longer than its client, so the client's fallback can
+  connect the pair before the server's setup ends; a native failure for an
+  address that is already connected only counts toward demotion (the
+  in-transit prune would remove the live peer's ring entry).
+Success: the connection's key is bound as IdentitySource::Proven; a
+  gateway records a JoinTransport::Native join.
+Demotion: recorded in the connection lifecycle, where the outcome is known,
+  and only for a dial the node made as joiner (OutboundEstablished and
+  OutboundFailed carry the origin), successes and failures alike. A joiner's
+  acceptors come from responses routed back along its CONNECT, while an
+  acceptor's joiner chose it and could fail on purpose with free keys. This
+  narrows who can drive a demotion; it does not exclude everyone: the
+  acceptor in a response is named by whoever sent it, so a relay on the
+  CONNECT's path can name acceptors that decide Native and never serve. The
+  effect is a 6 h downgrade to UDP, not a failed join. An acceptor's own
+  native failures never demote it (before-enabling item). Only
+  timed_out, handshake_failed and hello_lost count
+  (NativeSetupOutcome::counts_toward_demotion): a refusal by the node's own
+  limits, or a Hello the peer answered, says nothing about the path. Three
+  such failures with distinct peers turn native off for 6 h
+  (connect_native_demotions); a success as joiner resets the streak.
+Existing transport: a native dial does not drop a connection the node
+  already has to that peer; the joiner may have connected another way since
+  the acceptor decided.
+Simulation: every node shares [::1], so the per-destination punch budget
+  is one bucket for all of a node's peers, and a joiner dialling several
+  acceptors at once refuses some setups (over_budget_destination) and their
+  servers time out. The fallback covers them. SimNetwork::new_with_nat
+  (SimNat) instead gives every node an address of its own in a ULA prefix
+  (fd00:<network tag>:<node + 1>::1; the node number is in the third
+  segment, the last one Location::from_address reads) and puts the regular
+  nodes behind NATs (transport::nat_model: endpoint-independent mapping,
+  full, address-restricted or port-restricted filtering, bindings refreshed
+  by outbound datagrams, 30 s lifetime; or Symmetric, a fresh external
+  port per destination admitting only that destination, the node's own
+  address closed). The sender's NAT opens its binding (and, if symmetric,
+  rewrites the source) at send; the receiver's decides at DELIVERY
+  (in_memory_socket deliver_packet_to_network), so a punch crossing one the
+  receiver sends is admitted. A native setup with a symmetric peer never
+  connects, whatever the other side's class: the setup admits only the
+  peer's known address, and a symmetric peer's port toward anyone else is
+  not it (test_quic_native_symmetric_nat_pairs_fail_and_nodes_still_join). The 6.2 matrix
+  (quic/native/setup/matrix_tests.rs) runs connect_native/accept_native
+  behind NATs over classes, late side and skew, punch loss and round trip;
+  every cell of that original matrix establishes. The gate rows added
+  beside it (gates 14, 15, 17) follow. With 10% loss on Initial and Handshake packets too
+  (gate 15) one attempt established 72-91% at 800 ms (a lost late Handshake
+  packet leaves the next probe past the window), so the client makes
+  OVERLAPPING ATTEMPTS: a second dial (new connection, charged
+  CLIENT_BYTES_PER_DIAL again) OVERLAP_BEFORE_END (5 s) before its window's
+  end, at least OVERLAP_MIN_DELAY after the first; neither is cancelled, and
+  each attempt is the dial plus its Hello exchange, so a first attempt
+  established on the client but not on the server does not end the race.
+  A first attempt that ERRORS before the overlap point ends the setup with
+  that error and starts no second (a hard error is a refusal; loss shows as a
+  timeout, which the overlap covers).
+  The server takes up to MAX_IN_FLIGHT (2) attempts per waiter and runs
+  their handshakes at once. Gate 15 then 96-100% per cell (100 seeds). Cost:
+  a client setup can spend two charges, so about two overlapped setups per
+  destination per minute fit PUNCH_BUDGET_BYTES instead of four. Jitter at
+  the window edges (gate 17) still fails mostly one-sided (PR-4, option b).
+  Gate 17's binding-expiry half is NOT demonstrated: at a 5 s lifetime no
+  binding expires inside a setup (measured), and a lifetime short enough to
+  expire one (200 ms) is under the round trip, so it fails every setup
+  whatever the setup does and says nothing about it; those rows were dropped.
+Determinism: a plain tokio::select! draws its arm order from tokio's RNG,
+  which the seed does not set. bounded_send's loop (every QUIC path, upgrade
+  ones included: a send and its deadline ready together now resolve as the
+  send) and the native setup's four selects (connect_native, race_attempts,
+  and accept_native's accept loop and accept/deadline select) are `biased`
+  with a documented order, so one seed runs the
+  same twice (test_quic_native_connect_is_deterministic). Not
+  deterministic_select!: it draws from GlobalRng, which shifts the seed's
+  stream for every QUIC test after it.
 ```
 
 #### QUIC framing and path (`quic/framing.rs`, `quic/path.rs`, #5940 step e3)
@@ -2814,12 +3156,15 @@ Path recycling (quic/recycle.rs, #5940 step M6): besides the send-reset
     own deadline (no caller does this today) waits on in the background
     for at most the rest of its ack wait, then is reset and judged as one
     that ran out.
-  → Ack waits expired (#6205, recycle::AckWatch, Stall::AckWaitsExpired),
-    OBSERVE-ONLY (recycle::ACK_WAITS_EXPIRED_CLOSES is false): strikes and
-    would-closes are counted and the path is never closed by this rule;
-    the close is a follow-up calibrated from the field counts, which must
-    also count streams started after an end in its backlog (below). #6205
-    stays open as the gate before UDP removal. A reset at an expired wait (above) is a STRIKE when there is evidence
+  → Ack waits expired (#6205, recycle::AckWatch, Stall::AckWaitsExpired):
+    closes a path with no UDP session (a native one) with
+    PEER_NOT_ACKNOWLEDGING; on a path with a UDP session it only observes
+    (recycle::ACK_WAITS_EXPIRED_CLOSES_WITH_UDP is false): strikes and
+    would-closes are counted and the path is not closed, so the field
+    counts calibrate the rule before UDP removal without this node's own
+    closes in them (the same split as the dark rule). #6205 stays open as
+    the gate before UDP removal for the late-acknowledgement residual
+    (below). A reset at an expired wait (above) is a STRIKE when there is evidence
     the end went out and the peer is alive (path::StrikeCheck): ack batches
     came after the end was sent and the latest came while quinn was
     application-limited (quinn-proto app_limited = nothing built and not
@@ -2833,7 +3178,17 @@ Path recycling (quic/recycle.rs, #5940 step M6): besides the send-reset
     either when the expiry's timer woke more than LATE_WAKE_SLACK (2 s)
     past its deadline: this node's runtime stalled or its host slept, and
     acknowledgements already in the socket may not have been read
-    (an_expiry_whose_timer_woke_late_is_not_a_strike). A genuinely
+    (an_expiry_whose_timer_woke_late_is_not_a_strike). Nor when the path
+    was dark for at least the watch's window (10 s) at any sample since the
+    end was sent (AckWatch::publishing_long_dark, WatchShared::long_dark_at):
+    through an outage that ends, a send can outlast its wait with an honest
+    peer, because quinn resends only at its next backed-off probe; the
+    common case is a one-packet Short's 150 s bound on a path with a UDP
+    session, which the dark rule leaves to the idle timeout since #6239.
+    Short strikes per data path-hour rose about 4x from 0.2.158 to 0.2.159
+    (1.27 to 4.98 per 1000), consistent with that. A peer that withholds
+    acknowledgements while it keeps sending is heard at every sample, so the
+    exclusion never covers it. A genuinely
     slow path (every batch congestion-limited, under the floor) is not
     struck (the_strike_check_needs_evidence_that_the_end_went_out,
     ack_wait_expiries_on_a_congestion_limited_slow_path_are_not_strikes,
@@ -2849,7 +3204,8 @@ Path recycling (quic/recycle.rs, #5940 step M6): besides the send-reset
     acknowledgements are high), acknowledged multi-packet Shorts between
     included, or one end in three, would be closed at about its third ack
     wait, not after SEND_ABORT_LIMIT (4096) resets
-    (ack_wait_expiries_count_a_would_close_whatever_else_is_acknowledged). Flow
+    (ack_wait_expiries_count_a_would_close_whatever_else_is_acknowledged,
+    whose native cases close at the third strike). Flow
     control cannot hold bytes back after the end is sent (every byte
     written before it was within the peer's credit; a peer whose app stops
     reading blocks the write before the end, which the gap and credit
@@ -2857,10 +3213,26 @@ Path recycling (quic/recycle.rs, #5940 step M6): besides the send-reset
     congestion-limited path whose backlog drains within about a round
     trip of the expiry, the batch acknowledging the bytes before the end
     can be application-limited while the end's own acknowledgement is
-    still on its way. And the backlog is read once, when the end is sent:
-    streams started after it slow the end's drain and are not counted, so
-    a burst of large sends just after an end can make an honest path's
-    expiry a strike (the reason the rule only observes). Lateness is
+    still on its way. Streams started after an end slow its drain, so the
+    ack wait reads its backlog again once, when it first runs out
+    (bounded::LaterBacklog, QuicPath::backlog_wait, path::later_backlog):
+    the bytes ahead of the stream's last byte under quinn's round-robin
+    (the rest from each send in flight at the end, this one included, plus
+    each send started since at its own bytes but at most the rest, from
+    QuicPath::stream_opens, read before the permits in use so a concurrent
+    open is counted twice rather than missed), at the floor; nothing once
+    the peer has wholly acknowledged that many bytes of data streams
+    opened after the end (StreamOpens::acked_after: stream-only progress,
+    not control frames or quinn's own packets, and not a stream already
+    open at the end, which may have had most of its bytes acknowledged
+    before it; the last
+    byte went out with them, so a busy path that acknowledges quickly is
+    judged at its first wait). If that moves the deadline past now, the
+    wait goes on, within its total, and is then judged
+    (streams_started_after_an_end_extend_its_ack_wait: before this, a 1 MiB
+    stream followed by fifteen more on a 40 KiB/s link expired;
+    an_ack_wait_reads_its_backlog_again_once,
+    the_later_backlog_counts_bytes_ahead_until_they_are_acknowledged). Lateness is
     measured against the deadline only: a stall that ended within the
     slack of the deadline still has its stale evidence judged. Merely slow
     paths do not expire
@@ -2884,9 +3256,34 @@ Path recycling (quic/recycle.rs, #5940 step M6): besides the send-reset
     runs out holds the 48 permits (each for at least 5 min) and the 64
     one-packet Short epochs (about 150 s each) indefinitely, with no
     expiry and no abort; every further streamed send waits its 2 s open
-    deadline and goes on UDP (after UDP removal, it fails). Not counted as
-    a strike: the threshold for "acknowledged later than an honest peer
-    could" is the same backlog-sized wait, hours on a busy slow path.
+    deadline and goes on UDP (after UDP removal, it fails). The ack wait
+    cannot judge it (its threshold is the backlog-sized wait, hours on a
+    busy slow path), so a separate check judges the end by the
+    connection's progress (path::LateEndCheck, late_end_verdict): once
+    the peer has wholly acknowledged data streams opened after the end
+    totalling the bytes ahead of the
+    end's last byte under quinn's round-robin (path::bytes_ahead) plus the
+    congestion window when the end was sent (at least 64 KiB), the last
+    packet has been sent, and an honest stack acknowledges it within
+    late_end_grace (9 round trips and 75 ms, at least 2 s). An end still
+    unacknowledged then is a LATE END: counted in
+    quic_late_end_<stream|short|control> (the stream is not reset), and
+    three within 30 min count a would-close under late_ends
+    (quic_stall_would_close_late_ends). OBSERVE-ONLY on every path
+    (recycle::LATE_ENDS_CLOSE is false) until the field counts calibrate
+    it. Not judged while the egress cap holds a transmit or after a late
+    wake (the proof restarts), nor once the path was dark for the watch's
+    window since the end. Honest paths see none
+    (concurrent_large_streams_on_a_slow_path_see_no_expiry,
+    a_slow_lossy_path_stays_within_its_consumer_gap and the other no-expiry
+    tests assert it); the check itself is tested with a scripted
+    acknowledgement count (the_late_end_check_polls_until_the_end_is_late),
+    since the test harness's peer acknowledges every packet, and the calls
+    that run it are pinned (the_late_end_watch_runs_wherever_an_end_waits).
+    Residual: a peer that goes fully silent for at least the watch's window
+    (10 s) after each end excuses that end from both the expiry strike and
+    the late-end check, and on a path with a UDP session no dark close
+    follows; it stops all of its own traffic for each spell.
     Closes by the watch are counted by why in quic_stall_close_<label>.
   → No false close at 800 ms round trip and 15% loss with the loss gate on
     (a_slow_lossy_path_stays_within_its_consumer_gap: the send ends Sent on
@@ -3012,9 +3409,10 @@ QUIC send route (#5940 e5b-6, quic/upgrade/data_route.rs,
   nobody acknowledges is closed by the dark rule if it is native, and ended
   by quinn's idle timeout if it has a UDP session; a peer that never
   acknowledges a stream's end has the stream reset at its ack wait, and
-  three within 30 min are counted as a would-close (observe-only for now,
-  ACK_WAITS_EXPIRED_CLOSES; until the close lands, such a peer is bounded
-  only by SEND_ABORT_LIMIT); a peer that
+  three within 30 min close a native path (on a path with a UDP session
+  they are counted as a would-close, ACK_WAITS_EXPIRED_CLOSES_WITH_UDP, and
+  such a peer is bounded there by SEND_ABORT_LIMIT and the fallback); a
+  peer that
   withholds its stream limit
   is closed by the stream-credit rule (liveness rules, above).
   The window must stay: without it a busy relay whose 48 permits hold transfers
@@ -3161,7 +3559,7 @@ QUIC receive flow (#5940 e5b-4):
 
 #### QUIC errors, close codes and liveness (`quic/error.rs`, `quic/liveness.rs`, #5940 step e4)
 
-Live in production on Linux, macOS and Windows, where `prefer` is the default:
+Live in production on every platform, where `prefer` is the default:
 until a release's share reaches a pair its path carries control frames only,
 but endpoints, connections and their errors are real. With `transport-quic` off no endpoint is built and the transport
 reports `Disabled`.
@@ -3285,7 +3683,25 @@ Liveness ("alive" = the endpoint driver has not ENDED; it does not mean
   endpoint's QuicAvailability turns Down for good, once, with a WARN and
   quic_endpoint_down. Its connections end, accept() returns None and
   connect() fails as EndpointDown. The UDP transport is untouched.
-  → NEVER feed endpoint death to ListenerExit: that exits the node.
+  → NEVER feed endpoint death to ListenerExit: that exits the node. The
+    one exception is deliberate: a gateway in the `freenet` binary whose
+    unit sets FREENET_SUPERVISED=1 (liveness::gateway_quic_restarts,
+    enabled by enable_gateway_quic_restarts; systemd's INVOCATION_ID alone
+    does not count, since such a unit may not restart it) gets
+    ListenerExit::QuicEndpointDown, so its supervisor restarts it with a
+    new endpoint. The same switch restarts such a gateway when a breaker
+    cooldown that kept its QUIC off ends (ListenerExit::QuicCooldownEnded).
+    Both exits use code 42 at any uptime, never the fast-crash 45, which
+    the crash-loop rollback counts. The death is first recorded in the
+    breaker marker (breaker::note_endpoint_down_exit, which writes a
+    marker not yet armed). The first death in ENDPOINT_DOWN_WINDOW (24 h)
+    restarts QUIC at once; the next trips, as does every one while a recent
+    trip counts, so each death doubles the cooldown and restarts per day are
+    bounded (breaker::endpoint_down_verdict, the same on Windows). A death
+    it cannot record, or any death under quic-ignore-crash-breaker, does
+    not exit: otherwise a death at every start would restart the node
+    without bound. Peers, and other gateways, keep
+    running over UDP.
   → quinn's driver returns only on a receive I/O error. QuicSocket returns
     one only after it caught a panic (below); tests inject one
     (socket::SocketFaults::fail_receive).
@@ -3370,19 +3786,43 @@ Liveness ("alive" = the endpoint driver has not ENDED; it does not mean
   → Telling them apart: a caught adapter panic leaves the process running
     (ERROR log, quic_adapter_panicked, quic_endpoint_down) and leaves no
     crash-loop breaker state, so QUIC comes back on the next start, and a
-    deterministic fault recurs once per start. A panic that is not
-    contained aborts the process. On unix the next start trips the breaker
-    (quic_breaker_trips, see quic/breaker.rs). On Windows the breaker does
-    not look at how a run ended: a panic hook records a panic located in QUIC
+    deterministic fault recurs once per start. The exception is a
+    supervised gateway, which records the death in the breaker marker and
+    exits (see above). A panic that is not
+    contained aborts the process. On a gateway on Linux or macOS the next start trips the
+    breaker (quic_breaker_trips, see quic/breaker.rs): QUIC off for 15 min
+    (doubling on repeat trips up to 4 h), and a supervised gateway restarts
+    itself with exit 42 at the cooldown's end (breaker::quic_restore_at).
+    Every peer (24 h cooldown; on unix since #6151), a Windows gateway and a
+    gateway on a unix platform with no boot identity decide by short runs instead: the
+    breaker does not look at how a run ended: a panic hook records a panic located in QUIC
     code in the run's marker, and it counts runs that lasted under 10 minutes
-    and recorded one, so the fourth start after three such aborts in a row
-    trips it. An ordinary stop records no panic and never counts; an abort
+    and recorded one, so the start after two such aborts in a row trips a
+    peer while UDP exists (one below the rollback's three crashes, pinned by
+    the binary's peer_breaker_trips_before_the_crash_loop_rollback; the
+    rollback counts any crash, so an unrelated crash before two QUIC panics
+    still lets it act first; back to three when UDP is removed) and the start after three trips a gateway. An ordinary stop records no panic and never counts; an abort
     after 10 minutes or more never does, nor do aborts a day apart
     (quic/breaker/short_runs.rs). A panic counts as QUIC's when the thread
     is inside a QuicCode guard (quinn's driver polls in runtime.rs, the socket
     adapter's catch_unwind calls) or, failing that, by location. The hook is
     process-global: only a child-process test installs it (the arming tests
-    pass a no-op installer).
+    pass a no-op installer). The hook also records where the panic was
+    (file:line, cut to the crate directory). Each start sends a
+    `quic_breaker_start` telemetry event (role, rule, verdict, short runs,
+    that place); on a unix peer it adds `legacy_verdict`, what the old
+    exit-status rule would have decided, from a shadow that keeps its own
+    marker (quic-crash-breaker-legacy.json) and never changes whether QUIC
+    runs. It tells what the switch loses (crash loops with no QUIC panic) and
+    what it stops (kills read as crashes). The shadow goes with UDP (#6151).
+    With no UDP to fall back to (breaker::UDP_FALLBACK false, set by the
+    UDP-removal release; until then tests only, switched on in a
+    quic-panic-injection build by FREENET_TEST_BREAKER_NO_UDP_FALLBACK), a
+    peer trips at three again and its trip keeps QUIC on: a start delay of 1
+    minute doubling to 30 (Verdict::Backoff, waited out just before the
+    transport opens, cut short by a stop), the startup update check at once
+    (quic_crash_loop_update_now; the update claim still applies), and a
+    supervised peer exits on endpoint death like a gateway.
   → When the node drops its last handle, the availability is Released
     (final; the first final state stored wins, so a release and a
     driver return racing never overwrite each other) and the driver's

@@ -26,14 +26,19 @@
 //! | `quic_ended_paths_below_floor` | paths that ended in the period before sending 200 packets, so in no bucket |
 //! | `quic_carried_packets_sent`, `quic_carried_packets_lost` | the period's packets sent, and declared lost, while their path carried data (a subset of `quic_sent_packets` and `quic_lost_packets`; the shadow share is the difference, a reconciliation residual: both operands are recorded by `record_path_loss` under the one `loss` lock, the exception the bug-prevention rule "metric describing a filtering decision, re-derived at the call site" allows, as for `broadcast_payload_mix`) |
 //! | `quic_carrying_loss_rate_<bucket>`, `quic_carrying_ended_loss_rate_<bucket>`, `quic_carried_paths_ended_below_floor` | the same three as for every path, for paths that carry data, by their loss counted from the first report that found the path carrying (a path whose data bit came on after it started starts its carrying count then); every gauge bucket sent every period |
+//! | `quic_srtt_<bucket>` | live QUIC paths that carry data, by their smoothed round-trip time (quinn's `PathStats::rtt`) at their last tick (a gauge, not reset, every bucket sent every period, 0 included): `lt_10ms`, `lt_25ms`, `lt_50ms`, `lt_100ms`, `lt_200ms`, `lt_400ms`, `ge_400ms`. A path is in a bucket from its first tick as a data path (it is built from an established connection, which has an RTT sample), and leaves when it stops carrying or ends; paths that carry no data are in none |
+//! | `quic_tx_bps_<bucket>` | live QUIC paths that carry data, by the datagram bits per second quinn built on them over their last tick (about 2 s; a gauge, not reset, every bucket sent every period, 0 included): `lt_10kbps`, `lt_100kbps`, `lt_1mbps`, `lt_10mbps`, `lt_100mbps`, `ge_100mbps`. The bytes are UDP payload as quinn counts them (`udp_tx.bytes`): retransmissions, acknowledgements, padding and keepalives included, so it is neither goodput nor capacity. These two gauges describe path conditions; the speed of QUIC against UDP is answered from transfer events (bytes over duration, by transport and release), not from them. One tick's rate, sampled when the snapshot is taken, so it describes the fleet's distribution rather than one path's throughput; a tick of 0 ms is not counted |
 //! | `quic_streams_sampled_paths`, `quic_streams_open_ge_<n>`, `quic_streams_peak_max` | per path and period, the peak of inbound streams read at once: the paths sampled, those whose peak reached each level, and the highest peak |
 //! | `quic_gate_loss_<verdict>` | congestion events by the loss gate's verdict (`recycle::loss_gate`): passed to Cubic as `queue`, `share` (loss share above the ceiling), `persistent`, `ecn` (a congestion mark), `no_sample`, or `ignored` as random loss; summed over the node's paths up to each path's last tick. Over a path's life they sum to its `quic_congestion_events`; within one period they can differ by the events between the two reads of a tick |
 //! | `quic_gate_ended_queue_<bucket>` | paths that ended in the period after at least 20 gate verdicts, by the share of them passed as `queue`: `lt_10pct`, `lt_50pct`, `ge_50pct`. A path whose losses mostly read as a queue runs as plain Cubic, whether the queue is real or jitter |
 //! | `quic_carried_dark_episode_<label>` | the same, for the episodes of paths that carried data when the episode ended: a subset of `quic_dark_episode_<label>`, counted by the same decision |
 //! | `quic_dark_episode_<label>` | dark episodes on QUIC paths (`recycle::AckWatch`: packets outstanding, nothing acknowledged and nothing heard) by how they ended: `recovered_lt_5s`, `lt_10s`, `lt_30s`, `lt_120s`, `recovered_ge_120s`, `unrecovered` (the path closed, or nothing was outstanding any more), `cap_held` (the egress cap held this side's sends, so darkness could no longer be told), `closed_at_window` (the dark-path rule closed a path that carries data and has no UDP session, a native path). A path that carries no data, and since 0.2.159 a data path with a UDP session (`recycle::DARK_CLOSES_WITH_UDP`), is never closed by that rule, so its episodes run to their end (a data path with a UDP session counts the close the rule would have made in `quic_stall_would_close_dark`); read at the watch's 2 s ticks |
-//! | `quic_ack_wait_expired_<label>` | sends whose wait for the acknowledgement of their end ran out and whose stream was reset, by kind: `stream` (a send with an ack wait: a Stream, or a Short past one packet), `short` (a one-packet Short, past its 150 s bound) or `control` (a control frame, bounded as a one-packet Short); only those that count as strikes (`path::StrikeCheck`: evidence the end went out and the peer is alive). An honest peer acknowledges an end within a few round trips, so this should be 0 on every honest path (`recycle::ACK_WAIT_EXPIRY_LIMIT` in `ACK_WAIT_EXPIRY_WINDOW` counts a would-close; the rule does not close a path yet) |
-//! | `quic_stall_close_<label>` | paths the acknowledgement watch closed, by why: `not_acknowledging`, `dark`, `credit_starved`, `stream_credit_withheld`, `ack_waits_expired` (`recycle::Stall`) |
-//! | `quic_stall_would_close_<label>` | times a rule that only observes would have closed a path, by the same labels; each count starts the rule's window afresh. Two rules observe today. `ack_waits_expired` (`recycle::ACK_WAITS_EXPIRED_CLOSES` is false) counts each time `ACK_WAIT_EXPIRY_LIMIT` strikes came within `ACK_WAIT_EXPIRY_WINDOW`, for calibrating the close from the field (#6205). `dark` counts once per episode on a data path with a UDP session, where the dark rule does not close (`recycle::DARK_CLOSES_WITH_UDP` is false); the episode is counted to its end in `quic_carried_dark_episode_<label>` |
+//! | `quic_ack_wait_expired_<label>` | sends whose wait for the acknowledgement of their end ran out and whose stream was reset, by kind: `stream` (a send with an ack wait: a Stream, or a Short past one packet), `short` (a one-packet Short, past its 150 s bound) or `control` (a control frame, bounded as a one-packet Short); only those that count as strikes (`path::StrikeCheck`: evidence the end went out and the peer is alive). An honest peer acknowledges an end within a few round trips, so this should be 0 on every honest path (`recycle::ACK_WAIT_EXPIRY_LIMIT` in `ACK_WAIT_EXPIRY_WINDOW` closes a path with no UDP session and counts a would-close on one with a UDP session, `recycle::ACK_WAITS_EXPIRED_CLOSES_WITH_UDP`) |
+//! | `quic_late_end_<label>` | sends whose end was acknowledged late, or not at all, though the peer had wholly acknowledged enough data-stream bytes since the end to have carried it (`path::LateEndCheck`), by the same kinds as `quic_ack_wait_expired_<label>`; expected 0 on every honest path. Each time `recycle::ACK_WAIT_EXPIRY_LIMIT` come within `ACK_WAIT_EXPIRY_WINDOW` a would-close is counted under `late_ends` (observe-only, `recycle::LATE_ENDS_CLOSE`) |
+//! | `quic_stall_close_<label>` | paths the acknowledgement watch closed, by why: `not_acknowledging`, `dark`, `credit_starved`, `stream_credit_withheld`, `ack_waits_expired`, `late_ends` (`recycle::Stall`; `late_ends` never closes, `recycle::LATE_ENDS_CLOSE`) |
+//! | `quic_stall_would_close_<label>` | times a rule that only observes would have closed a path, by the same labels; each count starts the rule's window afresh. Three rules observe today. `ack_waits_expired` counts, on a path with a UDP session (`recycle::ACK_WAITS_EXPIRED_CLOSES_WITH_UDP` is false; a native path is closed), each time `ACK_WAIT_EXPIRY_LIMIT` strikes came within `ACK_WAIT_EXPIRY_WINDOW`, for calibrating the rule before UDP removal (#6205). `dark` counts once per episode on a data path with a UDP session, where the dark rule does not close (`recycle::DARK_CLOSES_WITH_UDP` is false); the episode is counted to its end in `quic_carried_dark_episode_<label>`. `late_ends` counts on every path (`recycle::LATE_ENDS_CLOSE` is false) each time `ACK_WAIT_EXPIRY_LIMIT` late ends came within `ACK_WAIT_EXPIRY_WINDOW` (`quic_late_end_<label>`) |
+//! | `quic_pipe_source_<label>` | pipes (an inbound stream forwarded on a path, `quic_data_send_pipe_*`) that ended `sent` or `dropped`, by what fed the inbound stream: `quic_fed_sent`, `quic_fed_dropped`, `udp_fed_sent`, `udp_fed_dropped`; each sums to its `quic_data_send_pipe_<result>` |
+//! | `quic_pipe_dropped_<label>` | the same dropped pipes by cause: `source_error` (the inbound stream failed or delivered the wrong length), `source_stall_timeout` (a deadline ran out while the pipe waited for its source), `own_path` (anything else: this path timed out, was lost, or the peer stopped the stream); sums to `quic_data_send_pipe_dropped` |
 //! | `quic_send_resets`, `quic_path_ms` | sends a path reset on this side, and the time QUIC paths were up, shadow paths included, up to each path's last tick: resets per connection-hour is their ratio |
 //! | `quic_budget_bytes`, `quic_budget_charged_bytes`, `quic_budget_charged_peak_bytes` | the node's QUIC buffer budget, what its data paths' windows have grown above their floor grants now (the floor grants are each path's fixed charge, not the budget's, so a node with every path at the floor reports 0 and uploads nothing; gauges, not reset, uploaded when not 0), and the most charged at once in the period (`quic::budget`) |
 //! | `quic_staged_peak_pct` | the most any connection staged in the period (bytes read for streams whose header its reader had not taken yet) as a percentage of its staging cap (`quic::path::inbound::ConnStaging`); streams stopped at the cap are `quic_inbound_evicted_staged` |
@@ -161,6 +166,53 @@ fn loss_rate_bucket(lost: u64, sent: u64) -> usize {
         .count()
 }
 
+/// The per-path round-trip-time gauges' prefix; every bucket is uploaded in
+/// every snapshot.
+const PATH_SRTT_PREFIX: &str = "quic_srtt_";
+
+/// The upper bounds of the round-trip-time buckets, in milliseconds; the last
+/// bucket is `ge_400ms`.
+const PATH_SRTT_BOUNDS_MS: [u128; 6] = [10, 25, 50, 100, 200, 400];
+
+/// The round-trip-time buckets' labels (`quic_srtt_<label>`), in order.
+pub(crate) const PATH_SRTT_LABELS: [&str; 7] = [
+    "lt_10ms", "lt_25ms", "lt_50ms", "lt_100ms", "lt_200ms", "lt_400ms", "ge_400ms",
+];
+
+fn path_srtt_bucket(rtt: std::time::Duration) -> usize {
+    let ms = rtt.as_millis();
+    PATH_SRTT_BOUNDS_MS
+        .iter()
+        .take_while(|bound| ms >= **bound)
+        .count()
+}
+
+/// The per-path send-rate gauges' prefix; uploaded like [`PATH_SRTT_PREFIX`].
+const PATH_TX_BPS_PREFIX: &str = "quic_tx_bps_";
+
+/// The upper bounds of the send-rate buckets, in bits per second; the last
+/// bucket is `ge_100mbps`.
+const PATH_TX_BPS_BOUNDS: [u128; 5] = [10_000, 100_000, 1_000_000, 10_000_000, 100_000_000];
+
+/// The send-rate buckets' labels (`quic_tx_bps_<label>`), in order.
+pub(crate) const PATH_TX_BPS_LABELS: [&str; 6] = [
+    "lt_10kbps",
+    "lt_100kbps",
+    "lt_1mbps",
+    "lt_10mbps",
+    "lt_100mbps",
+    "ge_100mbps",
+];
+
+/// The bucket of `bytes` sent in `ms` (not 0) milliseconds.
+fn path_tx_bps_bucket(bytes: u64, ms: u64) -> usize {
+    let bits_per_second = u128::from(bytes) * 8 * 1000 / u128::from(ms);
+    PATH_TX_BPS_BOUNDS
+        .iter()
+        .take_while(|bound| bits_per_second >= **bound)
+        .count()
+}
+
 /// A path enters a `quic_gate_ended_queue_` bucket only after this many gate
 /// verdicts; below it the share says too little.
 pub(crate) const GATE_MIN_VERDICTS: u64 = 20;
@@ -177,6 +229,28 @@ pub(crate) const GATE_QUEUE_LABELS: [&str; 3] = ["lt_10pct", "lt_50pct", "ge_50p
 /// as a one-packet Short's).
 pub(crate) const ACK_WAIT_EXPIRED_LABELS: [&str; 3] = ["stream", "short", "control"];
 
+/// `quic_pipe_source_<label>`: a pipe's end by what fed its inbound stream.
+pub(crate) const PIPE_SOURCE_LABELS: [&str; 4] = [
+    "quic_fed_sent",
+    "quic_fed_dropped",
+    "udp_fed_sent",
+    "udp_fed_dropped",
+];
+
+/// `quic_pipe_dropped_<label>`: why a pipe was dropped ([`PipeDropCause`]).
+pub(crate) const PIPE_DROP_LABELS: [&str; 3] = ["source_error", "source_stall_timeout", "own_path"];
+
+/// Why a pipe was dropped, in the order of [`PIPE_DROP_LABELS`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PipeDropCause {
+    /// The inbound stream failed, or delivered other than its length.
+    SourceError,
+    /// A deadline ran out while the pipe waited for its source.
+    SourceStallTimeout,
+    /// Anything else: the path timed out or was lost, or the peer stopped it.
+    OwnPath,
+}
+
 /// What kind of send's ack wait ran out, for `quic_ack_wait_expired_<label>`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AckWaitKind {
@@ -191,12 +265,13 @@ pub(crate) enum AckWaitKind {
 
 /// The labels of `quic_stall_close_<label>`: paths the acknowledgement watch
 /// closed, by why (`recycle::Stall::label`, in its order).
-pub(crate) const STALL_CLOSE_LABELS: [&str; 5] = [
+pub(crate) const STALL_CLOSE_LABELS: [&str; 6] = [
     "not_acknowledging",
     "dark",
     "credit_starved",
     "stream_credit_withheld",
     "ack_waits_expired",
+    "late_ends",
 ];
 
 /// The labels of `quic_dark_episode_<label>`: dark episodes on QUIC paths
@@ -306,6 +381,10 @@ pub(crate) struct PathLossWindow {
     carrying: PathTally,
     /// Some report found the path carrying data.
     carried: bool,
+    /// The round-trip-time and send-rate buckets the path is counted in
+    /// ([`QuicDataCounters::record_path_rates`]).
+    srtt_bucket: Option<usize>,
+    tx_bps_bucket: Option<usize>,
 }
 
 /// One path's packets of one kind and the bucket it is counted in.
@@ -358,6 +437,8 @@ impl PathLossWindow {
             all: PathTally::default(),
             carrying: PathTally::default(),
             carried: false,
+            srtt_bucket: None,
+            tx_bps_bucket: None,
         }
     }
 }
@@ -377,6 +458,12 @@ impl Drop for PathLossWindow {
     /// carried data is counted the same way in the carrying family.
     fn drop(&mut self) {
         let mut counts = self.node.loss.lock();
+        if let Some(old) = self.srtt_bucket.take() {
+            counts.path_srtt[old] = counts.path_srtt[old].saturating_sub(1);
+        }
+        if let Some(old) = self.tx_bps_bucket.take() {
+            counts.path_tx_bps[old] = counts.path_tx_bps[old].saturating_sub(1);
+        }
         self.all.end(&mut counts.all);
         if self.carried {
             self.carrying.end(&mut counts.carrying);
@@ -402,6 +489,10 @@ struct LossCounts {
     carrying_lost_packets: u64,
     /// The paths that carried data, by their loss while they did.
     carrying: LossFamily,
+    /// Live paths by round-trip-time bucket: a gauge, not reset.
+    path_srtt: [u32; PATH_SRTT_LABELS.len()],
+    /// Live paths by send-rate bucket: a gauge, not reset.
+    path_tx_bps: [u32; PATH_TX_BPS_LABELS.len()],
 }
 
 /// Paths by loss-rate bucket: live ones and those that ended in the period.
@@ -493,8 +584,11 @@ pub(crate) struct QuicDataCounters {
     /// built; `None` unless it may carry data (`policy::QuicPolicy::share_source`).
     share: Mutex<Option<ShareSource>>,
     ack_wait_expired: [AtomicU64; ACK_WAIT_EXPIRED_LABELS.len()],
+    late_end: [AtomicU64; ACK_WAIT_EXPIRED_LABELS.len()],
     stall_closes: [AtomicU64; STALL_CLOSE_LABELS.len()],
     stall_would_close: [AtomicU64; STALL_CLOSE_LABELS.len()],
+    pipe_source: [AtomicU64; PIPE_SOURCE_LABELS.len()],
+    pipe_dropped: [AtomicU64; PIPE_DROP_LABELS.len()],
 }
 
 impl QuicDataCounters {
@@ -532,9 +626,25 @@ impl QuicDataCounters {
             carried_dark_episodes: std::array::from_fn(|_| zero()),
             share: Mutex::new(None),
             ack_wait_expired: std::array::from_fn(|_| zero()),
+            late_end: std::array::from_fn(|_| zero()),
             stall_closes: std::array::from_fn(|_| zero()),
             stall_would_close: std::array::from_fn(|_| zero()),
+            pipe_source: std::array::from_fn(|_| zero()),
+            pipe_dropped: std::array::from_fn(|_| zero()),
         }
+    }
+
+    /// A pipe that ended `sent`, fed by a QUIC path or by UDP.
+    pub(crate) fn record_pipe_sent(&self, quic_fed: bool) {
+        let index = if quic_fed { 0 } else { 2 };
+        self.pipe_source[index].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A pipe that ended `dropped`, fed by a QUIC path or by UDP, for `cause`.
+    pub(crate) fn record_pipe_dropped(&self, quic_fed: bool, cause: PipeDropCause) {
+        let index = if quic_fed { 1 } else { 3 };
+        self.pipe_source[index].fetch_add(1, Ordering::Relaxed);
+        self.pipe_dropped[cause as usize].fetch_add(1, Ordering::Relaxed);
     }
 
     /// Where this node's data share is read from
@@ -654,6 +764,59 @@ impl QuicDataCounters {
         }
     }
 
+    /// A tick of a path. While the path `carrying` data, move it to the bucket
+    /// of its smoothed round-trip time `srtt` and, when `sent` bytes went out
+    /// in the `ms` (not 0) milliseconds since the last tick, to the bucket of
+    /// that rate; a path that is not carrying data is in neither (a path that
+    /// stops carrying leaves its buckets), so idle shadow paths do not fill the
+    /// lowest buckets. A tick of 0 ms leaves the rate where it was, and its
+    /// bytes are not counted in any rate. A path is in one bucket of each
+    /// family while it carries, and [`PathLossWindow`]'s drop takes it out.
+    /// `sent` is the datagram bytes quinn built (retransmissions,
+    /// acknowledgements, padding and keepalives included), not goodput.
+    ///
+    /// The buckets are moved under the `loss` lock, in a critical section of
+    /// their own: they are read by the same snapshot but not written with a
+    /// loss report's sums.
+    pub(crate) fn record_path_rates(
+        &self,
+        window: &mut PathLossWindow,
+        srtt: std::time::Duration,
+        sent: u64,
+        ms: u64,
+        carrying: bool,
+    ) {
+        debug_assert!(
+            std::ptr::eq(window.node, self),
+            "a window of these counters"
+        );
+        let srtt_bucket = carrying.then(|| path_srtt_bucket(srtt));
+        let tx_bps_bucket = match (carrying, ms) {
+            (false, _) => None,
+            (true, 0) => window.tx_bps_bucket,
+            (true, _) => Some(path_tx_bps_bucket(sent, ms)),
+        };
+        let mut counts = self.loss.lock();
+        if srtt_bucket != window.srtt_bucket {
+            if let Some(old) = window.srtt_bucket {
+                counts.path_srtt[old] = counts.path_srtt[old].saturating_sub(1);
+            }
+            if let Some(new) = srtt_bucket {
+                counts.path_srtt[new] += 1;
+            }
+            window.srtt_bucket = srtt_bucket;
+        }
+        if tx_bps_bucket != window.tx_bps_bucket {
+            if let Some(old) = window.tx_bps_bucket {
+                counts.path_tx_bps[old] = counts.path_tx_bps[old].saturating_sub(1);
+            }
+            if let Some(new) = tx_bps_bucket {
+                counts.path_tx_bps[new] += 1;
+            }
+            window.tx_bps_bucket = tx_bps_bucket;
+        }
+    }
+
     /// A session ended while its path carried data, `age` after it became active.
     pub(crate) fn record_session_ended_with_data_path(&self, age: std::time::Duration) {
         self.session_ended[QuicPathAge::bucket(age) as usize].fetch_add(1, Ordering::Relaxed);
@@ -743,6 +906,11 @@ impl QuicDataCounters {
         }
     }
 
+    /// A send's end was late (`path::LateEndCheck`).
+    pub(crate) fn record_late_end(&self, kind: AckWaitKind) {
+        self.late_end[kind as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
     /// A send's wait for the acknowledgement of its end ran out.
     pub(crate) fn record_ack_wait_expired(&self, kind: AckWaitKind) {
         self.ack_wait_expired[kind as usize].fetch_add(1, Ordering::Relaxed);
@@ -814,6 +982,8 @@ impl QuicDataCounters {
                 *counts = LossCounts {
                     all: now.all.next_period(),
                     carrying: now.carrying.next_period(),
+                    path_srtt: now.path_srtt,
+                    path_tx_bps: now.path_tx_bps,
                     ..LossCounts::default()
                 };
             }
@@ -854,6 +1024,8 @@ impl QuicDataCounters {
             carrying_loss_rate: loss.carrying.rates.to_vec(),
             carrying_ended_loss_rate: loss.carrying.ended.to_vec(),
             carrying_ended_below_floor: loss.carrying.ended_below_floor,
+            path_srtt: loss.path_srtt.to_vec(),
+            path_tx_bps: loss.path_tx_bps.to_vec(),
             streams_open_paths_sampled: streams.paths_sampled,
             streams_open_ge: streams.ge.to_vec(),
             streams_open_max: streams.max,
@@ -882,8 +1054,11 @@ impl QuicDataCounters {
             carried_dark_episodes: self.carried_dark_episodes.iter().map(get).collect(),
             ramp_share_pct: self.share.lock().as_ref().map_or(0, ShareSource::percent),
             ack_wait_expired: self.ack_wait_expired.iter().map(get).collect(),
+            late_end: self.late_end.iter().map(get).collect(),
             stall_closes: self.stall_closes.iter().map(get).collect(),
             stall_would_close: self.stall_would_close.iter().map(get).collect(),
+            pipe_source: self.pipe_source.iter().map(get).collect(),
+            pipe_dropped: self.pipe_dropped.iter().map(get).collect(),
         }
     }
 }
@@ -945,6 +1120,14 @@ pub struct QuicDataSnapshot {
     /// [`LOSS_RATE_MIN_SENT`] packets while carrying.
     #[serde(default)]
     pub carrying_ended_below_floor: u64,
+    /// Live paths by smoothed round-trip-time bucket, in the order of
+    /// `PATH_SRTT_LABELS`: a gauge, not reset.
+    #[serde(default)]
+    pub path_srtt: Vec<u32>,
+    /// Live paths by send-rate bucket over their last tick, in the order of
+    /// `PATH_TX_BPS_LABELS`: a gauge, not reset.
+    #[serde(default)]
+    pub path_tx_bps: Vec<u32>,
     pub streams_open_paths_sampled: u32,
     /// By `QUIC_STREAMS_OPEN_THRESHOLDS`.
     pub streams_open_ge: Vec<u32>,
@@ -994,6 +1177,17 @@ pub struct QuicDataSnapshot {
     /// period, by `STALL_CLOSE_LABELS`.
     #[serde(default)]
     pub stall_would_close: Vec<u64>,
+    /// Pipes that ended sent or dropped in the period, by what fed them, by
+    /// `PIPE_SOURCE_LABELS`.
+    #[serde(default)]
+    pub pipe_source: Vec<u64>,
+    /// Pipes dropped in the period, by `PIPE_DROP_LABELS`.
+    #[serde(default)]
+    pub pipe_dropped: Vec<u64>,
+    /// Sends whose end was late in the period (`path::LateEndCheck`), by
+    /// `ACK_WAIT_EXPIRED_LABELS`.
+    #[serde(default)]
+    pub late_end: Vec<u64>,
 }
 
 impl QuicDataSnapshot {
@@ -1038,6 +1232,8 @@ impl QuicDataSnapshot {
             carrying_loss_rate,
             carrying_ended_loss_rate,
             carrying_ended_below_floor,
+            path_srtt,
+            path_tx_bps,
             streams_open_paths_sampled,
             streams_open_ge,
             streams_open_max,
@@ -1060,6 +1256,9 @@ impl QuicDataSnapshot {
             ack_wait_expired,
             stall_closes,
             stall_would_close,
+            pipe_source,
+            pipe_dropped,
+            late_end,
         } = self;
         let mut keys = Vec::new();
         let mut family = |prefix: &'static str, labels: Vec<String>, values: Vec<u64>| {
@@ -1135,6 +1334,16 @@ impl QuicDataSnapshot {
             carrying_ended_loss_rate.clone(),
         );
         family(
+            PATH_SRTT_PREFIX,
+            PATH_SRTT_LABELS.iter().map(|l| l.to_string()).collect(),
+            path_srtt.iter().map(|n| u64::from(*n)).collect(),
+        );
+        family(
+            PATH_TX_BPS_PREFIX,
+            PATH_TX_BPS_LABELS.iter().map(|l| l.to_string()).collect(),
+            path_tx_bps.iter().map(|n| u64::from(*n)).collect(),
+        );
+        family(
             "quic_streams_open_ge_",
             QUIC_STREAMS_OPEN_THRESHOLDS
                 .iter()
@@ -1188,6 +1397,24 @@ impl QuicDataSnapshot {
             STALL_CLOSE_LABELS.iter().map(|l| l.to_string()).collect(),
             stall_would_close.clone(),
         );
+        family(
+            "quic_pipe_source_",
+            PIPE_SOURCE_LABELS.iter().map(|l| l.to_string()).collect(),
+            pipe_source.clone(),
+        );
+        family(
+            "quic_pipe_dropped_",
+            PIPE_DROP_LABELS.iter().map(|l| l.to_string()).collect(),
+            pipe_dropped.clone(),
+        );
+        family(
+            "quic_late_end_",
+            ACK_WAIT_EXPIRED_LABELS
+                .iter()
+                .map(|l| l.to_string())
+                .collect(),
+            late_end.clone(),
+        );
         for (key, value) in [
             ("quic_enabled_data_paths", *data_enabled),
             (LIVE_DATA_PATHS, *data_paths),
@@ -1232,8 +1459,8 @@ impl QuicDataSnapshot {
     }
 
     /// The keys the snapshot uploads: every count that is not 0, and the gauges
-    /// (`quic_live_data_paths`, `quic_ramp_share_pct` and every loss-rate
-    /// bucket) always, so a
+    /// (`quic_live_data_paths`, `quic_ramp_share_pct`, every loss-rate,
+    /// round-trip-time and send-rate bucket) always, so a
     /// gauge of 0 is told apart from one not reported.
     pub fn upload_keys(&self) -> impl Iterator<Item = (String, u64)> {
         self.keys_by_family()
@@ -1244,6 +1471,8 @@ impl QuicDataSnapshot {
                     || key == RAMP_SHARE_PCT
                     || *family == Some(LOSS_RATE_PREFIX)
                     || *family == Some(CARRYING_LOSS_RATE_PREFIX)
+                    || *family == Some(PATH_SRTT_PREFIX)
+                    || *family == Some(PATH_TX_BPS_PREFIX)
             })
             .map(|(_, key, value)| (key, value))
     }
@@ -1277,6 +1506,8 @@ impl QuicDataSnapshot {
             carrying_loss_rate: _,
             carrying_ended_loss_rate,
             carrying_ended_below_floor,
+            path_srtt: _,
+            path_tx_bps: _,
             streams_open_paths_sampled,
             streams_open_ge: _,
             streams_open_max: _,
@@ -1299,6 +1530,9 @@ impl QuicDataSnapshot {
             ack_wait_expired,
             stall_closes,
             stall_would_close,
+            pipe_source,
+            pipe_dropped,
+            late_end,
         } = self;
         let any = |values: &[u64]| values.iter().any(|n| *n != 0);
         any(sends)
@@ -1316,6 +1550,9 @@ impl QuicDataSnapshot {
             || any(ack_wait_expired)
             || any(stall_closes)
             || any(stall_would_close)
+            || any(pipe_source)
+            || any(pipe_dropped)
+            || any(late_end)
             || [
                 *data_enabled,
                 *sends_opened,
@@ -1407,7 +1644,9 @@ mod tests {
             key == "quic_live_data_paths"
                 || (key == "quic_ramp_share_pct" && value == 0)
                 || ((key.starts_with("quic_loss_rate_")
-                    || key.starts_with("quic_carrying_loss_rate_"))
+                    || key.starts_with("quic_carrying_loss_rate_")
+                    || key.starts_with("quic_srtt_")
+                    || key.starts_with("quic_tx_bps_"))
                     && value == 0)
         }));
         // A new period counts the path again.
@@ -1508,7 +1747,7 @@ mod tests {
         let uploaded: Vec<_> = counters.snapshot(true).upload_keys().collect();
         assert_eq!(
             uploaded.len(),
-            2 * LOSS_RATE_LABELS.len() + 2,
+            2 * LOSS_RATE_LABELS.len() + PATH_SRTT_LABELS.len() + PATH_TX_BPS_LABELS.len() + 2,
             "the gauges and nothing else: {uploaded:?}"
         );
         assert!(uploaded.iter().all(|(key, value)| {
@@ -1516,7 +1755,9 @@ mod tests {
                 && (key == "quic_live_data_paths"
                     || key == "quic_ramp_share_pct"
                     || key.starts_with("quic_loss_rate_")
-                    || key.starts_with("quic_carrying_loss_rate_"))
+                    || key.starts_with("quic_carrying_loss_rate_")
+                    || key.starts_with("quic_srtt_")
+                    || key.starts_with("quic_tx_bps_"))
         }));
         counters.data_path_started();
         counters.record_open(false);
@@ -1524,7 +1765,7 @@ mod tests {
             counters.snapshot(true).upload_keys().collect();
         assert_eq!(
             uploaded.len(),
-            2 * LOSS_RATE_LABELS.len() + 3,
+            2 * LOSS_RATE_LABELS.len() + PATH_SRTT_LABELS.len() + PATH_TX_BPS_LABELS.len() + 3,
             "{uploaded:?}"
         );
         assert_eq!(uploaded["quic_live_data_paths"], 1);
@@ -1815,6 +2056,122 @@ mod tests {
             0,
             "it ended"
         );
+    }
+
+    #[test]
+    fn rtt_buckets_have_these_bounds() {
+        use std::time::Duration;
+        for (ms, label) in [
+            (0, "lt_10ms"),
+            (9, "lt_10ms"),
+            (10, "lt_25ms"),
+            (24, "lt_25ms"),
+            (25, "lt_50ms"),
+            (50, "lt_100ms"),
+            (100, "lt_200ms"),
+            (200, "lt_400ms"),
+            (399, "lt_400ms"),
+            (400, "ge_400ms"),
+            (60_000, "ge_400ms"),
+        ] {
+            assert_eq!(
+                PATH_SRTT_LABELS[path_srtt_bucket(Duration::from_millis(ms))],
+                label,
+                "{ms} ms"
+            );
+        }
+    }
+
+    #[test]
+    fn send_rate_buckets_have_these_bounds() {
+        // Bytes in one second are bits per second divided by 8.
+        for (bytes, ms, label) in [
+            (0, 2000, "lt_10kbps"),
+            (1249, 1000, "lt_10kbps"),
+            (1250, 1000, "lt_100kbps"),
+            (12_500, 1000, "lt_1mbps"),
+            (125_000, 1000, "lt_10mbps"),
+            (1_250_000, 1000, "lt_100mbps"),
+            (12_500_000, 1000, "ge_100mbps"),
+            // The same rate over another interval is the same bucket.
+            (2_500_000, 2000, "lt_100mbps"),
+            (u64::MAX, 1, "ge_100mbps"),
+        ] {
+            assert_eq!(
+                PATH_TX_BPS_LABELS[path_tx_bps_bucket(bytes, ms)],
+                label,
+                "{bytes} bytes in {ms} ms"
+            );
+        }
+    }
+
+    /// A live path is in one bucket of each family, moved by its ticks and
+    /// taken out when it ends; both gauges survive a snapshot's reset, and
+    /// a tick of 0 ms leaves the rate where it was.
+    #[test]
+    fn a_path_is_in_one_rtt_and_one_rate_bucket_while_it_lives() {
+        use std::time::Duration;
+        let counters: &'static QuicDataCounters = Box::leak(Box::new(QuicDataCounters::new()));
+        let mut a = PathLossWindow::new(counters);
+        let mut b = PathLossWindow::new(counters);
+        assert_eq!(counters.snapshot(false).path_srtt.iter().sum::<u32>(), 0);
+        counters.record_path_rates(&mut a, Duration::from_millis(30), 0, 2000, true);
+        counters.record_path_rates(&mut b, Duration::from_millis(500), 250_000, 2000, true);
+        let snap = counters.snapshot(true);
+        assert_eq!(snap.path_srtt, vec![0, 0, 1, 0, 0, 0, 1]);
+        assert_eq!(snap.path_tx_bps, vec![1, 0, 0, 1, 0, 0]);
+        // `a` speeds up and its RTT falls; `b`'s tick has no time in it.
+        counters.record_path_rates(&mut a, Duration::from_millis(8), 2_500_000, 2000, true);
+        counters.record_path_rates(&mut b, Duration::from_millis(500), 9, 0, true);
+        let snap = counters.snapshot(true);
+        assert_eq!(snap.path_srtt, vec![1, 0, 0, 0, 0, 0, 1]);
+        assert_eq!(snap.path_tx_bps, vec![0, 0, 0, 1, 1, 0]);
+        assert!(!snap.has_activity(), "gauges alone are not activity");
+        drop(a);
+        let snap = counters.snapshot(true);
+        assert_eq!(snap.path_srtt, vec![0, 0, 0, 0, 0, 0, 1]);
+        assert_eq!(snap.path_tx_bps, vec![0, 0, 0, 1, 0, 0]);
+        drop(b);
+        let snap = counters.snapshot(true);
+        assert_eq!(snap.path_srtt.iter().sum::<u32>(), 0);
+        assert_eq!(snap.path_tx_bps.iter().sum::<u32>(), 0);
+    }
+
+    /// Only a path that carries data is in the gauges: an idle shadow path is
+    /// in neither, and a path that stops carrying leaves its buckets.
+    #[test]
+    fn a_path_that_does_not_carry_data_is_in_neither_gauge() {
+        use std::time::Duration;
+        let counters: &'static QuicDataCounters = Box::leak(Box::new(QuicDataCounters::new()));
+        let mut shadow = PathLossWindow::new(counters);
+        let mut data = PathLossWindow::new(counters);
+        counters.record_path_rates(&mut shadow, Duration::from_millis(30), 100, 2000, false);
+        let snap = counters.snapshot(false);
+        assert_eq!(snap.path_srtt.iter().sum::<u32>(), 0);
+        assert_eq!(snap.path_tx_bps.iter().sum::<u32>(), 0);
+        counters.record_path_rates(&mut data, Duration::from_millis(30), 0, 2000, true);
+        let snap = counters.snapshot(false);
+        assert_eq!(snap.path_srtt.iter().sum::<u32>(), 1);
+        assert_eq!(snap.path_tx_bps.iter().sum::<u32>(), 1);
+        // The peer refused data: the path leaves both.
+        counters.record_path_rates(&mut data, Duration::from_millis(30), 0, 2000, false);
+        let snap = counters.snapshot(false);
+        assert_eq!(snap.path_srtt.iter().sum::<u32>(), 0);
+        assert_eq!(snap.path_tx_bps.iter().sum::<u32>(), 0);
+    }
+
+    /// Every bucket of both gauges goes out in every snapshot, 0 included.
+    #[test]
+    fn the_rtt_and_rate_gauges_are_uploaded_at_zero() {
+        let counters = QuicDataCounters::new();
+        let uploaded: std::collections::BTreeMap<String, u64> =
+            counters.snapshot(true).upload_keys().collect();
+        for label in PATH_SRTT_LABELS {
+            assert_eq!(uploaded.get(&format!("quic_srtt_{label}")), Some(&0));
+        }
+        for label in PATH_TX_BPS_LABELS {
+            assert_eq!(uploaded.get(&format!("quic_tx_bps_{label}")), Some(&0));
+        }
     }
 
     /// A path that ends leaves the gauge and is counted once among the period's

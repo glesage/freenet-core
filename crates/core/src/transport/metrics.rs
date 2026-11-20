@@ -28,15 +28,15 @@ use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use tokio::sync::mpsc;
 
-use crate::tracing::{TransferDirection, TransferEvent};
+use crate::tracing::{TransferDirection, TransferEvent, TransferTransport};
 
 mod quic_data;
 pub use quic_data::QuicDataSnapshot;
 #[cfg(test)]
 pub(crate) use quic_data::STALL_CLOSE_LABELS;
 pub(crate) use quic_data::{
-    AckWaitKind, DarkEnd, PathGateWindow, PathLossWindow, QuicDataCounters, ShareSource,
-    StreamsOpenPeak,
+    AckWaitKind, DarkEnd, PathGateWindow, PathLossWindow, PipeDropCause, QuicDataCounters,
+    ShareSource, StreamsOpenPeak,
 };
 
 /// Global transport metrics instance.
@@ -134,6 +134,9 @@ labelled_counters! {
         /// An outbound connection was established and bound to the key
         /// it was dialled with.
         SetDialed => "set_dialed",
+        /// A QUIC-native connection was established and bound to the key its
+        /// peer proved in the TLS handshake (`IdentitySource::Proven`).
+        SetProven => "set_proven",
         /// An inbound connection matched an expected-inbound registration and
         /// was bound to the key the connect op dialled, which the
         /// registration carried. The match is by address only, so this
@@ -567,6 +570,140 @@ labelled_counters! {
     }
 }
 
+/// The side a node had in a CONNECT: the joiner dials the acceptors its
+/// request was routed to; the acceptor dials back the joiner it accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NativeConnectSide {
+    Joiner,
+    Acceptor,
+}
+
+labelled_counters! {
+    /// How a QUIC-native connection setup ended, counted where the setup
+    /// decides it (`QuicUpgrades::setup_native`), one per setup. Exported per
+    /// period as `connect_native_setup_<label>`. Zero until the connect op
+    /// asks for native connections (`connect::native::NATIVE_DIAL_READY`).
+    pub(crate) enum NativeSetupOutcome {
+        /// The setup gave a connection, after the Hello exchange.
+        Established => "established",
+        /// Less than `setup::MIN_WINDOW_LEFT` of the window was left.
+        TooLate => "too_late",
+        /// The destination's punch budget was spent.
+        OverBudgetDestination => "over_budget_destination",
+        /// The node's punch budget was spent.
+        OverBudgetNode => "over_budget_node",
+        /// The punch budget's table had no destination it could forget.
+        OverBudgetTable => "over_budget_table",
+        /// The node already ran `QuicPolicy::native_setups_max` setups.
+        SetupsFull => "setups_full",
+        /// A native setup from this address was already waiting.
+        AlreadyWaiting => "already_waiting",
+        /// The QUIC allow-set was full.
+        AllowSetFull => "allow_set_full",
+        /// The address was allowed for another key or kind.
+        KeyConflict => "key_conflict",
+        /// The peer's key cannot be used in a QUIC handshake.
+        UnusableKey => "unusable_key",
+        /// No connection within the window.
+        TimedOut => "timed_out",
+        /// The handshake failed (TLS, the dial, or the connection).
+        HandshakeFailed => "handshake_failed",
+        /// A Hello was refused, by this node or the peer.
+        HelloRefused => "hello_refused",
+        /// The two versions cannot talk to each other.
+        HelloVersion => "hello_version",
+        /// The Hello exchange ran out of time or lost its connection.
+        HelloLost => "hello_lost",
+        /// The node has no QUIC upgrades hub (no endpoint, policy or task
+        /// registrar), so it cannot set one up.
+        Unavailable => "unavailable",
+    }
+}
+
+labelled_counters! {
+    /// What a gateway's admission of native joins from sources it was not
+    /// told about did (`quic::admission`, #5940 A7b): per datagram from such
+    /// a source, then per connection attempt, then per admitted connection.
+    /// Exported per period as `quic_gateway_admission_<label>`. Zero on every
+    /// node until admission is switched on (`admission::GATEWAY_NATIVE_ADMISSION`).
+    pub(crate) enum GatewayAdmission {
+        /// A datagram was queued for the endpoint.
+        Queued => "queued",
+        /// A datagram was dropped: the queue for unknown sources was full.
+        QueueFull => "queue_full",
+        /// A datagram was dropped: a short header.
+        ShortHeader => "short_header",
+        /// A datagram was dropped: shorter than a client Initial.
+        Runt => "runt",
+        /// A datagram was dropped: a QUIC version the endpoint does not speak.
+        UnknownVersion => "unknown_version",
+        /// A datagram was dropped: a long header of a type other than Initial.
+        NotInitial => "not_initial",
+        /// An attempt without a Retry token was answered with a Retry.
+        Retried => "retried",
+        /// An attempt was ignored: its address had one admitted within a second.
+        ThrottledAddress => "throttled_address",
+        /// An attempt was ignored: the node's rate was spent.
+        ThrottledGlobal => "throttled_global",
+        /// An attempt was ignored: the allow-set was full.
+        AllowSetFull => "allow_set_full",
+        /// An attempt was admitted: recorded against both limits.
+        Admitted => "admitted",
+        /// An admission was given back before its handshake started (the
+        /// allow-set full, the attempt dropped on a full queue or at
+        /// shutdown); `admitted - refunded` is the admissions used.
+        Refunded => "refunded",
+        /// An admitted attempt was dropped: the queue of joins waiting to
+        /// start was full.
+        JoinQueueFull => "join_queue_full",
+        /// An admitted attempt's handshake failed or timed out.
+        HandshakeFailed => "handshake_failed",
+        /// A handshake completed without a proven client key.
+        Unproven => "unproven",
+        /// The Hello exchange failed.
+        HelloFailed => "hello_failed",
+        /// A joiner connection reached the end of admission. Until phase B
+        /// hands it to the node, it is closed there.
+        Joined => "joined",
+        /// A join panicked; its task's owner caught it and goes on.
+        JoinPanicked => "join_panicked",
+        /// An attempt was ignored: no room for another joiner inside the
+        /// node's QUIC connection cap (`admission`, `QuicPathPermits`), or
+        /// the cap is not attached yet.
+        JoinerCapFull => "joiner_cap_full",
+        /// A datagram from an admitted, unpromoted joiner was dropped: the
+        /// joiners' share of the ingress queue was full
+        /// (`demux::QUIC_INGRESS_JOINER_DATAGRAMS`).
+        JoinerShareFull => "joiner_share_full",
+    }
+}
+
+impl NativeSetupOutcome {
+    /// Whether this end says native does not work on the path to that peer,
+    /// so it counts toward the node's demotion. A refusal by this node's own
+    /// limits (budget, setup cap, allow-set, window left, no hub) says
+    /// nothing about the path, nor does a Hello the peer answered: the
+    /// connection worked. Counting those would let a busy node demote itself.
+    pub(crate) fn counts_toward_demotion(self) -> bool {
+        match self {
+            Self::TimedOut | Self::HandshakeFailed | Self::HelloLost => true,
+            Self::Established
+            | Self::TooLate
+            | Self::OverBudgetDestination
+            | Self::OverBudgetNode
+            | Self::OverBudgetTable
+            | Self::SetupsFull
+            | Self::AlreadyWaiting
+            | Self::AllowSetFull
+            | Self::KeyConflict
+            | Self::UnusableKey
+            | Self::HelloRefused
+            | Self::HelloVersion
+            | Self::Unavailable => false,
+        }
+    }
+}
+
 impl QuicPathAge {
     /// The bucket for a path that lasted `age`.
     pub(crate) fn bucket(age: std::time::Duration) -> Self {
@@ -892,14 +1029,38 @@ pub struct TransportMetrics {
     connect_native_decided_native: AtomicU64,
     connect_native_decided_udp: AtomicU64,
     /// Responses deciding `Native` this node received as joiner and could not
-    /// use: to a request with no offer or percent 0, or to a real offer this
-    /// build cannot dial (reset each snapshot). Each failed that attempt.
+    /// use: to a request with no offer or percent 0, or to a real offer when
+    /// it can no longer dial native (reset each snapshot). Each failed that
+    /// attempt.
     connect_native_decision_without_offer: AtomicU64,
     connect_native_decision_native_unsupported: AtomicU64,
     /// `Native` responses dropped unanswered once a CONNECT had refused as
     /// many acceptors as its acceptor limit (reset each snapshot). Not counted
     /// as failures above.
     connect_native_decision_over_cap: AtomicU64,
+    /// Times this node turned its own QUIC-native connects off after native
+    /// failures with distinct peers (`connect::native::NativeDemotion`)
+    /// (reset each snapshot).
+    connect_native_demotions: AtomicU64,
+    /// A UDP dial that followed a failed native setup connected, by the side
+    /// this node had in the CONNECT (reset each snapshot).
+    connect_native_rescued_by_udp_joiner: AtomicU64,
+    connect_native_rescued_by_udp_acceptor: AtomicU64,
+    /// A UDP dial that followed ANY failed native setup (a path failure, a
+    /// local refusal, a Hello mismatch) connected, by side: every join a node
+    /// without UDP would lose, which phase D's gate reads (reset each
+    /// snapshot).
+    connect_native_fallback_connected_joiner: AtomicU64,
+    connect_native_fallback_connected_acceptor: AtomicU64,
+    /// A native dial and the UDP dial beside it both connected, UDP first or
+    /// native first; the native connection was kept (reset each snapshot).
+    connect_native_both_dials_connected_udp_first: AtomicU64,
+    connect_native_both_dials_connected_native_first: AtomicU64,
+    /// Survivor-rule decisions, from any source: a native connection swapped
+    /// in for a UDP one to the same peer, or a UDP connection dropped because
+    /// a native one holds the peer (reset each snapshot).
+    connect_native_survivor_swapped: AtomicU64,
+    connect_native_survivor_udp_dropped: AtomicU64,
     /// The last offer this node built: level, percent and whether it was
     /// ready to dial native (a state, never reset).
     connect_native_offer_level: AtomicU8,
@@ -928,6 +1089,10 @@ pub struct TransportMetrics {
     quic_carried_fallback: [AtomicU64; QuicFallback::COUNT],
     /// Active paths that ended this period, by [`QuicPathAge`].
     quic_path_age: [AtomicU64; QuicPathAge::COUNT],
+    /// QUIC-native setups this period, by [`NativeSetupOutcome`].
+    connect_native_setup: [AtomicU64; NativeSetupOutcome::COUNT],
+    /// Gateway admission of native joins this period, by [`GatewayAdmission`].
+    quic_gateway_admission: [AtomicU64; GatewayAdmission::COUNT],
     /// Establish latencies this period in ms (bounded), and how many there
     /// were.
     quic_establish_ms: parking_lot::Mutex<Vec<u64>>,
@@ -1279,6 +1444,26 @@ thread_local! {
     /// reason.
     pub(crate) static NATIVE_OFFERS_ON_THIS_THREAD: std::cell::Cell<u64> =
         const { std::cell::Cell::new(0) };
+
+    /// Test-only: native setups rescued by UDP on this thread, as joiner and
+    /// as acceptor, for the same reason.
+    pub(crate) static NATIVE_RESCUES_ON_THIS_THREAD: std::cell::Cell<[u64; 2]> =
+        const { std::cell::Cell::new([0; 2]) };
+
+    /// Test-only: UDP dials that connected after any failed native setup on
+    /// this thread, as joiner and as acceptor, for the same reason.
+    pub(crate) static NATIVE_FALLBACKS_CONNECTED_ON_THIS_THREAD: std::cell::Cell<[u64; 2]> =
+        const { std::cell::Cell::new([0; 2]) };
+
+    /// Test-only: both dials connected on this thread, [UDP first, native
+    /// first], for the same reason.
+    pub(crate) static BOTH_DIALS_CONNECTED_ON_THIS_THREAD: std::cell::Cell<[u64; 2]> =
+        const { std::cell::Cell::new([0; 2]) };
+
+    /// Test-only: survivor-rule decisions on this thread, [UDP dropped,
+    /// native swapped in], for the same reason.
+    pub(crate) static SURVIVOR_ON_THIS_THREAD: std::cell::Cell<[u64; 2]> =
+        const { std::cell::Cell::new([0; 2]) };
 }
 
 #[cfg(test)]
@@ -1381,6 +1566,15 @@ impl TransportMetrics {
             connect_native_decision_without_offer: AtomicU64::new(0),
             connect_native_decision_native_unsupported: AtomicU64::new(0),
             connect_native_decision_over_cap: AtomicU64::new(0),
+            connect_native_demotions: AtomicU64::new(0),
+            connect_native_rescued_by_udp_joiner: AtomicU64::new(0),
+            connect_native_rescued_by_udp_acceptor: AtomicU64::new(0),
+            connect_native_fallback_connected_joiner: AtomicU64::new(0),
+            connect_native_fallback_connected_acceptor: AtomicU64::new(0),
+            connect_native_both_dials_connected_udp_first: AtomicU64::new(0),
+            connect_native_both_dials_connected_native_first: AtomicU64::new(0),
+            connect_native_survivor_swapped: AtomicU64::new(0),
+            connect_native_survivor_udp_dropped: AtomicU64::new(0),
             connect_native_offer_level: AtomicU8::new(0),
             connect_native_offer_percent: AtomicU8::new(0),
             connect_native_offer_ready: AtomicBool::new(false),
@@ -1391,6 +1585,8 @@ impl TransportMetrics {
             quic_churned_fallback: Default::default(),
             quic_carried_fallback: Default::default(),
             quic_path_age: Default::default(),
+            connect_native_setup: Default::default(),
+            quic_gateway_admission: Default::default(),
             quic_establish_ms: Default::default(),
             quic_establish_samples: AtomicU64::new(0),
             quic_paths_offered_or_dialing: AtomicU64::new(0),
@@ -1922,6 +2118,84 @@ impl TransportMetrics {
         NATIVE_OFFERS_ON_THIS_THREAD.with(|count| count.set(count.get() + 1));
     }
 
+    /// A UDP dial that followed ANY failed native setup connected: a join a
+    /// node without UDP would lose, whatever the native failure was. Counted
+    /// by the side whose own dial connected; phase D's gate reads the sum of
+    /// both sides (the joiner's dial and the acceptor's can each make the
+    /// connection, and the one that does not make it counts nothing). A
+    /// rescue (below) is the subset after a path failure.
+    pub(crate) fn record_connect_native_fallback_connected(&self, side: NativeConnectSide) {
+        match side {
+            NativeConnectSide::Joiner => &self.connect_native_fallback_connected_joiner,
+            NativeConnectSide::Acceptor => &self.connect_native_fallback_connected_acceptor,
+        }
+        .fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        NATIVE_FALLBACKS_CONNECTED_ON_THIS_THREAD.with(|count| {
+            let mut counts = count.get();
+            counts[side as usize] += 1;
+            count.set(counts);
+        });
+    }
+
+    /// A UDP dial that followed a native setup that failed ON THE PATH
+    /// connected: a connection that a node without UDP would not have made
+    /// because native does not work on that path (R5).
+    pub(crate) fn record_connect_native_rescued_by_udp(&self, side: NativeConnectSide) {
+        match side {
+            NativeConnectSide::Joiner => &self.connect_native_rescued_by_udp_joiner,
+            NativeConnectSide::Acceptor => &self.connect_native_rescued_by_udp_acceptor,
+        }
+        .fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        NATIVE_RESCUES_ON_THIS_THREAD.with(|count| {
+            let mut counts = count.get();
+            counts[side as usize] += 1;
+            count.set(counts);
+        });
+    }
+
+    /// A native dial and the UDP dial beside it both connected, UDP first
+    /// (`native_first` false) or native first. The native one was kept.
+    pub(crate) fn record_connect_native_both_dials_connected(&self, native_first: bool) {
+        if native_first {
+            &self.connect_native_both_dials_connected_native_first
+        } else {
+            &self.connect_native_both_dials_connected_udp_first
+        }
+        .fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        BOTH_DIALS_CONNECTED_ON_THIS_THREAD.with(|count| {
+            let mut counts = count.get();
+            counts[usize::from(native_first)] += 1;
+            count.set(counts);
+        });
+    }
+
+    /// The survivor rule kept a native connection over a UDP one to the same
+    /// peer: the native one was swapped in for a UDP entry (`swapped`), or
+    /// the UDP connection was dropped.
+    pub(crate) fn record_connect_native_survivor(&self, swapped: bool) {
+        if swapped {
+            &self.connect_native_survivor_swapped
+        } else {
+            &self.connect_native_survivor_udp_dropped
+        }
+        .fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        SURVIVOR_ON_THIS_THREAD.with(|count| {
+            let mut counts = count.get();
+            counts[usize::from(swapped)] += 1;
+            count.set(counts);
+        });
+    }
+
+    /// This node turned its own QUIC-native connects off.
+    pub(crate) fn record_connect_native_demotion(&self) {
+        self.connect_native_demotions
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// A `Native` response was dropped unanswered: the CONNECT had already
     /// refused its cap of acceptors.
     pub(crate) fn record_connect_native_decision_over_cap(&self) {
@@ -1983,6 +2257,16 @@ impl TransportMetrics {
 
     /// This node closed a QUIC connection to `remote` with `code`
     /// (`remote` is never exported).
+    /// A QUIC-native setup ended with `outcome`.
+    pub(crate) fn record_connect_native_setup(&self, outcome: NativeSetupOutcome) {
+        self.connect_native_setup[outcome as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A gateway's admission of a native join did `outcome`.
+    pub(crate) fn record_gateway_admission(&self, outcome: GatewayAdmission) {
+        self.quic_gateway_admission[outcome as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn record_quic_close_sent(&self, code: QuicCloseCode, remote: SocketAddr) {
         #[cfg(test)]
         push_test_log(&self.nat_detail.quic_close_sent_to, (remote, code));
@@ -2232,8 +2516,8 @@ impl TransportMetrics {
             })
             .ok();
 
-        // Update cwnd stats. A controller without a bounded window (FixedRate)
-        // reports `None`; recording its effectively-infinite window would make
+        // Update cwnd stats. A controller without a bounded window reports
+        // `None`; recording an effectively-infinite window would make
         // the snapshot's avg/peak/min cwnd a sentinel rather than a value.
         if let Some(final_cwnd) = stats.final_cwnd_bytes {
             self.record_cwnd_sample(final_cwnd);
@@ -2590,6 +2874,29 @@ impl TransportMetrics {
         self.record_per_peer(remote_addr, bytes, |s| &s.bytes_received);
     }
 
+    /// Record authenticated inbound QUIC stream payload bytes of one connection.
+    ///
+    /// QUIC packets are decrypted inside quinn and never reach
+    /// [`Self::record_packet_received`], so without this the download counters
+    /// miss every QUIC byte while [`Self::record_packet_sent`] counts QUIC
+    /// sends at the socket. `bytes` must come from data quinn returned after
+    /// authenticating it (stream reads), never from quinn's `udp_rx`, which
+    /// counts before decryption (#3999). `remote_addr` is `None` for a
+    /// connection that has ended: only the cumulative counter moves, so the
+    /// per-peer table does not regrow an entry for a peer that is gone. Skips
+    /// zero so an idle path does not churn the per-peer LRU. The packet count
+    /// is not moved: quinn exposes no authenticated packet count.
+    pub(crate) fn record_quic_received(&self, remote_addr: Option<SocketAddr>, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        self.cumulative_bytes_received
+            .fetch_add(bytes, Ordering::Relaxed);
+        if let Some(addr) = remote_addr {
+            self.record_per_peer(addr, bytes, |s| &s.bytes_received);
+        }
+    }
+
     /// Read cumulative bytes downloaded without resetting counters.
     pub fn cumulative_bytes_received(&self) -> u64 {
         self.cumulative_bytes_received.load(Ordering::Relaxed)
@@ -2801,6 +3108,25 @@ impl TransportMetrics {
                 &self.connect_native_decision_native_unsupported,
             ),
             connect_native_decision_over_cap: get64(&self.connect_native_decision_over_cap),
+            connect_native_demotions: get64(&self.connect_native_demotions),
+            connect_native_rescued_by_udp_joiner: get64(&self.connect_native_rescued_by_udp_joiner),
+            connect_native_rescued_by_udp_acceptor: get64(
+                &self.connect_native_rescued_by_udp_acceptor,
+            ),
+            connect_native_fallback_connected_joiner: get64(
+                &self.connect_native_fallback_connected_joiner,
+            ),
+            connect_native_fallback_connected_acceptor: get64(
+                &self.connect_native_fallback_connected_acceptor,
+            ),
+            connect_native_both_dials_connected_udp_first: get64(
+                &self.connect_native_both_dials_connected_udp_first,
+            ),
+            connect_native_both_dials_connected_native_first: get64(
+                &self.connect_native_both_dials_connected_native_first,
+            ),
+            connect_native_survivor_swapped: get64(&self.connect_native_survivor_swapped),
+            connect_native_survivor_udp_dropped: get64(&self.connect_native_survivor_udp_dropped),
             connect_native_offer_level: self.connect_native_offer_level.load(Ordering::Relaxed),
             connect_native_offer_percent: self.connect_native_offer_percent.load(Ordering::Relaxed),
             connect_native_offer_ready: self.connect_native_offer_ready.load(Ordering::Relaxed),
@@ -2840,6 +3166,8 @@ impl TransportMetrics {
             quic_churned_fallback: std::array::from_fn(|i| get64(&self.quic_churned_fallback[i])),
             quic_carried_fallback: std::array::from_fn(|i| get64(&self.quic_carried_fallback[i])),
             quic_path_age_at_close: std::array::from_fn(|i| get64(&self.quic_path_age[i])),
+            connect_native_setup: std::array::from_fn(|i| get64(&self.connect_native_setup[i])),
+            quic_gateway_admission: std::array::from_fn(|i| get64(&self.quic_gateway_admission[i])),
             quic_establish_ms_p50: establish_p50,
             quic_establish_ms_p90: establish_p90,
             quic_establish_samples: get64(&self.quic_establish_samples),
@@ -2950,6 +3278,7 @@ impl TransportMetrics {
             egress_retransmits_uncapped_bytes: get64(&egress.retransmits_uncapped_bytes),
             egress_probes_skipped: get64(&egress.probes_skipped),
             conn_identity_set_dialed: get32(&identity[ConnIdentity::SetDialed as usize]),
+            conn_identity_set_proven: get32(&identity[ConnIdentity::SetProven as usize]),
             conn_identity_expected_inbound_bound: get32(
                 &identity[ConnIdentity::ExpectedInboundBound as usize],
             ),
@@ -3284,7 +3613,9 @@ pub(crate) enum QuicEndpointState {
     /// `transport-quic` is set to `off`, or to a value this binary does not
     /// know.
     OffConfig = 2,
-    /// `transport-quic` is unset and this platform's default is off.
+    /// `transport-quic` is unset and this build's default is off. No build
+    /// has an off default today (it is `prefer` on every platform), so a
+    /// node reports this only if a later build restores one.
     OffPlatform = 3,
     /// The build aborts on panic, which the QUIC transport refuses.
     OffAbort = 4,
@@ -3357,8 +3688,8 @@ pub struct TransportSnapshot {
     /// Peak throughput observed (bytes per second).
     pub peak_throughput_bps: u64,
     /// Average congestion window size in bytes. `None` (JSON null) if no
-    /// bounded cwnd was sampled, e.g. when every transfer ran under the
-    /// FixedRate controller, which has no meaningful window.
+    /// bounded cwnd was sampled. FixedRate reports its flight-size ceiling
+    /// (or a loss pause's lower window).
     ///
     /// Type change: this was a `u32` that read `0` (or, under FixedRate,
     /// a `u32::MAX`-derived sentinel) with no samples. A typed consumer must
@@ -3463,9 +3794,11 @@ pub struct TransportSnapshot {
     /// released it (#5940). Not counted: a panic in a path's receive task.
     pub quic_adapter_panicked: u64,
     /// Times the QUIC crash-loop breaker tripped, so this run started with
-    /// QUIC off (#5940): on unix a run with QUIC enabled ended abnormally, on
-    /// Windows three runs in a row ended within ten minutes after a panic in
-    /// QUIC code.
+    /// QUIC off (#5940): on a peer (two while UDP exists) and a gateway on
+    /// Windows or with no boot identity (three), runs in a row ended within ten
+    /// minutes after a panic in QUIC code; on a gateway on Linux or macOS a run
+    /// with QUIC enabled ended
+    /// abnormally. The `quic_breaker_start` event says which rule decided.
     pub quic_breaker_trips: u64,
     /// Sends the QUIC socket refused with `WouldBlock` (egress cap or full
     /// socket buffer). Chiefly datagrams quinn's endpoint made on its own,
@@ -3484,13 +3817,34 @@ pub struct TransportSnapshot {
     pub connect_native_decided_native: u64,
     pub connect_native_decided_udp: u64,
     /// `Native` decisions received as joiner that failed the attempt: to a
-    /// request with no offer (or percent 0), and to a real offer this build
-    /// cannot dial.
+    /// request with no offer (or percent 0), and to a real offer when it can
+    /// no longer dial native.
     pub connect_native_decision_without_offer: u64,
     pub connect_native_decision_native_unsupported: u64,
     /// `Native` responses dropped past the per-CONNECT cap on refused
     /// acceptors.
     pub connect_native_decision_over_cap: u64,
+    /// Times the node turned its own native connects off after failures.
+    pub connect_native_demotions: u64,
+    /// UDP dials that connected after a native setup that failed on the
+    /// path, as joiner and as acceptor (R5's rescue).
+    pub connect_native_rescued_by_udp_joiner: u64,
+    pub connect_native_rescued_by_udp_acceptor: u64,
+    /// UDP dials that connected after ANY failed native setup: the joins
+    /// phase D would lose. Each side counts the UDP dial of its own that
+    /// connected, so phase D's gate reads the SUM of the joiner and acceptor
+    /// fields; neither alone is the figure (whichever side's dial makes the
+    /// connection first counts it, and the other side's does not).
+    pub connect_native_fallback_connected_joiner: u64,
+    pub connect_native_fallback_connected_acceptor: u64,
+    /// A native dial and the UDP dial beside it both connected, UDP first or
+    /// native first; the native connection was kept.
+    pub connect_native_both_dials_connected_udp_first: u64,
+    pub connect_native_both_dials_connected_native_first: u64,
+    /// Survivor-rule decisions: a native connection swapped in for a UDP one,
+    /// or a UDP connection dropped because a native one holds the peer.
+    pub connect_native_survivor_swapped: u64,
+    pub connect_native_survivor_udp_dropped: u64,
     /// The last offer built: level, percent, and whether the node could dial
     /// native. States, never reset, and not activity.
     pub connect_native_offer_level: u8,
@@ -3538,6 +3892,12 @@ pub struct TransportSnapshot {
     /// Active paths that ended, by [`QuicPathAge`]
     /// (`quic_path_age_at_close_<label>`).
     pub quic_path_age_at_close: [u64; QuicPathAge::COUNT],
+    /// QUIC-native setups, by [`NativeSetupOutcome`]
+    /// (`connect_native_setup_<label>`).
+    pub connect_native_setup: [u64; NativeSetupOutcome::COUNT],
+    /// Gateway admission of native joins, by [`GatewayAdmission`]
+    /// (`quic_gateway_admission_<label>`).
+    pub quic_gateway_admission: [u64; GatewayAdmission::COUNT],
     /// Median and p90 of this period's establish latencies, in ms (the
     /// first `QUIC_ESTABLISH_SAMPLES_MAX` of them), and how many there were.
     /// Both roles are mixed: a server times from its Offer to `ReadyAck`, a
@@ -3661,6 +4021,7 @@ pub struct TransportSnapshot {
     /// [`ConnIdentity`] (the field suffix is its label). Counts only, no
     /// addresses or keys.
     pub conn_identity_set_dialed: u32,
+    pub conn_identity_set_proven: u32,
     pub conn_identity_expected_inbound_bound: u32,
     pub conn_identity_expected_inbound_unbound: u32,
     pub conn_identity_set_connect_request: u32,
@@ -3745,6 +4106,7 @@ impl TransportSnapshot {
     pub(crate) fn conn_identity(&self, kind: ConnIdentity) -> u32 {
         match kind {
             ConnIdentity::SetDialed => self.conn_identity_set_dialed,
+            ConnIdentity::SetProven => self.conn_identity_set_proven,
             ConnIdentity::ExpectedInboundBound => self.conn_identity_expected_inbound_bound,
             ConnIdentity::ExpectedInboundUnbound => self.conn_identity_expected_inbound_unbound,
             ConnIdentity::SetConnectRequest => self.conn_identity_set_connect_request,
@@ -3909,6 +4271,15 @@ impl TransportSnapshot {
             connect_native_decision_without_offer,
             connect_native_decision_native_unsupported,
             connect_native_decision_over_cap,
+            connect_native_demotions,
+            connect_native_rescued_by_udp_joiner,
+            connect_native_rescued_by_udp_acceptor,
+            connect_native_fallback_connected_joiner,
+            connect_native_fallback_connected_acceptor,
+            connect_native_both_dials_connected_udp_first,
+            connect_native_both_dials_connected_native_first,
+            connect_native_survivor_swapped,
+            connect_native_survivor_udp_dropped,
             connect_native_offer_level,
             connect_native_offer_percent,
             connect_native_offer_ready,
@@ -3929,6 +4300,8 @@ impl TransportSnapshot {
             quic_churned_fallback,
             quic_carried_fallback,
             quic_path_age_at_close,
+            connect_native_setup,
+            quic_gateway_admission,
             quic_establish_ms_p50,
             quic_establish_ms_p90,
             quic_establish_samples,
@@ -3994,6 +4367,7 @@ impl TransportSnapshot {
             egress_retransmits_uncapped_bytes,
             egress_probes_skipped,
             conn_identity_set_dialed,
+            conn_identity_set_proven,
             conn_identity_expected_inbound_bound,
             conn_identity_expected_inbound_unbound,
             conn_identity_set_connect_request,
@@ -4073,6 +4447,18 @@ impl TransportSnapshot {
         self.connect_native_decision_native_unsupported =
             connect_native_decision_native_unsupported;
         self.connect_native_decision_over_cap = connect_native_decision_over_cap;
+        self.connect_native_demotions = connect_native_demotions;
+        self.connect_native_rescued_by_udp_joiner = connect_native_rescued_by_udp_joiner;
+        self.connect_native_rescued_by_udp_acceptor = connect_native_rescued_by_udp_acceptor;
+        self.connect_native_fallback_connected_joiner = connect_native_fallback_connected_joiner;
+        self.connect_native_fallback_connected_acceptor =
+            connect_native_fallback_connected_acceptor;
+        self.connect_native_both_dials_connected_udp_first =
+            connect_native_both_dials_connected_udp_first;
+        self.connect_native_both_dials_connected_native_first =
+            connect_native_both_dials_connected_native_first;
+        self.connect_native_survivor_swapped = connect_native_survivor_swapped;
+        self.connect_native_survivor_udp_dropped = connect_native_survivor_udp_dropped;
         self.connect_native_offer_level = connect_native_offer_level;
         self.connect_native_offer_percent = connect_native_offer_percent;
         self.connect_native_offer_ready = connect_native_offer_ready;
@@ -4093,6 +4479,8 @@ impl TransportSnapshot {
         self.quic_churned_fallback = quic_churned_fallback;
         self.quic_carried_fallback = quic_carried_fallback;
         self.quic_path_age_at_close = quic_path_age_at_close;
+        self.connect_native_setup = connect_native_setup;
+        self.quic_gateway_admission = quic_gateway_admission;
         self.quic_establish_ms_p50 = quic_establish_ms_p50;
         self.quic_establish_ms_p90 = quic_establish_ms_p90;
         self.quic_establish_samples = quic_establish_samples;
@@ -4158,6 +4546,7 @@ impl TransportSnapshot {
         self.egress_retransmits_uncapped_bytes = egress_retransmits_uncapped_bytes;
         self.egress_probes_skipped = egress_probes_skipped;
         self.conn_identity_set_dialed = conn_identity_set_dialed;
+        self.conn_identity_set_proven = conn_identity_set_proven;
         self.conn_identity_expected_inbound_bound = conn_identity_expected_inbound_bound;
         self.conn_identity_expected_inbound_unbound = conn_identity_expected_inbound_unbound;
         self.conn_identity_set_connect_request = conn_identity_set_connect_request;
@@ -4273,9 +4662,11 @@ struct SnapshotExtras {
     /// released it (#5940). Not counted: a panic in a path's receive task.
     pub quic_adapter_panicked: u64,
     /// Times the QUIC crash-loop breaker tripped, so this run started with
-    /// QUIC off (#5940): on unix a run with QUIC enabled ended abnormally, on
-    /// Windows three runs in a row ended within ten minutes after a panic in
-    /// QUIC code.
+    /// QUIC off (#5940): on a peer (two while UDP exists) and a gateway on
+    /// Windows or with no boot identity (three), runs in a row ended within ten
+    /// minutes after a panic in QUIC code; on a gateway on Linux or macOS a run
+    /// with QUIC enabled ended
+    /// abnormally. The `quic_breaker_start` event says which rule decided.
     pub quic_breaker_trips: u64,
     /// Sends the QUIC socket refused with `WouldBlock` (egress cap or full
     /// socket buffer). Chiefly datagrams quinn's endpoint made on its own,
@@ -4294,13 +4685,34 @@ struct SnapshotExtras {
     pub connect_native_decided_native: u64,
     pub connect_native_decided_udp: u64,
     /// `Native` decisions received as joiner that failed the attempt: to a
-    /// request with no offer (or percent 0), and to a real offer this build
-    /// cannot dial.
+    /// request with no offer (or percent 0), and to a real offer when it can
+    /// no longer dial native.
     pub connect_native_decision_without_offer: u64,
     pub connect_native_decision_native_unsupported: u64,
     /// `Native` responses dropped past the per-CONNECT cap on refused
     /// acceptors.
     pub connect_native_decision_over_cap: u64,
+    /// Times the node turned its own native connects off after failures.
+    pub connect_native_demotions: u64,
+    /// UDP dials that connected after a native setup that failed on the
+    /// path, as joiner and as acceptor (R5's rescue).
+    pub connect_native_rescued_by_udp_joiner: u64,
+    pub connect_native_rescued_by_udp_acceptor: u64,
+    /// UDP dials that connected after ANY failed native setup: the joins
+    /// phase D would lose. Each side counts the UDP dial of its own that
+    /// connected, so phase D's gate reads the SUM of the joiner and acceptor
+    /// fields; neither alone is the figure (whichever side's dial makes the
+    /// connection first counts it, and the other side's does not).
+    pub connect_native_fallback_connected_joiner: u64,
+    pub connect_native_fallback_connected_acceptor: u64,
+    /// A native dial and the UDP dial beside it both connected, UDP first or
+    /// native first; the native connection was kept.
+    pub connect_native_both_dials_connected_udp_first: u64,
+    pub connect_native_both_dials_connected_native_first: u64,
+    /// Survivor-rule decisions: a native connection swapped in for a UDP one,
+    /// or a UDP connection dropped because a native one holds the peer.
+    pub connect_native_survivor_swapped: u64,
+    pub connect_native_survivor_udp_dropped: u64,
     /// The last offer built: level, percent, and whether the node could dial
     /// native. States, never reset, and not activity.
     pub connect_native_offer_level: u8,
@@ -4345,6 +4757,12 @@ struct SnapshotExtras {
     /// Active paths that ended, by [`QuicPathAge`]
     /// (`quic_path_age_at_close_<label>`).
     pub quic_path_age_at_close: [u64; QuicPathAge::COUNT],
+    /// QUIC-native setups, by [`NativeSetupOutcome`]
+    /// (`connect_native_setup_<label>`).
+    pub connect_native_setup: [u64; NativeSetupOutcome::COUNT],
+    /// Gateway admission of native joins, by [`GatewayAdmission`]
+    /// (`quic_gateway_admission_<label>`).
+    pub quic_gateway_admission: [u64; GatewayAdmission::COUNT],
     /// Median and p90 of this period's establish latencies, in ms (the
     /// first `QUIC_ESTABLISH_SAMPLES_MAX` of them), and how many there were.
     /// Both roles are mixed: a server times from its Offer to `ReadyAck`, a
@@ -4468,6 +4886,7 @@ struct SnapshotExtras {
     /// [`ConnIdentity`] (the field suffix is its label). Counts only, no
     /// addresses or keys.
     pub conn_identity_set_dialed: u32,
+    pub conn_identity_set_proven: u32,
     pub conn_identity_expected_inbound_bound: u32,
     pub conn_identity_expected_inbound_unbound: u32,
     pub conn_identity_set_connect_request: u32,
@@ -4538,6 +4957,15 @@ impl SnapshotExtras {
             || self.connect_native_decision_without_offer != 0
             || self.connect_native_decision_native_unsupported != 0
             || self.connect_native_decision_over_cap != 0
+            || self.connect_native_demotions != 0
+            || self.connect_native_rescued_by_udp_joiner != 0
+            || self.connect_native_rescued_by_udp_acceptor != 0
+            || self.connect_native_fallback_connected_joiner != 0
+            || self.connect_native_fallback_connected_acceptor != 0
+            || self.connect_native_both_dials_connected_udp_first != 0
+            || self.connect_native_both_dials_connected_native_first != 0
+            || self.connect_native_survivor_swapped != 0
+            || self.connect_native_survivor_udp_dropped != 0
             || self.quic_close_sent_node_dropped_peer != 0
             || self.quic_close_sent_downgrade != 0
             || self.quic_close_sent_identity_mismatch != 0
@@ -4561,6 +4989,8 @@ impl SnapshotExtras {
                 .iter()
                 .any(|n| *n != 0)
             || self.quic_path_age_at_close.iter().any(|n| *n != 0)
+            || self.connect_native_setup.iter().any(|n| *n != 0)
+            || self.quic_gateway_admission.iter().any(|n| *n != 0)
             || self.quic_establish_samples != 0
             || self.quic_paths_offered_or_dialing != 0
             || self.quic_paths_active != 0
@@ -4619,6 +5049,7 @@ impl SnapshotExtras {
             || self.egress_retransmits_uncapped_bytes != 0
             || self.egress_probes_skipped != 0
             || self.conn_identity_set_dialed != 0
+            || self.conn_identity_set_proven != 0
             || self.conn_identity_expected_inbound_bound != 0
             || self.conn_identity_expected_inbound_unbound != 0
             || self.conn_identity_set_connect_request != 0
@@ -4676,7 +5107,10 @@ pub fn emit_transfer_started(
     peer_addr: SocketAddr,
     expected_bytes: u64,
     direction: TransferDirection,
+    transport: TransferTransport,
 ) {
+    #[cfg(test)]
+    note_transfer_event(stream_id, "transfer_started", transport);
     let sender_guard = TRANSFER_EVENT_SENDER.read();
     if let Some(sender) = sender_guard.as_ref() {
         let event = TransferEvent::Started {
@@ -4685,12 +5119,42 @@ pub fn emit_transfer_started(
             expected_bytes,
             direction,
             tx_id: None, // Transaction ID not available at transport layer
+            transport,
             timestamp: crate::tracing::telemetry::current_timestamp_ms(),
         };
         // Fire-and-forget: try_send avoids blocking the transport layer; channel full means telemetry drops
         #[allow(clippy::let_underscore_must_use)]
         let _ = sender.try_send(event);
     }
+}
+
+// Test-only: the transfer events emitted on this thread, as (stream id, event,
+// transport), so a test finds its own: events are recorded per thread and
+// transfers run on the test's thread (a current-thread runtime), so another
+// test's events never land here. Kept apart from the QUIC event log, which every
+// transfer would otherwise crowd.
+#[cfg(test)]
+thread_local! {
+    static TRANSFER_TEST_LOG: std::cell::RefCell<Vec<(u64, &'static str, TransferTransport)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+fn note_transfer_event(stream_id: u64, event: &'static str, transport: TransferTransport) {
+    TRANSFER_TEST_LOG.with(|log| log.borrow_mut().push((stream_id, event, transport)));
+}
+
+/// Test-only: the transfer events of `stream_id` emitted on this thread, in
+/// order.
+#[cfg(test)]
+pub(crate) fn transfer_events_of(stream_id: u64) -> Vec<(&'static str, TransferTransport)> {
+    TRANSFER_TEST_LOG.with(|log| {
+        log.borrow()
+            .iter()
+            .filter(|(id, _, _)| *id == stream_id)
+            .map(|(_, event, transport)| (*event, *transport))
+            .collect()
+    })
 }
 
 /// Emit a transfer completed event.
@@ -4712,7 +5176,10 @@ pub fn emit_transfer_completed(
     min_rtt_ms: Option<u32>,
     peak_flightsize_bytes: Option<u32>,
     direction: TransferDirection,
+    transport: TransferTransport,
 ) {
+    #[cfg(test)]
+    note_transfer_event(stream_id, "transfer_completed", transport);
     let sender_guard = TRANSFER_EVENT_SENDER.read();
     if let Some(sender) = sender_guard.as_ref() {
         let event = TransferEvent::Completed {
@@ -4731,6 +5198,7 @@ pub fn emit_transfer_completed(
             min_rtt_ms,
             peak_flightsize_bytes,
             direction,
+            transport,
             timestamp: crate::tracing::telemetry::current_timestamp_ms(),
         };
         // Fire-and-forget: try_send avoids blocking the transport layer; channel full means telemetry drops
@@ -4748,7 +5216,10 @@ pub fn emit_transfer_failed(
     reason: String,
     elapsed_ms: u64,
     direction: TransferDirection,
+    transport: TransferTransport,
 ) {
+    #[cfg(test)]
+    note_transfer_event(stream_id, "transfer_failed", transport);
     let sender_guard = TRANSFER_EVENT_SENDER.read();
     if let Some(sender) = sender_guard.as_ref() {
         let event = TransferEvent::Failed {
@@ -4758,6 +5229,7 @@ pub fn emit_transfer_failed(
             reason,
             elapsed_ms,
             direction,
+            transport,
             timestamp: crate::tracing::telemetry::current_timestamp_ms(),
         };
         // Fire-and-forget: try_send avoids blocking the transport layer; channel full means telemetry drops
@@ -5338,8 +5810,8 @@ mod tests {
         assert_eq!(metrics.cumulative_packets().0, 3, "cumulative is not reset");
     }
 
-    /// A FixedRate transfer has no bounded cwnd. It must not feed the cwnd
-    /// accumulators, and `avg_cwnd_bytes` must then be null, not a sentinel.
+    /// A transfer with no bounded cwnd must not feed the cwnd accumulators,
+    /// and `avg_cwnd_bytes` must then be null, not a sentinel.
     #[test]
     fn unbounded_cwnd_transfer_leaves_avg_cwnd_null() {
         let metrics = TransportMetrics::new();
@@ -5846,6 +6318,38 @@ mod tests {
         check_quic_family(
             |m, slot, remote| m.record_quic_close_received(raw(slot), remote),
             |snap| snap.quic_close_received,
+        );
+    }
+
+    #[test]
+    fn only_path_failures_count_toward_demotion() {
+        let counted: Vec<NativeSetupOutcome> = NativeSetupOutcome::ALL
+            .into_iter()
+            .filter(|o| o.counts_toward_demotion())
+            .collect();
+        assert_eq!(
+            counted,
+            [
+                NativeSetupOutcome::TimedOut,
+                NativeSetupOutcome::HandshakeFailed,
+                NativeSetupOutcome::HelloLost,
+            ]
+        );
+    }
+
+    #[test]
+    fn connect_native_setup_outcomes_count_snapshot_and_reset() {
+        check_quic_family(
+            |m, slot, _| m.record_connect_native_setup(NativeSetupOutcome::ALL[slot]),
+            |snap| snap.connect_native_setup,
+        );
+    }
+
+    #[test]
+    fn gateway_admission_outcomes_count_snapshot_and_reset() {
+        check_quic_family(
+            |m, slot, _| m.record_gateway_admission(GatewayAdmission::ALL[slot]),
+            |snap| snap.quic_gateway_admission,
         );
     }
 
@@ -7030,6 +7534,15 @@ mod tests {
             "connect_native_decision_without_offer",
             "connect_native_decision_native_unsupported",
             "connect_native_decision_over_cap",
+            "connect_native_demotions",
+            "connect_native_rescued_by_udp_joiner",
+            "connect_native_rescued_by_udp_acceptor",
+            "connect_native_fallback_connected_joiner",
+            "connect_native_fallback_connected_acceptor",
+            "connect_native_both_dials_connected_udp_first",
+            "connect_native_both_dials_connected_native_first",
+            "connect_native_survivor_swapped",
+            "connect_native_survivor_udp_dropped",
             "connect_native_offer_level",
             "connect_native_offer_percent",
             "connect_native_offer_ready",
@@ -7050,6 +7563,8 @@ mod tests {
             "quic_churned_fallback",
             "quic_carried_fallback",
             "quic_path_age_at_close",
+            "connect_native_setup",
+            "quic_gateway_admission",
             "quic_establish_ms_p50",
             "quic_establish_ms_p90",
             "quic_establish_samples",
@@ -7112,6 +7627,7 @@ mod tests {
             "egress_retransmits_deferred",
             "egress_probes_skipped",
             "conn_identity_set_dialed",
+            "conn_identity_set_proven",
             "conn_identity_expected_inbound_bound",
             "conn_identity_expected_inbound_unbound",
             "conn_identity_set_connect_request",

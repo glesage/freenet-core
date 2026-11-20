@@ -27,8 +27,7 @@ mod inbound_dispatch;
 mod inbound_stream;
 mod outbound_stream;
 // Built only by its tests until the connect op uses it (#5940, A5b).
-#[cfg_attr(not(test), allow(dead_code))]
-mod native_connection;
+pub(in crate::transport) mod native_connection;
 pub(super) use outbound_stream::embeds_metadata;
 mod peer_identity;
 pub(crate) mod piped_stream;
@@ -4952,9 +4951,9 @@ mod tests {
         // neither can gate a fragment.
         //
         // This budget is a belt, not a guarantee: today's default congestion
-        // algorithm is `FixedRate`, whose `current_cwnd()` returns
-        // `usize::MAX / 2`, so the cwnd gate is a no-op and liveness here is
-        // partly accidental. Should the default become BBR or LEDBAT, a
+        // algorithm is `FixedRate`, which ignores these settings: its window
+        // is its own flight-size ceiling (seconds of data at its rate, far
+        // above the payloads here), so liveness here is partly accidental. Should the default become BBR or LEDBAT, a
         // shortfall would park the sender forever on a clock that never
         // advances. `CAPTURE_TIMEOUT` below turns that into a named failure
         // instead of a CI run that hangs with no diagnostic.

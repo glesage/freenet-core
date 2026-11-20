@@ -193,6 +193,8 @@ pub(crate) mod demux;
 pub(crate) mod egress_cap;
 pub mod in_memory_socket;
 pub(crate) mod join_versions;
+/// A NAT for the in-memory network (filtering only), used by NAT simulations.
+pub mod nat_model;
 pub(crate) mod quic;
 #[cfg(test)]
 pub(crate) mod test_net;
@@ -271,8 +273,9 @@ pub struct TransferStats {
     /// Note: This is when we finished SENDING, not when all ACKs arrived.
     pub elapsed: Duration,
     /// Peak congestion window during transfer (bytes). `None` when the
-    /// controller has no bounded window (FixedRate outside a loss pause
-    /// reports an effectively infinite cwnd, which is not a measurement).
+    /// controller has no bounded window (an effectively infinite cwnd is not
+    /// a measurement). FixedRate reports its flight-size ceiling, or the
+    /// lower window of a loss pause.
     pub peak_cwnd_bytes: Option<u32>,
     /// Final congestion window at completion (bytes). `None` under the same
     /// condition as `peak_cwnd_bytes`.
@@ -349,14 +352,23 @@ impl From<SocketAddr> for ObservedAddr {
     }
 }
 
+#[cfg(test)]
+pub(crate) use self::boundary::NativeConnectFuture;
 pub(crate) use self::boundary::TransportHandle;
+pub(crate) use self::metrics::{NativeConnectSide, NativeSetupOutcome};
+pub(crate) use self::quic::native::setup::{
+    MIN_WINDOW_LEFT as NATIVE_MIN_WINDOW_LEFT, NATIVE_FALLBACK_AFTER,
+    window_of as native_setup_window,
+};
+pub(crate) use self::quic::upgrade::driver::NativeDial;
+pub(crate) use self::quic::{QuicAvailability, QuicAvailabilityWatch};
 // For the node's test that pins each end's disconnect label.
 #[cfg(test)]
 pub(crate) use self::boundary::QuicPathEnd;
 pub(crate) use self::boundary::{
-    CloseReason, InboundAcceptor, InboundExpectations, InboundStreamRegistry, ListenerExit,
-    NextConnection, ObservedSend, OutboundConnector, PeerConnectionApi, PendingConnection,
-    ReceiptStamp, StreamProgressObserver, StreamSendOutcome,
+    CloseReason, GatewayQuicRestart, InboundAcceptor, InboundExpectations, InboundStreamRegistry,
+    ListenerExit, NextConnection, ObservedSend, OutboundConnector, PeerConnectionApi,
+    PendingConnection, ReceiptStamp, StreamProgressObserver, StreamSendOutcome,
 };
 pub use self::boundary::{IncomingChunks, IncomingStream, StreamIdentity};
 #[cfg(test)]

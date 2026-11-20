@@ -49,9 +49,16 @@ struct Recording<S> {
     addr: SocketAddr,
     time: VirtualTime,
     log: Arc<Mutex<Vec<Sent>>>,
+    /// While set, a datagram sent through this socket is lost on the way:
+    /// the send reports success and nothing is delivered or logged.
+    muted: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl<S: Socket> Recording<S> {
+    fn is_muted(&self) -> bool {
+        self.muted.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     fn note(&self, buf: &[u8], to: SocketAddr) {
         self.log.lock().unwrap().push(Sent {
             at_ns: self.time.now_nanos(),
@@ -72,18 +79,27 @@ impl<S: Socket> Socket for Recording<S> {
     }
 
     async fn send_to(&self, buf: &[u8], target: SocketAddr) -> std::io::Result<usize> {
+        if self.is_muted() {
+            return Ok(buf.len());
+        }
         let sent = self.inner.send_to(buf, target).await?;
         self.note(buf, target);
         Ok(sent)
     }
 
     fn send_to_blocking(&self, buf: &[u8], target: SocketAddr) -> std::io::Result<usize> {
+        if self.is_muted() {
+            return Ok(buf.len());
+        }
         let sent = self.inner.send_to_blocking(buf, target)?;
         self.note(buf, target);
         Ok(sent)
     }
 
     fn try_send_to(&self, buf: &[u8], target: SocketAddr) -> std::io::Result<usize> {
+        if self.is_muted() {
+            return Ok(buf.len());
+        }
         let sent = self.inner.try_send_to(buf, target)?;
         self.note(buf, target);
         Ok(sent)
@@ -336,6 +352,8 @@ pub(in crate::transport::quic) struct Pair {
     a_socket: Arc<SimDemux>,
     b_socket: Arc<SimDemux>,
     log: Arc<Mutex<Vec<Sent>>>,
+    /// Loses every datagram `b` sends while set.
+    pub(super) b_muted: Arc<std::sync::atomic::AtomicBool>,
     pumps: Vec<tokio::task::JoinHandle<()>>,
 }
 
@@ -374,24 +392,32 @@ pub(in crate::transport::quic) async fn pair_with(
     register_address_network(a_addr, network);
     register_address_network(b_addr, network);
     let log = Arc::new(Mutex::new(Vec::new()));
-    let bind = |addr: SocketAddr, cap: Option<EgressCap>| {
-        let time = time.clone();
-        let log = log.clone();
-        async move {
-            let inner = SimulationSocket::bind(addr).await.expect("sim bind");
-            Arc::new(DemuxSocket::wrap(
-                Recording {
-                    inner,
-                    addr,
-                    time,
-                    log,
-                },
-                cap,
-            ))
-        }
-    };
-    let a_socket = bind(a_addr, a_cap.map(|rate| EgressCap::new(rate, time.clone()))).await;
-    let b_socket = bind(b_addr, None).await;
+    let b_muted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let bind =
+        |addr: SocketAddr, cap: Option<EgressCap>, muted: Arc<std::sync::atomic::AtomicBool>| {
+            let time = time.clone();
+            let log = log.clone();
+            async move {
+                let inner = SimulationSocket::bind(addr).await.expect("sim bind");
+                Arc::new(DemuxSocket::wrap(
+                    Recording {
+                        inner,
+                        addr,
+                        time,
+                        log,
+                        muted,
+                    },
+                    cap,
+                ))
+            }
+        };
+    let a_socket = bind(
+        a_addr,
+        a_cap.map(|rate| EgressCap::new(rate, time.clone())),
+        Arc::default(),
+    )
+    .await;
+    let b_socket = bind(b_addr, None, b_muted.clone()).await;
     let a_keys = TransportKeypair::new();
     let b_keys = TransportKeypair::new();
     let a = QuicEndpoint::bind(a_socket.clone(), a_addr, time.clone(), &settings, &a_keys)
@@ -411,11 +437,20 @@ pub(in crate::transport::quic) async fn pair_with(
         a_socket,
         b_socket,
         log,
+        b_muted,
         pumps,
     }
 }
 
 impl Pair {
+    /// Send `bytes` from `a`'s socket to `b`'s, as a forger on the path would.
+    pub(in crate::transport::quic) async fn inject_from_a(&self, bytes: &[u8]) {
+        self.a_socket
+            .send_to(bytes, self.b_addr)
+            .await
+            .expect("inject");
+    }
+
     fn a_key(&self) -> TransportPublicKey {
         self.a_keys.public().clone()
     }
@@ -484,6 +519,7 @@ impl Pair {
                 addr,
                 time: self.time.clone(),
                 log: self.log.clone(),
+                muted: Arc::default(),
             },
             None,
         ));
@@ -715,6 +751,8 @@ enum ServerTls {
     Pinned,
     /// With this rustls configuration instead (an impostor's).
     Custom(Box<rustls::ServerConfig>),
+    /// With this QUIC TLS configuration, which may serve several attempts.
+    Shared(Arc<quinn::crypto::rustls::QuicServerConfig>),
 }
 
 /// `client` connects to `server` at `server_addr` with `client_config`,
@@ -736,12 +774,16 @@ async fn attempt(
                 let incoming = server.accept().await.expect("an incoming attempt");
                 match server_tls {
                     ServerTls::Pinned => incoming.establish().await,
-                    ServerTls::Custom(tls) => {
+                    ServerTls::Custom(_) | ServerTls::Shared(_) => {
                         let mut config = (*server.server).clone();
-                        config.crypto = Arc::new(
-                            quinn::crypto::rustls::QuicServerConfig::try_from(Arc::new(*tls))
-                                .unwrap(),
-                        );
+                        config.crypto = match server_tls {
+                            ServerTls::Custom(tls) => Arc::new(
+                                quinn::crypto::rustls::QuicServerConfig::try_from(Arc::new(*tls))
+                                    .unwrap(),
+                            ),
+                            ServerTls::Shared(tls) => tls,
+                            ServerTls::Pinned => unreachable!("matched above"),
+                        };
                         let connection =
                             super::socket::with_poller_holds(&incoming.cap_holds, || {
                                 incoming.incoming.accept_with(Arc::new(config))
@@ -1935,10 +1977,20 @@ fn transport_quic_values_and_unknown_ones() {
     assert_eq!(QuicMode::from_config_value(Some("force")), QuicMode::Off);
     assert_eq!(QuicMode::from_config_value(Some("")), QuicMode::Off);
     assert_eq!(QuicMode::default(), QuicMode::default_mode());
-    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    // Prefer on every platform, not only the three that ship binaries.
     assert_eq!(QuicMode::from_config_value(None), QuicMode::Prefer);
-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    assert_eq!(QuicMode::from_config_value(None), QuicMode::Off);
+}
+
+/// The default is `prefer` on every platform, not only the three that ship
+/// binaries. A test, not a const assertion, so the emergency-stop release
+/// (docs/RELEASING.md) can change this test alongside `default_mode` without
+/// a compile error. It runs on the host only, so a `cfg` that brought `off`
+/// back for another platform is not seen by it on a Linux host.
+#[test]
+fn the_default_mode_is_prefer() {
+    assert_eq!(QuicMode::default_mode(), QuicMode::Prefer);
+    assert_eq!(QuicMode::from_config_value(None), QuicMode::Prefer);
+    assert!(QuicMode::default_mode().builds_endpoint());
 }
 
 /// The socket sends one datagram per transmit and receives one per call.
@@ -2334,7 +2386,7 @@ fn a_hold_left_by_an_ended_connection_stops_pausing_the_ack_watch() {
     let record = Arc::default();
     let tick = ACK_WATCH_TICK.as_secs();
     let sample = |t: u64| AckSample::synthetic(&record, 5, 5, 0, 10 + t, 100 + t, holds.read());
-    let mut watch = AckWatch::new(ACK_WATCH_WINDOW, sample(0));
+    let mut watch = AckWatch::new(ACK_WATCH_WINDOW, sample(0), false);
     let closed = (1..=200u64)
         .find(|t| watch.observe(t * tick * 1_000_000_000, sample(*t)))
         .map(|t| Duration::from_secs(t * tick));
@@ -2387,7 +2439,7 @@ fn a_held_connection_does_not_pause_another_connections_ack_watch() {
     let tick = ACK_WATCH_TICK.as_secs();
     let sample_other =
         |t: u64| AckSample::synthetic(&record, 5, 5, 0, 10 + t, 100 + t, other.read());
-    let mut watch = AckWatch::new(ACK_WATCH_WINDOW, sample_other(0));
+    let mut watch = AckWatch::new(ACK_WATCH_WINDOW, sample_other(0), false);
     let closed = (1..=50u64).find(|t| {
         // The held connection's poller is polled every tick and still waits.
         assert!(held_poller.as_mut().poll_writable(&mut cx).is_pending());
@@ -4882,6 +4934,56 @@ async fn connected(pair: &Pair) -> (QuicConnection, QuicConnection) {
     result
 }
 
+/// A path's final report must not regrow the per-peer entry of a peer whose
+/// connection is gone, and the tick report must count what the connection's
+/// streams read, once (#6301). Private metrics, so no other test is in them.
+#[test]
+fn a_path_report_counts_stream_reads_per_peer_on_ticks_and_cumulative_on_drop() {
+    use crate::transport::metrics::TransportMetrics;
+    use crate::transport::quic::path::inbound::ConnRanges;
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let net = crate::transport::test_net::subnet();
+        let rig = pair("quic-wire-report", net.addr(1), net.addr(2), None).await;
+        let (_client, server) = connected(&rig).await;
+        let wire: &'static TransportMetrics = Box::leak(Box::new(TransportMetrics::new()));
+        let node: &'static crate::transport::metrics::QuicDataCounters =
+            Box::leak(Box::new(crate::transport::metrics::QuicDataCounters::new()));
+        let ranges = Arc::new(ConnRanges::new(1000, 64));
+        let mut report = super::recycle::PathReport::new(
+            server.inner().clone(),
+            node,
+            0,
+            None,
+            super::recycle::Carrying {
+                now: Arc::default(),
+                at_end: Arc::default(),
+            },
+        )
+        .with_wire(wire)
+        .with_read(ranges.clone());
+        ranges.note_read(1000);
+        report.report(Some(1));
+        assert_eq!(wire.cumulative_bytes_received(), 1000);
+        assert_eq!(wire.peer_bytes(rig.a_addr), Some((0, 1000)));
+        report.report(Some(2));
+        assert_eq!(wire.cumulative_bytes_received(), 1000, "counted once");
+        ranges.note_read(500);
+        drop(report);
+        assert_eq!(
+            wire.cumulative_bytes_received(),
+            1500,
+            "the final report counts"
+        );
+        assert_eq!(
+            wire.peer_bytes(rig.a_addr),
+            Some((0, 1000)),
+            "the final report leaves the per-peer table alone"
+        );
+        assert_eq!(wire.cumulative_bytes_sent(), 0, "sent is the socket's");
+    })
+}
+
 /// DATA_BLOCKED and STREAM_DATA_BLOCKED frames this side sent.
 fn blocked_frames(connection: &QuicConnection) -> u64 {
     let tx = connection.inner().stats().frame_tx;
@@ -4974,7 +5076,7 @@ async fn watch_for(
     ticks: u32,
 ) -> Option<(u32, super::recycle::Stall)> {
     use super::recycle::{ACK_WATCH_TICK, ACK_WATCH_WINDOW, AckWatch};
-    let mut watch = AckWatch::new(ACK_WATCH_WINDOW, ack_sample(connection, writers));
+    let mut watch = AckWatch::new(ACK_WATCH_WINDOW, ack_sample(connection, writers), false);
     for tick in 1..=ticks {
         time.sleep(ACK_WATCH_TICK).await;
         if watch.observe(time.now_nanos(), ack_sample(connection, writers)) {
@@ -5269,4 +5371,941 @@ fn the_bind_records_its_endpoint_state() {
         record < branch,
         "recorded before the result is used, for both arms"
     );
+}
+
+/// A real QUIC handshake under `server_tls_proven`: two clients with
+/// different keys connect through ONE server configuration, each is
+/// accepted, the key read from each connection (`proven_client_key`) is that
+/// client's own, and the ALPN agreed is the native one. A verifier that kept
+/// the first client's key would refuse the second.
+#[test]
+fn a_proven_server_config_accepts_each_client_by_its_own_key() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let net = crate::transport::test_net::subnet();
+        let pair = pair("quic-identity-proven", net.addr(1), net.addr(2), None).await;
+        // The attempt reaches `accept` only from an allowed address; the key
+        // it is allowed with is not used by this server configuration.
+        let _permit = pair.b.allow_peer(pair.a_addr, &pair.a_key()).unwrap();
+        let shared = Arc::new(pair.b.identity.server_tls_proven().unwrap());
+        let server_peer = PeerKey::of(pair.b_keys.public()).unwrap();
+        let second_keys = TransportKeypair::new();
+        let second = Arc::new(QuicIdentity::new(&second_keys).unwrap());
+        let clients = [
+            (&pair.a.identity, pair.a_keys.public()),
+            (&second, second_keys.public()),
+        ];
+        for (identity, expected) in clients {
+            let tls = identity
+                .client_tls_for(&server_peer, config::Alpn::Native)
+                .unwrap();
+            let (client, server) = attempt(
+                &pair.time,
+                &pair.a,
+                &pair.b,
+                pair.b_addr,
+                (pair.a.client_config(Arc::new(tls)), server_peer.clone()),
+                ServerTls::Shared(shared.clone()),
+            )
+            .await;
+            let client = client.expect("the client connects");
+            let server = server.expect("the server accepts");
+            let proven = super::identity::proven_client_key(server.inner())
+                .expect("the connection carries the proven key");
+            assert_eq!(proven.transport_key(), expected);
+            let protocol = server
+                .inner()
+                .handshake_data()
+                .and_then(|data| data.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
+                .and_then(|data| data.protocol);
+            assert_eq!(protocol.as_deref(), Some(config::NATIVE_ALPN));
+            client.inner().close(0u32.into(), b"");
+            server.inner().close(0u32.into(), b"");
+        }
+    })
+}
+
+/// Turn gateway admission on for `endpoint` with room for 64 paths' worth of
+/// joiners, as the hub does with the node's path permits.
+fn enable_admission(endpoint: &QuicEndpoint, time: VirtualTime) -> bool {
+    endpoint.attach_joiner_cap(super::upgrade::policy::QuicPathPermits::new(64));
+    endpoint.enable_gateway_admission(time)
+}
+
+/// What a client's native dial to `server` gave, and what `server`'s
+/// accept loop made of the attempts it read, for the admission tests.
+async fn native_dial_to_gateway(
+    time: &VirtualTime,
+    client: &QuicEndpoint,
+    server: &QuicEndpoint,
+    server_addr: SocketAddr,
+    server_key: &TransportPublicKey,
+    limit: Duration,
+) -> (
+    Result<QuicConnection, QuicConnectError>,
+    Option<Result<QuicConnection, super::JoinerError>>,
+) {
+    let server_peer = PeerKey::of(server_key).unwrap();
+    let tls = client
+        .identity
+        .client_tls_for(&server_peer, config::Alpn::Native)
+        .unwrap();
+    let client_config = client.client_config(Arc::new(tls));
+    let (client, server) = (client.clone(), server.clone());
+    drive(time, limit, async move {
+        let accept = async {
+            match server.accept_attempt().await {
+                Some(super::EndpointAttempt::Joiner(joiner)) => Some(
+                    joiner
+                        .establish()
+                        .await
+                        .map(|(connection, _charge)| connection),
+                ),
+                Some(super::EndpointAttempt::Allowed(_)) => {
+                    panic!("the client was never allowed")
+                }
+                None => None,
+            }
+        };
+        let dial = client.connect_with(server_addr, client_config, server_peer);
+        tokio::join!(dial, accept)
+    })
+    .await
+}
+
+/// With gateway admission on, a client the gateway was never told about
+/// joins natively: its first Initial is answered with a Retry, the second is
+/// admitted, and the handshake proves the client's own transport key, which
+/// becomes the connection's peer key. The client's address is on the
+/// allow-set for the connection's life.
+#[test]
+fn a_gateway_with_admission_accepts_a_native_join_from_an_unknown_source() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let net = crate::transport::test_net::subnet();
+        let pair = pair("quic-admission-join", net.addr(1), net.addr(2), None).await;
+        assert!(enable_admission(&pair.b, pair.time.clone()));
+        assert!(
+            !enable_admission(&pair.b, pair.time.clone()),
+            "once per endpoint"
+        );
+        let (dialled, joined) = native_dial_to_gateway(
+            &pair.time,
+            &pair.a,
+            &pair.b,
+            pair.b_addr,
+            pair.b_keys.public(),
+            Duration::from_secs(30),
+        )
+        .await;
+        let client = dialled.expect("the client connects");
+        let server = joined
+            .expect("an admitted joiner")
+            .expect("the handshake proves a key");
+        assert_eq!(server.peer_key().transport_key(), pair.a_keys.public());
+        // The gateway's first answer was a Retry (long header, type 3), and it
+        // sent exactly one: the token-bearing second Initial was admitted.
+        let from_gateway: Vec<Vec<u8>> = pair
+            .sent()
+            .into_iter()
+            .filter(|sent| sent.from == pair.b_addr && sent.to == pair.a_addr)
+            .map(|sent| sent.bytes)
+            .collect();
+        let is_retry = |bytes: &[u8]| bytes[0] & 0x80 != 0 && (bytes[0] & 0x30) >> 4 == 3;
+        assert!(is_retry(&from_gateway[0]), "the first answer is a Retry");
+        assert_eq!(from_gateway.iter().filter(|b| is_retry(b)).count(), 1);
+        let protocol = server
+            .inner()
+            .handshake_data()
+            .and_then(|data| data.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
+            .and_then(|data| data.protocol);
+        assert_eq!(
+            protocol.as_deref(),
+            Some(config::NATIVE_ALPN),
+            "native only"
+        );
+        assert!(
+            pair.b_socket.is_quic_source_allowed(pair.a_addr),
+            "the joiner's address is on the allow-set while it is connected"
+        );
+        assert_eq!(
+            pair.b.admission.get().expect("enabled").decisions.tracked(),
+            1,
+            "a join whose handshake started keeps its admission"
+        );
+        drop(server);
+        drop(client);
+    })
+}
+
+/// Without admission, the same dial reaches nothing: the attempt from a
+/// source nobody named is never handed to the accept loop as a joiner, and
+/// the demux drops it.
+#[test]
+fn without_admission_a_native_dial_from_an_unknown_source_gets_nothing() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let net = crate::transport::test_net::subnet();
+        let pair = pair("quic-admission-off", net.addr(1), net.addr(2), None).await;
+        let server_peer = PeerKey::of(pair.b_keys.public()).unwrap();
+        let tls = pair
+            .a
+            .identity
+            .client_tls_for(&server_peer, config::Alpn::Native)
+            .unwrap();
+        let client_config = pair.a.client_config(Arc::new(tls));
+        let (a, b_addr, time) = (pair.a.clone(), pair.b_addr, pair.time.clone());
+        let dialled = drive(&pair.time, Duration::from_secs(60), async move {
+            time.timeout(Duration::from_secs(10), async move {
+                a.connect_with(b_addr, client_config, server_peer).await
+            })
+            .await
+        })
+        .await;
+        assert!(
+            !matches!(dialled, Some(Ok(_))),
+            "nothing answers within 10 s"
+        );
+        assert!(
+            pair.b_socket
+                .quic_outcome_count(crate::transport::metrics::QuicIngressOutcome::NotAllowed)
+                > 0,
+            "the Initials were dropped as not allowed"
+        );
+        assert_eq!(
+            pair.b_socket
+                .quic_outcome_count(crate::transport::metrics::QuicIngressOutcome::Forwarded),
+            0,
+            "and none reached the endpoint"
+        );
+    })
+}
+
+/// A second validated attempt from the same address within a second is
+/// ignored. Driven through the accept path directly: two clients on one
+/// address are not possible on the simulated network, so this checks the
+/// decision the accept loop applies, on the endpoint's own admission.
+#[test]
+fn a_gateways_admission_decides_on_the_endpoints_clock() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let net = crate::transport::test_net::subnet();
+        let pair = pair("quic-admission-clock", net.addr(1), net.addr(2), None).await;
+        assert!(enable_admission(&pair.b, pair.time.clone()));
+        use super::admission::tests::{DecideKept, Verdict};
+        let admission = &pair.b.admission.get().expect("enabled").decisions;
+        let from = pair.a_addr;
+        assert_eq!(admission.decide_kept(from, true), Verdict::Admit);
+        assert_eq!(admission.decide_kept(from, true), Verdict::ThrottledAddress);
+        pair.time.advance(Duration::from_secs(1));
+        assert_eq!(
+            admission.decide_kept(from, true),
+            Verdict::Admit,
+            "a second on the endpoint's virtual clock"
+        );
+    })
+}
+
+/// The gateway's whole join (`driver::join_gateway`): handshake and Hello
+/// exchange within the window, then, until phase B hands the connection to
+/// the node, a close at the hook counted as `joined`. A client that never
+/// sends its Hello ends as `hello_failed` once the window is over.
+#[test]
+fn an_admitted_join_exchanges_hellos_and_is_closed_at_the_hook() {
+    use super::upgrade::driver::join_gateway;
+    use crate::transport::metrics::GatewayAdmission;
+    for client_sends_hello in [true, false] {
+        bounded(move || async move {
+            let _seed = GlobalRng::seed_guard(SEED);
+            let net = crate::transport::test_net::subnet();
+            let pair = pair("quic-admission-hello", net.addr(1), net.addr(2), None).await;
+            assert!(enable_admission(&pair.b, pair.time.clone()));
+            let server_peer = PeerKey::of(pair.b_keys.public()).unwrap();
+            let tls = pair
+                .a
+                .identity
+                .client_tls_for(&server_peer, config::Alpn::Native)
+                .unwrap();
+            let client_config = pair.a.client_config(Arc::new(tls));
+            let (a, b, b_addr, time) = (
+                pair.a.clone(),
+                pair.b.clone(),
+                pair.b_addr,
+                pair.time.clone(),
+            );
+            let (client, joined) = drive(&pair.time, Duration::from_secs(60), async move {
+                let client = async {
+                    let connection = a
+                        .connect_with(b_addr, client_config, server_peer)
+                        .await
+                        .expect("the client connects");
+                    if client_sends_hello {
+                        let own = super::native::setup::own_hello(b_addr, 0);
+                        let hello = super::native::exchange::exchange(
+                            &connection,
+                            &own,
+                            true,
+                            &time,
+                            Duration::from_secs(8),
+                        )
+                        .await;
+                        assert!(hello.is_ok(), "{hello:?}");
+                    }
+                    connection
+                };
+                let server = async {
+                    match b.accept_attempt().await {
+                        Some(super::EndpointAttempt::Joiner(joiner)) => {
+                            join_gateway(joiner, &time).await
+                        }
+                        Some(super::EndpointAttempt::Allowed(_)) | None => {
+                            panic!("an admitted joiner")
+                        }
+                    }
+                };
+                tokio::join!(client, server)
+            })
+            .await;
+            if client_sends_hello {
+                assert_eq!(joined, GatewayAdmission::Joined);
+                let closed = drive(&pair.time, Duration::from_secs(10), async move {
+                    client.inner().closed().await
+                })
+                .await;
+                assert!(
+                    matches!(&closed, quinn::ConnectionError::ApplicationClosed(close)
+                        if close.error_code == QuicCloseCode::NodeDroppedPeer.code().into()),
+                    "{closed:?}"
+                );
+            } else {
+                assert_eq!(joined, GatewayAdmission::HelloFailed);
+            }
+        })
+    }
+}
+
+/// The gateway keeps the connection open until its Hello is acknowledged: a
+/// close stops retransmission, so with the gateway's first transmissions lost
+/// (everything it sends is dropped for a while after the handshake) a join
+/// that closed as soon as the exchange returned would leave the client with
+/// no Hello while counting `joined`. Here the client gets its Hello, by
+/// retransmission, and the join still counts as `joined`.
+#[test]
+fn a_gateway_hello_lost_at_first_is_retransmitted_before_the_join_closes() {
+    use super::upgrade::driver::join_gateway;
+    use crate::transport::metrics::GatewayAdmission;
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let net = crate::transport::test_net::subnet();
+        let pair = pair("quic-admission-hello-lost", net.addr(1), net.addr(2), None).await;
+        assert!(enable_admission(&pair.b, pair.time.clone()));
+        let server_peer = PeerKey::of(pair.b_keys.public()).unwrap();
+        let tls = pair
+            .a
+            .identity
+            .client_tls_for(&server_peer, config::Alpn::Native)
+            .unwrap();
+        let client_config = pair.a.client_config(Arc::new(tls));
+        let (a, b, b_addr, time) = (
+            pair.a.clone(),
+            pair.b.clone(),
+            pair.b_addr,
+            pair.time.clone(),
+        );
+        let muted = pair.b_muted.clone();
+        let (hello, joined) = drive(&pair.time, Duration::from_secs(60), async move {
+            let client = async {
+                let connection = a
+                    .connect_with(b_addr, client_config, server_peer)
+                    .await
+                    .expect("the client connects");
+                // The gateway's Hello is sent after the handshake finishes,
+                // which needs this side's last flight: mute from here.
+                muted.store(true, std::sync::atomic::Ordering::SeqCst);
+                let heal = async {
+                    time.sleep(Duration::from_millis(500)).await;
+                    muted.store(false, std::sync::atomic::Ordering::SeqCst);
+                };
+                let own = super::native::setup::own_hello(b_addr, 0);
+                let (hello, ()) = tokio::join!(
+                    super::native::exchange::exchange(
+                        &connection,
+                        &own,
+                        true,
+                        &time,
+                        Duration::from_secs(8),
+                    ),
+                    heal
+                );
+                hello
+            };
+            let server = async {
+                match b.accept_attempt().await {
+                    Some(super::EndpointAttempt::Joiner(joiner)) => {
+                        join_gateway(joiner, &time).await
+                    }
+                    Some(super::EndpointAttempt::Allowed(_)) | None => {
+                        panic!("an admitted joiner")
+                    }
+                }
+            };
+            tokio::join!(client, server)
+        })
+        .await;
+        assert!(hello.is_ok(), "the client's exchange: {hello:?}");
+        assert_eq!(joined, GatewayAdmission::Joined);
+    })
+}
+
+/// An admission whose attempt cannot be accepted is given back: with the
+/// gateway's allow-set full, the client's validated attempt is admitted and
+/// then dropped, and the record is empty again (the address and the node's
+/// rate are as before), so the client gets nothing and costs nothing.
+#[test]
+fn an_admission_refused_by_a_full_allow_set_is_given_back() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let net = crate::transport::test_net::subnet();
+        let pair = pair("quic-admission-allow-full", net.addr(1), net.addr(2), None).await;
+        assert!(enable_admission(&pair.b, pair.time.clone()));
+        let max = crate::transport::demux::QUIC_ALLOWED_SOURCES_MAX;
+        // Allow-set entries only: never bound, sent to, or read from a log.
+        let filler = |i: usize| SocketAddr::from(([10, 252, (i >> 8) as u8, i as u8], 1)); // test_net: exempt (allow-set filler)
+        let fillers: Vec<_> = (0..max)
+            .map(|i| pair.b_socket.allow_quic_source(filler(i)).expect("room"))
+            .collect();
+        let server_peer = PeerKey::of(pair.b_keys.public()).unwrap();
+        let tls = pair
+            .a
+            .identity
+            .client_tls_for(&server_peer, config::Alpn::Native)
+            .unwrap();
+        let client_config = pair.a.client_config(Arc::new(tls));
+        let (a, b, b_addr, time) = (
+            pair.a.clone(),
+            pair.b.clone(),
+            pair.b_addr,
+            pair.time.clone(),
+        );
+        let decided = drive(&pair.time, Duration::from_secs(60), async move {
+            let dial = time.timeout(Duration::from_secs(10), async move {
+                a.connect_with(b_addr, client_config, server_peer).await
+            });
+            // The accept loop: every attempt is a Retry or refused, so none
+            // comes out before the dial gives up.
+            let accept = time.timeout(Duration::from_secs(10), async move {
+                b.accept_attempt().await.map(super::EndpointAttempt::ignore)
+            });
+            let (dialled, accepted) = tokio::join!(dial, accept);
+            (matches!(dialled, Some(Ok(_))), accepted.is_some())
+        })
+        .await;
+        assert_eq!(decided, (false, false), "nothing was accepted");
+        assert_eq!(
+            pair.b.admission.get().expect("enabled").decisions.tracked(),
+            0,
+            "the admission was given back"
+        );
+        drop(fillers);
+    })
+}
+
+/// An admitted joiner dropped before its handshake starts (the accept
+/// queue or the join queue full, or the node stopping, all drop it the same
+/// way) gives its admission back; one whose handshake started keeps it.
+#[test]
+fn a_dropped_joiner_gives_its_admission_back() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let net = crate::transport::test_net::subnet();
+        let pair = pair("quic-admission-dropped", net.addr(1), net.addr(2), None).await;
+        assert!(enable_admission(&pair.b, pair.time.clone()));
+        let server_peer = PeerKey::of(pair.b_keys.public()).unwrap();
+        let tls = pair
+            .a
+            .identity
+            .client_tls_for(&server_peer, config::Alpn::Native)
+            .unwrap();
+        let client_config = pair.a.client_config(Arc::new(tls));
+        let (a, b, b_addr, time) = (
+            pair.a.clone(),
+            pair.b.clone(),
+            pair.b_addr,
+            pair.time.clone(),
+        );
+        let tracked = drive(&pair.time, Duration::from_secs(60), async move {
+            let dial = time.timeout(Duration::from_secs(10), async move {
+                a.connect_with(b_addr, client_config, server_peer).await
+            });
+            let accept = async {
+                let tracked = || b.admission.get().expect("enabled").decisions.tracked();
+                let Some(super::EndpointAttempt::Joiner(joiner)) = b.accept_attempt().await else {
+                    panic!("an admitted joiner");
+                };
+                let held = tracked();
+                joiner.ignore();
+                (held, tracked())
+            };
+            tokio::join!(dial, accept).1
+        })
+        .await;
+        assert_eq!(
+            tracked,
+            (1, 0),
+            "recorded while held, given back when dropped"
+        );
+    })
+}
+
+/// A client config for a native dial from `client` to the gateway whose
+/// transport key is `server_key`.
+fn native_client_config(
+    client: &QuicEndpoint,
+    server_key: &TransportPublicKey,
+) -> (quinn::ClientConfig, PeerKey) {
+    let server_peer = PeerKey::of(server_key).unwrap();
+    let tls = client
+        .identity
+        .client_tls_for(&server_peer, config::Alpn::Native)
+        .unwrap();
+    (client.client_config(Arc::new(tls)), server_peer)
+}
+
+/// Item 5 (joiners inside the connection cap): a native joiner takes a
+/// handshake-phase charge from its admission and gives it back at the first
+/// of the exits. Each exit is a row: the joiner is dropped before its
+/// handshake (`ignored`), the handshake fails (`handshake_failed`), the
+/// handshake cannot finish within the window (`window_elapsed`), the Hello
+/// does not arrive in time (`hello_failed`), and the join completes and the
+/// connection is closed (`closed`). A promoted joiner (`promoted`) is
+/// re-charged at the full rate instead.
+#[test]
+fn a_joiner_is_charged_from_admission_and_released_at_each_exit() {
+    use super::upgrade::driver::join_gateway;
+    use super::upgrade::policy::QuicPathPermits;
+    use crate::transport::metrics::GatewayAdmission;
+    for exit in [
+        "ignored",
+        "handshake_failed",
+        "window_elapsed",
+        "hello_failed",
+        "closed",
+        "promoted",
+    ] {
+        bounded(move || async move {
+            let _seed = GlobalRng::seed_guard(SEED);
+            let net = crate::transport::test_net::subnet();
+            let pair = pair("quic-joiner-cap-exits", net.addr(1), net.addr(2), None).await;
+            let cap = QuicPathPermits::new(3);
+            assert!(pair.b.attach_joiner_cap(cap.clone()));
+            assert!(pair.b.enable_gateway_admission(pair.time.clone()));
+            let wrong_key = TransportKeypair::new();
+            let dialed_key = if exit == "handshake_failed" {
+                wrong_key.public().clone()
+            } else {
+                pair.b_keys.public().clone()
+            };
+            let (client_config, server_peer) = native_client_config(&pair.a, &dialed_key);
+            let (a, b, b_addr, time, muted, cap) = (
+                pair.a.clone(),
+                pair.b.clone(),
+                pair.b_addr,
+                pair.time.clone(),
+                pair.b_muted.clone(),
+                cap.clone(),
+            );
+            let time_for_client = pair.time.clone();
+            let (held, outcome, after) = drive(&pair.time, Duration::from_secs(60), async move {
+                let client_time = time.clone();
+                let client = async move {
+                    let connection = a.connect_with(b_addr, client_config, server_peer).await;
+                    if let (Ok(connection), "hello_failed" | "closed" | "promoted") =
+                        (&connection, exit)
+                    {
+                        if exit != "hello_failed" {
+                            let own = super::native::setup::own_hello(b_addr, 0);
+                            drop(
+                                super::native::exchange::exchange(
+                                    connection,
+                                    &own,
+                                    true,
+                                    &client_time,
+                                    Duration::from_secs(8),
+                                )
+                                .await,
+                            );
+                        }
+                    }
+                    connection
+                };
+                let server = async {
+                    let Some(super::EndpointAttempt::Joiner(joiner)) = b.accept_attempt().await
+                    else {
+                        panic!("an admitted joiner");
+                    };
+                    let held = cap.joiners_in_use();
+                    let outcome = match exit {
+                        "ignored" => {
+                            joiner.ignore();
+                            None
+                        }
+                        "promoted" => {
+                            let (connection, charge) =
+                                joiner.establish().await.expect("established");
+                            let path = charge.promote().ok().expect("room at the full rate");
+                            let promoted = (cap.joiners_in_use(), cap.in_use());
+                            drop(connection);
+                            drop(path);
+                            assert_eq!(promoted, (0, 1), "re-charged as a path");
+                            None
+                        }
+                        "window_elapsed" => {
+                            muted.store(true, std::sync::atomic::Ordering::SeqCst);
+                            Some(join_gateway(joiner, &time).await)
+                        }
+                        _ => Some(join_gateway(joiner, &time).await),
+                    };
+                    (held, outcome, (cap.joiners_in_use(), cap.in_use()))
+                };
+                // The client of a join that ends early has nothing to wait for.
+                let client = time_for_client.timeout(Duration::from_secs(20), client);
+                let (_client, server) = tokio::join!(client, server);
+                server
+            })
+            .await;
+            assert_eq!(held, 1, "{exit}: charged from admission");
+            assert_eq!(after, (0, 0), "{exit}: released");
+            let want = match exit {
+                "ignored" | "promoted" => None,
+                "handshake_failed" | "window_elapsed" => Some(GatewayAdmission::HandshakeFailed),
+                "hello_failed" => Some(GatewayAdmission::HelloFailed),
+                _ => Some(GatewayAdmission::Joined),
+            };
+            assert_eq!(outcome, want, "{exit}");
+        })
+    }
+}
+
+/// The join window counts from the moment the hub queued the join, so time
+/// spent waiting for a join slot comes out of it: a join that waited past the
+/// window ends at once and gives its charge back, and one that waited part of
+/// it ends within the window as measured from the queueing, not from the
+/// start of its handshake.
+#[test]
+fn the_join_window_counts_from_queueing() {
+    use super::upgrade::driver::join_gateway;
+    use super::upgrade::policy::QuicPathPermits;
+    use crate::transport::metrics::GatewayAdmission;
+    // (seconds waited in the queue, wanted outcome, longest total from queueing)
+    for (waited, want, longest) in [
+        (9u64, GatewayAdmission::HandshakeFailed, 9u64),
+        (5, GatewayAdmission::HelloFailed, 9),
+    ] {
+        bounded(move || async move {
+            let _seed = GlobalRng::seed_guard(SEED);
+            let net = crate::transport::test_net::subnet();
+            let pair = pair("quic-joiner-window", net.addr(1), net.addr(2), None).await;
+            let cap = QuicPathPermits::new(3);
+            assert!(pair.b.attach_joiner_cap(cap.clone()));
+            assert!(pair.b.enable_gateway_admission(pair.time.clone()));
+            let (client_config, server_peer) = native_client_config(&pair.a, pair.b_keys.public());
+            let (a, b, b_addr, time) = (
+                pair.a.clone(),
+                pair.b.clone(),
+                pair.b_addr,
+                pair.time.clone(),
+            );
+            let (held, outcome, total, after) =
+                drive(&pair.time, Duration::from_secs(60), async move {
+                    let client = time.timeout(Duration::from_secs(30), async move {
+                        a.connect_with(b_addr, client_config, server_peer).await
+                    });
+                    let server = async {
+                        let Some(super::EndpointAttempt::Joiner(mut joiner)) =
+                            b.accept_attempt().await
+                        else {
+                            panic!("an admitted joiner");
+                        };
+                        let queued = time.now_nanos();
+                        joiner.stamp(queued);
+                        let held = cap.joiners_in_use();
+                        time.advance(Duration::from_secs(waited));
+                        let outcome = join_gateway(joiner, &time).await;
+                        let total = Duration::from_nanos(time.now_nanos() - queued);
+                        (held, outcome, total, cap.joiners_in_use())
+                    };
+                    tokio::join!(client, server).1
+                })
+                .await;
+            assert_eq!(held, 1, "charged while queued");
+            assert_eq!(outcome, want, "waited {waited} s");
+            assert!(
+                total <= Duration::from_secs(longest),
+                "waited {waited} s: held for {total:?} in all"
+            );
+            assert_eq!(after, 0, "released");
+        })
+    }
+}
+
+/// With no room in the cap a newcomer is ignored (no handshake, nothing
+/// recorded against the address or the rate), and once a joiner releases its
+/// charge the next one is admitted. Three paths of cap hold one joiner (a quarter of the cap).
+#[test]
+fn a_joiner_with_no_room_in_the_cap_is_ignored_until_one_is_released() {
+    use super::upgrade::policy::QuicPathPermits;
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let net = crate::transport::test_net::subnet();
+        let mut pair = pair("quic-joiner-cap-full", net.addr(1), net.addr(2), None).await;
+        let (c, c_keys) = pair.third(net.addr(3)).await;
+        let _ = c_keys;
+        let cap = QuicPathPermits::new(3);
+        assert!(pair.b.attach_joiner_cap(cap.clone()));
+        assert!(pair.b.enable_gateway_admission(pair.time.clone()));
+        let (a_config, server_peer) = native_client_config(&pair.a, pair.b_keys.public());
+        let (c_config, _) = native_client_config(&c, pair.b_keys.public());
+        let (a, b, b_addr, time) = (
+            pair.a.clone(),
+            pair.b.clone(),
+            pair.b_addr,
+            pair.time.clone(),
+        );
+        let (first_held, second_admitted, ignored_count, third_admitted) =
+            drive(&pair.time, Duration::from_secs(120), async move {
+                let first_peer = server_peer.clone();
+                let second_peer = server_peer.clone();
+                let first_dial = tokio::spawn(async move {
+                    drop(a.connect_with(b_addr, a_config, first_peer).await);
+                });
+                let Some(super::EndpointAttempt::Joiner(first)) = b.accept_attempt().await else {
+                    panic!("the first joiner");
+                };
+                let first_held = cap.joiners_in_use();
+                let admitted_before = b.admission.get().expect("enabled").decisions.tracked();
+                // The second joiner finds the cap full.
+                let c2 = c.clone();
+                let second_dial = tokio::spawn({
+                    let c_config = c_config.clone();
+                    async move {
+                        drop(c2.connect_with(b_addr, c_config, second_peer).await);
+                    }
+                });
+                let second = time
+                    .timeout(Duration::from_secs(10), {
+                        let b = b.clone();
+                        async move { b.accept_attempt().await }
+                    })
+                    .await;
+                let second_admitted = second.is_some();
+                let ignored_count = (
+                    cap.joiners_in_use(),
+                    b.admission.get().expect("enabled").decisions.tracked() - admitted_before,
+                );
+                second_dial.abort();
+                // Releasing the first admits a newcomer.
+                first.ignore();
+                let c3 = c.clone();
+                let third_dial = tokio::spawn(async move {
+                    drop(c3.connect_with(b_addr, c_config, server_peer).await);
+                });
+                let third = time
+                    .timeout(Duration::from_secs(20), {
+                        let b = b.clone();
+                        async move { b.accept_attempt().await }
+                    })
+                    .await;
+                third_dial.abort();
+                first_dial.abort();
+                (
+                    first_held,
+                    second_admitted,
+                    ignored_count,
+                    matches!(third, Some(Some(super::EndpointAttempt::Joiner(_)))),
+                )
+            })
+            .await;
+        assert_eq!(first_held, 1);
+        assert!(!second_admitted, "no room: ignored");
+        assert_eq!(
+            ignored_count,
+            (1, 0),
+            "still one charge held, and the ignored attempt recorded nothing"
+        );
+        assert!(third_admitted, "admitted once the charge was released");
+    })
+}
+
+/// Off by default: with gateway admission off (as it is on every node while
+/// `GATEWAY_NATIVE_ADMISSION` is false) an unknown source is ignored whether
+/// or not the cap is attached, no joiner is ever charged, and the hub is
+/// what attaches the cap.
+#[test]
+fn with_admission_off_no_joiner_is_charged() {
+    use super::upgrade::policy::QuicPathPermits;
+    const { assert!(!super::admission::GATEWAY_NATIVE_ADMISSION) };
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let net = crate::transport::test_net::subnet();
+        let pair = pair("quic-joiner-cap-off", net.addr(1), net.addr(2), None).await;
+        let cap = QuicPathPermits::new(4);
+        assert!(pair.b.attach_joiner_cap(cap.clone()));
+        assert!(!pair.b.gateway_admission_enabled());
+        let (client_config, server_peer) = native_client_config(&pair.a, pair.b_keys.public());
+        let (a, b, b_addr, time) = (
+            pair.a.clone(),
+            pair.b.clone(),
+            pair.b_addr,
+            pair.time.clone(),
+        );
+        let (dialed, attempt) = drive(&pair.time, Duration::from_secs(60), async move {
+            let dial = time.timeout(Duration::from_secs(10), async move {
+                a.connect_with(b_addr, client_config, server_peer).await
+            });
+            let accept = time.timeout(
+                Duration::from_secs(10),
+                async move { b.accept_attempt().await },
+            );
+            tokio::join!(dial, accept)
+        })
+        .await;
+        assert!(dialed.is_none() || dialed.is_some_and(|dial| dial.is_err()));
+        assert!(attempt.is_none(), "nothing reached the accept loop");
+        assert_eq!(cap.joiners_in_use(), 0);
+        assert_eq!(cap.in_use(), 0);
+    });
+    // The cap the joiners are charged against is the node's path permits:
+    // the hub attaches them when it is built, and the accept path charges
+    // before it puts the address on the allow-set.
+    // Source scrapes, bounded to the production bodies (a renamed or missing
+    // function fails them): the hub attaches the permits in
+    // `QuicUpgrades::new`, and `EndpointCore::admit` charges before it allows.
+    use crate::transport::demux::production_fn_body;
+    let new_body = production_fn_body(
+        include_str!("upgrade/driver.rs"),
+        "    pub(in crate::transport) fn new(\n        endpoint: QuicEndpoint,",
+    );
+    assert!(new_body.contains("endpoint.attach_joiner_cap(policy.permits().clone());"));
+    let admit = production_fn_body(
+        include_str!("../quic.rs"),
+        "    fn admit(&self, gate: &GatewayAdmission, incoming: quinn::Incoming)",
+    );
+    let charge = admit.find("try_acquire_joiner").expect("the charge");
+    let allow = admit
+        .find("self.sources.allow_joiner(remote)")
+        .expect("the allow");
+    assert!(charge < allow, "charged before the address is allowed");
+}
+
+/// The whole path on a gateway listener, as the node builds it: a test
+/// override turns admission on for this one listener (and the test checks
+/// it took: the endpoint admits and the join task is registered), the
+/// listener's demux, accept loop, attempt router and registered join task
+/// carry a native dial from an address nobody named through the handshake
+/// and the Hello exchange, and the join is closed at the phase-B hook.
+#[test]
+fn a_gateway_listener_with_admission_carries_a_join_to_the_hook() {
+    bounded(|| async move {
+        use crate::node::background_task_monitor::BackgroundTaskMonitor;
+        use crate::transport::connection_handler::{UdpTransportConfig, bind_udp_listener};
+        use crate::transport::quic::breaker::BreakerOutcome;
+        use crate::transport::quic::upgrade::policy::QuicPolicyConfig;
+        let _seed = GlobalRng::seed_guard(SEED);
+        let network = "quic-admission-listener";
+        let time = VirtualTime::new();
+        let _clock = Registration::time_source(network, time.clone());
+        let net = crate::transport::test_net::subnet();
+        let (gateway, client_addr) = (net.addr_port(1, 5100), net.addr_port(2, 5101));
+        let _gateway_net = Registration::address(gateway, network);
+        let _client_net = Registration::address(client_addr, network);
+        let _forced = super::admission::force_on_for_test(gateway);
+
+        let monitor = BackgroundTaskMonitor::new();
+        let registrar = monitor.late_registrar();
+        let wait = tokio::spawn(monitor.wait_for_any_exit());
+        let mut network_config: crate::config::NetworkApiConfig =
+            toml::from_str("").expect("default network config");
+        network_config.transport_quic = Some("shadow".to_string());
+        let gateway_keys = TransportKeypair::new();
+        let (outbound, _inbound, listener) = bind_udp_listener::<SimulationSocket>(
+            gateway_keys.clone(),
+            gateway.ip(),
+            gateway.port(),
+            true,
+            UdpTransportConfig {
+                quic: Some(settings()),
+                quic_policy: Some(QuicPolicyConfig::new(
+                    &network_config,
+                    BreakerOutcome::NotConsulted,
+                )),
+                task_registrar: Some(registrar.clone()),
+                ..UdpTransportConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+        let endpoint = outbound.quic_endpoint().expect("an endpoint");
+        assert!(endpoint.gateway_admission_enabled(), "the override took");
+        assert!(
+            registrar.registered().contains(&"quic_gateway_joins"),
+            "{:?}",
+            registrar.registered()
+        );
+
+        let client_socket = Arc::new(DemuxSocket::wrap(
+            SimulationSocket::bind(client_addr).await.expect("sim bind"),
+            None,
+        ));
+        let client_keys = TransportKeypair::new();
+        let client = QuicEndpoint::bind(
+            client_socket.clone(),
+            client_addr,
+            time.clone(),
+            &settings(),
+            &client_keys,
+        )
+        .expect("client endpoint");
+        let pump = tokio::spawn({
+            let socket = client_socket.clone();
+            async move {
+                let mut buf = vec![0u8; MAX_RECV_PACKET_SIZE];
+                while socket.recv_classified(&mut buf).await.is_ok() {}
+            }
+        });
+        let server_peer = PeerKey::of(gateway_keys.public()).unwrap();
+        let tls = client
+            .identity
+            .client_tls_for(&server_peer, config::Alpn::Native)
+            .unwrap();
+        let client_config = client.client_config(Arc::new(tls));
+        let clock = time.clone();
+        let closed = drive(&time, Duration::from_secs(60), async move {
+            let connection = client
+                .connect_with(gateway, client_config, server_peer)
+                .await
+                .expect("the gateway admits the join");
+            let own = super::native::setup::own_hello(gateway, 0);
+            let hello = super::native::exchange::exchange(
+                &connection,
+                &own,
+                true,
+                &clock,
+                Duration::from_secs(8),
+            )
+            .await;
+            assert!(hello.is_ok(), "{hello:?}");
+            connection.inner().closed().await
+        })
+        .await;
+        assert!(
+            matches!(&closed, quinn::ConnectionError::ApplicationClosed(close)
+                if close.error_code == QuicCloseCode::NodeDroppedPeer.code().into()),
+            "{closed:?}"
+        );
+        assert!(!wait.is_finished(), "no registered task ended");
+        pump.abort();
+        wait.abort();
+        listener.abort();
+        crate::transport::in_memory_socket::clear_quic_endpoint_clocks(network);
+    })
 }

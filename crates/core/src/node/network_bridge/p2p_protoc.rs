@@ -56,6 +56,8 @@ mod connection_lifecycle;
 mod connection_map;
 mod dispatch;
 mod identity;
+#[cfg(all(test, not(feature = "simulation_tests")))]
+mod large_state_fanout_tests;
 mod migration;
 mod zombie_sweep;
 
@@ -120,7 +122,13 @@ async fn query_app_subscriptions_bounded(
     let (tx, mut rx) = tokio::sync::mpsc::channel(1);
     match timeout(
         QUERY_SUBSCRIPTIONS_HANDLER_TIMEOUT,
-        ch_outbound.send_to_handler(ContractHandlerEvent::QuerySubscriptions { callback: tx }),
+        // Diagnostics, so the background lane: it must not take relay-lane
+        // room from peers' requests (ANT-2026-K0YQ8CG4). A refusal yields an
+        // empty list, like any other failure here.
+        ch_outbound.send_to_handler_prioritized(
+            ContractHandlerEvent::QuerySubscriptions { callback: tx },
+            crate::contract::Priority::Background,
+        ),
     )
     .await
     {
@@ -564,7 +572,46 @@ struct ConnectionEntry {
     /// `None` when the version wasn't exchanged (e.g. joiner->gateway path).
     /// Used to gate version-dependent message types (e.g. SubscribeHint).
     remote_version: Option<(u8, u8, u16)>,
+    /// Whether this transport is a QUIC-native connection rather than a
+    /// legacy UDP one. The survivor rule reads it: when a node holds, or is
+    /// handed, a native and a UDP connection to one peer, it keeps the
+    /// native one once it has carried a frame from the peer
+    /// (`P2pConnManager::promote_held_native`, and
+    /// `P2pConnManager::swap_udp_in_beside_native` while it has not).
+    native: bool,
+    /// Whether this transport has carried a frame from the peer. A UDP
+    /// entry is born with one (its handshake was a round trip). A native
+    /// entry gets it from the listener's first decoded message
+    /// (`ConnEvent::NativeFirstFrame`): until then a UDP connection that
+    /// arrives for the same peer is kept beside it (`HeldNative` mirrors
+    /// this for the native connection kept beside a UDP entry) rather than
+    /// dropped, because only one end may have finished the native setup.
+    frame_seen: bool,
 }
+
+/// A QUIC-native connection kept beside the UDP entry for the same peer
+/// until it has carried a frame from the peer (option (b), 10.4 answer 2).
+/// Its listener runs, but nothing is sent over it except the first-frame
+/// probe, and the peer's messages it receives are handled by address like
+/// any other. The entry swaps to it on `NativeFirstFrame`, or it is
+/// dropped when it closes, when `HELD_NATIVE_WINDOW` passes, or when no UDP
+/// entry for the same peer remains. Bounded: at most one per address.
+struct HeldNative {
+    sender: PeerConnChannelSender,
+    connection_id: u64,
+    receipt: Option<crate::transport::ReceiptStamp>,
+    remote_version: Option<(u8, u8, u16)>,
+    /// The key the connection proved, which the entry it would replace must
+    /// still be bound to.
+    key: TransportPublicKey,
+    since: Instant,
+}
+
+/// How long a native connection is kept beside the UDP entry waiting for a
+/// frame from the peer: past the native setup window's start skew, so the
+/// peer's own setup can finish and its probe arrive. On expiry the native
+/// connection is dropped and UDP stays.
+const HELD_NATIVE_WINDOW: Duration = Duration::from_secs(15);
 
 impl ConnectionEntry {
     /// The key bound to this connection, if any.
@@ -704,6 +751,9 @@ pub(in crate::node) struct P2pConnManager {
     /// Must be kept in sync with `connections`.
     /// Uses BTreeMap for deterministic iteration order in simulation tests.
     addr_by_pub_key: identity::KeyIndex,
+    /// Native connections kept beside a UDP entry until they carry a frame
+    /// from the peer (see [`HeldNative`]). Keyed by the entry's address.
+    held_native: HashMap<SocketAddr, HeldNative>,
     conn_event_tx: Option<Sender<ConnEvent>>,
     key_pair: TransportKeypair,
     listening_ip: IpAddr,
@@ -1174,8 +1224,11 @@ use crate::operations::connect::native::NativeWire;
 /// Raised from 0.2.158 to 0.2.159 by the QUIC data ramp PR (#6224): 0.2.158
 /// starts the data ramp, and turning on the native connect offer in the same
 /// release would change two things at once. Raised to 0.2.160 for 0.2.159,
-/// which ships while the data ramp is still under watch.
-pub(crate) const QUIC_NATIVE_MIN_VERSION: (u8, u8, u16) = (0, 2, 160);
+/// which ships while the data ramp is still under watch. Raised to 0.2.161
+/// for 0.2.160: native connect is still off (`QUIC_NATIVE_PERCENT` is 0) and
+/// its wire fields may change before it is enabled, so no release is frozen
+/// as the floor yet. Raised to 0.2.162 for 0.2.161 for the same reasons.
+pub(crate) const QUIC_NATIVE_MIN_VERSION: (u8, u8, u16) = (0, 2, 162);
 
 /// Has the decoder for the QUIC-native `ConnectMsg` variants shipped, and in
 /// which release?
@@ -1265,7 +1318,15 @@ impl P2pConnManager {
 
     /// Removes a transport from the connection map and the open-transport set.
     fn remove_connection(&mut self, addr: SocketAddr) -> Option<ConnectionEntry> {
-        self.connections.remove(addr)
+        let removed = self.connections.remove(addr);
+        // A native connection held beside the entry belongs to its session:
+        // it must never be promoted onto a later entry at this address.
+        self.held_native.remove(&addr);
+        #[cfg(any(test, feature = "testing"))]
+        if removed.is_some() {
+            self.trace_transport(addr, None);
+        }
+        removed
     }
 
     pub(in crate::node) fn listening_port(&self) -> u16 {
@@ -1361,6 +1422,7 @@ impl P2pConnManager {
             config.config.network_api.quic_ignore_crash_breaker,
             config.config.shutdown_drain_secs,
             quic_breaker_now,
+            crate::transport::quic::breaker::BreakerRole::from_is_gateway(config.is_gateway),
         )
         .await;
         // The endpoint state telemetry reports, when QUIC is already off here;
@@ -1388,6 +1450,7 @@ impl P2pConnManager {
             event_listener: Box::new(event_listener),
             connections,
             addr_by_pub_key: identity::KeyIndex::default(),
+            held_native: HashMap::new(),
             conn_event_tx: None,
             key_pair,
             listening_ip: listener_ip,
@@ -1483,6 +1546,17 @@ impl P2pConnManager {
         notification_channel: EventLoopNotificationsReceiver,
         node_controller: Receiver<NodeEvent>,
     ) -> anyhow::Result<Infallible> {
+        // A peer in a QUIC crash loop with no UDP to fall back to waits here,
+        // before its transport opens (#6151, `breaker::Verdict::Backoff`).
+        // The update check is already running by now; a stop ends the wait.
+        // Nothing waits unless the binary's breaker decided a backoff.
+        if crate::transport::quic::breaker::wait_out_crash_loop_backoff(&op_manager.shutting_down)
+            .await
+        {
+            // Stopped during the wait: do not bind the socket for a node
+            // that is going away.
+            return Err(EventLoopExitReason::GracefulShutdown.into());
+        }
         let transport = open_udp_transport::<S>(
             self.key_pair.clone(),
             self.listening_ip,
@@ -1529,6 +1603,7 @@ impl P2pConnManager {
             event_listener,
             connections,
             addr_by_pub_key,
+            held_native,
             conn_event_tx: _,
             key_pair,
             listening_ip,
@@ -1561,7 +1636,14 @@ impl P2pConnManager {
             expected_inbound,
             listener: mut listener_liveness,
             quic_endpoint: transport_has_quic,
+            quic_availability,
         } = transport;
+        bridge
+            .op_manager
+            .ring
+            .connection_manager
+            .native_connect()
+            .set_endpoint(quic_availability);
 
         tracing::info!(
             listening_port,
@@ -1625,6 +1707,7 @@ impl P2pConnManager {
             event_listener,
             connections,
             addr_by_pub_key,
+            held_native,
             conn_event_tx: Some(conn_event_tx.clone()),
             key_pair,
             listening_ip,
@@ -1704,8 +1787,11 @@ impl P2pConnManager {
                     &mut select_stream,
                     zombie_sweep::earliest(
                         zombie_sweep_state.backlog_deadline(),
-                        pending_claim_retry
-                            .deadline(ctx.addr_by_pub_key.may_have_pending_claims()),
+                        zombie_sweep::earliest(
+                            pending_claim_retry
+                                .deadline(ctx.addr_by_pub_key.may_have_pending_claims()),
+                            ctx.held_native_deadline(),
+                        ),
                     ),
                 ) => {
                     match wake {
@@ -1846,6 +1932,10 @@ impl P2pConnManager {
                 ctx.sweep_zombie_transports(&handshake_cmd_sender, &mut zombie_sweep_state, false)
                     .await;
             }
+
+            // Native connections kept beside a UDP entry that waited too long
+            // for a frame (`HeldNative`); a no-op when none is held.
+            ctx.expire_held_native(Instant::now());
 
             match event {
                 EventResult::Continue => continue,
@@ -2080,6 +2170,7 @@ impl P2pConnManager {
                                             callback,
                                             is_gw,
                                             origin: unconnected_dial_origin(is_gw),
+                                            transport: crate::operations::connect::native::DialTransport::Udp,
                                         }),
                                     ) {
                                         // `err` owns the ConnectPeer event (and thus the
@@ -2260,6 +2351,7 @@ impl P2pConnManager {
                                 "SetPeerIdentity reached the event loop; ignoring it"
                             );
                         }
+                        ConnEvent::NativeFirstFrame { .. } => {}
                         ConnEvent::TransportClosed {
                             remote_addr,
                             error,
@@ -2540,7 +2632,7 @@ impl P2pConnManager {
                                         // Best effort notification during shutdown - receiver may already be dropped
                                         for mut callback in callbacks {
                                             #[allow(clippy::let_underscore_must_use)]
-                                            let _ = callback.send_result(Err(())).await;
+                                            let _ = callback.send_result(Err(None)).await;
                                         }
                                     }
 
@@ -2653,6 +2745,7 @@ impl P2pConnManager {
                                 callback,
                                 is_gw: transient,
                                 origin,
+                                transport,
                             } => {
                                 tracing::debug!(
                                     tx = %tx,
@@ -2670,6 +2763,7 @@ impl P2pConnManager {
                                     &mut state,
                                     transient,
                                     origin,
+                                    transport,
                                 )
                                 .await?;
                             }
@@ -3198,14 +3292,14 @@ impl P2pConnManager {
 trait ConnectResultSender: Send {
     fn send_result(
         &mut self,
-        result: Result<(SocketAddr, Option<usize>), ()>,
+        result: crate::message::ConnectResult,
     ) -> Pin<Box<dyn Future<Output = Result<(), ()>> + Send + '_>>;
 }
 
-impl ConnectResultSender for mpsc::Sender<Result<(SocketAddr, Option<usize>), ()>> {
+impl ConnectResultSender for mpsc::Sender<crate::message::ConnectResult> {
     fn send_result(
         &mut self,
-        result: Result<(SocketAddr, Option<usize>), ()>,
+        result: crate::message::ConnectResult,
     ) -> Pin<Box<dyn Future<Output = Result<(), ()>> + Send + '_>> {
         async move { self.send(result).await.map_err(|_| ()) }.boxed()
     }
@@ -3282,7 +3376,7 @@ fn unsent_message_notice(
 /// Extracted as a free function so its callback/state invariants are
 /// unit-testable without standing up a full `P2pConnManager`:
 ///
-/// 1. Every awaiting callback for `peer_addr` is resolved with `Err(())` — never
+/// 1. Every awaiting callback for `peer_addr` is resolved with `Err(None)` — never
 ///    left parked — so callers (including the SubscribeHint resend-waiter) fail
 ///    fast and the op can retry.
 /// 2. `awaiting_connection` AND `awaiting_connection_txs` are both drained for
@@ -3315,7 +3409,7 @@ async fn fail_awaiting_connection(
             "Cleaning up callbacks after connect command failure"
         );
         for mut cb in callbacks {
-            cb.send_result(Err(()))
+            cb.send_result(Err(None))
                 .await
                 .inspect_err(|send_err| {
                     tracing::debug!(
@@ -3337,6 +3431,10 @@ async fn fail_awaiting_connection(
     // (3) Deliberately NO state.peer_backoff.record_failure() here.
 }
 
+/// One requester of a UDP dial running beside a native dial
+/// ([`EventListenerState::udp_beside_native`]): its transaction and callback.
+type BesideUdpRequester = (Transaction, Box<dyn ConnectResultSender>);
+
 struct EventListenerState {
     expected_inbound: Arc<dyn InboundExpectations>,
     pending_from_executor: HashSet<Transaction>,
@@ -3347,6 +3445,28 @@ struct EventListenerState {
     awaiting_connection:
         crate::util::DecisionHashMap<SocketAddr, Vec<Box<dyn ConnectResultSender>>>,
     awaiting_connection_txs: HashMap<SocketAddr, Vec<Transaction>>,
+    /// Addresses whose pending dial (`awaiting_connection`) is a QUIC-native
+    /// one. Removed when that dial ends.
+    native_pending: HashSet<SocketAddr>,
+    /// The callbacks of a UDP dial running BESIDE a native dial to the same
+    /// address. A UDP dial asked for while a native dial is pending is not
+    /// merged into it (the native dial's failure is not its failure, and a
+    /// UDP fallback must not fail with another CONNECT's native dial), and it
+    /// is not held back until the native dial ends (its hole punch must
+    /// overlap the peer's). It starts at once and its outcome, which carries
+    /// its transport, answers only these callbacks. A later UDP dial to the
+    /// address joins it. An entry ends with its dial's outcome, as an
+    /// `awaiting_connection` entry does; its requesters may be answered
+    /// earlier (the native dial connected first), leaving it empty until the
+    /// outcome arrives. Requesters are this node's own CONNECT ops, never a
+    /// remote peer's, so the bound is the dial's.
+    udp_beside_native: HashMap<SocketAddr, Vec<BesideUdpRequester>>,
+    /// Addresses whose UDP dial beside a still-pending native dial connected
+    /// first. If the native dial then connects too, it is swapped in for the
+    /// UDP connection (the survivor rule keeps native) and counted as
+    /// `connect_native_both_dials_connected_udp_first`. Cleared when the
+    /// native dial ends.
+    beside_udp_connected: HashSet<SocketAddr>,
     pending_op_results: HashMap<Transaction, Sender<WaiterReply>>,
     /// Last time pending_op_results was scanned for closed senders.
     last_pending_op_cleanup: Instant,
@@ -3368,6 +3488,9 @@ impl EventListenerState {
             pending_op_results: HashMap::new(),
             last_pending_op_cleanup: Instant::now(),
             awaiting_connection_txs: HashMap::new(),
+            native_pending: HashSet::new(),
+            udp_beside_native: HashMap::new(),
+            beside_udp_connected: HashSet::new(),
             peer_backoff: PeerConnectionBackoff::new(),
             last_backoff_cleanup: Instant::now(),
         }
@@ -3410,6 +3533,12 @@ pub(super) enum ConnEvent {
     },
     NodeAction(NodeEvent),
     ClosedChannel(ChannelCloseReason),
+    /// A native connection's listener decoded its first message from the
+    /// peer. Sent once per native connection, before that message.
+    NativeFirstFrame {
+        remote_addr: SocketAddr,
+        connection_id: u64,
+    },
     TransportClosed {
         remote_addr: SocketAddr,
         error: TransportError,
@@ -3765,6 +3894,7 @@ async fn handle_peer_channel_message(
                 | other @ ConnEvent::OutboundMessage(_)
                 | other @ ConnEvent::OutboundMessageWithTarget { .. }
                 | other @ ConnEvent::NodeAction(_)
+                | other @ ConnEvent::NativeFirstFrame { .. }
                 | other @ ConnEvent::TransportClosed { .. } => {
                     unreachable!(
                         "Unexpected action from peer_connection_listener channel: {:?}",
@@ -3864,14 +3994,21 @@ async fn peer_connection_listener(
     propagation: crate::operations::update::propagation_stats::PropagationSink,
     link_use: zombie_sweep::LinkUseStamp,
     native_wire: NativeWire,
+    report_first_frame: bool,
 ) {
     let remote_addr = conn.remote_addr();
+    // A native connection tells the event loop once when it first hears from
+    // the peer, for the survivor rule's hold (`HeldNative`).
+    let mut first_frame_pending = report_first_frame;
     tracing::debug!(
         to = %remote_addr,
         %peer_addr,
         "[CONN_LIFECYCLE] Starting peer_connection_listener task"
     );
 
+    // Transient send failures on this connection so far, for the warn's
+    // throttle (`warn_transient_send_failure`).
+    let mut transient_send_failures: u64 = 0;
     loop {
         // Yield to allow the tokio runtime to schedule other tasks.
         // This is critical for cooperative scheduling - without it, tokio's coop
@@ -3902,10 +4039,10 @@ async fn peer_connection_listener(
                     .await
                     {
                         if !error.closes_connection() {
-                            tracing::warn!(
-                                to = %remote_addr,
-                                ?error,
-                                "[CONN_LIFECYCLE] Transient send failure, continuing"
+                            warn_transient_send_failure(
+                                remote_addr,
+                                &error,
+                                &mut transient_send_failures,
                             );
                         } else {
                             tracing::debug!(
@@ -3971,10 +4108,10 @@ async fn peer_connection_listener(
                     Some(msg) => {
                         if let Err(error) = handle_peer_channel_message(&mut conn, msg, &outbound_mix, &propagation, native_wire).await {
                             if !error.closes_connection() {
-                                tracing::warn!(
-                                    to = %remote_addr,
-                                    ?error,
-                                    "[CONN_LIFECYCLE] Transient send failure, continuing"
+                                warn_transient_send_failure(
+                                    remote_addr,
+                                    &error,
+                                    &mut transient_send_failures,
                                 );
                             } else {
                                 tracing::debug!(
@@ -4032,6 +4169,19 @@ async fn peer_connection_listener(
                             // may not dequeue it for a while, and the zombie sweep
                             // must already see this transport as in use (#5654).
                             zombie_sweep::record_link_use_request(&link_use, &net_message, Instant::now());
+                            if first_frame_pending {
+                                first_frame_pending = false;
+                                if conn_events
+                                    .send(ConnEvent::NativeFirstFrame {
+                                        remote_addr,
+                                        connection_id,
+                                    })
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
                             if conn_events
                                 .send(ConnEvent::InboundMessage(IncomingMessage::with_remote(
                                     net_message,
@@ -4108,6 +4258,32 @@ async fn peer_connection_listener(
     }
 }
 
+/// Log a send that failed without ending the connection, throttled per
+/// connection: at the 1st, 2nd, 4th, 8th ... failure, with the count so far.
+/// A connection whose sends keep failing (a QUIC-native connection with its
+/// short queue backed up refuses every send with `SendQueueFull`) then logs a
+/// few lines over its life, not one per message.
+fn warn_transient_send_failure(
+    remote_addr: std::net::SocketAddr,
+    error: &crate::transport::TransportError,
+    failures: &mut u64,
+) {
+    *failures = failures.saturating_add(1);
+    if transient_failure_warns(*failures) {
+        tracing::warn!(
+            to = %remote_addr,
+            ?error,
+            failures_so_far = *failures,
+            "[CONN_LIFECYCLE] Transient send failure, continuing"
+        );
+    }
+}
+
+/// Whether the `count`th transient send failure on a connection is logged.
+fn transient_failure_warns(count: u64) -> bool {
+    count.is_power_of_two()
+}
+
 /// The telemetry label for a connection that `recv` ended: the idle timeout
 /// is the only liveness check, so it is the "timeout" case; every other recv
 /// error is a transport closure.
@@ -4130,7 +4306,10 @@ fn disconnect_reason_for_close(
 /// Log a stopped transport listener and return the error that ends the event
 /// loop. The log lines are the ones the node wrote when it read the listener
 /// task's `JoinHandle` itself: a returned error is logged with `error`, a
-/// panic or cancellation with `cause` and the join error's text.
+/// panic or cancellation with `cause` and the join error's text. A gateway
+/// restart for QUIC is not logged here: it returns
+/// [`crate::transport::GatewayQuicRestart`], which the node's fatal-listener
+/// path logs as the planned restart it is.
 fn listener_exit_error(exit: &ListenerExit) -> anyhow::Error {
     match exit {
         ListenerExit::Error(e) => {
@@ -4150,6 +4329,16 @@ fn listener_exit_error(exit: &ListenerExit) -> anyhow::Error {
                 cause = "cancelled",
                 "CRITICAL: UDP listen task failed: {join_err}"
             );
+        }
+        ListenerExit::QuicEndpointDown => {
+            return anyhow::Error::new(crate::transport::GatewayQuicRestart {
+                reason: "its QUIC endpoint died",
+            });
+        }
+        ListenerExit::QuicCooldownEnded => {
+            return anyhow::Error::new(crate::transport::GatewayQuicRestart {
+                reason: "the crash-breaker cooldown that kept QUIC off has ended",
+            });
         }
     }
     anyhow!(
@@ -4327,6 +4516,35 @@ pub(crate) mod tests {
         }
     }
 
+    /// A gateway restart for QUIC (#5940) ends the loop with the typed
+    /// error the fatal-listener path recognises, not the "transport layer is
+    /// dead" error, and is not logged as CRITICAL here.
+    #[test]
+    fn a_gateway_quic_restart_ends_the_loop_with_its_own_error() {
+        use crate::transport::{GatewayQuicRestart, ListenerExit};
+        let (logs, _guard) = crate::util::test_log_capture::install();
+        for exit in [
+            ListenerExit::QuicEndpointDown,
+            ListenerExit::QuicCooldownEnded,
+        ] {
+            logs.lock().unwrap().clear();
+            let err = super::listener_exit_error(&exit);
+            let restart = err
+                .downcast_ref::<GatewayQuicRestart>()
+                .unwrap_or_else(|| panic!("{exit:?}: {err}"));
+            assert!(!restart.reason.is_empty());
+            assert!(
+                !crate::listener_exit_is_graceful(&err),
+                "{exit:?} takes the fatal-listener exit"
+            );
+            let captured = logs.lock().unwrap().clone();
+            assert!(
+                !captured.iter().any(|l| l.contains("CRITICAL")),
+                "{exit:?}: {captured:?}"
+            );
+        }
+    }
+
     /// A message the node cannot serialize fails its send as an `Other`
     /// error with exactly the text and classification the transport's own
     /// serialization error had.
@@ -4475,6 +4693,17 @@ pub(crate) mod tests {
                 assert_eq!(new, old, "idle={idle} refusals={refusals}");
             }
         }
+    }
+
+    /// The transient-send warn fires at the 1st, 2nd, 4th ... failure only, so
+    /// 10,000 failures on one connection log 14 lines.
+    #[test]
+    fn transient_send_failures_log_at_powers_of_two() {
+        let logged: Vec<u64> = (1..=10_000)
+            .filter(|n| super::transient_failure_warns(*n))
+            .collect();
+        assert_eq!(logged.len(), 14);
+        assert_eq!(&logged[..5], &[1, 2, 4, 8, 16]);
     }
 
     /// Every `QuicPathEnd` label reaches telemetry as `Explicit(label)`, both
@@ -4866,7 +5095,15 @@ pub(crate) mod tests {
         let (me, other) = (peer(1), peer(4));
         let gateway = std::net::SocketAddr::from(([127, 0, 0, 1], 2));
         let tx = Transaction::new::<ConnectMsg>();
-        let own_request = prepare_join_request(tx, &me, &peer(2), Location::new(0.5), 10, &[]);
+        let own_request = prepare_join_request(
+            tx,
+            &me,
+            &peer(2),
+            Location::new(0.5),
+            10,
+            &[],
+            crate::operations::connect::native::NativeReadiness::current(),
+        );
         let notice = |msg: ConnectMsg| {
             super::unsent_message_notice(
                 &NetMessage::V1(NetMessageV1::Connect(msg)),
@@ -4881,7 +5118,15 @@ pub(crate) mod tests {
             }
             other => panic!("an unsent CONNECT request must end its driver, got {other:?}"),
         }
-        let relayed = prepare_join_request(tx, &other, &peer(2), Location::new(0.5), 10, &[]);
+        let relayed = prepare_join_request(
+            tx,
+            &other,
+            &peer(2),
+            Location::new(0.5),
+            10,
+            &[],
+            crate::operations::connect::native::NativeReadiness::current(),
+        );
         assert!(
             notice(relayed).is_none(),
             "a relayed request is not ours to end"
@@ -4974,7 +5219,8 @@ pub(crate) mod tests {
 
     /// Source pin: the event loop's dial for a message with no connection
     /// is tagged by `unconnected_dial_origin` (the event loop has no harness
-    /// here). The call must be the `origin:` field of that `ConnectPeer`.
+    /// here). The call must be the `origin:` field of that `ConnectPeer`,
+    /// and the dial is UDP: only the connect op asks for a native one.
     #[test]
     fn the_unconnected_dial_uses_unconnected_dial_origin() {
         let code = event_loop_code();
@@ -4983,7 +5229,7 @@ pub(crate) mod tests {
             .expect("the unconnected-dial ConnectPeer");
         assert!(
             code[dispatch..].starts_with(
-                "P2pBridgeEvent::NodeAction(NodeEvent::ConnectPeer{peer:target_peer.clone(),tx,callback,is_gw,origin:unconnected_dial_origin(is_gw),}),"
+                "P2pBridgeEvent::NodeAction(NodeEvent::ConnectPeer{peer:target_peer.clone(),tx,callback,is_gw,origin:unconnected_dial_origin(is_gw),transport:crate::operations::connect::native::DialTransport::Udp,}),"
             ),
             "the dial's origin must come from unconnected_dial_origin"
         );
@@ -5756,6 +6002,8 @@ pub(crate) mod tests {
                 created_at: Instant::now(),
                 link_use: super::zombie_sweep::LinkUseStamp::new(Instant::now()),
                 remote_version: None,
+                native: false,
+                frame_seen: true,
             },
         );
         let (tx2, _rx2) = mpsc::channel(1);
@@ -5769,6 +6017,8 @@ pub(crate) mod tests {
                 created_at: Instant::now(),
                 link_use: super::zombie_sweep::LinkUseStamp::new(Instant::now()),
                 remote_version: None,
+                native: false,
+                frame_seen: true,
             },
         );
 
@@ -6555,7 +6805,11 @@ pub(crate) mod tests {
         // does not start writing a stash on every fan-out.
         let branch = &body[covered_pos..retry_pos];
         assert!(
-            branch.contains("pending_broadcasts.take(key.id()).is_some()"),
+            branch
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .contains("if op_manager.pending_broadcasts.take(key.id()) {"),
             "the fully-covered branch must act on a deferred re-broadcast stash \
              only when one EXISTS. An unconditional take discards an earlier \
              give-up's stash with no replacement; an unconditional stash adds a \
@@ -7660,7 +7914,7 @@ pub(crate) mod tests {
     ///   (a) prune the in-transit connection slot — covered by the source pin
     ///       `connect_peer_full_handshake_channel_prunes_in_transit` below,
     ///       since the prune touches the live ring;
-    ///   (b) resolve EVERY awaiting callback with Err(()) — never park it;
+    ///   (b) resolve EVERY awaiting callback with Err(None) — never park it;
     ///   (c) drain BOTH awaiting_connection and awaiting_connection_txs;
     ///   (d) NOT record peer backoff (local channel contention, not a remote
     ///       failure).
@@ -7678,8 +7932,8 @@ pub(crate) mod tests {
         let tx = Transaction::new::<crate::operations::connect::ConnectMsg>();
 
         // Two callers queued on this peer (mirrors the Occupied-entry append).
-        let (cb1, mut rx1) = mpsc::channel::<Result<(SocketAddr, Option<usize>), ()>>(1);
-        let (cb2, mut rx2) = mpsc::channel::<Result<(SocketAddr, Option<usize>), ()>>(1);
+        let (cb1, mut rx1) = mpsc::channel::<crate::message::ConnectResult>(1);
+        let (cb2, mut rx2) = mpsc::channel::<crate::message::ConnectResult>(1);
         state.awaiting_connection.insert(
             peer_addr,
             vec![
@@ -7697,15 +7951,15 @@ pub(crate) mod tests {
 
         super::fail_awaiting_connection(&mut state, peer_addr, tx, false).await;
 
-        // (b) every callback resolved with Err(()), immediately (not parked).
+        // (b) every callback resolved with Err(None), immediately (not parked).
         let r1 = timeout(Duration::from_secs(1), rx1.recv())
             .await
             .expect("callback 1 must resolve immediately, not park");
         let r2 = timeout(Duration::from_secs(1), rx2.recv())
             .await
             .expect("callback 2 must resolve immediately, not park");
-        assert_eq!(r1, Some(Err(())), "callback 1 must receive Err(())");
-        assert_eq!(r2, Some(Err(())), "callback 2 must receive Err(())");
+        assert_eq!(r1, Some(Err(None)), "callback 1 must receive Err(None)");
+        assert_eq!(r2, Some(Err(None)), "callback 2 must receive Err(None)");
 
         // (c) both maps drained for this peer.
         assert!(
@@ -7732,22 +7986,27 @@ pub(crate) mod tests {
     #[test]
     fn connect_peer_full_handshake_channel_prunes_in_transit() {
         let src = production_src();
-        // Locate the Connect-command try_send and bound a window over its
-        // failure branch (the `fail_awaiting_connection` call is the tail).
-        let from = src
-            .find("try_send(HandshakeCommand::Connect {")
-            .expect("connect_peer must enqueue HandshakeCommand::Connect via try_send");
-        let end = (from + 1200).min(src.len());
-        let branch = &src[from..end];
+        // Two sites enqueue a Connect: the ordinary dial and the UDP dial
+        // beside a pending native one. Bound a window over each failure branch.
+        let sites: Vec<&str> = src
+            .match_indices("try_send(HandshakeCommand::Connect {")
+            .map(|(from, _)| &src[from..(from + 1200).min(src.len())])
+            .collect();
+        assert_eq!(
+            sites.len(),
+            2,
+            "connect_peer enqueues HandshakeCommand::Connect via try_send at two sites"
+        );
+        let (ordinary, beside): (Vec<&str>, Vec<&str>) = sites
+            .into_iter()
+            .partition(|branch| branch.contains("fail_awaiting_connection("));
+        let [branch] = ordinary[..] else {
+            panic!("exactly one site fails awaiting callbacks via fail_awaiting_connection()");
+        };
         assert!(
             branch.contains("prune_in_transit_connection(peer_addr)"),
             "#4145 SITE 6: the connect-command-drop branch must prune the in-transit \
              connection slot so the dropped attempt does not leak a reservation."
-        );
-        assert!(
-            branch.contains("fail_awaiting_connection("),
-            "#4145 SITE 6: the connect-command-drop branch must fail awaiting callbacks \
-             via fail_awaiting_connection()."
         );
         // Must NOT record backoff on this local-contention path.
         assert!(
@@ -7755,6 +8014,17 @@ pub(crate) mod tests {
             "#4145 SITE 6: the connect-command-drop branch must NOT record peer backoff \
              (local channel contention is not a remote connection failure)."
         );
+        // The UDP dial beside a native one fails only its own callbacks: the
+        // native dial still holds the in-transit slot, so nothing is pruned.
+        let [branch] = beside[..] else {
+            panic!("exactly one site is the UDP dial beside a native one");
+        };
+        let failure = &branch[..branch
+            .find("return Ok(());")
+            .expect("the beside site returns after its send")];
+        assert!(failure.contains("fail_udp_beside_native("));
+        assert!(!failure.contains("prune_in_transit_connection"));
+        assert!(!failure.contains("record_failure"));
     }
 
     /// Source-scrape regression guard for #5154: the periodic 30s

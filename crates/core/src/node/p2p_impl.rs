@@ -73,7 +73,7 @@ const FATAL_LISTENER_EXIT_CODE: i32 = 42;
 const FAST_CRASH_EXIT_CODE: i32 = 45;
 
 /// Minimum uptime for a fatal listener exit to be treated as a "ran healthily,
-/// then died" event eligible for the burst-exempt auto-update self-heal path
+/// then died" event eligible for the non-failure auto-update self-heal path
 /// (exit [`FATAL_LISTENER_EXIT_CODE`] = 42). A fatal exit BELOW this threshold is
 /// classified as a fast crash / boot-wedge and uses the counted
 /// [`FAST_CRASH_EXIT_CODE`] instead so a tight loop is rate-limited.
@@ -95,7 +95,7 @@ const MIN_HEALTHY_UPTIME_FOR_UPDATE_EXIT: Duration = Duration::from_secs(60);
 ///   [`FAST_CRASH_EXIT_CODE`] (45): a counted failure, so a tight boot-wedge loop
 ///   trips `StartLimitBurst` and the unit stops. The unit's `ExecStopPost` still
 ///   runs `freenet update` on 45, so a fixable boot-crash self-heals.
-/// - otherwise → [`FATAL_LISTENER_EXIT_CODE`] (42): burst-exempt, fires the
+/// - otherwise → [`FATAL_LISTENER_EXIT_CODE`] (42): non-failure, fires the
 ///   `freenet update` self-heal hook.
 ///
 /// `fast_crash_enabled` comes from [`EMIT_FAST_CRASH_EXIT_CODE`], which the binary
@@ -109,6 +109,25 @@ fn fatal_listener_exit_code(uptime: Duration, fast_crash_enabled: bool) -> i32 {
         FAST_CRASH_EXIT_CODE
     } else {
         FATAL_LISTENER_EXIT_CODE
+    }
+}
+
+/// The exit code for the fatal listener exit that ends with `error`. A
+/// gateway's deliberate restart to restore QUIC
+/// ([`crate::transport::GatewayQuicRestart`], #5940) always takes
+/// [`FATAL_LISTENER_EXIT_CODE`], whatever the uptime: it is not a crash, and
+/// the fast-crash code is counted by the unit's start limit and by the
+/// post-update crash-loop rollback, so three early endpoint deaths would roll
+/// a release back. The breaker bounds those restarts instead
+/// (`breaker::ENDPOINT_DOWN_EXITS_TO_TRIP`).
+fn listener_exit_code(error: &anyhow::Error, uptime: Duration, fast_crash_enabled: bool) -> i32 {
+    if error
+        .downcast_ref::<crate::transport::GatewayQuicRestart>()
+        .is_some()
+    {
+        FATAL_LISTENER_EXIT_CODE
+    } else {
+        fatal_listener_exit_code(uptime, fast_crash_enabled)
     }
 }
 
@@ -178,7 +197,7 @@ pub fn enable_abort_on_redb_poison() {
 /// #4549 / #4551 fatal-listener path, so the poison exit integrates with the
 /// existing crash-loop protection without adding a second policy:
 /// - poison after a healthy uptime (>= [`MIN_HEALTHY_UPTIME_FOR_UPDATE_EXIT`]) →
-///   [`FATAL_LISTENER_EXIT_CODE`] (42): burst-exempt, fires the `freenet update`
+///   [`FATAL_LISTENER_EXIT_CODE`] (42): non-failure, fires the `freenet update`
 ///   self-heal hook. A genuinely transient I/O blip (the #4604 case: a node that
 ///   ran healthily for hours) restarts cleanly without tripping `StartLimitBurst`.
 /// - poison within the healthy-uptime window, when the supervisor understands it →
@@ -577,8 +596,6 @@ impl NodeP2P {
         if let Some(event) = crate::tracing::NetEventLog::peer_startup(
             &self.op_manager.ring,
             crate::config::PCK_VERSION.to_string(),
-            None, // git_commit - not available in library, only in binary
-            None, // git_dirty - not available in library, only in binary
         ) {
             use either::Either;
             self.op_manager
@@ -680,7 +697,7 @@ impl NodeP2P {
                if !listener_exit_is_graceful(&e)
                    && ABORT_ON_FATAL_LISTENER_EXIT.load(std::sync::atomic::Ordering::Relaxed)
                {
-                   // #4551: pick 42 (burst-exempt, fires the auto-update self-heal
+                   // #4551: pick 42 (non-failure, fires the auto-update self-heal
                    // hook) for a node that ran healthily before dying, vs the counted
                    // FAST_CRASH_EXIT_CODE for a fast crash / boot-wedge so a tight loop
                    // trips the unit's StartLimitBurst and is stopped instead of looping.
@@ -688,10 +705,35 @@ impl NodeP2P {
                    // regenerated systemd unit that handles 45); otherwise 42 is kept so
                    // an old unit / the mac/Windows run-wrapper still self-heals.
                    let uptime = start_time.elapsed();
-                   let exit_code = fatal_listener_exit_code(
+                   let exit_code = listener_exit_code(
+                       &e,
                        uptime,
                        EMIT_FAST_CRASH_EXIT_CODE.load(std::sync::atomic::Ordering::Relaxed),
                    );
+                   // #5940: a supervised gateway restarting to restore QUIC
+                   // takes this same exit, but it is planned, so it is not
+                   // logged as a failure.
+                   if let Some(restart) = e.downcast_ref::<crate::transport::GatewayQuicRestart>() {
+                       tracing::warn!(
+                           reason = restart.reason,
+                           exit_code,
+                           uptime_secs = uptime.as_secs(),
+                           "Gateway exiting for its service supervisor to restart it with QUIC \
+                            on: {}",
+                           restart.reason
+                       );
+                       eprintln!(
+                           "Gateway exiting with code {exit_code} for its service supervisor to \
+                            restart it with QUIC on: {}",
+                           restart.reason
+                       );
+                       // The file log is written by a background worker that
+                       // `process::exit` does not wait for; give it a moment
+                       // so the line above reaches the log. Blocking this
+                       // worker thread is harmless: the process exits next.
+                       std::thread::sleep(std::time::Duration::from_millis(500));
+                       std::process::exit(exit_code);
+                   }
                    eprintln!("CRITICAL: Network event listener exited (fatal): {e}");
                    tracing::error!(
                        error = %e,
@@ -952,6 +994,17 @@ impl NodeP2P {
             &background_task_monitor,
         );
 
+        // `auto_update_state` (#5975): the updater's state as the binary read
+        // it at startup, once per start. Sending is a no-op unless the
+        // telemetry reporter (built with the node config) is enabled.
+        if let Some(state) = super::network_status::auto_update_state() {
+            crate::tracing::telemetry::send_standalone_event_with_peer_id(
+                "auto_update_state",
+                &config.local_peer_id_string(),
+                state,
+            );
+        }
+
         // `join_versions` (#5940): hourly versions of gateway joiners and live
         // neighbours. Only with telemetry on, since it exists to be uploaded.
         crate::transport::join_versions::spawn_join_versions_reporter_if_enabled(
@@ -972,6 +1025,18 @@ impl NodeP2P {
             &background_task_monitor,
         )
         .await?;
+
+        // `quic_breaker_start` (#6151): what the QUIC crash-loop breaker
+        // decided at this start (`P2pConnManager::build` runs it), once per
+        // start, including, on a unix peer, what the legacy exit-status rule
+        // would have decided. Sending is a no-op unless telemetry is enabled.
+        if let Some(report) = crate::transport::quic::breaker::take_start_report() {
+            crate::tracing::telemetry::send_standalone_event_with_peer_id(
+                "quic_breaker_start",
+                &config.local_peer_id_string(),
+                report.to_json(),
+            );
+        }
 
         let parent_span = tracing::Span::current();
         let contract_executor_handle = GlobalExecutor::spawn({
@@ -1076,6 +1141,81 @@ impl NodeP2P {
 mod tests {
     use super::*;
 
+    /// #5975: `NodeP2P::build` sends the `auto_update_state` event the binary
+    /// recorded at startup. Deleting the send, or sending a different event
+    /// name or payload, silently ends the report with every test still green.
+    #[test]
+    fn build_sends_the_recorded_auto_update_state() {
+        let all = include_str!("p2p_impl.rs");
+        let production = &all[..all
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("test module not located; this pin cannot verify anything")];
+        let code: String = production
+            .lines()
+            .map(|line| line.split_once("//").map_or(line, |(code, _)| code))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let start = code
+            .find("pub(crate) async fn build<")
+            .expect("NodeP2P::build not found");
+        let (build, _) = code[start..]
+            .split_once("\n    }\n")
+            .expect("could not locate the end of NodeP2P::build");
+        let squeezed: String = build.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            squeezed.contains(
+                "iflet Some(state)=super::network_status::auto_update_state()"
+                    .replace(' ', "")
+                    .as_str()
+            ),
+            "build must read the state the binary recorded"
+        );
+        assert!(
+            squeezed.contains(
+                "send_standalone_event_with_peer_id(\"auto_update_state\",&config.local_peer_id_string(),state,)"
+            ),
+            "build must send it as the `auto_update_state` event with that state"
+        );
+    }
+
+    /// #6151: `NodeP2P::build` sends what the crash-loop breaker decided as
+    /// the `quic_breaker_start` event, after `P2pConnManager::build` (which
+    /// runs the breaker), so the report exists when it is taken.
+    #[test]
+    fn build_sends_the_quic_breaker_start_report_after_the_breaker_ran() {
+        let all = include_str!("p2p_impl.rs");
+        let production = &all[..all
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("test module not located; this pin cannot verify anything")];
+        let code: String = production
+            .lines()
+            .map(|line| line.split_once("//").map_or(line, |(code, _)| code))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let start = code
+            .find("pub(crate) async fn build<")
+            .expect("NodeP2P::build not found");
+        let (build, _) = code[start..]
+            .split_once("\n    }\n")
+            .expect("could not locate the end of NodeP2P::build");
+        let squeezed: String = build.chars().filter(|c| !c.is_whitespace()).collect();
+        let at = |needle: &str| {
+            squeezed
+                .find(needle)
+                .unwrap_or_else(|| panic!("NodeP2P::build must contain {needle}"))
+        };
+        let breaker_ran = at("letconn_manager=P2pConnManager::build(");
+        let taken = at(
+            "iflet Some(report)=crate::transport::quic::breaker::take_start_report()"
+                .replace(' ', "")
+                .as_str(),
+        );
+        let sent = at(
+            "send_standalone_event_with_peer_id(\"quic_breaker_start\",&config.local_peer_id_string(),report.to_json(),)",
+        );
+        assert!(breaker_ran < taken && taken < sent);
+    }
+
     /// #4549: the fast-exit watchdog (`process::exit(42)` on a fatal listener exit)
     /// is gated by `listener_exit_is_graceful`. A regression in this predicate is
     /// dangerous in BOTH directions: classifying a graceful shutdown as fatal would
@@ -1151,7 +1291,7 @@ mod tests {
         );
         assert_ne!(
             FAST_CRASH_EXIT_CODE, FATAL_LISTENER_EXIT_CODE,
-            "a fast crash must NOT reuse the burst-exempt update code 42"
+            "a fast crash must NOT reuse the non-failure update code 42"
         );
         // 43 = EXIT_CODE_ALREADY_RUNNING (RestartPreventExitStatus), 44 =
         // EXIT_CODE_BUNDLE_UPDATE_STAGED. The fast-crash code must avoid both.
@@ -1165,10 +1305,35 @@ mod tests {
         );
     }
 
+    /// #5940: a gateway's deliberate restart to restore QUIC takes 42 at any
+    /// uptime, even under a 45-aware unit; every other fatal listener exit is
+    /// unchanged.
+    #[test]
+    fn a_gateway_quic_restart_always_exits_with_42() {
+        for secs in [0u64, 1, 59, 60, 3600] {
+            let uptime = Duration::from_secs(secs);
+            for fast_crash in [true, false] {
+                let restart =
+                    anyhow::Error::new(crate::transport::GatewayQuicRestart { reason: "test" });
+                assert_eq!(
+                    listener_exit_code(&restart, uptime, fast_crash),
+                    FATAL_LISTENER_EXIT_CODE,
+                    "{secs}s, fast_crash={fast_crash}"
+                );
+                let other = anyhow::anyhow!("listener died");
+                assert_eq!(
+                    listener_exit_code(&other, uptime, fast_crash),
+                    fatal_listener_exit_code(uptime, fast_crash),
+                    "{secs}s, fast_crash={fast_crash}"
+                );
+            }
+        }
+    }
+
     /// #4551: with fast-crash enabled (a 45-aware systemd unit), a fatal listener exit
     /// that happens *soon* after start is a fast crash / boot-wedge — it must use the
     /// counted [`FAST_CRASH_EXIT_CODE`] so a tight loop trips the limiter. An exit after
-    /// a *healthy* uptime keeps the burst-exempt update code 42 so a real fault/update
+    /// a *healthy* uptime keeps the non-failure update code 42 so a real fault/update
     /// self-heals and is never rate-limited.
     #[test]
     fn fatal_listener_exit_code_distinguishes_fast_crash_from_healthy_uptime() {
@@ -1192,7 +1357,7 @@ mod tests {
             assert_eq!(
                 fatal_listener_exit_code(Duration::from_secs(secs), true),
                 FATAL_LISTENER_EXIT_CODE,
-                "a fatal exit after {secs}s uptime keeps the burst-exempt update code"
+                "a fatal exit after {secs}s uptime keeps the non-failure update code"
             );
         }
     }
@@ -1225,7 +1390,7 @@ mod tests {
 
     /// #4604: the redb-poison fast-exit reuses [`fatal_listener_exit_code`], so it
     /// inherits the crash-loop protection exactly:
-    /// - A poison after a *healthy* uptime exits 42 (burst-exempt, fires the
+    /// - A poison after a *healthy* uptime exits 42 (non-failure, fires the
     ///   auto-update hook): a one-off transient I/O blip restarts cleanly.
     /// - A poison *within* the healthy window, under a supervisor that understands
     ///   it, exits the COUNTED code 45 — so a database that re-poisons on every boot
@@ -1244,12 +1409,12 @@ mod tests {
                  code so a corrupt node does not restart-loop forever (#4604/#4591)"
             );
         }
-        // A genuinely transient poison after a healthy run → burst-exempt update
+        // A genuinely transient poison after a healthy run → non-failure update
         // code so the restart self-heals and is never rate-limited.
         assert_eq!(
             fatal_listener_exit_code(MIN_HEALTHY_UPTIME_FOR_UPDATE_EXIT, true),
             FATAL_LISTENER_EXIT_CODE,
-            "a transient poison after a healthy uptime restarts via the burst-exempt \
+            "a transient poison after a healthy uptime restarts via the non-failure \
              update code (the #4604 real-world case: ran healthily for hours)"
         );
         // Both codes are ones the supervisor already handles (declared in the
