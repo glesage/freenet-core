@@ -137,20 +137,76 @@ static CONTRACT_REFRESH_LOCKS: LazyLock<
 /// `Retry-After`). A suppressed request must get the SAME answer the request
 /// that recorded the failure got, not an arbitrary pick between them — so this
 /// records which one it was, not just that failure occurred.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum TerminalAbsenceKind {
     ContractNotFound,
     MissingContract,
     /// The contract's state is not an archive this node will unpack (malformed,
     /// or over the unpack limits). The answer is a function of the state, so it
     /// repeats until the state changes; without recording it, every request
-    /// re-fetches and re-unpacks the same refused archive.
-    ArchiveRefused,
+    /// re-fetches and re-unpacks the same refused archive. A genuine write
+    /// failure (disk full) is recorded too, because it cannot be told apart
+    /// from an archive fault at the point it surfaces (see [`unpack_error`]);
+    /// it is retried once the refresh window ends.
+    ///
+    /// Carries the full error text the first request got (bounded by
+    /// [`unpack_failed_message`]), so a replayed refusal still says WHY rather
+    /// than only that it failed.
+    ArchiveRefused(std::sync::Arc<str>),
 }
 
-/// Prefix of the error `unpack_if_stale` returns for an archive it refuses;
-/// `ensure_contract_cached`'s caller recognises it to record the refusal.
+/// Prefix of the error `unpack_if_stale` returns for an archive it refuses,
+/// followed by the contract key and, for a `Refused` archive, `: <reason>`.
+/// `ensure_contract_cached`'s caller recognises the prefix to record the
+/// refusal.
 const UNPACK_FAILED_PREFIX: &str = "failed unpacking contract: ";
+
+/// The error `unpack_if_stale` returns when unpacking `key`'s archive fails:
+/// always an `InvalidParam` (400) carrying [`unpack_failed_message`], which
+/// the negative cache records.
+///
+/// That includes a [`WebContractError::StoringError`], although it can be a
+/// node fault (disk full). It comes from `tar`'s `unpack_in`, which also
+/// READS the entry's data and refuses a duplicate entry (`set_overwrite(false)`),
+/// so a truncated or corrupt stream, the decoder cap tripping mid-file, or a
+/// crafted duplicate all surface as the same variant. Leaving those uncached
+/// would let a hostile archive be fetched and unpacked again on every request;
+/// caching a real disk fault only delays its retry to the end of the window.
+fn unpack_error(key: &str, err: &WebContractError) -> WebSocketApiError {
+    WebSocketApiError::InvalidParam {
+        error_cause: unpack_failed_message(key, err),
+    }
+}
+
+/// The 400 body for an archive this node will not serve.
+///
+/// A [`WebContractError::Refused`] reason is appended: it names the limit and
+/// the size, and without it a site's author sees only that the page failed
+/// (the 0.2.161 media-site refusal was reported with exactly that). Any other
+/// error stays generic, since an I/O error can carry a local filesystem path
+/// and this body is shown at the node's origin, including on hosted nodes.
+///
+/// The reason is cut to [`REFUSAL_REASON_MAX_CHARS`]. `Refused` already bounds
+/// the archive-controlled path it quotes; this is the backstop, because the
+/// result is served on every request and kept in the negative cache
+/// (`TerminalAbsenceKind::ArchiveRefused`).
+fn unpack_failed_message(key: &str, err: &WebContractError) -> String {
+    match err {
+        WebContractError::Refused(reason) => {
+            let mut shown: String = reason.chars().take(REFUSAL_REASON_MAX_CHARS).collect();
+            if shown.len() < reason.len() {
+                shown.push_str("...");
+            }
+            format!("{UNPACK_FAILED_PREFIX}{key}: {shown}")
+        }
+        WebContractError::UnpackingError(_)
+        | WebContractError::StoringError(_)
+        | WebContractError::FileNotFound(_) => format!("{UNPACK_FAILED_PREFIX}{key}"),
+    }
+}
+
+/// Most characters of a refusal reason [`unpack_failed_message`] passes on.
+const REFUSAL_REASON_MAX_CHARS: usize = 512;
 
 impl TerminalAbsenceKind {
     fn into_error(self, instance_id: ContractInstanceId) -> WebSocketApiError {
@@ -161,8 +217,8 @@ impl TerminalAbsenceKind {
             TerminalAbsenceKind::MissingContract => {
                 WebSocketApiError::MissingContract { instance_id }
             }
-            TerminalAbsenceKind::ArchiveRefused => WebSocketApiError::InvalidParam {
-                error_cause: format!("{UNPACK_FAILED_PREFIX}{instance_id}"),
+            TerminalAbsenceKind::ArchiveRefused(error_cause) => WebSocketApiError::InvalidParam {
+                error_cause: error_cause.to_string(),
             },
         }
     }
@@ -198,8 +254,8 @@ impl RefreshState {
         &self,
         instance_id: &ContractInstanceId,
     ) -> Option<TerminalAbsenceKind> {
-        self.last_cold_failure.and_then(|(id, at, kind)| {
-            (id == *instance_id && at.elapsed() < CONTRACT_CACHE_REFRESH_TTL).then_some(kind)
+        self.last_cold_failure.as_ref().and_then(|(id, at, kind)| {
+            (id == instance_id && at.elapsed() < CONTRACT_CACHE_REFRESH_TTL).then(|| kind.clone())
         })
     }
 }
@@ -371,21 +427,32 @@ fn try_acquire_cache_lock(
 /// (measured: 325 MB / 61 entries on one peer, 1.2 GB / 82 entries on another,
 /// with entries up to six months untouched).
 ///
-/// 64 MiB is chosen against the observed per-entry distribution: a typical
-/// unpacked webapp is a few hundred KB to a few MB, so the budget keeps roughly
-/// the last 15-30 distinct webapps the user actually browsed — far more than a
-/// browsing session touches — while cutting >90% of the observed footprint.
+/// The budget must hold one maximal archive (`MAX_UNPACKED_TOTAL_BYTES`, 256
+/// MiB, sized to admit a measured 53 MB media-heavy site with headroom), so it
+/// is 512 MiB. A typical unpacked webapp is a few hundred KB to a few MB, so
+/// the budget still keeps the last dozens of distinct webapps the user browsed
+/// while cutting about 60% of the worst observed footprint (1.2 GB).
 /// This LRU cap is the only thing that bounds these bytes. Since #5007
 /// `ring/hosting/disk_usage.rs` also measures and reports the cache, but does
 /// NOT charge it against the hosting disk budget (#5853 tracks whether it
 /// should; hosting eviction has no lever on webapp entries, and the cache may
 /// sit on a different mount than the one the budget's free-space term measures).
-const WEBAPP_CACHE_MAX_BYTES: u64 = 64 * 1024 * 1024;
+const WEBAPP_CACHE_MAX_BYTES: u64 = 512 * 1024 * 1024;
 
 // One archive must fit the budget on its own: the sweep never evicts the entry
 // that triggered it (`in_use`), so an entry larger than the budget would stay
 // over it. The unpack limits guarantee that cannot happen.
 const _: () = assert!(super::app_packaging::MAX_UNPACKED_TOTAL_BYTES < WEBAPP_CACHE_MAX_BYTES);
+
+/// Most archives this node unpacks to disk at once.
+///
+/// `unpack_if_stale` holds only a per-contract lock, so without this bound N
+/// different contracts could each write up to `MAX_UNPACKED_TOTAL_BYTES` before
+/// the cache sweep runs. Worst-case transient disk is
+/// `MAX_CONCURRENT_UNPACKS * MAX_UNPACKED_TOTAL_BYTES` = 4 x 256 MiB = 1 GiB,
+/// which exceeds [`WEBAPP_CACHE_MAX_BYTES`] until the sweep catches up. Further
+/// unpacks queue for a permit rather than being refused.
+const MAX_CONCURRENT_UNPACKS: usize = 4;
 
 /// Largest cached file the handlers will read whole into memory, for the two
 /// cases that rewrite text (`.js` and HTML pages). Everything else is streamed
@@ -560,6 +627,9 @@ pub(crate) struct WebappCache {
     /// simulation harness does). A global would let one simulated node's
     /// traffic refuse another's.
     speculative_fetches: Arc<Semaphore>,
+    /// Permits for in-flight unpacks, see [`MAX_CONCURRENT_UNPACKS`]. Per node
+    /// for the same reason as `speculative_fetches`.
+    unpacks: Arc<Semaphore>,
 }
 
 impl WebappCache {
@@ -604,6 +674,7 @@ impl WebappCache {
             max_bytes: WEBAPP_CACHE_MAX_BYTES,
             sweep: Arc::new(parking_lot::Mutex::new(SweepState::default())),
             speculative_fetches: Arc::new(Semaphore::new(SPECULATIVE_FETCH_LIMIT)),
+            unpacks: Arc::new(Semaphore::new(MAX_CONCURRENT_UNPACKS)),
         }
     }
 
@@ -1441,7 +1512,9 @@ async fn refresh_cache_if_due(
             Err(WebSocketApiError::InvalidParam { error_cause })
                 if error_cause.starts_with(UNPACK_FAILED_PREFIX) =>
             {
-                Some(TerminalAbsenceKind::ArchiveRefused)
+                Some(TerminalAbsenceKind::ArchiveRefused(
+                    error_cause.as_str().into(),
+                ))
             }
             _ => None,
         };
@@ -1807,18 +1880,28 @@ async fn unpack_if_stale(
     let state_shared: Arc<[u8]> = Arc::from(state_bytes);
     let path_owned = path.clone();
     let hash_path_owned = hash_path.clone();
+    let unpack_slots = cache.unpacks.clone();
     crate::config::GlobalExecutor::spawn(async move {
         let _guard = _guard;
+        // Queue for a node-wide unpack slot, held until the unpack finishes.
+        // Acquired inside the detached task so that dropping the caller cannot
+        // release it while the blocking unpack is still writing. The semaphore
+        // is never closed, so acquisition cannot fail.
+        let _unpack_slot =
+            unpack_slots
+                .acquire_owned()
+                .await
+                .map_err(|e| WebSocketApiError::NodeError {
+                    error_cause: format!("unpack limiter closed: {e}"),
+                })?;
         let contract = &contract_owned;
         let path = path_owned;
         let hash_path = hash_path_owned;
 
         fn err(err: WebContractError, contract: &ContractContainer) -> WebSocketApiError {
             let key = contract.key();
-            tracing::error!("{err}");
-            WebSocketApiError::InvalidParam {
-                error_cause: format!("{UNPACK_FAILED_PREFIX}{key}"),
-            }
+            tracing::error!(contract = %key, "web archive not unpacked: {err}");
+            unpack_error(&key.to_string(), &err)
         }
 
         // Clear existing cache if any; may not exist yet
@@ -2969,6 +3052,7 @@ mod tests {
             max_bytes,
             sweep: Arc::new(parking_lot::Mutex::new(SweepState::default())),
             speculative_fetches: Arc::new(Semaphore::new(SPECULATIVE_FETCH_LIMIT)),
+            unpacks: Arc::new(Semaphore::new(MAX_CONCURRENT_UNPACKS)),
         }
     }
 
@@ -5476,21 +5560,139 @@ mod tests {
         assert!(read_file_bounded(&sparse, 1024 * 1024).await.is_err());
     }
 
+    /// Only a `Refused` reason reaches the 400 body. An I/O error can name a
+    /// local path (the webapp cache dir), and the body is served at the node's
+    /// origin, hosted nodes included, so it must stay generic.
+    #[test]
+    fn unpack_failed_message_shows_refusals_but_not_io_errors() {
+        let refused = unpack_failed_message(
+            "KEY",
+            &WebContractError::Refused("the website unpacks to more than 1.0 MiB".into()),
+        );
+        assert_eq!(
+            refused,
+            format!("{UNPACK_FAILED_PREFIX}KEY: the website unpacks to more than 1.0 MiB")
+        );
+
+        let leaky_path = "/home/someone/.cache/freenet/webapp_cache/KEY: disk full";
+        for err in [
+            WebContractError::StoringError(std::io::Error::other(leaky_path)),
+            WebContractError::UnpackingError(anyhow::anyhow!(leaky_path)),
+        ] {
+            assert_eq!(
+                unpack_failed_message("KEY", &err),
+                format!("{UNPACK_FAILED_PREFIX}KEY"),
+                "{err:?} must not reach the body"
+            );
+        }
+    }
+
+    /// The backstop on the reason's length holds even for a `Refused` built
+    /// somewhere that forgot to bound its archive-controlled parts.
+    #[test]
+    fn unpack_failed_message_bounds_the_reason() {
+        let body = unpack_failed_message("KEY", &WebContractError::Refused("x".repeat(1_000_000)));
+        assert!(
+            body.len() < UNPACK_FAILED_PREFIX.len() + REFUSAL_REASON_MAX_CHARS + 16,
+            "body is {} bytes",
+            body.len()
+        );
+        assert!(body.ends_with("..."), "{body}");
+
+        // Counted in characters, cut on a character boundary: a byte slice
+        // would panic mid-character here.
+        let cjk = "\u{5b57}".repeat(10_000);
+        let body = unpack_failed_message("KEY", &WebContractError::Refused(cjk));
+        let reason = body
+            .strip_prefix(&format!("{UNPACK_FAILED_PREFIX}KEY: "))
+            .expect("prefix");
+        assert_eq!(reason.chars().count(), REFUSAL_REASON_MAX_CHARS + 3);
+        assert!(reason.ends_with("..."), "{reason}");
+
+        // Exactly at the cap: passed whole, no cut marker.
+        let exact = "y".repeat(REFUSAL_REASON_MAX_CHARS);
+        let body = unpack_failed_message("KEY", &WebContractError::Refused(exact.clone()));
+        assert_eq!(body, format!("{UNPACK_FAILED_PREFIX}KEY: {exact}"));
+    }
+
+    /// The reason carries archive-controlled text (an entry path) to a page
+    /// served at the node's origin. It must arrive HTML-escaped from a real
+    /// unpack through [`unpack_error`] (what `unpack_if_stale` returns) and
+    /// `into_response`, not only in hand-built errors. The handler wiring and
+    /// the negative-cache replay are covered by
+    /// `a_refused_archive_is_not_fetched_or_unpacked_again_within_the_window`.
+    #[tokio::test]
+    async fn a_refusal_naming_a_hostile_file_is_escaped_in_the_response() {
+        let name = "<img src=x onerror=alert(1)>.bin";
+        let size = super::super::app_packaging::MAX_UNPACKED_FILE_BYTES + 1;
+        // Header only: the size check runs on the header, before any data.
+        let mut archive = tar::Builder::new(std::io::Cursor::new(Vec::new()));
+        let mut header = tar::Header::new_gnu();
+        header.set_size(size);
+        header.set_mode(0o644);
+        archive
+            .append_data(&mut header, name, std::io::empty())
+            .unwrap();
+        let mut web = WebApp::from_data(Vec::new(), archive).unwrap();
+        let err = web
+            .unpack(tempfile::tempdir().unwrap().path())
+            .expect_err("premise: the archive is refused");
+        let response = unpack_error("KEY", &err).into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+        let raw = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&raw);
+        assert!(!body.contains("<img "), "markup survived: {body}");
+        assert!(
+            body.contains("&lt;img src=x"),
+            "the name must survive, escaped: {body}"
+        );
+    }
+
+    /// A crafted duplicate entry fails inside `tar`'s `unpack_in` as a
+    /// `StoringError`, the same variant a full disk produces. It must still
+    /// come back as a recordable refusal (`InvalidParam` with
+    /// `UNPACK_FAILED_PREFIX`, which `refresh_cache_if_due` negative-caches),
+    /// or a hostile archive is fetched and unpacked again on every request.
+    /// The body stays generic: an I/O error can name a local path.
+    #[test]
+    fn an_archive_failing_inside_unpack_in_is_still_a_cached_refusal() {
+        let mut archive = tar::Builder::new(std::io::Cursor::new(Vec::new()));
+        for _ in 0..2 {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(1);
+            header.set_mode(0o644);
+            archive
+                .append_data(&mut header, "dup.txt", &b"x"[..])
+                .unwrap();
+        }
+        let mut web = WebApp::from_data(Vec::new(), archive).unwrap();
+        let err = web
+            .unpack(tempfile::tempdir().unwrap().path())
+            .expect_err("premise: the duplicate entry is refused");
+        assert!(
+            matches!(err, WebContractError::StoringError(_)),
+            "premise: a duplicate surfaces as StoringError, got {err:?}"
+        );
+        assert!(matches!(
+            unpack_error("KEY", &err),
+            WebSocketApiError::InvalidParam { ref error_cause }
+                if *error_cause == format!("{UNPACK_FAILED_PREFIX}KEY")
+        ));
+    }
+
     /// A contract whose state is a web archive holding one file over the unpack
-    /// limit. A few KB compressed.
+    /// limit. Header only (the size check runs on the header, before any data
+    /// is read), so it is a few hundred bytes whatever the limit.
     fn oversized_archive_contract_and_state(seed: &[u8]) -> (ContractContainer, WrappedState) {
         let limit = super::super::app_packaging::MAX_UNPACKED_FILE_BYTES + 1;
         let mut archive = tar::Builder::new(std::io::Cursor::new(Vec::new()));
         let mut header = tar::Header::new_gnu();
         header.set_size(limit);
         header.set_mode(0o644);
-        header.set_cksum();
         archive
-            .append_data(
-                &mut header,
-                "big.bin",
-                std::io::Read::take(std::io::repeat(0), limit),
-            )
+            .append_data(&mut header, "big.bin", std::io::empty())
             .unwrap();
         let packed = WebApp::from_data(Vec::new(), archive)
             .unwrap()
@@ -5537,9 +5739,16 @@ mod tests {
             .await
             .expect("the first request must resolve")
             .expect("handler must not panic");
+        // The body must say why, not only that it failed: the 0.2.161
+        // media-site refusal reached its author as a bare "failed unpacking
+        // contract: <key>".
+        let first_cause = match &first {
+            Err(WebSocketApiError::InvalidParam { error_cause }) => error_cause.clone(),
+            other => panic!("premise: the oversized archive must be refused, got {other:?}"),
+        };
         assert!(
-            matches!(first, Err(WebSocketApiError::InvalidParam { .. })),
-            "premise: the oversized archive must be refused, got {first:?}"
+            first_cause.contains("\"big.bin\"") && first_cause.contains("over this node's"),
+            "the refusal must name the file and the limit, got {first_cause:?}"
         );
         while rx.try_recv().is_ok() {}
 
@@ -5551,8 +5760,8 @@ mod tests {
         .expect("the second request must resolve, not queue behind a refetch");
         assert!(
             matches!(second, Err(WebSocketApiError::InvalidParam { ref error_cause })
-                if error_cause.starts_with(UNPACK_FAILED_PREFIX)),
-            "the refusal must be replayed, got {second:?}"
+                if *error_cause == first_cause),
+            "the refusal must be replayed with the same reason, got {second:?}"
         );
         assert!(
             rx.try_recv().is_err(),
@@ -5560,6 +5769,70 @@ mod tests {
         );
 
         CONTRACT_REFRESH_LOCKS.remove(&instance_id);
+        clear_cache(&instance_id).await;
+    }
+
+    /// With every unpack slot taken, a further unpack queues instead of
+    /// writing to disk, and starts once a slot frees.
+    #[tokio::test]
+    async fn unpacks_queue_when_the_node_wide_limit_is_reached() {
+        let (contract, state) = webapp_contract_and_state(&rand::random::<[u8; 16]>());
+        let instance_id = *contract.key().id();
+        let root = tempfile::tempdir().expect("tempdir");
+        let webapp_cache = WebappCache {
+            unpacks: Arc::new(Semaphore::new(1)),
+            ..cache(root.path(), u64::MAX)
+        };
+        clear_cache(&instance_id).await;
+
+        // The test gate sits AFTER the slot acquisition, so `started` firing
+        // means the unpack got its slot.
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Semaphore::new(1));
+        UNPACK_TEST_GATES.insert(instance_id, (started.clone(), release));
+
+        let slot = webapp_cache
+            .unpacks
+            .clone()
+            .try_acquire_owned()
+            .expect("the only slot is free");
+        let task = tokio::spawn({
+            let webapp_cache = webapp_cache.clone();
+            async move { unpack_if_stale(&contract, state.as_ref(), &webapp_cache).await }
+        });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), started.notified())
+                .await
+                .is_err(),
+            "an unpack started while every slot was taken"
+        );
+        assert!(
+            !webapp_cache
+                .entry_dir(&instance_id)
+                .join("index.html")
+                .exists(),
+            "an unpack wrote to disk while every slot was taken"
+        );
+
+        drop(slot);
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("the queued unpack must run once a slot frees")
+            .expect("join")
+            .expect("unpack succeeds");
+        assert!(
+            webapp_cache
+                .entry_dir(&instance_id)
+                .join("index.html")
+                .exists()
+        );
+        assert_eq!(
+            webapp_cache.unpacks.available_permits(),
+            1,
+            "the slot must be returned when the unpack finishes"
+        );
+        UNPACK_TEST_GATES.remove(&instance_id);
         clear_cache(&instance_id).await;
     }
 
