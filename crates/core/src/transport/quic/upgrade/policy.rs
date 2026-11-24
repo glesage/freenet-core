@@ -185,6 +185,11 @@ pub(crate) struct QuicPolicyConfig {
 }
 
 impl QuicPolicyConfig {
+    /// The configured `transport-quic` mode.
+    pub(crate) fn mode(&self) -> QuicMode {
+        self.mode
+    }
+
     /// The policy inputs for a node configured by `config`, whose crash-loop
     /// breaker decided `breaker` ([`breaker::gate`]).
     ///
@@ -312,7 +317,6 @@ impl QuicJoinerPermit {
     /// units are given up and a path's taken, or, if the path does not fit,
     /// nothing changes and the permit comes back. A promoted joiner holds a
     /// path permit and no joiner charge.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn promote(mut self) -> Result<QuicPathPermit, Self> {
         let count = self.0.take().expect("a live joiner permit holds its count");
         let total = count.total();
@@ -367,6 +371,14 @@ impl QuicPolicy {
             permits: QuicPathPermits::new(config.max_paths),
             native_setups_max: config.native_setups_max,
         }
+    }
+
+    /// This policy, counting its paths against `permits` (another policy's)
+    /// instead of its own: an endpoint built in place of a dead one
+    /// (`quic::rebuild`) keeps the node's one cap.
+    pub(crate) fn sharing_permits(mut self, permits: QuicPathPermits) -> Self {
+        self.permits = permits;
+        self
     }
 
     /// The most QUIC-native setups the node runs at once:

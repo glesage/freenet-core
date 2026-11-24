@@ -81,8 +81,53 @@ back to the client, which cannot answer it; such a delegate does not continue.
 Grants are per app (the web app's ContractInstanceId, attested only for LOCAL
 connections) and remembered; the prompt is node-authored (PromptAuthor::Node,
 "Freenet asks:") and raised off the contract loop. Unprompted runs
-(InterDelegateDispatch::Suppressed) of delegates that opted in are budgeted;
+(RunTrigger::Unprompted) of delegates that opted in are budgeted;
 delegates without a manifest are untouched.
+
+Inter-delegate messages (SendDelegateMessage) are delivered from EVERY run
+kind, including node-started ones (notifications, lifecycle, wake-ups); Ian,
+2026-11-20. The receiver sees MessageOrigin::Delegate(caller), which the
+runtime attests. The core also sets the delivered DelegateMessage's `sender`
+to the caller. Each receiver decides whom to trust; the core does not
+protect delegates from each other. Background consent is therefore transitive: a
+delegate allowed to run in the background can run any delegate by messaging
+it. A client-driven hop carries the originating connection scope, so an
+off-host client gets no attested origin through it. Hosted nodes start no
+background runs. A hop runs the target's process() (after the target's
+pending lane round-trip, if the lane handed one to the loop); the target's
+own contract requests are not executed. One reply per hop (per message), no
+further chaining: the target's first SendDelegateMessage addressed back to
+the caller is queued and delivered to the caller as an inbound DelegateMessage
+in a later iteration of its own (carried across a park), with `sender` set by
+the core to the target (split_hop_output), so the caller sees
+MessageOrigin::Delegate(target) while handling it (next_call), never the
+run's WebApp or inherited origin. The target's key travels BESIDE the reply
+(PendingReply), never read from the message. A prompt the caller raises
+while handling a reply is shown under the run's own app identity. Every
+other SendDelegateMessage from the target is dropped, counted and logged
+once per iteration, and so is a reply over MAX_HOP_REPLY_BYTES (64 KiB),
+past MAX_HOP_REPLY_BYTES_PER_RUN, beyond what the run's remaining iterations
+can deliver (checked at enqueue, so the queue never outgrows them), still
+waiting when the run ends early, or one the caller fails on (that call's
+context is not persisted; secrets it wrote before failing stay written).
+Every iteration makes ONE executor call (a batch or one reply) and processes
+its output before the next, so a run still makes at most
+MAX_CONTRACT_REQUEST_ITERATIONS calls into the caller and holds at most one
+call's output at a time. The batch goes first, so replies wait while the
+caller's own request chain keeps its batch non-empty; a caller that never
+stops issuing requests never receives them, and they are counted as dropped
+at the cap. The reply never runs the target again; hops the
+caller makes while handling it count against its own cap. From a background run the target's other output is dropped
+(counted, one info! per hop), never merged into the caller's output, which
+would fan it out to the caller's apps under the caller's name. A background run
+attempts at most MAX_UNPROMPTED_HOPS_PER_RUN (16) hops, manifest or not;
+refusals are counted and logged once per iteration. Hop time (including a
+target lane round-trip the hop runs first) is charged to the caller's duty
+budget only for a budgeted (manifest) caller; a manifest-less caller is
+bounded by the cap alone, and the target is never charged. Self-hops are
+refused for every run kind, counted and logged once per iteration.
+Do not reintroduce suppression for background runs (it was the
+GHSA-824h-7x5x-wfmf "scope-laundering guard").
 
 Wake-ups (#3972): WakeupFired (tag 9) goes only to a delegate whose manifest
 declares `wakeups = [tag = secs]`, under the same two conditions, re-checked at

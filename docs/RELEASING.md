@@ -6,10 +6,13 @@
 > they explain why a check exists. It is no longer a rollout target: the release
 > matrix, the manual SSH driver in `release.sh`, and `RELEASE_AGENT_HMAC_VEGA`
 > have all been removed. nova now runs two gateway processes; the second,
-> `freenet-gateway-2`, has no release-agent of its own and is brought up by the
-> primary's stop/start cycle, with `gateway-auto-update.sh` verifying it via the
-> `.wants` symlinks so a companion that fails to start is not reported as a
-> successful update.
+> `freenet-gateway-2`, has no release-agent of its own. It is deliberately not
+> tied to the primary's stop/start (#6336: restarting both together doubled the
+> share of subscribes needing extra hops for 10+ hours). After the primary is
+> updated, `gateway-auto-update.sh` queues `freenet-gateway-stagger.service`,
+> which restarts gw2 once the primary has been active for 10 minutes and exits
+> non-zero (unit `failed`, crit-priority journal line) if gw2 does not come up
+> on the new binary.
 
 
 The release pipeline is fully automated: one workflow trigger cascades into
@@ -501,9 +504,13 @@ Current wire-gated floors:
   (which accepts the marker one release ahead of the crate version, so it
   holds on 0.2.162 main and on 0.2.163). 0.2.157 to 0.2.162 carry the decoder
   but were cut with the floor raised past them, so they never emitted the
-  native variants. In 0.2.163 every offer carries percent 0
-  (`QUIC_NATIVE_PERCENT` 0, `NATIVE_DIAL_READY` false); the step that turns
-  the native path on is a later release. Do not raise the floor again unless the V2 layout itself has to change. Same failure mode as the
+  native variants. In 0.2.163 every offer carries percent 0.
+  A+ step 1 (0.2.164) sets `NATIVE_DIAL_READY` true and
+  `QUIC_NATIVE_PERCENT` 25 and does not touch the floor. The
+  acceptor decides on `min(offered, own)`, so a reversal takes effect for a
+  pair once either the acceptor or the joiner has updated; there is no
+  runtime kill switch. Do not raise the floor again unless the V2 layout
+  itself has to change. Same failure mode as the
   application-message floors above: a peer at
   or above the floor without the decoder closes the connection on the variant,
   so bias high. Only `connect::wire::encode_for_peer`, at the one peer-bound
@@ -1466,10 +1473,13 @@ verification skill if you have it):
    published (not draft) with 14 assets.
 3. `curl https://nova.locut.us/release-agent/version` returns the new version,
    and `systemctl is-active freenet-gateway freenet-gateway-2` on nova reports
-   both units `active`. These are two separate checks: the first confirms the
-   binary was swapped, the second that BOTH gateway processes came back up —
-   the second gateway follows the first via `WantedBy=`, and a companion that
-   fails to start is the case `verify_service_active` now catches.
+   both units `active`. These are separate checks: the first confirms the
+   binary was swapped and the primary is up. The second gateway restarts about
+   10-12 minutes after the primary (`freenet-gateway-stagger.service`), so check
+   it after that: `systemctl show freenet-gateway-stagger -p Result` is
+   `success` and `readlink /proc/<gw2 MainPID>/exe` does not end in
+   `(deleted)`. If gw2 is stuck on the old binary, run
+   `sudo systemctl start freenet-gateway-stagger`; do not restart the primary.
 4. Matrix room shows the announcement.
 5. `sudo journalctl -u freenet-gateway --since "30 min ago"` on each
    gateway shows no errors.

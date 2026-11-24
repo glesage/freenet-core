@@ -269,6 +269,26 @@ pub enum SimOperation {
     /// anti-entropy. Handled specially by `run_controlled_simulation` (it is not
     /// a client request).
     RecoverNode,
+    /// Have the scheduled node send `InterestMessage::SummaryRequest` for
+    /// `key` to `to`, through `NodeEvent::SendInterestMessage`, in-order with
+    /// the surrounding events. The peer answers with a full-bytes `Summaries`,
+    /// which the sender runs through its usual staleness check and heal.
+    /// Handled specially by `run_controlled_simulation` (it is not a client
+    /// request).
+    SendSummaryRequest {
+        /// The contract whose summary is requested.
+        key: ContractKey,
+        /// The peer asked for its summary.
+        to: NodeLabel,
+    },
+    /// Stop the inline-leg fault seam dropping legs for `key`
+    /// (`dev_tool::inline_leg_fault_injection::lift`), in-order with the
+    /// surrounding events. The `node` on the [`ScheduledOperation`] is only a
+    /// sequencing placeholder. Handled specially by `run_controlled_simulation`.
+    LiftInlineLegFault {
+        /// The contract whose rules are removed.
+        key: ContractKey,
+    },
 }
 
 impl SimOperation {
@@ -398,6 +418,12 @@ impl SimOperation {
                 panic!(
                     "AdvanceHostingClock is not a client request — it must be handled \
                      by run_controlled_simulation during event dispatch"
+                )
+            }
+            SimOperation::SendSummaryRequest { .. } | SimOperation::LiftInlineLegFault { .. } => {
+                panic!(
+                    "SendSummaryRequest/LiftInlineLegFault are not client requests — they \
+                     must be handled by run_controlled_simulation during event dispatch"
                 )
             }
             SimOperation::CrashNode => {
@@ -610,6 +636,23 @@ pub struct ControlledSimulationResult {
         (std::net::SocketAddr, std::net::SocketAddr),
         crate::ring::topology_registry::ZombieSweepObservation,
     >,
+    /// How the join-convergence barrier ended, when the test asked for one
+    /// (`wait_for_join_convergence_before_ops`); `None` otherwise. Lets a test
+    /// fail when its operations started against a partly-formed network
+    /// instead of only logging it.
+    pub join_convergence: Option<JoinConvergence>,
+}
+
+/// How a controlled simulation's join-convergence barrier ended.
+#[derive(Debug, Clone, Copy)]
+pub struct JoinConvergence {
+    /// Whether the target fraction of peers had joined before the cap.
+    pub reached: bool,
+    /// Virtual time the barrier waited (after the client's initial 3 s).
+    pub waited: Duration,
+    /// Peers joined when the barrier ended, and the target.
+    pub joined: usize,
+    pub target: usize,
 }
 
 #[cfg(any(test, feature = "testing"))]
@@ -949,12 +992,23 @@ impl NodeLabel {
 
     /// Returns true if this is a gateway label.
     pub fn is_gateway(&self) -> bool {
-        self.0.contains("-gateway-")
+        self.role() == Some("gateway")
     }
 
     /// Returns true if this is a regular node label.
     pub fn is_node(&self) -> bool {
-        self.0.contains("-node-")
+        self.role() == Some("node")
+    }
+
+    /// The role segment of `{network_name}-{gateway|node}-{id}` (or of
+    /// `{gateway|node}-{id}`): the one before the numeric id. Read from the
+    /// end, so a network name that itself contains "-gateway-" or "-node-"
+    /// does not change any label's role.
+    fn role(&self) -> Option<&str> {
+        let mut parts = self.0.rsplitn(3, '-');
+        let id = parts.next()?;
+        id.parse::<usize>().ok()?;
+        parts.next()
     }
 
     pub fn number(&self) -> usize {
@@ -1715,6 +1769,9 @@ pub struct SimNetwork {
     /// Transient connection budget (`--transient-budget`) for every node this
     /// network builds, when set ([`SimNetwork::with_transient_budget`]).
     transient_budget_override: Option<usize>,
+    /// Base interval of every node's connect-failure backoff, when set
+    /// ([`SimNetwork::with_connect_backoff_base`]).
+    connect_backoff_base_override: Option<Duration>,
     /// Per-node capture slots for the live `Arc<Ring>`, populated by
     /// `run_controlled_simulation` so governance sim tests can read each
     /// node's `contract_ban_list` after the simulation completes. Keyed by
@@ -1937,6 +1994,7 @@ impl SimNetwork {
             hosting_clock: None,
             hosting_budget_override: None,
             transient_budget_override: None,
+            connect_backoff_base_override: None,
             shared_rings: HashMap::new(),
             node_port_override,
             quic_datagram_drops: Vec::new(),
@@ -2305,8 +2363,8 @@ impl SimNetwork {
 
     /// Turns QUIC-native connects on for every node, at `percent` (the share
     /// of joins an acceptor decides native), in place of this release's
-    /// `NATIVE_DIAL_READY` and `QUIC_NATIVE_PERCENT`, which are off. Pair it
-    /// with [`Self::with_quic_native_floor`], since without the native wire
+    /// `NATIVE_DIAL_READY` and `QUIC_NATIVE_PERCENT`, which are on (25) in
+    /// production. Pair it with [`Self::with_quic_native_floor`], since without the native wire
     /// variants no decision reaches a joiner, and with
     /// [`Self::with_transport_quic`], since a node without a QUIC endpoint
     /// cannot set one up. Call before the simulation starts.
@@ -2318,10 +2376,82 @@ impl SimNetwork {
         self
     }
 
+    /// Turns on admission of native joins (`transport::quic::admission`) at
+    /// the gateway `label`'s QUIC listener, in place of this release's
+    /// `GATEWAY_NATIVE_ADMISSION`, which is off. A joiner reaches it with
+    /// [`Self::with_native_gateway_join`] when the gateway is marked native.
+    /// Call before the simulation starts.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn with_gateway_native_admission(&mut self, label: &NodeLabel) -> &mut Self {
+        assert!(label.is_gateway(), "only a gateway admits native joins");
+        let addr = *self
+            .node_addresses
+            .get(label)
+            .expect("the gateway must have an address in this network");
+        crate::transport::in_memory_socket::force_gateway_native_admission(&self.name, addr);
+        self
+    }
+
+    /// Makes the gateway `label` close every native join it completes, right
+    /// after the Hello, as a release before the hand-off to the node did.
+    /// Pair it with [`Self::with_gateway_native_admission`]. Call before the
+    /// simulation starts.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn with_gateway_closing_native_joins(&mut self, label: &NodeLabel) -> &mut Self {
+        assert!(label.is_gateway(), "only a gateway admits native joins");
+        let addr = *self
+            .node_addresses
+            .get(label)
+            .expect("the gateway must have an address in this network");
+        crate::transport::in_memory_socket::force_gateway_closing_native_joins(&self.name, addr);
+        self
+    }
+
+    /// Turns native gateway joins (phase B) on for every node, at `percent`
+    /// (the share of joiner-gateway pairs that dial native first), in place of
+    /// `NATIVE_DIAL_READY` and `GATEWAY_NATIVE_JOIN_PERCENT`, which are off,
+    /// and marks every gateway each node knows native, as the published index
+    /// does for a gateway that admits native joins. A joiner with a QUIC
+    /// endpoint (see [`Self::with_transport_quic`]) then tries a native join
+    /// first, and falls back to the UDP join when it fails. Call before the
+    /// simulation starts.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn with_native_gateway_join(&mut self, percent: u8) -> &mut Self {
+        for label in self.pending_labels() {
+            let config = self.node_config_mut(&label);
+            config.native_gateway_join_override = Some(percent);
+            for gateway in &mut config.gateways {
+                gateway.native = true;
+            }
+        }
+        self
+    }
+
     /// As [`Self::with_native_connect`], for the node `label` only.
     #[cfg(any(test, feature = "testing"))]
     pub fn with_node_native_connect(&mut self, label: &NodeLabel, percent: u8) -> &mut Self {
         self.node_config_mut(label).native_connect_override = Some(percent);
+        self
+    }
+
+    /// Makes the node `label` offer QUIC-native as joiner but unable to use a
+    /// `Native` decision when the acceptor's response arrives, standing in
+    /// for a joiner demoted (or whose endpoint went down) between its offer
+    /// and the response. Call before the simulation starts.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn with_node_native_refuses_decisions(&mut self, label: &NodeLabel) -> &mut Self {
+        self.node_config_mut(label).native_refuses_decisions = true;
+        self
+    }
+
+    /// Makes the node `label` never offer QUIC-native as joiner while it
+    /// still decides as acceptor, standing in for a node that rarely joins
+    /// (a gateway, a peer at its target). Its joiner role then never
+    /// demotes, so its acceptor role's own demotion shows. Call before the
+    /// simulation starts.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn with_node_native_joiner_off(&mut self, label: &NodeLabel) -> &mut Self {
+        self.node_config_mut(label).native_joiner_off = true;
         self
     }
 
@@ -2383,6 +2513,19 @@ impl SimNetwork {
         Arc::make_mut(&mut config.config)
             .network_api
             .quic_data_percent = Some(percent.to_string());
+        self
+    }
+
+    /// Sets every gateway's `max_connections` to `max`, leaving the regular
+    /// nodes at the network's value. Production gateways carry many more
+    /// connections than peers; a sparse simulation that gives the gateway the
+    /// peers' cap can saturate, after which a late joiner is refused by every
+    /// node. Call before the simulation starts.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn with_gateway_max_connections(&mut self, max: usize) -> &mut Self {
+        for (builder, _) in &mut self.gateways {
+            builder.config.max_number_of_connections(max);
+        }
         self
     }
 
@@ -2802,6 +2945,22 @@ impl SimNetwork {
         self
     }
 
+    /// Give every node this network builds `base` as the base interval of its
+    /// connect-failure backoff, in place of `FREENET_BACKOFF_BASE_SECS` (which
+    /// the CI workflow sets to 5 s). A test whose outcome depends on how long
+    /// a failed joiner waits pins it here, so it means the same on every
+    /// machine. Call before `start*`.
+    pub fn with_connect_backoff_base(&mut self, base: Duration) -> &mut Self {
+        self.connect_backoff_base_override = Some(base);
+        for (builder, _) in self.gateways.iter_mut() {
+            builder.config.connect_backoff_base = Some(base);
+        }
+        for (builder, _) in self.nodes.iter_mut() {
+            builder.config.connect_backoff_base = Some(base);
+        }
+        self
+    }
+
     /// Set the per-node hosting-cache byte budget (`max_hosting_storage`) for
     /// every node this network builds. A tiny budget forces cache pressure so a
     /// test can observe demand-driven eviction of low-demand contracts
@@ -3091,6 +3250,22 @@ impl SimNetwork {
         }
         for (builder, _) in self.nodes.iter_mut() {
             builder.config.broadcast_target_list_floor_override = floor;
+        }
+        self
+    }
+
+    /// Set the hash-first summary floor on every node, so a peer advertising a
+    /// version below `floor` (see `with_node_advertised_version`) is treated as
+    /// pre-hash-first: it is sent full-bytes summaries and no `SummaryRequest`.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn with_hash_first_summaries_floor(&mut self, floor: (u8, u8, u16)) -> &mut Self {
+        let floor = Some(floor);
+        self.hash_first_summaries_floor_override = floor;
+        for (builder, _) in self.gateways.iter_mut() {
+            builder.config.hash_first_summaries_floor_override = floor;
+        }
+        for (builder, _) in self.nodes.iter_mut() {
+            builder.config.hash_first_summaries_floor_override = floor;
         }
         self
     }
@@ -3826,6 +4001,7 @@ impl SimNetwork {
             if let Some(budget) = self.transient_budget_override {
                 config.transient_budget = budget;
             }
+            config.connect_backoff_base = self.connect_backoff_base_override;
             config.key_pair = keypair;
             config.network_listener_ip = ip.into();
             config.network_listener_port = port;
@@ -3936,6 +4112,7 @@ impl SimNetwork {
             if let Some(budget) = self.transient_budget_override {
                 config.transient_budget = budget;
             }
+            config.connect_backoff_base = self.connect_backoff_base_override;
             for GatewayConfig {
                 peer_key_location,
                 location,
@@ -5837,7 +6014,9 @@ impl SimNetwork {
                 // client-request generator.
                 | SimOperation::AdvanceHostingClock { .. }
                 | SimOperation::CrashNode
-                | SimOperation::RecoverNode => event_ops.push(scheduled_op),
+                | SimOperation::RecoverNode
+                | SimOperation::SendSummaryRequest { .. }
+                | SimOperation::LiftInlineLegFault { .. } => event_ops.push(scheduled_op),
             }
         }
 
@@ -5903,6 +6082,12 @@ impl SimNetwork {
             AdvanceHostingClock(Duration),
             CrashNode(SocketAddr),
             RecoverNode(SocketAddr),
+            SendSummaryRequest {
+                from: NodeLabel,
+                target: SocketAddr,
+                key: ContractKey,
+            },
+            LiftInlineLegFault(ContractKey),
         }
 
         // Build a map of label -> list of (event_id, operation)
@@ -5944,6 +6129,22 @@ impl SimNetwork {
                             )
                         });
                     special_ops.insert(event_id, SpecialDispatch::RecoverNode(addr));
+                }
+                SimOperation::SendSummaryRequest { key, ref to } => {
+                    let target = *self.node_addresses.get(to).unwrap_or_else(|| {
+                        panic!("SendSummaryRequest: node {to:?} has no known address")
+                    });
+                    special_ops.insert(
+                        event_id,
+                        SpecialDispatch::SendSummaryRequest {
+                            from: scheduled_op.node.clone(),
+                            target,
+                            key,
+                        },
+                    );
+                }
+                SimOperation::LiftInlineLegFault { key } => {
+                    special_ops.insert(event_id, SpecialDispatch::LiftInlineLegFault(key));
                 }
                 op @ (SimOperation::Put { .. }
                 | SimOperation::Get { .. }
@@ -6217,6 +6418,8 @@ impl SimNetwork {
         // Clone the network name for the client closure (the outer
         // `network_name` is still needed after the run for topology capture).
         let network_name_for_client = network_name.clone();
+        // Ring slots, so `SendSummaryRequest` can reach the sender's OpManager.
+        let rings_for_client = self.shared_rings.clone();
 
         // Optional pre-operation join-convergence barrier (see
         // `wait_for_join_convergence_before_ops`). Captured by value into the
@@ -6242,6 +6445,8 @@ impl SimNetwork {
         // barrier's wall-clock for no change in what the metric measures.
         const PEER_READY_MIN_CONNECTIONS: usize = 1;
         let join_conn_threshold = PEER_READY_MIN_CONNECTIONS;
+        let join_record: Arc<std::sync::Mutex<Option<JoinConvergence>>> = Default::default();
+        let join_record_client = join_record.clone();
 
         // Register the test client that triggers controlled events
         sim.client("test", async move {
@@ -6276,9 +6481,21 @@ impl SimNetwork {
                             waited_secs = waited.as_secs(),
                             "controlled sim: ring join-convergence reached — firing operations"
                         );
+                        *join_record_client.lock().unwrap() = Some(JoinConvergence {
+                            reached: true,
+                            waited,
+                            joined,
+                            target,
+                        });
                         break;
                     }
                     if waited >= max_wait {
+                        *join_record_client.lock().unwrap() = Some(JoinConvergence {
+                            reached: false,
+                            waited,
+                            joined,
+                            target,
+                        });
                         tracing::warn!(
                             joined,
                             target,
@@ -6354,6 +6571,35 @@ impl SimNetwork {
                                     "RecoverNode scheduled but no fault injector registered"
                                 );
                             }
+                        }
+                        SpecialDispatch::SendSummaryRequest { from, target, key } => {
+                            let op_manager = rings_for_client
+                                .get(from)
+                                .and_then(|slot| slot.lock().clone())
+                                .and_then(|ring| ring.upgrade_op_manager());
+                            let Some(op_manager) = op_manager else {
+                                panic!("SendSummaryRequest: node {from:?} has no live OpManager");
+                            };
+                            let sent = op_manager.try_notify_node_event(
+                                crate::message::NodeEvent::SendInterestMessage {
+                                    target: *target,
+                                    message: crate::message::InterestMessage::SummaryRequest {
+                                        hashes: vec![crate::ring::interest::contract_hash(key)],
+                                    },
+                                },
+                            );
+                            tracing::info!(
+                                event_id,
+                                node = %from,
+                                %target,
+                                contract = %key,
+                                queued = sent.is_ok(),
+                                "Sent SummaryRequest from a controlled event"
+                            );
+                        }
+                        SpecialDispatch::LiftInlineLegFault(key) => {
+                            crate::operations::update::inline_leg_fault_injection::seam::lift(key);
+                            tracing::info!(event_id, contract = %key, "Lifted inline-leg fault");
                         }
                     }
                     // Let the effect settle before the next event.
@@ -6446,6 +6692,7 @@ impl SimNetwork {
             crash_packets_dropped,
             summarize_wasm_calls,
             zombie_sweep_observations,
+            join_convergence: *join_record.lock().unwrap(),
         }
     }
 
@@ -7886,6 +8133,28 @@ use crate::contract::OperationMode;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A label's role is the segment before its id, whatever the network is
+    /// called: a network name containing "-gateway-" or "-node-" makes no
+    /// node a gateway, or the reverse.
+    #[test]
+    fn node_label_role_ignores_the_network_name() {
+        for network in [
+            "sim",
+            "native-gateway-join-off",
+            "a-node-b",
+            "x-gateway-1-node-2",
+        ] {
+            let gateway = NodeLabel::gateway(network, 3);
+            let node = NodeLabel::node(network, 4);
+            assert!(gateway.is_gateway() && !gateway.is_node(), "{gateway}");
+            assert!(node.is_node() && !node.is_gateway(), "{node}");
+            assert_eq!((gateway.number(), node.number()), (3, 4));
+        }
+        let (gateway, node) = (NodeLabel::from("gateway-0"), NodeLabel::from("node-7"));
+        assert!(gateway.is_gateway() && !gateway.is_node());
+        assert!(node.is_node() && !node.is_gateway());
+    }
 
     /// The helper moves VirtualTime with turmoil's clock: after a run whose client
     /// sleeps 5 s, VirtualTime reads 5 s, within a tick or two.

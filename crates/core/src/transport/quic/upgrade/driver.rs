@@ -81,15 +81,15 @@ use super::machine::{
     Action, BackoffSeed, CONTROL_SEND_TIMEOUT, Event, FALLBACK_CHURN_WINDOW, FallbackCause, Inputs,
     Outcome, RECENT_FALLBACKS_MAX, Role, UpgradeMachine,
 };
-use super::policy::QuicPolicy;
+use super::policy::{QuicPathPermits, QuicPolicy};
 use crate::config::{GlobalExecutor, GlobalRng};
-use crate::node::background_task_monitor::LateRegistrar;
 use crate::simulation::{RealTime, TimeSource, VirtualTime};
 use crate::transport::boundary::QuicPathEnd;
 use crate::transport::crypto::TransportPublicKey;
 use crate::transport::metrics::{QuicCloseCode, QuicFallback, QuicUpgradeOutcome};
 use crate::transport::peer_connection::UdpSender;
 use crate::transport::peer_connection::inbound_budget::SharedInboundBudget;
+use crate::transport::peer_connection::native_connection::NativePeerConnection;
 use crate::transport::quic::config::QuicRateLimit;
 use crate::transport::quic::control::ControlError;
 use crate::transport::quic::identity::PeerKey;
@@ -107,16 +107,25 @@ use crate::transport::{
     QuicErrorKind, QuicRefusal, Socket, TRANSPORT_METRICS, normalize_mapped_addr,
 };
 
+/// A native join that completed at a gateway: the connection, the version
+/// in the joiner's Hello, and the joiner's charge against the connection
+/// cap, held until the node promotes the connection or it closes.
+pub(in crate::transport::quic) struct GatewayJoined {
+    pub(in crate::transport::quic) connection: QuicConnection,
+    pub(in crate::transport::quic) version: (u8, u8, u16),
+    pub(in crate::transport::quic) charge: crate::transport::quic::JoinerCharge,
+}
+
 /// An admitted native join at a gateway (`quic::admission`): the handshake
 /// and the Hello exchange, within [`NATIVE_JOIN_WINDOW`] on `clock`, where
 /// the exchange includes the client's acknowledgement of the gateway's Hello
-/// (a close stops retransmission, so closing earlier could lose it). Until
-/// phase B hands the connection to the node, a join that gets this far is
-/// closed here and counted as `joined`. Returns what to count.
-pub(in crate::transport::quic) async fn join_gateway<T: TimeSource>(
+/// (a close stops retransmission, so closing earlier could lose it). A join
+/// that gets this far is handed to the node ([`QuicUpgrades::hand_off_join`]);
+/// any other end says what to count.
+pub(in crate::transport::quic) async fn establish_gateway_join<T: TimeSource>(
     joiner: JoinerIncoming,
     clock: &T,
-) -> crate::transport::metrics::GatewayAdmission {
+) -> Result<GatewayJoined, crate::transport::metrics::GatewayAdmission> {
     use crate::transport::metrics::GatewayAdmission;
     use crate::transport::quic::JoinerError;
     // The window counts from the moment the join was queued, so a join that
@@ -128,20 +137,20 @@ pub(in crate::transport::quic) async fn join_gateway<T: TimeSource>(
     let start = clock.now().saturating_sub(queued_for);
     let window = NATIVE_JOIN_WINDOW.saturating_sub(queued_for);
     if window.is_zero() {
-        return GatewayAdmission::HandshakeFailed;
+        return Err(GatewayAdmission::HandshakeFailed);
     }
     let Some(established) = clock.timeout(window, joiner.establish()).await else {
-        return GatewayAdmission::HandshakeFailed;
+        return Err(GatewayAdmission::HandshakeFailed);
     };
-    // The joiner's charge against the connection cap is held to the end of
-    // this function: a failed handshake or an elapsed window drops it with
-    // the future above, and closing the connection ends it here.
-    let (connection, _charge) = match established {
+    // The joiner's charge against the connection cap travels with the
+    // connection: a failed handshake or an elapsed window drops it with the
+    // future above, a failed Hello here.
+    let (connection, charge) = match established {
         Ok(established) => established,
-        Err(JoinerError::Unproven) => return GatewayAdmission::Unproven,
+        Err(JoinerError::Unproven) => return Err(GatewayAdmission::Unproven),
         Err(JoinerError::Handshake(error)) => {
             tracing::debug!(%error, "An admitted native join's handshake failed");
-            return GatewayAdmission::HandshakeFailed;
+            return Err(GatewayAdmission::HandshakeFailed);
         }
     };
     let own =
@@ -156,15 +165,33 @@ pub(in crate::transport::quic) async fn join_gateway<T: TimeSource>(
     )
     .await
     {
-        Ok(_) => {
-            connection.close(crate::transport::metrics::QuicCloseCode::NodeDroppedPeer);
-            drop(_charge);
-            GatewayAdmission::Joined
-        }
+        Ok(peer) => Ok(GatewayJoined {
+            connection,
+            version: peer.version,
+            charge,
+        }),
         Err(error) => {
             tracing::debug!(%error, "An admitted native join's Hello exchange failed");
-            GatewayAdmission::HelloFailed
+            Err(GatewayAdmission::HelloFailed)
         }
+    }
+}
+
+/// [`establish_gateway_join`], closing a completed join at once and counting
+/// it `joined`: a gateway with no node to hand joins to.
+#[cfg(test)]
+pub(in crate::transport::quic) async fn join_gateway<T: TimeSource>(
+    joiner: JoinerIncoming,
+    clock: &T,
+) -> crate::transport::metrics::GatewayAdmission {
+    match establish_gateway_join(joiner, clock).await {
+        Ok(joined) => {
+            joined
+                .connection
+                .close(crate::transport::metrics::QuicCloseCode::NodeDroppedPeer);
+            crate::transport::metrics::GatewayAdmission::Joined
+        }
+        Err(outcome) => outcome,
     }
 }
 
@@ -178,13 +205,17 @@ const GATEWAY_JOIN_QUEUE: usize = 64;
 const GATEWAY_JOINS_MAX: usize = 512;
 
 /// The registered task that runs every admitted gateway join
-/// ([`join_gateway`]) as a future of its own, at most [`GATEWAY_JOINS_MAX`]
+/// ([`establish_gateway_join`], then [`QuicUpgrades::hand_off_join`]) as a future of its own, at most [`GATEWAY_JOINS_MAX`]
 /// at once (the queue backs up past that, and a full queue gives admissions
 /// back). A join that panics is counted (`join_panicked`) and logged, and the
 /// task goes on. Once the queue's sender is gone (the hub dropped), it
 /// finishes the joins it holds and parks, as the attempt router does, so the
 /// monitor does not read its end as a failure.
-async fn run_gateway_joins(mut queue: mpsc::Receiver<JoinerIncoming>, clock: PathClock) {
+async fn run_gateway_joins(
+    mut queue: mpsc::Receiver<JoinerIncoming>,
+    clock: PathClock,
+    hub: Weak<QuicUpgrades>,
+) {
     use crate::transport::metrics::GatewayAdmission;
     use futures::FutureExt;
     use futures::stream::{FuturesUnordered, StreamExt};
@@ -194,10 +225,21 @@ async fn run_gateway_joins(mut queue: mpsc::Receiver<JoinerIncoming>, clock: Pat
         tokio::select! {
             joiner = queue.recv(), if open && running.len() < GATEWAY_JOINS_MAX => match joiner {
                 Some(joiner) => {
-                    let clock = clock.clone();
+                    let (clock, hub) = (clock.clone(), hub.clone());
                     running.push(
-                        std::panic::AssertUnwindSafe(async move { join_gateway(joiner, &clock).await })
-                            .catch_unwind(),
+                        std::panic::AssertUnwindSafe(async move {
+                            match establish_gateway_join(joiner, &clock).await {
+                                Ok(joined) => match hub.upgrade() {
+                                    Some(hub) => hub.hand_off_join(joined),
+                                    // The stack is gone (a rebuild replaced
+                                    // it, or the node is stopping): the join
+                                    // is dropped, which closes it.
+                                    None => GatewayAdmission::StackGone,
+                                },
+                                Err(outcome) => outcome,
+                            }
+                        })
+                        .catch_unwind(),
                     );
                 }
                 None => open = false,
@@ -593,6 +635,10 @@ pub(in crate::transport) struct QuicUpgrades {
     /// registered task that runs them ([`run_gateway_joins`]). Set by
     /// [`Self::spawn_attempt_router`] only when the endpoint admits joins.
     gateway_joins: std::sync::OnceLock<mpsc::Sender<JoinerIncoming>>,
+    /// Where completed gateway joins go: the node's inbound connections
+    /// (`InboundConnectionHandler`). Set once by the listener; without it a
+    /// completed join is closed ([`Self::hand_off_join`]).
+    join_handoff: std::sync::OnceLock<mpsc::Sender<NativePeerConnection>>,
     /// The node's bandwidth settings, which pace a native connection's data
     /// as a session's settings pace an upgrade path's.
     native_rate: crate::transport::quic::config::QuicRateLimit,
@@ -635,6 +681,7 @@ impl QuicUpgrades {
             punch_budget: crate::transport::quic::native::punch::PunchBudget::default(),
             native_setups,
             gateway_joins: std::sync::OnceLock::new(),
+            join_handoff: std::sync::OnceLock::new(),
             native_rate,
             #[cfg(any(test, feature = "testing"))]
             trace,
@@ -647,14 +694,28 @@ impl QuicUpgrades {
     /// session of its address. It holds this value weakly, so it does not keep
     /// the endpoint alive, and it parks when `attempts` closes, as the accept loop
     /// does, since the monitor reads any end of a registered task as a failure.
-    pub(in crate::transport) fn spawn_attempt_router(
+    ///
+    /// Each task it starts is handed to `register`: the node's monitor for
+    /// the first endpoint, the rebuild loop for one built in place of a dead
+    /// one (`quic::rebuild`).
+    pub(in crate::transport) fn spawn_attempt_router_with(
         self: &Arc<Self>,
-        registrar: &LateRegistrar,
+        register: &mut dyn FnMut(&'static str, JoinHandle<()>),
         mut attempts: mpsc::Receiver<EndpointAttempt>,
     ) {
         let hub = Arc::downgrade(self);
+        let availability = self.endpoint.availability();
         let handle = GlobalExecutor::spawn(async move {
             while let Some(incoming) = attempts.recv().await {
+                // #6184: once the endpoint is not Up, a panic in a quinn
+                // driver may have poisoned its lock, which `ignore`, `retry`
+                // and `accept` unwrap: an attempt queued before the death
+                // would panic this monitored task. Dropping it is safe
+                // (quinn's `Incoming::drop` skips a poisoned lock).
+                if availability.get() != crate::transport::quic::QuicAvailability::Up {
+                    drop(incoming);
+                    continue;
+                }
                 match hub.upgrade() {
                     Some(hub) => hub.dispatch(incoming),
                     None => incoming.ignore(),
@@ -664,13 +725,14 @@ impl QuicUpgrades {
             drop(attempts);
             std::future::pending::<()>().await;
         });
-        registrar.register("quic_attempt_router", handle);
+        register("quic_attempt_router", handle);
         if self.endpoint.gateway_admission_enabled() {
             let (joins, queue) = mpsc::channel(GATEWAY_JOIN_QUEUE);
             if self.gateway_joins.set(joins).is_ok() {
                 let clock = self.path_clock.clone();
-                let handle = GlobalExecutor::spawn(run_gateway_joins(queue, clock));
-                registrar.register("quic_gateway_joins", handle);
+                let handle =
+                    GlobalExecutor::spawn(run_gateway_joins(queue, clock, Arc::downgrade(self)));
+                register("quic_gateway_joins", handle);
             }
         }
     }
@@ -695,15 +757,19 @@ impl QuicUpgrades {
         }
     }
 
+    /// The node's QUIC path permits, which an endpoint built in place of this
+    /// one's counts against too (`quic::rebuild`), so the cap holds across
+    /// endpoints.
+    pub(in crate::transport) fn permits(&self) -> &QuicPathPermits {
+        self.policy.permits()
+    }
+
     /// The native waiters the router hands native attempts to.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(in crate::transport) fn native_waiters(&self) -> &Arc<NativeWaiters> {
         &self.native
     }
 
-    /// Hand `incoming` to the session of its address, without waiting. With no
-    /// session, or one whose inbox is full, the attempt is ignored and counted:
-    /// the client retransmits its Initial, as after a lost datagram.
     /// Hand an admitted joiner to the task that runs gateway joins. A full
     /// queue, or none (an endpoint that does not admit joins), drops it,
     /// which gives its admission back.
@@ -727,6 +793,44 @@ impl QuicUpgrades {
                 mpsc::error::TrySendError::Closed(joiner) => joiner,
             };
             joiner.ignore();
+        }
+    }
+
+    /// Where completed gateway joins go (`InboundConnectionHandler`). Only
+    /// the first call counts.
+    pub(in crate::transport) fn set_join_handoff(
+        &self,
+        to_node: mpsc::Sender<NativePeerConnection>,
+    ) {
+        drop(self.join_handoff.set(to_node));
+    }
+
+    /// Hand a completed gateway join to the node as an inbound native
+    /// connection holding the joiner's charge, without waiting: counted
+    /// `joined`. With no room in the hand-off queue, or no node to take it,
+    /// the join is closed and counted `handoff_full`.
+    pub(in crate::transport::quic) fn hand_off_join(
+        &self,
+        joined: GatewayJoined,
+    ) -> crate::transport::metrics::GatewayAdmission {
+        use crate::transport::metrics::GatewayAdmission;
+        let Some(to_node) = self.join_handoff.get() else {
+            joined
+                .connection
+                .close(crate::transport::metrics::QuicCloseCode::NodeDroppedPeer);
+            return GatewayAdmission::HandoffFull;
+        };
+        let remote = normalize_mapped_addr(joined.connection.inner().remote_address());
+        let connection = self
+            .native_connection(joined.connection, joined.version, remote)
+            .with_joiner_charge(joined.charge);
+        match to_node.try_send(connection) {
+            Ok(()) => GatewayAdmission::Joined,
+            // Dropping the connection closes it and releases the charge.
+            Err(_) => {
+                tracing::debug!(%remote, "No room to hand a native join to the node; closing it");
+                GatewayAdmission::HandoffFull
+            }
         }
     }
 
@@ -1872,9 +1976,12 @@ async fn drive<S: Socket, T: TimeSource>(
 /// How a new connection joins its node's upgrades. With QUIC off, or with an
 /// endpoint that could not be built, it holds no upgrades. Holds them weakly: the
 /// listener owns them, and a handler must not keep the endpoint alive after it.
+/// Clones share one place: when the node rebuilds its endpoint
+/// (`quic::rebuild`) the listener points it at the new upgrades
+/// ([`Self::replace`]), and every clone sees them.
 #[derive(Clone, Default)]
 pub(in crate::transport) struct UpgradeSite {
-    upgrades: Weak<QuicUpgrades>,
+    upgrades: Arc<parking_lot::RwLock<Weak<QuicUpgrades>>>,
     #[cfg(any(test, feature = "testing"))]
     trace: Option<super::sim_trace::NodeTrace>,
 }
@@ -1886,14 +1993,22 @@ impl UpgradeSite {
         local_addr: SocketAddr,
     ) -> Self {
         Self {
-            upgrades: upgrades.map_or_else(Weak::new, Arc::downgrade),
+            upgrades: Arc::new(parking_lot::RwLock::new(
+                upgrades.map_or_else(Weak::new, Arc::downgrade),
+            )),
             #[cfg(any(test, feature = "testing"))]
             trace: crate::transport::in_memory_socket::quic_upgrade_trace_at(local_addr),
         }
     }
 
     pub(in crate::transport) fn upgrades(&self) -> Option<Arc<QuicUpgrades>> {
-        self.upgrades.upgrade()
+        self.upgrades.read().upgrade()
+    }
+
+    /// Point this site, and every clone of it, at `upgrades`: those of an
+    /// endpoint the node built in place of a dead one (`quic::rebuild`).
+    pub(in crate::transport) fn replace(&self, upgrades: Option<&Arc<QuicUpgrades>>) {
+        *self.upgrades.write() = upgrades.map_or_else(Weak::new, Arc::downgrade);
     }
 
     /// Where this node's upgrade messages are recorded for a test.

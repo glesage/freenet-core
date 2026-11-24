@@ -50,6 +50,7 @@ pub(crate) mod native;
 #[cfg(any(test, feature = "quic-panic-injection"))]
 pub(crate) mod panic_injection;
 pub(crate) mod path;
+pub(crate) mod rebuild;
 pub(crate) mod recycle;
 pub(crate) mod runtime;
 pub(crate) mod socket;
@@ -486,6 +487,15 @@ fn require_unwinding(unwinds: bool) -> io::Result<()> {
 /// ([`require_unwinding`]).
 pub(crate) const UNWINDS: bool = cfg!(panic = "unwind");
 
+/// What building an endpoint does to its socket's QUIC ingress.
+#[derive(Clone, Copy)]
+enum Ingress {
+    /// Enable it; the build fails if it was already enabled.
+    Enable,
+    /// Replace the one a dead endpoint read ([`QuicEndpoint::rebuild`]).
+    Replace,
+}
+
 impl EndpointCore {
     /// The node's buffer budget, which sets each data path's windows.
     pub(crate) fn buffer_budget(&self) -> &Arc<budget::QuicBudget> {
@@ -494,7 +504,7 @@ impl EndpointCore {
 
     /// Connection pollers this endpoint's socket built outside
     /// `socket::with_poller_holds`: their cap holds go into a record nobody
-    /// reads. Expected 0 (quinn 0.11.12 builds one elsewhere only on a
+    /// reads. Expected 0 (freenet-quinn 0.11.13 builds one elsewhere only on a
     /// rebind, which needs migration, which is off).
     #[cfg(test)]
     pub(crate) fn fallback_pollers(&self) -> u64 {
@@ -503,6 +513,13 @@ impl EndpointCore {
 }
 
 impl QuicEndpoint {
+    /// Whether `other` is a handle on this same endpoint, not one built in
+    /// place of it (`rebuild`).
+    #[cfg(test)]
+    pub(crate) fn same_endpoint(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.owner, &other.owner)
+    }
+
     /// Build an endpoint over `socket`, which must be the socket the
     /// listener reads (it fills the QUIC ingress queue), bound at
     /// `local_addr`, authenticating as the holder of `keypair`.
@@ -542,6 +559,31 @@ impl QuicEndpoint {
     ) -> io::Result<Self> {
         require_unwinding(unwinds)?;
         Self::bind_with(
+            socket,
+            local_addr,
+            time,
+            settings,
+            keypair,
+            config::endpoint_config()?,
+        )
+    }
+
+    /// Build an endpoint as [`Self::bind`] does, to replace one on the same
+    /// socket that died (`rebuild`): the socket's QUIC ingress is replaced
+    /// rather than enabled (`DemuxSocket::with_replaced_quic_ingress`), so
+    /// the new endpoint starts with an empty allow-set and nothing the dead
+    /// one queued. Fails, leaving the socket's QUIC ingress disabled, as
+    /// [`Self::bind`] fails; also if the socket never had an ingress.
+    pub(crate) fn rebuild<S: Socket, T: TimeSource>(
+        socket: Arc<DemuxSocket<S>>,
+        local_addr: SocketAddr,
+        time: T,
+        settings: &QuicSettings,
+        keypair: &TransportKeypair,
+    ) -> io::Result<Self> {
+        require_unwinding(UNWINDS)?;
+        Self::bind_on(
+            Ingress::Replace,
             socket,
             local_addr,
             time,
@@ -599,6 +641,28 @@ impl QuicEndpoint {
         keypair: &TransportKeypair,
         endpoint_config: quinn::EndpointConfig,
     ) -> io::Result<Self> {
+        Self::bind_on(
+            Ingress::Enable,
+            socket,
+            local_addr,
+            time,
+            settings,
+            keypair,
+            endpoint_config,
+        )
+    }
+
+    /// [`Self::bind_with`], enabling the socket's QUIC ingress or replacing
+    /// it ([`Self::rebuild`]).
+    fn bind_on<S: Socket, T: TimeSource>(
+        ingress_mode: Ingress,
+        socket: Arc<DemuxSocket<S>>,
+        local_addr: SocketAddr,
+        time: T,
+        settings: &QuicSettings,
+        keypair: &TransportKeypair,
+        endpoint_config: quinn::EndpointConfig,
+    ) -> io::Result<Self> {
         let invalid = |error: &dyn std::fmt::Display| {
             io::Error::new(io::ErrorKind::InvalidInput, error.to_string())
         };
@@ -619,37 +683,44 @@ impl QuicEndpoint {
         let mut cap_holds = None;
         // If quinn refuses the socket after the ingress is enabled, the
         // ingress is disabled again, so the node is left as with QUIC off.
-        let endpoint = socket
-            .with_quic_ingress(|ingress| {
-                let quic_socket = Arc::new(socket::QuicSocket::new(
-                    socket.clone(),
-                    ingress,
-                    local_addr,
-                    health.clone(),
-                ));
-                cap_holds = Some(quic_socket.cap_holds());
-                #[cfg(any(test, feature = "testing"))]
-                {
-                    faults = Some(quic_socket.faults());
-                }
-                let runtime = Arc::new(runtime::QuicRuntime::new(time, health.clone()));
-                // The server configuration is set so quinn hands every
-                // Initial from an allowed source to `accept` (without one it
-                // answers with a stateless reset); its TLS refuses every
-                // client, and `accept` replaces it per attempt.
-                quinn::Endpoint::new_with_abstract_socket(
-                    endpoint_config,
-                    Some((*server).clone()),
-                    quic_socket,
-                    runtime,
-                )
-            })
-            .ok_or_else(|| {
+        let build = |ingress| {
+            let quic_socket = Arc::new(socket::QuicSocket::new(
+                socket.clone(),
+                ingress,
+                local_addr,
+                health.clone(),
+            ));
+            cap_holds = Some(quic_socket.cap_holds());
+            #[cfg(any(test, feature = "testing"))]
+            {
+                faults = Some(quic_socket.faults());
+            }
+            let runtime = Arc::new(runtime::QuicRuntime::new(time, health.clone()));
+            // The server configuration is set so quinn hands every
+            // Initial from an allowed source to `accept` (without one it
+            // answers with a stateless reset); its TLS refuses every
+            // client, and `accept` replaces it per attempt.
+            quinn::Endpoint::new_with_abstract_socket(
+                endpoint_config,
+                Some((*server).clone()),
+                quic_socket,
+                runtime,
+            )
+        };
+        let endpoint = match ingress_mode {
+            Ingress::Enable => socket.with_quic_ingress(build).ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::AlreadyExists,
                     "the socket's QUIC ingress is already enabled",
                 )
-            })??;
+            }),
+            Ingress::Replace => socket.with_replaced_quic_ingress(build).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "the socket has no QUIC ingress to replace",
+                )
+            }),
+        }??;
         let buffer_budget = budget::QuicBudget::new(
             config::quic_buffer_budget_for(settings.memory_limit) as u64,
             settings.window_bytes(),
@@ -777,8 +848,10 @@ impl QuicEndpoint {
     /// reads any end of a registered task as a node failure and an
     /// endpoint's end must not stop the node. Endpoint death is reported by
     /// the driver's watcher ([`Self::availability`]), not by this task. A
-    /// panic here is still a node failure, as for every monitored task; a
-    /// quinn panic is not contained (see `liveness`).
+    /// panic here is still a node failure, as for every monitored task,
+    /// including one from quinn's poisoned endpoint lock; the loop checks the
+    /// availability before every poll of quinn's `accept` so that a driver
+    /// panic, which turns it `Down`, stops the loop instead (see `liveness`).
     ///
     /// The registrar is a [`LateRegistrar`] because in `run_node` the
     /// monitor starts waiting before the event listener opens the transport,
@@ -795,9 +868,24 @@ impl QuicEndpoint {
     /// consumers. A second call logs a WARN, starts nothing and returns
     /// `false`.
     #[must_use = "false means no accept loop was started"]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn spawn_accept_loop(
         &self,
         registrar: &LateRegistrar,
+        attempts: mpsc::Sender<EndpointAttempt>,
+    ) -> bool {
+        self.spawn_accept_loop_with(
+            &mut |name, handle| registrar.register(name, handle),
+            attempts,
+        )
+    }
+
+    /// [`Self::spawn_accept_loop`], handing the loop's task to `register`:
+    /// the node's monitor for the first endpoint, the rebuild loop for one
+    /// built in place of a dead one (`rebuild`).
+    pub(crate) fn spawn_accept_loop_with(
+        &self,
+        register: &mut dyn FnMut(&'static str, tokio::task::JoinHandle<()>),
         attempts: mpsc::Sender<EndpointAttempt>,
     ) -> bool {
         if self
@@ -815,9 +903,17 @@ impl QuicEndpoint {
         let full = self.owner.accept_queue_full.clone();
         let handle = GlobalExecutor::spawn(async move {
             loop {
+                // `biased`, availability first: once the endpoint is not Up,
+                // quinn's `accept` is never polled again. After a panic in
+                // quinn's endpoint driver its state lock is poisoned and
+                // `Accept::poll` unwraps it, and `EndpointDriver::drop` wakes
+                // this very future during that unwind (see `liveness`). Nothing can
+                // starve: the first arm ends the loop, so no per-iteration cap is
+                // needed, and dropping `accept_attempt()` is cancel-safe.
                 let incoming = tokio::select! {
-                    incoming = core.accept_attempt() => incoming,
+                    biased;
                     _ = availability.not_up() => None,
+                    incoming = core.accept_attempt() => incoming,
                 };
                 let Some(incoming) = incoming else { break };
                 match attempts.try_send(incoming) {
@@ -847,7 +943,7 @@ impl QuicEndpoint {
             drop(core);
             std::future::pending::<()>().await;
         });
-        registrar.register("quic_accept_loop", handle);
+        register("quic_accept_loop", handle);
         true
     }
 
@@ -1246,7 +1342,6 @@ impl JoinerCharge {
     /// The joiner becomes a normal connection: charged as a data path at the
     /// full rate and counted as an established source from now on. If the
     /// cap has no room for the full charge the joiner stays as it was.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn promote(self) -> Result<QuicPathPermit, Self> {
         match self.cap.promote() {
             Ok(path) => Ok(path),
@@ -1282,7 +1377,7 @@ impl JoinerIncoming {
         self.permit.addr()
     }
 
-    /// Record when the join was queued, on the clock `join_gateway` runs on,
+    /// Record when the join was queued, on the clock `establish_gateway_join` runs on,
     /// so time spent waiting for a free join slot comes out of the join
     /// window instead of extending the joiner's charge.
     pub(crate) fn stamp(&mut self, now_nanos: u64) {
@@ -1389,7 +1484,7 @@ impl QuicIncoming {
     /// handshake (write readiness or send) ends the driver with an error,
     /// which skips quinn's own terminate. The handshake still ends: dropping
     /// the driver drops the second-to-last reference to the connection, and
-    /// quinn's `ConnectionRef::drop` (quinn 0.11.12, `connection.rs:946`)
+    /// quinn's `ConnectionRef::drop` (freenet-quinn 0.11.13, `connection.rs:1032`)
     /// then closes it implicitly, so this returns `LocallyClosed` (read as
     /// `EndpointDown` through `QuicEndpoint::error_kind`) and the permit
     /// goes with it. A panic anywhere else in the adapter (another
@@ -1544,6 +1639,13 @@ impl QuicConnection {
 
 impl Drop for QuicConnection {
     fn drop(&mut self) {
+        // #6184: after a panic in a quinn driver is reported, the
+        // connection's watcher closes it (see `new`), and its state lock may
+        // be poisoned. During an unwind `close_inner` moves the close to a
+        // task.
+        if self.closer.quinn_may_be_poisoned() {
+            return;
+        }
         self.closer.close(QuicCloseCode::NodeDroppedPeer);
     }
 }
@@ -1588,6 +1690,15 @@ pub(crate) struct QuicCloser {
 }
 
 impl QuicCloser {
+    /// Whether a panic in a quinn driver of this connection's endpoint was
+    /// reported (`EndpointHealth::quinn_panicked`, which also sets the
+    /// adapter-panic flag read here; after a socket-adapter panic this is
+    /// `true` too). The panic may have poisoned this connection's state
+    /// lock, which most quinn calls unwrap (#6184).
+    pub(crate) fn quinn_may_be_poisoned(&self) -> bool {
+        self.health.has_adapter_panicked()
+    }
+
     /// The connection's smoothed round trip, as quinn estimates it.
     pub(crate) fn rtt(&self) -> std::time::Duration {
         self.connection.rtt()
@@ -1618,6 +1729,9 @@ impl QuicCloser {
     /// one). That covers the
     /// close the connection's watcher makes on Down, and a close after a
     /// panic that left the endpoint Released.
+    ///
+    /// During an unwind the close is sent from a task (`close_inner`), and
+    /// `true` means only that this call took it.
     pub(crate) fn close(&self, code: QuicCloseCode) -> bool {
         self.close_with_reason(code, code.reason())
     }
@@ -1649,6 +1763,36 @@ impl QuicCloser {
         if self.closing.swap(true, std::sync::atomic::Ordering::AcqRel) {
             return false;
         }
+        // #6184: `close_reason` and `close` unwrap the connection's state
+        // lock, which a panic in a quinn driver may have poisoned. During an
+        // unwind (a `Drop` that tears a path down, such as a session's
+        // `EndOnExit`) a second panic would abort the process, so the close
+        // runs in a task of its own, where a panic ends only that task. Not
+        // skipped on `quinn_may_be_poisoned`: that flag is endpoint-wide, and
+        // the watcher's close of every sound connection goes through here.
+        // With no runtime the node is stopping, and nothing is closed.
+        if std::thread::panicking() {
+            if tokio::runtime::Handle::try_current().is_ok() {
+                let (closer, reason) = (self.clone(), reason.to_vec());
+                // Intentionally detached and unmonitored: short-lived, and a
+                // panic in it ends only this task.
+                drop(GlobalExecutor::spawn(async move {
+                    closer.send_close(code, &reason, cause);
+                }));
+            }
+            return true;
+        }
+        self.send_close(code, reason, cause)
+    }
+
+    /// The part of [`Self::close_inner`] that calls quinn, once this closer
+    /// has taken the close.
+    fn send_close(
+        &self,
+        code: QuicCloseCode,
+        reason: &[u8],
+        cause: Option<crate::transport::boundary::QuicPathEnd>,
+    ) -> bool {
         if self.connection.close_reason().is_some() {
             return false;
         }

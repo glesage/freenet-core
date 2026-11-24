@@ -778,9 +778,20 @@ impl ConnectionManager {
             config.quic_native_floor_override,
             config.native_wire_pre_floor,
         );
-        cm.native_connect = Arc::new(crate::operations::connect::native::NativeConnectState::new(
+        let native_connect = crate::operations::connect::native::NativeConnectState::new(
             config.native_connect_override,
-        ));
+        )
+        .with_gateway_join_override(config.native_gateway_join_override)
+        .with_joiner_off(config.native_joiner_off)
+        .with_refuses_decisions(config.native_refuses_decisions)
+        .with_acceptor_setup_limit(cm.max_connections);
+        native_connect.set_native_gateways(
+            config
+                .gateways
+                .iter()
+                .filter_map(crate::node::InitPeerNode::native_addr),
+        );
+        cm.native_connect = Arc::new(native_connect);
         cm.broadcast_target_list_floor_override = config.broadcast_target_list_floor_override;
         cm
     }
@@ -1144,7 +1155,7 @@ impl ConnectionManager {
                 let score = self.compute_kleinberg_score(me, location);
                 self.topology_manager
                     .write()
-                    .evaluate_new_connection_with_score(score, Instant::now())
+                    .evaluate_new_connection_with_score(addr, score, Instant::now())
             } else {
                 true
             };
@@ -1691,6 +1702,13 @@ impl ConnectionManager {
     /// How this node encodes and decodes the QUIC-native connect variants.
     pub(crate) fn native_wire(&self) -> crate::operations::connect::native::NativeWire {
         self.native_wire
+    }
+
+    /// [`Self::native_connect`], shared, for a task that outlives the borrow.
+    pub(crate) fn native_connect_shared(
+        &self,
+    ) -> Arc<crate::operations::connect::native::NativeConnectState> {
+        Arc::clone(&self.native_connect)
     }
 
     /// This node's QUIC-native connect state.
@@ -2782,6 +2800,16 @@ impl ConnectionManager {
                 connection_count = count_after,
                 "add_connection: successfully added to ring"
             );
+            #[cfg(any(test, feature = "testing"))]
+            if let Some(own) = self.get_own_addr() {
+                crate::operations::connect::native_wire_trace::record_at(
+                    addr,
+                    crate::operations::connect::native_wire_trace::NativeWireEvent::Ring {
+                        own,
+                        member: true,
+                    },
+                );
+            }
         }
 
         // Remove from transient connections if present, since we're now a full ring connection.
@@ -2878,6 +2906,16 @@ impl ConnectionManager {
     /// shared by the normal path and the no-mapping (ghost) path so they
     /// cannot drift apart.
     fn forget_pruned_peer(&self, addr: SocketAddr) {
+        #[cfg(any(test, feature = "testing"))]
+        if let Some(own) = self.get_own_addr() {
+            crate::operations::connect::native_wire_trace::record_at(
+                addr,
+                crate::operations::connect::native_wire_trace::NativeWireEvent::Ring {
+                    own,
+                    member: false,
+                },
+            );
+        }
         // Readiness state
         self.ready_peers.remove(&addr);
         // Connection timestamp for optimistic readiness
@@ -4762,6 +4800,37 @@ mod tests {
         // `_nn_guard` restores the production default (flag ON, floor RE-ARMED) on
         // drop — even on panic — so this test's `set_nn_lattice_enabled(false)`
         // cannot leak to a later same-thread test.
+    }
+
+    /// `should_accept` must name the candidate to the evaluator. With a
+    /// constant (or no) address every candidate would share one entry, and
+    /// the window would stop rate-limiting arrivals; with no identity at all,
+    /// a candidate's retry competes with its own earlier score and is refused
+    /// for as long as it keeps retrying (the stranded-holder simulation).
+    #[test]
+    fn should_accept_names_the_candidate_to_the_evaluator() {
+        let source = include_str!("connection_manager.rs");
+        let production = &source[..source
+            .find("#[cfg(test)]\nmod tests {")
+            .expect("the test module")];
+        let start = production
+            .find("pub fn should_accept(&self, location: Location, addr: SocketAddr)")
+            .expect("should_accept");
+        let end = start
+            + production[start..]
+                .find("\n    }\n")
+                .expect("the end of should_accept");
+        let code: String = production[start..end]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .split_whitespace()
+            .collect();
+        assert!(
+            code.contains(".evaluate_new_connection_with_score(addr,score,"),
+            "should_accept passes the candidate's address to the evaluator"
+        );
     }
 
     #[test]

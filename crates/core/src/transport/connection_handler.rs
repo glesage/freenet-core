@@ -18,13 +18,10 @@ use futures::{
     future::BoxFuture,
     stream::{FuturesUnordered, StreamExt},
 };
-use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
 use recv_errors::{RecvErrorAction, RecvErrorLog, RecvErrorPause, RecvErrorTracker};
 use tokio::{
     net::UdpSocket,
     sync::{mpsc, oneshot},
-    task_local,
 };
 use tracing::{Instrument, span};
 use version_cmp::PROTOC_VERSION;
@@ -306,6 +303,7 @@ pub async fn create_connection_handler<S: Socket>(
             ledbat_min_ssthresh,
             congestion_config,
             ack_version_floor_override,
+            legacy_responder_override: None,
             // `create_connection_handler` is the test and tool entry point;
             // the node opens the transport through `open_udp_transport`.
             quic: None,
@@ -331,6 +329,10 @@ pub(crate) struct UdpTransportConfig {
     pub(crate) congestion_config: Option<CongestionControlConfig>,
     /// The #5161 version-carrying-ack floor override; `None` in production.
     pub(crate) ack_version_floor_override: Option<(u8, u8, u16)>,
+    /// Test override for `legacy_responder::LEGACY_RESPONDER_ENABLED`:
+    /// `Some(version)` turns the responder on and names that version in its
+    /// reply. `None` uses the constant.
+    pub(crate) legacy_responder_override: Option<String>,
     /// QUIC endpoint settings when `transport-quic` is on, `None` (no
     /// endpoint, no QUIC ingress) when it is off. See `transport::quic`.
     pub(crate) quic: Option<super::quic::QuicSettings>,
@@ -469,15 +471,27 @@ pub(super) async fn bind_udp_listener<S: Socket>(
     // with it off the only additions are an idle queue and its poll, one
     // atomic load per datagram from a source not on the allow-set, and
     // counters that stay 0.
-    if let Some(endpoint) = &quic_endpoint {
-        if super::quic::admission::enabled_at(is_gateway, bind_addr) {
-            let enabled = match quic_virtual_time {
-                Some(time) => endpoint.enable_gateway_admission(time),
-                None => endpoint.enable_gateway_admission(RealTime::new()),
-            };
-            tracing::info!(enabled, "QUIC gateway admission of native joins");
-        }
-    }
+    admit_native_joins_if_on(
+        quic_endpoint.as_ref(),
+        is_gateway,
+        bind_addr,
+        quic_virtual_time.clone(),
+    );
+    // What a node that rebuilds its endpoint when it dies (`quic::rebuild`)
+    // builds in place of the dead one: the same build, on this socket.
+    let rebuild_endpoint = quic_endpoint
+        .as_ref()
+        .and(quic_settings.clone())
+        .map(|settings| {
+            endpoint_rebuilder(
+                socket.clone(),
+                bind_addr,
+                keypair.clone(),
+                is_gateway,
+                settings,
+                quic_virtual_time.clone(),
+            )
+        });
 
     // Test builds only: kill the endpoint after the delay this variable
     // names, through a caught socket adapter panic, so a real-process test can
@@ -503,38 +517,312 @@ pub(super) async fn bind_udp_listener<S: Socket>(
         is_gateway,
         "UDP socket bound successfully"
     );
-    let (och, new_connection_notifier, listen_handle) = OutboundConnectionHandler::config_listener(
+    OutboundConnectionHandler::config_listener(
         socket,
         keypair,
         is_gateway,
         (listen_host, listen_port).into(),
         config,
         quic_endpoint,
-    )?;
-    Ok((
-        och,
-        InboundConnectionHandler {
-            new_connection_notifier,
-        },
-        listen_handle,
-    ))
+        rebuild_endpoint,
+    )
+}
+
+/// Admit native joins from sources nobody named on `endpoint`, on the
+/// endpoint's clock, when this gateway does (`quic::admission`).
+fn admit_native_joins_if_on(
+    endpoint: Option<&super::quic::QuicEndpoint>,
+    is_gateway: bool,
+    bind_addr: SocketAddr,
+    quic_virtual_time: Option<VirtualTime>,
+) {
+    if let Some(endpoint) = endpoint {
+        if super::quic::admission::enabled_at(is_gateway, bind_addr) {
+            let enabled = match quic_virtual_time {
+                Some(time) => endpoint.enable_gateway_admission(time),
+                None => endpoint.enable_gateway_admission(RealTime::new()),
+            };
+            tracing::info!(enabled, "QUIC gateway admission of native joins");
+        }
+    }
+}
+
+/// How a node that rebuilds its endpoint (`quic::rebuild`) builds one in
+/// place of a dead one: as `bind_udp_listener` built the first, on the same
+/// socket, clock (and `GlobalRng` side stream, in a simulation), settings and
+/// key, with the same admission, replacing the socket's QUIC ingress
+/// (`QuicEndpoint::rebuild`). The test-only faults of the first build (the
+/// endpoint-down variable, the trace's `fail_endpoint_at`) are not set again.
+fn endpoint_rebuilder<S: Socket>(
+    socket: Arc<DemuxSocket<S>>,
+    bind_addr: SocketAddr,
+    keypair: TransportKeypair,
+    is_gateway: bool,
+    settings: super::quic::QuicSettings,
+    quic_virtual_time: Option<VirtualTime>,
+) -> super::quic::rebuild::EndpointFactory {
+    use super::quic::QuicEndpoint;
+    Box::new(move || {
+        let built = match quic_virtual_time.clone() {
+            Some(time) => GlobalRng::with_side_stream(side_stream_of(bind_addr), || {
+                QuicEndpoint::rebuild(socket.clone(), bind_addr, time, &settings, &keypair)
+            }),
+            None => QuicEndpoint::rebuild(
+                socket.clone(),
+                bind_addr,
+                RealTime::new(),
+                &settings,
+                &keypair,
+            ),
+        };
+        let endpoint = match built {
+            Ok(endpoint) => endpoint,
+            Err(error) => {
+                tracing::warn!(%error, %bind_addr, "Could not rebuild the QUIC endpoint");
+                return None;
+            }
+        };
+        admit_native_joins_if_on(
+            Some(&endpoint),
+            is_gateway,
+            bind_addr,
+            quic_virtual_time.clone(),
+        );
+        Some(endpoint)
+    })
+}
+
+/// What runs on one QUIC endpoint besides quinn's own drivers, held by the
+/// listener for as long as it reads the socket that feeds the endpoint. The
+/// node replaces all of it when it rebuilds its endpoint (`quic::rebuild`).
+pub(super) struct QuicStack {
+    /// The endpoint, with its allow-set empty until an upgrade allows a peer
+    /// (#5940). Read only by tests; held for its owner share.
+    #[cfg_attr(not(test), allow(dead_code))]
+    endpoint: super::quic::QuicEndpoint,
+    /// The connection attempts the endpoint's accept loop hands on, when it
+    /// runs (`UdpTransportConfig::task_registrar` was set) and the node has no
+    /// upgrades to route them to (`upgrades`): nothing allows a peer then,
+    /// so no attempt is handed on. Each queued attempt would keep quinn's
+    /// endpoint alive until drained or dropped.
+    _attempts: Option<mpsc::Receiver<super::quic::EndpointAttempt>>,
+    /// The node's upgrades on this endpoint. Holds an endpoint share, and
+    /// every connection holds these while it lives; the router and the
+    /// listener's `upgrade_site` hold them weakly.
+    upgrades: Option<Arc<super::quic::upgrade::driver::QuicUpgrades>>,
+}
+
+/// Where a task of a QUIC stack is handed when it starts.
+type RegisterTask<'a> = &'a mut dyn FnMut(&'static str, tokio::task::JoinHandle<()>);
+
+/// Start what runs on `endpoint`: its accept loop and, with a policy, the
+/// upgrades and their attempt router, handing each task to `register` (the
+/// node's monitor, or the rebuild loop). Without `register` (tools and tests)
+/// no accept loop is started. `permits` are the node's path permits when an
+/// earlier endpoint's upgrades had them, so the cap holds across a rebuild.
+/// `arm_faults` sets the test-only faults of the first build.
+#[allow(clippy::too_many_arguments)]
+fn start_quic_stack(
+    endpoint: super::quic::QuicEndpoint,
+    mut register: Option<RegisterTask<'_>>,
+    policy: Option<super::quic::upgrade::policy::QuicPolicyConfig>,
+    permits: Option<super::quic::upgrade::policy::QuicPathPermits>,
+    local_key: TransportPublicKey,
+    socket_addr: SocketAddr,
+    native_rate: super::quic::config::QuicRateLimit,
+    join_handoff: Option<
+        mpsc::Sender<super::peer_connection::native_connection::NativePeerConnection>,
+    >,
+    arm_faults: bool,
+) -> QuicStack {
+    // The endpoint's accept loop runs from the start. Its allow-set is empty
+    // until an upgrade allows a peer. The upgrades' router consumes its queue.
+    let attempts = register.as_mut().and_then(|register| {
+        let (attempts, attempts_rx) = mpsc::channel(super::quic::config::MAX_INCOMING);
+        let started = endpoint.spawn_accept_loop_with(&mut **register, attempts);
+        #[cfg(any(test, feature = "testing"))]
+        if started {
+            super::in_memory_socket::record_quic_accept_loop(socket_addr);
+        }
+        started.then_some(attempts_rx)
+    });
+    let time_source = RealTime::new();
+    let upgrades = build_quic_upgrades(
+        Some(&endpoint),
+        policy,
+        register.is_some(),
+        permits,
+        local_key,
+        socket_addr,
+        &time_source,
+        native_rate,
+        arm_faults,
+    );
+    // Completed gateway joins go to the node's inbound connections
+    // (`InboundConnectionHandler`); without a hand-off they are closed.
+    if let (Some(upgrades), Some(to_node)) = (&upgrades, join_handoff) {
+        upgrades.set_join_handoff(to_node);
+    }
+    // With upgrades the router takes the queue; without them the listener
+    // holds it, so the accept loop still has a live consumer.
+    let attempts = match (&upgrades, register, attempts) {
+        (Some(upgrades), Some(register), Some(attempts)) => {
+            upgrades.spawn_attempt_router_with(register, attempts);
+            None
+        }
+        (_, _, attempts) => attempts,
+    };
+    QuicStack {
+        endpoint,
+        _attempts: attempts,
+        upgrades,
+    }
+}
+
+/// The listener's QUIC stack, shared with the rebuild loop (weakly).
+type QuicStackSlot = Arc<parking_lot::Mutex<Option<QuicStack>>>;
+
+/// What a node that rebuilds its endpoint (`quic::rebuild`) needs to start
+/// a new stack on the new endpoint, as `new_listener` started the first.
+struct StackInputs {
+    policy: Option<super::quic::upgrade::policy::QuicPolicyConfig>,
+    local_key: TransportPublicKey,
+    socket_addr: SocketAddr,
+    native_rate: super::quic::config::QuicRateLimit,
+    /// Where completed gateway joins go (#5940, phase B).
+    join_handoff:
+        Option<mpsc::Sender<super::peer_connection::native_connection::NativePeerConnection>>,
+}
+
+/// Start the task that rebuilds the endpoint whenever it dies
+/// (`quic::rebuild::run`), registered with the node's monitor, handing it
+/// `first_tasks`, those serving the first endpoint. Each rebuild
+/// builds an endpoint with `factory`, starts its stack, points `site` at
+/// its upgrades and swaps it into `slot`, dropping the dead stack. The task
+/// holds `slot` weakly and stops when `stop` resolves (the listener holds
+/// its sender), then drops everything it holds and parks, as the accept
+/// loop does, since the monitor reads any end as a failure. It ends only
+/// when a task serving the endpoint ends while the endpoint stays up, which
+/// the monitor then reports.
+#[allow(clippy::too_many_arguments)]
+fn spawn_endpoint_rebuild(
+    registrar: &crate::node::background_task_monitor::LateRegistrar,
+    mut factory: super::quic::rebuild::EndpointFactory,
+    slot: std::sync::Weak<parking_lot::Mutex<Option<QuicStack>>>,
+    site: super::quic::upgrade::driver::UpgradeSite,
+    first: super::quic::QuicAvailabilityWatch,
+    first_tasks: Vec<(&'static str, tokio::task::JoinHandle<()>)>,
+    node: tokio::sync::watch::Sender<super::quic::QuicAvailability>,
+    stop: oneshot::Receiver<()>,
+    inputs: StackInputs,
+) {
+    use super::quic::rebuild::{self, RebuildEnd, Rebuilt};
+    use super::quic::upgrade::driver::PathClock;
+    let clock = get_socket_virtual_time(&inputs.socket_addr)
+        .map_or_else(|| PathClock::Real(RealTime::new()), PathClock::Virtual);
+    #[cfg(any(test, feature = "testing"))]
+    let trace = super::in_memory_socket::quic_upgrade_trace_at(inputs.socket_addr);
+    #[cfg(any(test, feature = "testing"))]
+    let trace_clock = clock.clone();
+    let rebuild = move || {
+        // The listener is gone: the node is stopping, and `stop` ends the loop.
+        let slot = slot.upgrade()?;
+        let endpoint = factory()?;
+        let availability = endpoint.availability();
+        let permits = slot
+            .lock()
+            .as_ref()
+            .and_then(|stack| stack.upgrades.as_ref())
+            .map(|upgrades| upgrades.permits().clone());
+        let mut tasks = Vec::new();
+        let stack = start_quic_stack(
+            endpoint,
+            Some(
+                &mut |name: &'static str, handle: tokio::task::JoinHandle<()>| {
+                    tasks.push((name, handle))
+                },
+            ),
+            inputs.policy,
+            permits,
+            inputs.local_key.clone(),
+            inputs.socket_addr,
+            inputs.native_rate.clone(),
+            inputs.join_handoff.clone(),
+            false,
+        );
+        site.replace(stack.upgrades.as_ref());
+        let dead = slot.lock().replace(stack);
+        // Dropped outside the lock: the dead endpoint, its upgrades and its
+        // queued attempts.
+        drop(dead);
+        super::TRANSPORT_METRICS
+            .record_quic_endpoint_rebuilt(availability.get() == super::quic::QuicAvailability::Up);
+        #[cfg(any(test, feature = "testing"))]
+        if let Some(trace) = &trace {
+            let ms = trace_clock.now_nanos() / 1_000_000;
+            trace.record(trace.addr(), 0, format!("rebuilt the endpoint at {ms} ms"));
+        }
+        Some(Rebuilt {
+            availability,
+            tasks,
+        })
+    };
+    let handle = GlobalExecutor::spawn(async move {
+        // A `let`, so the loop's future, and the socket its factory holds,
+        // are dropped before the park below.
+        let end = rebuild::run(
+            clock,
+            first,
+            first_tasks,
+            node,
+            rebuild,
+            rebuild::jitter_sample,
+            stop,
+        )
+        .await;
+        match end {
+            RebuildEnd::Stopped => {
+                tracing::debug!("QUIC endpoint rebuild stopped; parking");
+                std::future::pending::<()>().await;
+            }
+            RebuildEnd::TaskEnded(task) => {
+                tracing::error!(task, "A task serving the rebuilt QUIC endpoint ended");
+            }
+        }
+    });
+    registrar.register("quic_endpoint_rebuild", handle);
 }
 
 /// The node's QUIC upgrades, when it has what they need: an endpoint, a policy
-/// and a registrar for the attempt router.
+/// and a registrar for the attempt router. `permits` are the node's path
+/// permits from an earlier endpoint's upgrades, if any (`quic::rebuild`).
+/// `arm_faults` sets the trace's endpoint fault (tests): only for the first
+/// endpoint, since one rebuilt after it would be failed again at once.
+#[allow(clippy::too_many_arguments)]
 fn build_quic_upgrades(
     endpoint: Option<&super::quic::QuicEndpoint>,
     policy: Option<super::quic::upgrade::policy::QuicPolicyConfig>,
-    registrar: Option<&crate::node::background_task_monitor::LateRegistrar>,
+    has_registrar: bool,
+    permits: Option<super::quic::upgrade::policy::QuicPathPermits>,
     local_key: TransportPublicKey,
     socket_addr: SocketAddr,
     time_source: &RealTime,
     native_rate: super::quic::config::QuicRateLimit,
+    arm_faults: bool,
 ) -> Option<Arc<super::quic::upgrade::driver::QuicUpgrades>> {
     use super::quic::upgrade::driver::{PathClock, QuicUpgrades};
-    let (endpoint, policy, _registrar) = (endpoint?, policy?, registrar?);
+    #[cfg(not(any(test, feature = "testing")))]
+    let _ = arm_faults;
+    let (endpoint, policy) = (endpoint?, policy?);
+    if !has_registrar {
+        return None;
+    }
     let policy =
         super::quic::upgrade::policy::QuicPolicy::from_config(policy, endpoint.availability());
+    let policy = match permits {
+        Some(permits) => policy.sharing_permits(permits),
+        None => policy,
+    };
     // The clock quinn runs on (`bind_udp_listener`).
     let path_clock = get_socket_virtual_time(&socket_addr)
         .map_or_else(|| PathClock::Real(time_source.clone()), PathClock::Virtual);
@@ -545,7 +833,11 @@ fn build_quic_upgrades(
     #[cfg(any(test, feature = "testing"))]
     let trace = super::in_memory_socket::quic_upgrade_trace_at(socket_addr);
     #[cfg(any(test, feature = "testing"))]
-    if let Some(at) = trace.as_ref().and_then(|trace| trace.down_at()) {
+    if let Some(at) = trace
+        .as_ref()
+        .filter(|_| arm_faults)
+        .and_then(|trace| trace.down_at())
+    {
         let failing = endpoint.clone();
         let clock = path_clock.clone();
         let noted = trace.clone();
@@ -672,7 +964,7 @@ pub(crate) struct GatewayQuicRestartWatch {
 /// when its supervisor is unverified and an ERROR when its QUIC stays off
 /// until it restarts. The endpoint is watched when it is up, and when it is
 /// already down at open (a death between the bind and here).
-fn gateway_quic_restart(
+pub(in crate::transport) fn gateway_quic_restart(
     is_gateway: bool,
     enabled: bool,
     unverified: bool,
@@ -731,6 +1023,12 @@ pub(crate) fn udp_transport_handle<S: Socket>(
     listen_task: tokio::task::JoinHandle<TransportError>,
     restart: Option<GatewayQuicRestartWatch>,
 ) -> super::TransportHandle {
+    if restart
+        .as_ref()
+        .is_some_and(|watch| watch.endpoint.is_some())
+    {
+        super::quic::liveness::exit_for_endpoint_death();
+    }
     super::TransportHandle {
         quic_endpoint: outbound.quic_availability().get()
             != super::quic::liveness::QuicAvailability::Disabled,
@@ -741,7 +1039,7 @@ pub(crate) fn udp_transport_handle<S: Socket>(
         listener: Box::pin(listener_liveness(
             listen_task,
             restart,
-            super::quic::breaker::note_endpoint_down_exit,
+            super::quic::breaker::note_endpoint_down_exit_once,
         )),
     }
 }
@@ -753,7 +1051,7 @@ pub(crate) fn udp_transport_handle<S: Socket>(
 /// first. A death ends it only once `record` noted it in the crash-loop
 /// breaker's marker (`breaker::note_endpoint_down_exit`), so the next start
 /// can count it; a death that cannot be noted leaves the node running.
-async fn listener_liveness(
+pub(in crate::transport) async fn listener_liveness(
     mut listen_task: tokio::task::JoinHandle<TransportError>,
     restart: Option<GatewayQuicRestartWatch>,
     record: fn(std::time::SystemTime) -> bool,
@@ -832,7 +1130,17 @@ async fn bind_socket_with_retry<S: Socket>(
 /// Receives  new inbound connections from the network.
 pub struct InboundConnectionHandler<S = UdpSocket, TS: TimeSource = RealTime> {
     new_connection_notifier: mpsc::Receiver<PeerConnection<S, TS>>,
+    /// Gateway joins completed over QUIC (#5940, phase B), handed over by
+    /// every QUIC stack this listener runs (the first and each rebuilt one).
+    /// `Some` whenever the node has a QUIC endpoint; `None` without one, or
+    /// once every sender is gone.
+    native_joins:
+        Option<mpsc::Receiver<super::peer_connection::native_connection::NativePeerConnection>>,
 }
+
+/// Completed QUIC gateway joins waiting for the node to take them; the
+/// upgrades close one that finds the queue full (`handoff_full`).
+const NATIVE_JOIN_HANDOFF: usize = 64;
 
 impl<S: Send + Sync, TS: TimeSource> InboundConnectionHandler<S, TS> {
     pub async fn next_connection(&mut self) -> Option<PeerConnection<S, TS>> {
@@ -842,11 +1150,33 @@ impl<S: Send + Sync, TS: TimeSource> InboundConnectionHandler<S, TS> {
 
 impl<S: Socket> super::InboundAcceptor for InboundConnectionHandler<S> {
     fn next_connection(&mut self) -> super::NextConnection<'_> {
-        // `mpsc::Receiver::recv` is cancel-safe, so the boxed future is too.
+        // `mpsc::Receiver::recv` is cancel-safe, so the boxed future is too:
+        // a connection is taken from a channel only by the branch that
+        // returns it.
         Box::pin(async move {
-            InboundConnectionHandler::<S>::next_connection(self)
-                .await
-                .map(|conn| Box::new(conn) as Box<dyn super::PeerConnectionApi>)
+            loop {
+                let native_closed = {
+                    let native = async {
+                        match self.native_joins.as_mut() {
+                            Some(native_joins) => native_joins.recv().await,
+                            None => std::future::pending().await,
+                        }
+                    };
+                    tokio::select! {
+                        conn = self.new_connection_notifier.recv() => {
+                            return conn.map(|conn| Box::new(conn) as Box<dyn super::PeerConnectionApi>);
+                        }
+                        joined = native => match joined {
+                            Some(conn) => return Some(Box::new(conn) as Box<dyn super::PeerConnectionApi>),
+                            None => true,
+                        },
+                    }
+                };
+                // The upgrades are gone: only the UDP listener is left.
+                if native_closed {
+                    self.native_joins = None;
+                }
+            }
         })
     }
 }
@@ -863,6 +1193,9 @@ pub struct OutboundConnectionHandler<S = UdpSocket, TS: TimeSource = RealTime> {
     /// The listener's QUIC endpoint, so tests can fail its driver.
     #[cfg(test)]
     quic_endpoint: Option<super::quic::QuicEndpoint>,
+    /// The listener's QUIC stack, so tests can reach a rebuilt endpoint.
+    #[cfg(test)]
+    quic_stack: std::sync::Weak<parking_lot::Mutex<Option<QuicStack>>>,
 }
 
 impl<S, TS: TimeSource> Clone for OutboundConnectionHandler<S, TS> {
@@ -874,6 +1207,8 @@ impl<S, TS: TimeSource> Clone for OutboundConnectionHandler<S, TS> {
             upgrade_site: self.upgrade_site.clone(),
             #[cfg(test)]
             quic_endpoint: self.quic_endpoint.clone(),
+            #[cfg(test)]
+            quic_stack: self.quic_stack.clone(),
         }
     }
 }
@@ -892,13 +1227,34 @@ impl<S, TS: TimeSource> OutboundConnectionHandler<S, TS> {
     pub(crate) fn quic_endpoint(&self) -> Option<&super::quic::QuicEndpoint> {
         self.quic_endpoint.as_ref()
     }
+
+    /// The path permits of the listener's current upgrades, when it has
+    /// some (tests).
+    #[cfg(test)]
+    pub(crate) fn current_quic_permits(
+        &self,
+    ) -> Option<super::quic::upgrade::policy::QuicPathPermits> {
+        let stack = self.quic_stack.upgrade()?;
+        let stack = stack.lock();
+        let upgrades = stack.as_ref()?.upgrades.as_ref()?;
+        Some(upgrades.permits().clone())
+    }
+
+    /// The listener's current QUIC endpoint: the one it rebuilt last, or the
+    /// first (tests). `None` once the listener is gone.
+    #[cfg(test)]
+    pub(crate) fn current_quic_endpoint(&self) -> Option<super::quic::QuicEndpoint> {
+        let stack = self.quic_stack.upgrade()?;
+        let stack = stack.lock();
+        stack.as_ref().map(|stack| stack.endpoint.clone())
+    }
 }
 
-/// Return type for `config_listener`: the outbound handler, inbound connection receiver,
+/// Return type for `config_listener`: the outbound handler, inbound connection handler,
 /// and the JoinHandle for the UDP listen task (must be monitored for unexpected exits).
 type ListenerSetup<S> = (
     OutboundConnectionHandler<S>,
-    mpsc::Receiver<PeerConnection<S>>,
+    InboundConnectionHandler<S>,
     tokio::task::JoinHandle<TransportError>,
 );
 
@@ -911,29 +1267,24 @@ impl<S: Socket> OutboundConnectionHandler<S> {
         socket_addr: SocketAddr,
         config: UdpTransportConfig,
         quic_endpoint: Option<super::quic::QuicEndpoint>,
+        rebuild_endpoint: Option<super::quic::rebuild::EndpointFactory>,
     ) -> Result<ListenerSetup<S>, TransportError> {
-        let (transport, connection_handler, new_connection_notifier) = Self::new_listener(
+        let (mut transport, connection_handler, inbound) = Self::new_listener(
             socket,
             keypair,
             is_gateway,
             socket_addr,
             config,
             quic_endpoint,
+            rebuild_endpoint,
         );
         // Packets are now sent directly to socket from each connection,
         // bypassing the centralized rate limiter that was causing serialization bottlenecks.
         // Per-connection rate limiting is handled by TokenBucket and LEDBAT in RemoteConnection.
-        let listen_handle = GlobalExecutor::spawn(RANDOM_U64.scope(
-            {
-                // Use GlobalRng for deterministic simulation
-                let seed = GlobalRng::random_u64();
-                let mut rng = StdRng::seed_from_u64(seed);
-                rng.random()
-            },
-            transport.listen(),
-        ));
+        transport.accepted_keys = AcceptedKeys::for_new_listener();
+        let listen_handle = GlobalExecutor::spawn(transport.listen());
 
-        Ok((connection_handler, new_connection_notifier, listen_handle))
+        Ok((connection_handler, inbound, listen_handle))
     }
 
     /// Build the listener (not yet running) and the handles onto it.
@@ -945,10 +1296,11 @@ impl<S: Socket> OutboundConnectionHandler<S> {
         socket_addr: SocketAddr,
         config: UdpTransportConfig,
         quic_endpoint: Option<super::quic::QuicEndpoint>,
+        rebuild_endpoint: Option<super::quic::rebuild::EndpointFactory>,
     ) -> (
         UdpPacketsListener<S>,
         OutboundConnectionHandler<S>,
-        mpsc::Receiver<PeerConnection<S>>,
+        InboundConnectionHandler<S>,
     ) {
         let UdpTransportConfig {
             bandwidth_limit,
@@ -956,6 +1308,7 @@ impl<S: Socket> OutboundConnectionHandler<S> {
             ledbat_min_ssthresh,
             congestion_config,
             ack_version_floor_override,
+            legacy_responder_override,
             // Used by `bind_udp_listener`, which built `quic_endpoint` from it.
             quic: _,
             quic_policy,
@@ -965,51 +1318,117 @@ impl<S: Socket> OutboundConnectionHandler<S> {
         let (conn_handler_sender, conn_handler_receiver) = mpsc::channel(100);
         let (new_connection_sender, new_connection_notifier) = mpsc::channel(10);
         let expected_non_gateway = Arc::new(DashSet::new());
-        let quic_availability = quic_endpoint.as_ref().map_or_else(
+        let endpoint_availability = quic_endpoint.as_ref().map_or_else(
             super::quic::QuicAvailabilityWatch::disabled,
             super::quic::QuicEndpoint::availability,
         );
         #[cfg(test)]
         let test_quic_endpoint = quic_endpoint.clone();
         let local_key = keypair.public().clone();
-        // The endpoint's accept loop runs from the start, registered with
-        // the node's monitor. Its allow-set is empty until an upgrade allows
-        // a peer. The upgrades' router consumes its queue.
-        let quic_attempts = quic_endpoint
-            .as_ref()
+        let native_rate =
+            super::quic::config::QuicRateLimit::new(bandwidth_limit, global_bandwidth.clone());
+        // A node that does not exit for its supervisor when its endpoint dies
+        // rebuilds it in process, when that is on (`quic::rebuild`; dark).
+        // Its connector and the node then read the node's own view of the
+        // endpoint, which goes `Up` again after a rebuild; every other node
+        // reads the endpoint's own availability, as before.
+        let rebuild = rebuild_endpoint
             .zip(task_registrar.as_ref())
-            .and_then(|(endpoint, registrar)| {
-                let (attempts, attempts_rx) = mpsc::channel(super::quic::config::MAX_INCOMING);
-                let started = endpoint.spawn_accept_loop(registrar, attempts);
-                #[cfg(any(test, feature = "testing"))]
-                if started {
-                    super::in_memory_socket::record_quic_accept_loop(socket_addr);
-                }
-                started.then_some(attempts_rx)
+            .filter(|_| endpoint_availability.get() != super::quic::QuicAvailability::Disabled)
+            .filter(|_| {
+                super::quic::rebuild::enabled_at(
+                    super::quic::liveness::gateway_quic_restarts(is_gateway),
+                    socket_addr,
+                )
             });
-
-        let time_source = RealTime::new();
-        let quic_upgrades = build_quic_upgrades(
-            quic_endpoint.as_ref(),
-            quic_policy,
-            task_registrar.as_ref(),
-            local_key,
-            socket_addr,
-            &time_source,
-            super::quic::config::QuicRateLimit::new(bandwidth_limit, global_bandwidth.clone()),
-        );
-        // With upgrades the router takes the queue; without them the listener
-        // holds it, so the accept loop still has a live consumer.
-        let quic_attempts = match (&quic_upgrades, task_registrar.as_ref(), quic_attempts) {
-            (Some(upgrades), Some(registrar), Some(attempts)) => {
-                upgrades.spawn_attempt_router(registrar, attempts);
-                None
-            }
-            (_, _, attempts) => attempts,
+        // The endpoint's accept loop and router are registered with the
+        // node's monitor (`start_quic_stack`), or, on a node that rebuilds
+        // its endpoint, handed to the rebuild loop, which owns them as it
+        // owns a rebuilt endpoint's: one that ends as the endpoint dies (a
+        // quinn driver panic poisons quinn's lock for every task that still
+        // reaches it, #6184) is that death, which the loop repairs, not a
+        // failure that ends the node.
+        let mut first_tasks = Vec::new();
+        let mut keep_for_rebuild = |name: &'static str, handle: tokio::task::JoinHandle<()>| {
+            first_tasks.push((name, handle))
         };
-        let upgrade_site =
-            super::quic::upgrade::driver::UpgradeSite::new(quic_upgrades.as_ref(), socket_addr);
+        // Gateway joins completed over QUIC reach the node beside the UDP
+        // listener's new connections (#5940, phase B). Every stack on this
+        // listener, the first and each rebuilt one, hands its joins here.
+        let (join_handoff, native_joins) = if quic_endpoint.is_some() {
+            let (to_node, native_joins) = mpsc::channel(NATIVE_JOIN_HANDOFF);
+            // A simulation can stand in for a release without the hand-off,
+            // which closes every completed join after its Hello.
+            #[cfg(any(test, feature = "testing"))]
+            let to_node = (!super::in_memory_socket::gateway_closes_native_joins(socket_addr))
+                .then_some(to_node);
+            #[cfg(not(any(test, feature = "testing")))]
+            let to_node = Some(to_node);
+            (to_node, Some(native_joins))
+        } else {
+            (None, None)
+        };
+        let mut register_with_monitor = task_registrar.clone().map(|registrar| {
+            move |name: &'static str, handle: tokio::task::JoinHandle<()>| {
+                registrar.register(name, handle)
+            }
+        });
+        let register: Option<RegisterTask<'_>> = if rebuild.is_some() {
+            Some(&mut keep_for_rebuild)
+        } else {
+            register_with_monitor
+                .as_mut()
+                .map(|register| register as RegisterTask<'_>)
+        };
+        let quic_stack = quic_endpoint.map(|endpoint| {
+            start_quic_stack(
+                endpoint,
+                register,
+                quic_policy,
+                None,
+                local_key.clone(),
+                socket_addr,
+                native_rate.clone(),
+                join_handoff.clone(),
+                true,
+            )
+        });
+        let upgrade_site = super::quic::upgrade::driver::UpgradeSite::new(
+            quic_stack
+                .as_ref()
+                .and_then(|stack| stack.upgrades.as_ref()),
+            socket_addr,
+        );
+        let quic_stack: QuicStackSlot = Arc::new(parking_lot::Mutex::new(quic_stack));
+        let (quic_availability, quic_rebuild_stop) = match rebuild {
+            Some((factory, registrar)) => {
+                let (node, availability) =
+                    super::quic::QuicAvailabilityWatch::settable(endpoint_availability.get());
+                let (stop, stopped) = oneshot::channel();
+                spawn_endpoint_rebuild(
+                    registrar,
+                    factory,
+                    Arc::downgrade(&quic_stack),
+                    upgrade_site.clone(),
+                    endpoint_availability,
+                    first_tasks,
+                    node,
+                    stopped,
+                    StackInputs {
+                        policy: quic_policy,
+                        local_key: local_key.clone(),
+                        socket_addr,
+                        native_rate,
+                        join_handoff,
+                    },
+                );
+                (availability, Some(stop))
+            }
+            None => (endpoint_availability, None),
+        };
+        let time_source = RealTime::new();
         let transport = UdpPacketsListener {
+            accepted_keys: AcceptedKeys::default(),
             is_gateway,
             socket_listener: socket,
             this_peer_keypair: keypair,
@@ -1034,14 +1453,19 @@ impl<S: Socket> OutboundConnectionHandler<S> {
                 time_source.clone(),
                 get_socket_virtual_time(&socket_addr),
             ),
+            legacy_responder: legacy_responder::build(
+                time_source.clone(),
+                legacy_responder_override,
+            ),
             time_source,
             congestion_config: Some(congestion_config.unwrap_or_default()),
             ack_version_floor_override,
             advertised_version: advertised_version_override
                 .map_or(PROTOC_VERSION, version_cmp::encode_version),
-            _quic_endpoint: quic_endpoint,
-            _quic_attempts: quic_attempts,
-            _quic_upgrades: quic_upgrades,
+            #[cfg(test)]
+            quic_stack_for_test: Arc::downgrade(&quic_stack),
+            _quic_rebuild_stop: quic_rebuild_stop,
+            _quic_stack: quic_stack,
             upgrade_site: upgrade_site.clone(),
         };
         let connection_handler = OutboundConnectionHandler {
@@ -1051,8 +1475,17 @@ impl<S: Socket> OutboundConnectionHandler<S> {
             upgrade_site,
             #[cfg(test)]
             quic_endpoint: test_quic_endpoint,
+            #[cfg(test)]
+            quic_stack: transport.quic_stack_for_test.clone(),
         };
-        (transport, connection_handler, new_connection_notifier)
+        (
+            transport,
+            connection_handler,
+            InboundConnectionHandler {
+                new_connection_notifier,
+                native_joins,
+            },
+        )
     }
 
     #[cfg(any(test, feature = "bench"))]
@@ -1087,7 +1520,7 @@ impl<S: Socket> OutboundConnectionHandler<S> {
         bandwidth_limit: Option<usize>,
         ack_version_floor_override: Option<(u8, u8, u16)>,
     ) -> Result<(Self, mpsc::Receiver<PeerConnection<S>>), TransportError> {
-        let (handler, receiver, _listen_handle) = Self::config_listener(
+        let (handler, inbound, _listen_handle) = Self::config_listener(
             socket,
             keypair,
             is_gateway,
@@ -1098,8 +1531,10 @@ impl<S: Socket> OutboundConnectionHandler<S> {
                 ..UdpTransportConfig::default()
             },
             None,
+            None,
         )?;
-        Ok((handler, receiver))
+        // No QUIC endpoint here (`None` above), so no native joins.
+        Ok((handler, inbound.new_connection_notifier))
     }
 
     /// Connect with no node-level origin (tests, benchmarks); the attempt
@@ -1215,8 +1650,13 @@ impl<S: Socket> super::OutboundConnector for OutboundConnectionHandler<S> {
         let upgrades = self.upgrade_site.upgrades();
         Box::pin(async move {
             let Some(upgrades) = upgrades else {
-                super::TRANSPORT_METRICS
-                    .record_connect_native_setup(super::NativeSetupOutcome::Unavailable);
+                // A gateway join is counted by its caller, not here.
+                if !dial.join {
+                    super::TRANSPORT_METRICS.record_connect_native_setup(
+                        super::NativeSetupOutcome::Unavailable,
+                        dial.addr,
+                    );
+                }
                 return Err(super::NativeSetupOutcome::Unavailable);
             };
             upgrades
@@ -1293,7 +1733,8 @@ impl<S: Socket> OutboundConnectionHandler<S, crate::simulation::VirtualTime> {
         let (new_connection_sender, new_connection_notifier) = mpsc::channel(10);
         let expected_non_gateway = Arc::new(DashSet::new());
 
-        let transport = UdpPacketsListener {
+        let mut transport = UdpPacketsListener {
+            accepted_keys: AcceptedKeys::default(),
             is_gateway,
             socket_listener: socket,
             this_peer_keypair: keypair,
@@ -1311,9 +1752,11 @@ impl<S: Socket> OutboundConnectionHandler<S, crate::simulation::VirtualTime> {
             // This listener's `time_source` is already VirtualTime, so the admission
             // clock needs no override.
             gw_rate_limiter: GatewayConnectionRateLimiter::new(time_source.clone(), None),
-            _quic_endpoint: None,
-            _quic_attempts: None,
-            _quic_upgrades: None,
+            legacy_responder: legacy_responder::build(time_source.clone(), None),
+            #[cfg(test)]
+            quic_stack_for_test: std::sync::Weak::new(),
+            _quic_rebuild_stop: None,
+            _quic_stack: Default::default(),
             upgrade_site: Default::default(),
             time_source,
             congestion_config,
@@ -1329,6 +1772,8 @@ impl<S: Socket> OutboundConnectionHandler<S, crate::simulation::VirtualTime> {
             upgrade_site: Default::default(),
             #[cfg(test)]
             quic_endpoint: None,
+            #[cfg(test)]
+            quic_stack: std::sync::Weak::new(),
         };
 
         // Packets are now sent directly to socket from each connection,
@@ -1336,14 +1781,8 @@ impl<S: Socket> OutboundConnectionHandler<S, crate::simulation::VirtualTime> {
         // Per-connection rate limiting is handled by TokenBucket and LEDBAT in RemoteConnection.
         // Note: In test/bench code, the listen handle is intentionally dropped by callers
         // since mock sockets manage their own lifetimes.
-        let _listen_handle = GlobalExecutor::spawn(RANDOM_U64.scope(
-            {
-                let seed = GlobalRng::random_u64();
-                let mut rng = StdRng::seed_from_u64(seed);
-                rng.random()
-            },
-            transport.listen(),
-        ));
+        transport.accepted_keys = AcceptedKeys::for_new_listener();
+        let _listen_handle = GlobalExecutor::spawn(transport.listen());
 
         Ok((connection_handler, new_connection_notifier))
     }
@@ -1452,6 +1891,8 @@ impl<S: Socket> OutboundConnectionHandler<S, crate::simulation::VirtualTime> {
 /// Handles UDP transport internally.
 struct UdpPacketsListener<S = UdpSocket, T: TimeSource = RealTime> {
     socket_listener: Arc<S>,
+    /// Source of the inbound session key for each accepted intro.
+    accepted_keys: AcceptedKeys,
     /// Unified state manager for all remote connections.
     /// Ensures atomic state transitions during connection lifecycle
     /// (handshake → established → closed) to prevent race conditions.
@@ -1490,6 +1931,9 @@ struct UdpPacketsListener<S = UdpSocket, T: TimeSource = RealTime> {
     /// Ramps up connection acceptance rate to prevent thundering herd.
     /// Only active when `is_gateway` is true.
     gw_rate_limiter: GatewayConnectionRateLimiter<T>,
+    /// The stateless reply to a legacy intro, which replaces the gateway
+    /// handshake when present. `None` (the handshake runs) until D-8.
+    legacy_responder: Option<legacy_responder::LegacyResponder<T>>,
     /// Test-only override for [`version_cmp::GATEWAY_ACK_VERSION_MIN_VERSION`]
     /// (#5161). `None` in production, where the real floor applies.
     ///
@@ -1506,20 +1950,18 @@ struct UdpPacketsListener<S = UdpSocket, T: TimeSource = RealTime> {
     /// (`UdpTransportConfig::advertised_version_override`). Compatibility
     /// checks still use `PROTOC_VERSION`.
     advertised_version: [u8; 8],
-    /// The QUIC endpoint on this listener's socket, when `transport-quic`
-    /// is on. Held here so it lives as long as the listener reading the
-    /// socket that feeds it. Its allow-set is empty until an upgrade allows a
-    /// peer (#5940).
-    _quic_endpoint: Option<super::quic::QuicEndpoint>,
-    /// The connection attempts the endpoint's accept loop hands on, when it
-    /// runs (`UdpTransportConfig::task_registrar` was set) and the node has no
-    /// upgrades to route them to (`_quic_upgrades`): nothing allows a peer then,
-    /// so no attempt is handed on. Each queued attempt would keep quinn's endpoint
-    /// alive until drained or dropped.
-    _quic_attempts: Option<mpsc::Receiver<super::quic::EndpointAttempt>>,
-    /// The node's upgrades. Holds an endpoint share, and every connection holds
-    /// these while it lives; the router and `upgrade_site` hold them weakly.
-    _quic_upgrades: Option<Arc<super::quic::upgrade::driver::QuicUpgrades>>,
+    /// Stops the endpoint rebuild loop (`quic::rebuild`) when dropped, with
+    /// the listener. `None` when the node does not rebuild its endpoint.
+    _quic_rebuild_stop: Option<oneshot::Sender<()>>,
+    /// The QUIC endpoint on this listener's socket and what runs on it, when
+    /// `transport-quic` is on ([`QuicStack`]). Held here so it lives as long
+    /// as the listener reading the socket that feeds it; a node that
+    /// rebuilds its endpoint swaps a new stack in (the rebuild loop holds
+    /// this weakly).
+    _quic_stack: QuicStackSlot,
+    /// The same, for tests to reach the current endpoint.
+    #[cfg(test)]
+    quic_stack_for_test: std::sync::Weak<parking_lot::Mutex<Option<QuicStack>>>,
     /// How a new connection joins the upgrades.
     upgrade_site: super::quic::upgrade::driver::UpgradeSite,
 }
@@ -2175,9 +2617,6 @@ impl<S, T: TimeSource> Drop for UdpPacketsListener<S, T> {
         tracing::info!(%self.this_addr, "Dropping UdpPacketsListener");
     }
 }
-task_local! {
-    static RANDOM_U64: [u8; 8];
-}
 
 /// The amount of times to retry NAT traversal before giving up. It should be sufficient
 /// so we give peers enough time for the other party to start the connection on its end.
@@ -2441,6 +2880,10 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
 
                             // Gateway intro packet handling
                             if self.is_gateway {
+                                if self.legacy_responder.is_some() && packet_data.is_intro_packet() {
+                                    self.answer_legacy_intro(&packet_data, remote_addr);
+                                    continue;
+                                }
                                 if self.connections.has_gateway_handshake(&remote_addr) {
                                     tracing::debug!(peer_addr = %remote_addr, "Gateway connection already in progress");
                                     continue;
@@ -2481,7 +2924,9 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
 
                                 self.connections.record_asym_attempt(remote_addr);
 
-                                let inbound_key_bytes = key_from_addr(&remote_addr);
+                                let Some(inbound_key_bytes) = self.accepted_keys.next() else {
+                                    continue;
+                                };
                                 let (gw_ongoing_connection, packets_sender) = self.gateway_connection(packet_data, remote_addr, inbound_key_bytes);
                                 if !self.connections.start_gateway_handshake(remote_addr, packets_sender) {
                                     continue; // State transition failed (e.g., RecentlyClosed still draining)
@@ -2825,7 +3270,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
             Result<(RemoteConnection<S, T>, InboundRemoteConnection), (TransportError, SocketAddr)>,
         >,
     > {
-        let inbound_key_bytes = key_from_addr(&remote_addr);
+        let inbound_key_bytes = self.accepted_keys.next()?;
         let (gw_ongoing_connection, packets_sender) =
             self.gateway_connection(packet_data, remote_addr, inbound_key_bytes);
         if !self
@@ -2842,6 +3287,39 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                     (error, remote_addr)
                 }),
         ))
+    }
+
+    /// Answer a legacy intro without a handshake (see `legacy_responder`).
+    /// The reply is sent from its own task so the listener loop never waits on
+    /// the socket; it is bounded by the responder's global bucket.
+    fn answer_legacy_intro(
+        &mut self,
+        packet_data: &PacketData<UnknownEncryption>,
+        remote_addr: SocketAddr,
+    ) {
+        let Some(responder) = self.legacy_responder.as_mut() else {
+            return;
+        };
+        match responder.respond(&self.this_peer_keypair.secret, packet_data.data()) {
+            legacy_responder::Outcome::RateLimited => {
+                tracing::trace!(peer_addr = %remote_addr, "Legacy intro dropped: responder rate limit");
+            }
+            legacy_responder::Outcome::Invalid => {
+                tracing::trace!(peer_addr = %remote_addr, "Legacy intro dropped: not a valid intro");
+            }
+            legacy_responder::Outcome::Reply(packet) => {
+                let socket = self.socket_listener.clone();
+                GlobalExecutor::spawn(async move {
+                    if let Err(err) = socket.send_to(&packet.prepared_send(), remote_addr).await {
+                        tracing::debug!(
+                            peer_addr = %remote_addr,
+                            error = %err,
+                            "Failed to send legacy intro reply"
+                        );
+                    }
+                });
+            }
+        }
     }
 
     /// Count an intro packet dropped because nothing exists for its exact
@@ -3231,9 +3709,11 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
             let start_time_nanos = time_source.now_nanos();
             let overall_deadline = NAT_TRAVERSAL_DEADLINE;
 
-            // Generate symmetric key using GlobalRng for deterministic simulation
-            let mut inbound_sym_key_bytes = [0u8; 16];
-            GlobalRng::fill_bytes(&mut inbound_sym_key_bytes);
+            let inbound_sym_key_bytes = new_inbound_key().ok_or_else(|| {
+                TransportError::ConnectionEstablishmentFailure {
+                    cause: "no entropy for the session key".into(),
+                }
+            })?;
             let inbound_sym_key = Aes128Gcm::new(&inbound_sym_key_bytes.into());
 
             let mut outbound_sym_key: Option<Aes128Gcm> = None;
@@ -4202,33 +4682,150 @@ fn split_asym_intro_payload(data: &[u8]) -> Option<([u8; 8], [u8; ASYM_INTRO_SYM
     Some((protoc_bytes, key_bytes))
 }
 
-fn key_from_addr(addr: &SocketAddr) -> [u8; 16] {
-    let current_time = chrono::Utc::now();
-    let mut hasher = blake3::Hasher::new();
-    match addr {
-        SocketAddr::V4(v4) => {
-            hasher.update(&v4.ip().octets());
-            hasher.update(&v4.port().to_le_bytes());
-        }
-        SocketAddr::V6(v6) => {
-            hasher.update(&v6.ip().octets());
-            hasher.update(&v6.port().to_le_bytes());
+/// Fresh random inbound session key for one handshake. This is AEAD key
+/// material, so it comes from the OS entropy pool (`OsRng`, the cryptographic
+/// exception in `.claude/rules/code-style.md`): a seeded `GlobalRng` is known
+/// to anyone who reads a test's seed. Only a run that has seeded `GlobalRng`
+/// (the deterministic simulation harness) draws from it, so simulations stay
+/// reproducible. Called once per handshake, never per packet.
+///
+/// Returns `None` if the OS entropy source fails, so the caller drops that one
+/// handshake instead of panicking the listener loop.
+fn new_inbound_key() -> Option<[u8; 16]> {
+    new_key_with(|key| GlobalRng::fill_bytes(key))
+}
+
+/// Source of the inbound session key for each handshake a listener accepts
+/// from a remote's intro (the gateway path and the restart path).
+///
+/// Under a seeded simulation the key comes from a side stream of the seed
+/// keyed by `(base, count)`. `base` is the one value the listener takes from
+/// the main seeded stream when it starts (the draw the listener has always
+/// taken at that point), so accepting handshakes consumes nothing further
+/// from the main stream: the number of intros a node accepts depends on
+/// timing, and drawing from the main stream per handshake would shift every
+/// later seeded choice in the run. The count is per listener, so the same
+/// seed gives the same keys on any thread and in any run. Unseeded, keys come
+/// from the OS entropy pool.
+#[derive(Default)]
+struct AcceptedKeys {
+    base: u64,
+    count: u64,
+}
+
+impl AcceptedKeys {
+    fn for_new_listener() -> Self {
+        Self {
+            base: GlobalRng::random_u64(),
+            count: 0,
         }
     }
-    hasher.update(
-        current_time
-            .date_naive()
-            .and_hms_opt(0, 0, 0)
-            .unwrap()
-            .and_utc()
-            .timestamp()
-            .to_le_bytes()
-            .as_ref(),
-    );
-    RANDOM_U64.with(|&random_value| {
-        hasher.update(random_value.as_ref());
-    });
-    hasher.finalize().as_bytes()[..16].try_into().unwrap()
+
+    /// A remote can trigger a draw only with an intro that passes the per-IP
+    /// intro throttle (gateway path) or the restart-intro rate limit (restart
+    /// path), so the draw rate a remote controls is bounded by those.
+    fn next(&mut self) -> Option<[u8; 16]> {
+        let stream = self
+            .base
+            .wrapping_add(self.count.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        self.count = self.count.wrapping_add(1);
+        new_key_with(|key| GlobalRng::with_side_stream(stream, || GlobalRng::fill_bytes(key)))
+    }
+}
+
+/// OS entropy when `GlobalRng` is unseeded, otherwise `seeded_draw`.
+fn new_key_with(seeded_draw: impl FnOnce(&mut [u8; 16])) -> Option<[u8; 16]> {
+    let mut key = [0u8; 16];
+    if GlobalRng::is_seeded() {
+        seeded_draw(&mut key);
+    } else {
+        use chacha20poly1305::aead::{OsRng, rand_core::RngCore};
+        if let Err(error) = OsRng.try_fill_bytes(&mut key) {
+            tracing::warn!(%error, "OS entropy unavailable; dropping this handshake");
+            return None;
+        }
+    }
+    Some(key)
+}
+
+#[cfg(test)]
+mod inbound_key_tests {
+    use super::*;
+
+    /// Each listener takes its one main-stream draw through
+    /// `AcceptedKeys::for_new_listener()` right before it starts. Deleting
+    /// the call at either construction site silently drops that draw and
+    /// shifts every later seeded choice in a simulation run, so pin both.
+    #[test]
+    fn both_listener_construction_sites_take_the_listener_draw() {
+        let source = include_str!("connection_handler.rs");
+        let production = source
+            .split("mod inbound_key_tests")
+            .next()
+            .expect("split yields a first part");
+        // Built at run time so this test's own text does not match.
+        let call = ["accepted_keys = Accepted", "Keys::for_new_listener();"].concat();
+        assert_eq!(
+            production.matches(call.as_str()).count(),
+            2,
+            "both UdpPacketsListener construction sites must call it before spawning"
+        );
+    }
+
+    #[test]
+    fn seeded_keys_are_deterministic_for_the_seed() {
+        let first = {
+            let _seed = GlobalRng::seed_guard(7);
+            new_inbound_key().expect("seeded draw cannot fail")
+        };
+        let again = {
+            let _seed = GlobalRng::seed_guard(7);
+            new_inbound_key().expect("seeded draw cannot fail")
+        };
+        let other = {
+            let _seed = GlobalRng::seed_guard(8);
+            new_inbound_key().expect("seeded draw cannot fail")
+        };
+        assert_eq!(first, again, "the same seed must give the same key");
+        assert_ne!(first, other, "a different seed must give a different key");
+    }
+
+    #[test]
+    fn accepted_keys_leave_the_main_seeded_stream_untouched() {
+        let after_accepts = {
+            let _seed = GlobalRng::seed_guard(7);
+            let mut keys = AcceptedKeys::for_new_listener();
+            let a = keys.next().expect("seeded draw cannot fail");
+            let b = keys.next().expect("seeded draw cannot fail");
+            assert_ne!(a, b, "each accepted handshake gets its own key");
+            GlobalRng::random_u64()
+        };
+        let untouched = {
+            let _seed = GlobalRng::seed_guard(7);
+            let _ = AcceptedKeys::for_new_listener();
+            GlobalRng::random_u64()
+        };
+        assert_eq!(after_accepts, untouched);
+    }
+
+    #[test]
+    fn accepted_keys_repeat_for_a_seed_on_one_thread() {
+        let run = |seed| {
+            let _seed = GlobalRng::seed_guard(seed);
+            let mut keys = AcceptedKeys::for_new_listener();
+            [keys.next().unwrap(), keys.next().unwrap()]
+        };
+        assert_eq!(run(7), run(7), "same seed, same keys, on the same thread");
+        assert_ne!(run(7), run(8));
+    }
+
+    #[test]
+    fn unseeded_keys_differ() {
+        assert!(!GlobalRng::is_seeded());
+        let a = new_inbound_key().expect("OS entropy");
+        let b = new_inbound_key().expect("OS entropy");
+        assert_ne!(a, b);
+    }
 }
 
 pub(crate) enum ConnectionEvent<S = UdpSocket, TS: TimeSource = RealTime> {
@@ -4279,6 +4876,7 @@ struct InboundRemoteConnection {
     inbound_packet_sender: mpsc::Sender<InboundPacket>,
 }
 
+mod legacy_responder;
 mod recv_errors;
 mod stray_intro;
 mod version_cmp;
@@ -7635,6 +8233,7 @@ pub mod mock_transport {
                 addr,
                 UdpTransportConfig::default(),
                 None,
+                None,
             )
             .expect("listener setup");
         (public, handler, listen_handle, addr)
@@ -8031,6 +8630,7 @@ pub mod mock_transport {
                 is_gateway,
                 addr,
                 UdpTransportConfig::default(),
+                None,
                 None,
             )
             .expect("listener setup");
@@ -9122,6 +9722,164 @@ pub mod mock_transport {
                 Ok((conn, gw_addr, gw, gw_key, joiner_key))
             }
 
+            /// Two handshakes from the same IP:port (a joiner that restarted
+            /// from the same address) each get their own gateway inbound key.
+            #[tokio::test]
+            async fn gateway_inbound_key_is_fresh_for_each_handshake() -> anyhow::Result<()> {
+                let vt = VirtualTime::new();
+                let channels: Channels = Arc::new(DashMap::new());
+                let mut remote = ScriptedRemote::new(&channels);
+                let (gw_pub, (_gw, mut gw_conns), gw_addr) = create_mock_peer_internal_vt(
+                    PacketDropPolicy::ReceiveAll,
+                    PacketDelayPolicy::NoDelay,
+                    true,
+                    channels.clone(),
+                    None,
+                    Some(vt.clone()),
+                )
+                .await?;
+
+                let mut keys = Vec::new();
+                let mut conns = Vec::new();
+                for _ in 0..2 {
+                    // The per-IP intro throttle runs on the gateway's clock.
+                    vt.advance(Duration::from_secs(2));
+                    let mut joiner_key = [0u8; 16];
+                    GlobalRng::fill_bytes(&mut joiner_key);
+                    let mut payload = PROTOC_VERSION.to_vec();
+                    payload.extend_from_slice(&joiner_key);
+                    let intro =
+                        PacketData::<_, MAX_PACKET_SIZE>::encrypt_with_pubkey(&payload, &gw_pub);
+                    remote.send(gw_addr, intro.data());
+                    let gw_key = tokio::time::timeout(WAIT, async {
+                        loop {
+                            if let Some(msg) = open(remote.recv().await, joiner_key) {
+                                let (key, _, _) = ack_ok_parts(&msg.payload)
+                                    .expect("the gateway answers with a success ack");
+                                break key;
+                            }
+                        }
+                    })
+                    .await
+                    .expect("the gateway answers the intro");
+                    let ack = SymmetricMessage::ack_ok(&cipher(gw_key), joiner_key, gw_addr)?;
+                    remote.send(gw_addr, ack.data());
+                    let conn = tokio::time::timeout(WAIT, gw_conns.recv())
+                        .await?
+                        .expect("the gateway hands over the connection");
+                    keys.push(gw_key);
+                    conns.push(conn);
+                }
+                assert_ne!(
+                    keys[0], keys[1],
+                    "each handshake must get its own inbound key"
+                );
+                Ok(())
+            }
+
+            /// A peer that restarts from the same IP:port and reconnects
+            /// through `accept_restarted_peer` gets a new inbound key for each
+            /// restart, different from the first session's key and from the
+            /// previous restart's.
+            #[tokio::test]
+            async fn restart_accepted_by_a_peer_gets_a_fresh_inbound_key() -> anyhow::Result<()> {
+                let vt = VirtualTime::new();
+                let channels: Channels = Arc::new(DashMap::new());
+                let mut remote = ScriptedRemote::new(&channels);
+                // The inbound receiver is kept and drained: the listener stops
+                // when it cannot deliver an accepted restart.
+                let (peer_pub, (mut peer, mut inbound_conns), peer_addr) =
+                    create_mock_peer_internal_vt(
+                        PacketDropPolicy::ReceiveAll,
+                        PacketDelayPolicy::NoDelay,
+                        false,
+                        channels.clone(),
+                        None,
+                        Some(vt.clone()),
+                    )
+                    .await?;
+
+                // First session: the peer dials the remote and answers its
+                // intro, so it holds an established connection to the remote.
+                let conn = peer
+                    .connect(remote.keypair.public().clone(), remote.addr)
+                    .await;
+                let conn = tokio::spawn(conn);
+                let intro = remote.recv().await;
+                let decrypted = PacketData::<_, MAX_PACKET_SIZE>::from_buf(&intro)
+                    .try_decrypt_asym(remote.keypair.secret())
+                    .expect("the first packet is the peer's intro");
+                let (_, first_key) =
+                    split_asym_intro_payload(decrypted.data()).expect("well-formed intro");
+                let mut remote_key = [0u8; 16];
+                GlobalRng::fill_bytes(&mut remote_key);
+                let mut payload = PROTOC_VERSION.to_vec();
+                payload.extend_from_slice(&remote_key);
+                let our_intro =
+                    PacketData::<_, MAX_PACKET_SIZE>::encrypt_with_pubkey(&payload, &peer_pub);
+                remote.send(peer_addr, our_intro.data());
+                let ack = SymmetricMessage::ack_ok(&cipher(first_key), remote_key, peer_addr)?;
+                remote.send(peer_addr, ack.data());
+                let _first_conn = established(conn).await;
+
+                // Real-time bound only as a hang guard: the sockets are in-memory
+                // and the peer's clock is virtual, so a healthy run answers at
+                // once. It is generous so a heavily loaded host cannot trip it.
+                const WAIT_REAL: Duration = Duration::from_secs(30);
+
+                // Each restart: the same address sends a new intro. A retry
+                // covers the window in which the previous restart's handshake
+                // has not yet been recorded as an established connection.
+                let mut keys = vec![first_key];
+                let mut restarted = Vec::new();
+                for _ in 0..2 {
+                    let mut joiner_key = [0u8; 16];
+                    GlobalRng::fill_bytes(&mut joiner_key);
+                    let mut payload = PROTOC_VERSION.to_vec();
+                    payload.extend_from_slice(&joiner_key);
+                    let mut accepted = None;
+                    for _ in 0..20 {
+                        // The per-IP intro throttle runs on the peer's clock.
+                        vt.advance(Duration::from_secs(2));
+                        let intro = PacketData::<_, MAX_PACKET_SIZE>::encrypt_with_pubkey(
+                            &payload, &peer_pub,
+                        );
+                        remote.send(peer_addr, intro.data());
+                        let answer = tokio::time::timeout(WAIT_REAL, async {
+                            loop {
+                                let packet = remote.inbound.recv().await.expect("channel open");
+                                if let Some(msg) = open(packet.data, joiner_key) {
+                                    if let Some((key, _, _)) = ack_ok_parts(&msg.payload) {
+                                        break key;
+                                    }
+                                }
+                            }
+                        })
+                        .await;
+                        if let Ok(key) = answer {
+                            accepted = Some(key);
+                            break;
+                        }
+                    }
+                    let key = accepted.expect("the peer accepts the restarted remote");
+                    let ack = SymmetricMessage::ack_ok(&cipher(key), joiner_key, peer_addr)?;
+                    remote.send(peer_addr, ack.data());
+                    // The restarted session is delivered once its handshake
+                    // completes; until then the address has no recorded state.
+                    restarted.push(
+                        tokio::time::timeout(WAIT_REAL, inbound_conns.recv())
+                            .await
+                            .expect("the restarted session is delivered")
+                            .expect("channel open"),
+                    );
+                    keys.push(key);
+                }
+                assert_ne!(keys[1], keys[0], "a restart must not reuse the first key");
+                assert_ne!(keys[2], keys[1], "each restart must get its own key");
+                assert_ne!(keys[2], keys[0], "a restart must not reuse the first key");
+                Ok(())
+            }
+
             /// Hole punch, the side that answered the remote's intro
             /// (`RemoteInbound` arm): the WAN bench case.
             #[tokio::test]
@@ -9280,5 +10038,55 @@ pub mod mock_transport {
                 Ok(())
             }
         }
+    }
+}
+
+/// A native dial on a transport with no QUIC upgrades is refused as
+/// `Unavailable`. A peer-to-peer dial counts as a native setup; a gateway join
+/// does not (its caller counts it), so the A+ pair comparison never sees it.
+#[cfg(test)]
+mod native_dial_unavailable_tests {
+    use super::*;
+    use crate::transport::OutboundConnector as _;
+
+    async fn unavailable_dial(addr: SocketAddr, join: bool) -> Vec<String> {
+        let (send_queue, _rx) = mpsc::channel(1);
+        let handler: OutboundConnectionHandler = OutboundConnectionHandler {
+            send_queue,
+            expected_non_gateway: Default::default(),
+            quic_availability: super::super::quic::QuicAvailabilityWatch::disabled(),
+            upgrade_site: Default::default(),
+            quic_endpoint: None,
+            quic_stack: std::sync::Weak::new(),
+        };
+        let dial = super::super::NativeDial {
+            addr,
+            key: super::super::TransportKeypair::new().public().clone(),
+            is_gateway: join,
+            within: std::time::Duration::from_secs(8),
+            join,
+        };
+        let result = handler.connect_native(dial).await;
+        assert!(matches!(
+            result,
+            Err(super::super::NativeSetupOutcome::Unavailable)
+        ));
+        super::super::TRANSPORT_METRICS
+            .quic_events_of(addr)
+            .into_iter()
+            .filter(|event| event.starts_with("(\"setup\""))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_gateway_join_is_not_counted_as_a_native_setup() {
+        let peer_to_peer = unavailable_dial("203.0.113.71:4401".parse().unwrap(), false).await;
+        assert_eq!(
+            peer_to_peer,
+            ["(\"setup\", Unavailable)"],
+            "premise: a peer-to-peer dial is counted"
+        );
+        let join = unavailable_dial("203.0.113.72:4401".parse().unwrap(), true).await;
+        assert!(join.is_empty(), "a gateway join is not counted: {join:?}");
     }
 }

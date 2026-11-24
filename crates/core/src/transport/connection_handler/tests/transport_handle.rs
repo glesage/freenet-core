@@ -49,10 +49,12 @@ async fn udp_handle_shares_one_expected_ip_set_and_reports_the_listener() {
         quic_availability: crate::transport::quic::QuicAvailabilityWatch::disabled(),
         upgrade_site: Default::default(),
         quic_endpoint: None,
+        quic_stack: std::sync::Weak::new(),
     };
     let (inbound_tx, inbound_rx) = mpsc::channel(1);
     let inbound = InboundConnectionHandler {
         new_connection_notifier: inbound_rx,
+        native_joins: None,
     };
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
     let listen_task = tokio::spawn(async move {
@@ -112,16 +114,8 @@ async fn listener_outlives_a_dropped_connector_while_a_clone_remains() {
         addr,
         UdpTransportConfig::default(),
         None,
+        None,
     )
-    .map(|(o, rx, task)| {
-        (
-            o,
-            InboundConnectionHandler {
-                new_connection_notifier: rx,
-            },
-            task,
-        )
-    })
     .expect("listener setup");
     let TransportHandle {
         connector,
@@ -170,11 +164,13 @@ async fn udp_transport_config_reaches_the_listener_by_name() {
             ledbat_min_ssthresh: Some(2_222),
             congestion_config: None,
             ack_version_floor_override: Some((9, 8, 7)),
+            legacy_responder_override: None,
             quic: None,
             quic_policy: None,
             advertised_version_override: Some((0, 2, 148)),
             task_registrar: None,
         },
+        None,
         None,
     );
     assert_eq!(listener.bandwidth_limit, Some(1_111));

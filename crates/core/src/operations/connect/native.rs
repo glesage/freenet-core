@@ -9,9 +9,9 @@
 //!
 //! On `Native` the joiner and the acceptor each dial a native connection
 //! ([`DialTransport::Native`]), and a failed setup falls back to today's UDP
-//! dial. In production nothing changes yet: [`NATIVE_DIAL_READY`] is false,
-//! so every offer carries percent 0 and every decision is
-//! [`NativeDecision::Udp`]; a simulation turns it on per node
+//! dial. In production [`NATIVE_DIAL_READY`] is true and
+//! [`QUIC_NATIVE_PERCENT`] is 25 (A+ step 1), so a ready pair whose bucket is
+//! below 25 decides `Native`; a simulation sets both per node
 //! ([`NativeConnectState`]). A `Native` the joiner cannot honour fails that
 //! attempt ([`joiner_response_action`]).
 //!
@@ -36,15 +36,55 @@ use crate::transport::TransportPublicKey;
 use crate::transport::metrics::ConnectArm;
 use crate::transport::metrics::TRANSPORT_METRICS;
 
-/// Whether this build can dial a native connection. False until the native
-/// connection exists and is wired into the connect op; while false, every offer
-/// this node sends carries percent 0 and it never decides `Native`.
-pub(crate) const NATIVE_DIAL_READY: bool = false;
+/// Whether this build can dial a native connection. True since A+ step 1;
+/// while false, every offer this node sends carries percent 0 and it never
+/// decides `Native`.
+pub(crate) const NATIVE_DIAL_READY: bool = true;
 
 /// This release's share of pairs, 0 to 100, that set up a native connection
-/// when both sides are ready. Each step is its own release; the acceptor's
-/// release governs, since only the acceptor decides.
-pub(crate) const QUIC_NATIVE_PERCENT: u8 = 0;
+/// when both sides are ready. Each step is its own release. Only the acceptor
+/// decides, and it decides on `min(offered, own)`, so a pair goes native only
+/// if both releases allow it: a reversal takes effect for any pair where either
+/// the acceptor or the joiner has updated, as nodes update. There is no runtime
+/// kill switch. 25 is A+ step 1.
+pub(crate) const QUIC_NATIVE_PERCENT: u8 = 25;
+
+/// This release's share, 0 to 100, of (joiner, gateway) pairs whose join
+/// tries a native connection to the gateway first (#5940, phase B), when the
+/// gateway is marked native in the gateway index and this node can dial
+/// native. Any failure falls back at once to today's join. The joiner alone
+/// decides (there is no connection to the gateway yet to ask it), so the
+/// joiner's release governs. At 0 no join tries native. `NATIVE_DIAL_READY`
+/// is true since A+ step 1, so this 0 alone keeps gateway-native off.
+pub(crate) const GATEWAY_NATIVE_JOIN_PERCENT: u8 = 0;
+
+/// After a native join with a gateway fails, joins to that gateway go
+/// straight to today's join for this long (provisional). The gateway index
+/// is read at startup, so a running joiner keeps a mark that was taken away;
+/// without this, a marked gateway that stops answering native joins would
+/// cost every join to it a whole native window before the fallback. Only
+/// lowers: it never makes a join try native.
+pub(crate) const GATEWAY_NATIVE_FAILURE_COOLDOWN: Duration = Duration::from_secs(600);
+
+/// Whether a join to a gateway tries a native connection first: this node
+/// can dial native (`ready`), the gateway is marked native in the index, and
+/// the pair's bucket ([`native_bucket`], the slice the connect op uses) is
+/// below `percent`.
+pub(crate) fn gateway_join_native(ready: bool, marked: bool, bucket: u8, percent: u8) -> bool {
+    ready && marked && bucket < percent.min(100)
+}
+
+/// How a join to a gateway connects ([`NativeConnectState::plan_gateway_join`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GatewayJoinPlan {
+    /// Today's join only.
+    Legacy,
+    /// A native connection first, then today's join if it gives none.
+    NativeFirst,
+    /// Would be [`Self::NativeFirst`], but a native join with this gateway
+    /// failed within [`GATEWAY_NATIVE_FAILURE_COOLDOWN`]: today's join only.
+    LegacyCoolingDown,
+}
 
 /// Offer level: the joiner can set up a native connection, and also UDP.
 pub(crate) const LEVEL_NATIVE_CAPABLE: u8 = 1;
@@ -54,12 +94,50 @@ pub(crate) const LEVEL_NATIVE_CAPABLE: u8 = 1;
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const LEVEL_NATIVE_ONLY: u8 = 2;
 
-/// Consecutive native failures, across distinct acceptors, after which a
-/// joiner offers percent 0 for [`DEMOTION_COOLDOWN`].
+/// Strikes, across distinct acceptors, after which a joiner offers percent 0
+/// for [`DEMOTION_COOLDOWN`]. A strike is a RESCUE: a native setup with that
+/// acceptor failed on the path (`NativeSetupOutcome::counts_toward_demotion`)
+/// and UDP to the same acceptor then connected. A native failure where UDP
+/// failed too (a symmetric or otherwise incompatible pair, a peer that never
+/// dialled, a peer gone) is no evidence against native and is not counted.
 pub(crate) const DEMOTION_FAILURES: usize = 3;
+
+/// Strikes, across distinct joiners, after which a node decides `Udp` as
+/// acceptor for [`DEMOTION_COOLDOWN`]. A strike is a rescue, as for the joiner
+/// ([`DEMOTION_FAILURES`]). Field data (0.2.162, independent-mapping nodes)
+/// put a healthy acceptor's raw failure share at about 71% of the dials it
+/// takes, almost all caused by the joiner (endpoint-dependent joiners, joiners
+/// that never dial); counting those demoted a healthy acceptor within about
+/// an hour at 25%. A rescue needs UDP to that joiner to work, which those
+/// cases do not give, while an acceptor whose own native path is broken
+/// collects a rescue on every pair UDP can connect.
+pub(crate) const ACCEPTOR_DEMOTION_FAILURES: usize = 3;
+
+/// How long a strike counts: a streak drops strikes older than this, so
+/// strikes spread thinly over days (a node that rarely uses native) do not
+/// add up to a demotion. Equal to [`DEMOTION_COOLDOWN`]: a node whose native
+/// path is broken collects its strikes at its rate of UDP-rescued native
+/// setups, which at 25% is several an hour for a node that accepts or joins
+/// at all, so three fall well inside 6 h; and a fault that does not recur
+/// within one cooldown would not have kept native off for long either.
+pub(crate) const STRIKE_WINDOW: Duration = DEMOTION_COOLDOWN;
 
 /// How long a demoted node offers (or decides) nothing native.
 pub(crate) const DEMOTION_COOLDOWN: Duration = Duration::from_secs(6 * 3600);
+
+/// Native setups this node may have decided as acceptor and not yet seen end,
+/// at a connection limit of `max_connections`: half of the node's native
+/// setup slots (`QuicPolicy::native_setups_max`, which is
+/// [`crate::transport::NATIVE_SETUPS_MAX`] lowered to the connection limit),
+/// so its own dials as joiner keep the other half; at least 1.
+pub(crate) fn acceptor_pending_setups_max(max_connections: usize) -> usize {
+    (crate::transport::NATIVE_SETUPS_MAX.min(max_connections) / 2).max(1)
+}
+
+/// Of the acceptor's pending setups, how many may be for joiner addresses
+/// in one source: an IPv4 address, or an IPv6 /64 (what one host or one
+/// customer line usually gets). Provisional.
+pub(crate) const ACCEPTOR_PENDING_SETUPS_PER_SOURCE: usize = 4;
 
 const SLICE_DOMAIN: &[u8] = b"freenet-quic-native-slice-v1";
 
@@ -276,11 +354,16 @@ impl DialTransport {
 
 /// How long a native dial may wait when its caller has no deadline of its
 /// own. The setup's own window is shorter and ends it first (8 s for the
-/// client, 12 s for the server), so this only bounds a setup that never
-/// reports.
+/// client, 12 s for the server), so for the setup this only bounds one that
+/// never reports. It ALSO sets how long an acceptor holds a native setup
+/// admission ([`SetupTicket`]): from the dispatch of its native dial to this
+/// long after it. Changing it changes the acceptor's admission throughput
+/// (pending cap / this duration).
 pub(crate) const NATIVE_CONNECT_WITHIN: std::time::Duration = std::time::Duration::from_secs(20);
 
-/// This node's readiness for native connections, as both joiner and acceptor.
+/// This node's readiness for native connections in one role: as joiner
+/// ([`NativeConnectState::readiness`]) or as acceptor
+/// ([`NativeConnectState::acceptor_readiness`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct NativeReadiness {
     /// The build can dial native, the endpoint is up and the node is not
@@ -288,6 +371,11 @@ pub(crate) struct NativeReadiness {
     pub ready: bool,
     /// The effective percent ([`effective_native_percent`]).
     pub percent: u8,
+    /// A demotion holds native off for this readiness (other causes may as
+    /// well): the joiner streak for [`NativeConnectState::readiness`], either
+    /// streak for [`NativeConnectState::acceptor_readiness`].
+    /// [`acceptor_arm`] then counts the pair in neither arm.
+    pub demoted: bool,
 }
 
 impl NativeReadiness {
@@ -314,6 +402,7 @@ impl NativeReadiness {
     ) -> Self {
         Self {
             ready: dial_ready && endpoint_up && !demoted,
+            demoted,
             percent: effective_native_percent(
                 dial_ready,
                 endpoint_up,
@@ -357,7 +446,10 @@ pub(crate) fn decide_native(
 /// the bucket is at or above the lower of the two percents, so the pair dials
 /// UDP because of the slice (every such pair while that percent is 0).
 /// `None`: no offer, a transport already held (reused, so no dial is decided),
-/// or a pair below the percent that this node is not ready to dial.
+/// a pair below the percent that this node is not ready to dial, or a node
+/// that is demoted (either role). A demoted node is left out of both arms:
+/// demotion follows native failures, so counting its pairs as control would
+/// fill the control arm with exactly the pairs where native fails.
 pub(crate) fn acceptor_arm(
     offer: Option<NativeOffer>,
     own: NativeReadiness,
@@ -365,7 +457,7 @@ pub(crate) fn acceptor_arm(
     holds_transport: bool,
 ) -> Option<ConnectArm> {
     let offered = offer?.effective_percent();
-    if holds_transport {
+    if holds_transport || own.demoted {
         return None;
     }
     if bucket < offered.min(own.percent.min(100)) {
@@ -383,9 +475,12 @@ pub(crate) fn acceptor_arm(
 /// to UDP is not counted here (the acceptor's own count has it), and nor is
 /// one with no decision (an acceptor or a relay below the floor).
 ///
-/// It includes pairs where the acceptor already held a transport to the
-/// joiner and reused it without dialling ([`acceptor_arm`] gives `None`): the
-/// joiner cannot see that, so the acceptor's counters are the ones for rates.
+/// It includes pairs the acceptor leaves out of both arms ([`acceptor_arm`]
+/// gives `None`), which the joiner cannot see: those where it already held a
+/// transport to the joiner and reused it without dialling, and those decided
+/// while it was demoted. It also includes every UDP-answered pair of a
+/// demoted joiner, whose offer reads percent 0. So the acceptor's counters
+/// are the ones for rates.
 pub(crate) fn joiner_in_control(
     sent: Option<NativeOffer>,
     decision: Option<NativeDecision>,
@@ -432,6 +527,38 @@ pub(crate) enum JoinerDecisionFailure {
     NativeUnsupported,
 }
 
+/// What a joiner does about an acceptor whose `Native` decision it cannot use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RefusedDecisionPlan {
+    /// Dial the acceptor over UDP at this time: the acceptor falls back to
+    /// UDP when its native wait ends, `NATIVE_FALLBACK_AFTER` after its
+    /// decision at the earliest, and two UDP hole punches through restricted
+    /// NATs connect only when they overlap. A lone punch from the acceptor
+    /// never gets through.
+    DialUdpAt(Instant),
+    /// Report the acceptor failed upstream (`ConnectFailed`), so the relay
+    /// re-routes.
+    ReportFailed,
+}
+
+/// The plan for a `Native` decision the joiner cannot use, answered at
+/// `answered_at`. A joiner that offered native and was demoted (or lost its
+/// endpoint) before the response came still has UDP, and a failed native
+/// setup must never cost the join, so it dials UDP at the common fallback
+/// time, as after a native dial that failed. A decision that answered no
+/// offer comes only from a bug or a misbehaving relay and is reported.
+pub(crate) fn refused_decision_plan(
+    failure: JoinerDecisionFailure,
+    answered_at: Instant,
+) -> RefusedDecisionPlan {
+    match failure {
+        JoinerDecisionFailure::NativeUnsupported => {
+            RefusedDecisionPlan::DialUdpAt(answered_at + crate::transport::NATIVE_FALLBACK_AFTER)
+        }
+        JoinerDecisionFailure::DecisionWithoutOffer => RefusedDecisionPlan::ReportFailed,
+    }
+}
+
 /// How the joiner dials an acceptor, given the offer it sent, the response's
 /// decision and whether it can dial native now (`can_dial`, its current
 /// readiness). `None`, `Udp` and a decision this release does not know keep
@@ -456,6 +583,168 @@ pub(crate) fn joiner_response_action(
     }
 }
 
+/// Where a joiner's native setup is counted for
+/// [`ACCEPTOR_PENDING_SETUPS_PER_SOURCE`]: the crate's per-host source unit
+/// (`put::stream_admission::Source`: an IPv4 address or an IPv6 /64). In test
+/// builds only, a loopback or unspecified address is counted per port, since
+/// local test networks run every node on one such address; a release build
+/// counts it as one host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SetupSource {
+    Host(crate::operations::put::stream_admission::Source),
+    #[cfg(any(test, feature = "testing"))]
+    Exact(std::net::SocketAddr),
+}
+
+impl SetupSource {
+    fn of(addr: std::net::SocketAddr) -> Self {
+        #[cfg(any(test, feature = "testing"))]
+        {
+            let ip = addr.ip().to_canonical();
+            if ip.is_loopback() || ip.is_unspecified() {
+                return Self::Exact(addr);
+            }
+        }
+        Self::Host(crate::operations::put::stream_admission::Source::of(addr))
+    }
+}
+
+/// Why the acceptor decided `Udp` for a pair it would otherwise have decided
+/// `Native`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SetupAdmissionRefusal {
+    /// The acceptor's pending setups are at its cap
+    /// ([`acceptor_pending_setups_max`]).
+    Full,
+    /// [`ACCEPTOR_PENDING_SETUPS_PER_SOURCE`] joiner addresses are pending
+    /// from the joiner's source.
+    SourceFull,
+    /// The joiner's address is not known, so there is nothing to count it by
+    /// (or to dial).
+    NoAddress,
+}
+
+/// The native setups this node decided as acceptor and has not yet seen end
+/// ([`NativeConnectState::admit_acceptor_setup`]), by joiner address: the
+/// unit the node's native setups, allow-set slots and dial coalescing all
+/// use. A `Native` decision holds a native setup slot and an allow-set slot
+/// for up to the server's window, so the acceptor admits a setup before
+/// deciding `Native` rather than finding the slots taken when its setup
+/// starts. A joiner that was refused is decided `Udp` at once: it never waits
+/// out the native fallback because the acceptor had no room.
+#[derive(Debug)]
+pub(crate) struct NativeSetupAdmission {
+    /// By joiner address: its source and how many tickets hold it (CONNECTs
+    /// to one address share its one setup, since dials to one address
+    /// coalesce).
+    pending: std::collections::HashMap<std::net::SocketAddr, (SetupSource, usize)>,
+    cap: usize,
+}
+
+impl NativeSetupAdmission {
+    fn new(cap: usize) -> Self {
+        Self {
+            pending: std::collections::HashMap::new(),
+            cap: cap.max(1),
+        }
+    }
+
+    /// Whether a ticket for `addr` would be admitted now, without taking one.
+    fn check(&self, addr: Option<std::net::SocketAddr>) -> Result<(), SetupAdmissionRefusal> {
+        let Some(addr) = addr else {
+            return Err(SetupAdmissionRefusal::NoAddress);
+        };
+        if self.pending.contains_key(&addr) {
+            return Ok(());
+        }
+        if self.pending.len() >= self.cap {
+            return Err(SetupAdmissionRefusal::Full);
+        }
+        let source = SetupSource::of(addr);
+        let from_source = self.pending.values().filter(|(s, _)| *s == source).count();
+        if from_source >= ACCEPTOR_PENDING_SETUPS_PER_SOURCE {
+            return Err(SetupAdmissionRefusal::SourceFull);
+        }
+        Ok(())
+    }
+
+    /// Takes a hold on `addr`'s entry, creating it if admitted.
+    fn admit(
+        &mut self,
+        addr: Option<std::net::SocketAddr>,
+    ) -> Result<std::net::SocketAddr, SetupAdmissionRefusal> {
+        self.check(addr)?;
+        let Some(addr) = addr else {
+            return Err(SetupAdmissionRefusal::NoAddress);
+        };
+        self.pending
+            .entry(addr)
+            .or_insert((SetupSource::of(addr), 0))
+            .1 += 1;
+        Ok(addr)
+    }
+
+    /// Gives back one hold on `addr`'s entry, removing it with the last.
+    fn release(&mut self, addr: std::net::SocketAddr) {
+        if let Some((_, holds)) = self.pending.get_mut(&addr) {
+            *holds = holds.saturating_sub(1);
+            if *holds == 0 {
+                self.pending.remove(&addr);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.pending.len()
+    }
+}
+
+/// One admitted native setup as acceptor, held from the decision until the
+/// acceptor's native dial deadline, [`NATIVE_CONNECT_WITHIN`] after the dial
+/// is dispatched (when the setup can no longer hold a setup slot); dropping
+/// it releases the admission, so an accept that is never dispatched (or whose
+/// dispatch fails) releases it at once.
+///
+/// Residuals: the cap bounds distinct pending joiner ADDRESSES, not
+/// decisions (CONNECTs to one address share an entry); the node's own native
+/// dials as joiner take setup slots uncapped (the other half is left for
+/// them, not reserved); and once UDP is removed (phase D), "refused, so
+/// decide UDP" no longer has a UDP to decide, so a refusal will need another
+/// answer (a `Rejected`).
+pub(crate) struct SetupTicket {
+    /// `None` for a ticket a test made with no admission behind it.
+    admission: Option<std::sync::Arc<parking_lot::Mutex<NativeSetupAdmission>>>,
+    addr: std::net::SocketAddr,
+}
+
+impl SetupTicket {
+    /// A ticket with no admission behind it, for tests of the decision.
+    #[cfg(test)]
+    pub(crate) fn detached(addr: std::net::SocketAddr) -> Self {
+        Self {
+            admission: None,
+            addr,
+        }
+    }
+}
+
+impl std::fmt::Debug for SetupTicket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SetupTicket")
+            .field("addr", &self.addr)
+            .finish()
+    }
+}
+
+impl Drop for SetupTicket {
+    fn drop(&mut self) {
+        if let Some(admission) = &self.admission {
+            admission.lock().release(self.addr);
+        }
+    }
+}
+
 /// A node's QUIC-native connect state: whether it may dial native and at what
 /// percent, and the demotion its native failures drive. One per node, in the
 /// `ConnectionManager`.
@@ -465,46 +754,271 @@ pub(crate) struct NativeConnectState {
     /// [`NATIVE_DIAL_READY`] and [`QUIC_NATIVE_PERCENT`]
     /// (`NodeConfig::native_connect_override`). `None` in production.
     release_override: Option<u8>,
+    /// Driven by native setups this node made as joiner. Lowers its offer
+    /// and, through [`Self::acceptor_readiness`], its decisions as acceptor
+    /// too.
     demotion: parking_lot::Mutex<NativeDemotion>,
+    /// Driven only by rescues of native setups this node made as acceptor,
+    /// across distinct joiners. Lowers only its decisions as acceptor
+    /// ([`Self::acceptor_readiness`]): an acceptor whose own native path is
+    /// broken (a gateway, a node at its target that rarely joins) would
+    /// otherwise keep deciding `Native` for every joiner, and each of those
+    /// joiners would wait out the fallback (and take a strike against it,
+    /// unless the acceptor is one of its configured gateways, whose dials are
+    /// labelled `Gateway`).
+    acceptor_demotion: parking_lot::Mutex<NativeDemotion>,
+    /// Native setups decided as acceptor and not yet ended.
+    setup_admission: std::sync::Arc<parking_lot::Mutex<NativeSetupAdmission>>,
+    /// Simulation only: this node never offers native as joiner, but decides
+    /// as acceptor as usual (`NodeConfig::native_joiner_off`), standing in
+    /// for a node that rarely joins. `false` in production.
+    joiner_off: bool,
+    /// Simulation only: this node offers native as joiner but cannot use a
+    /// `Native` decision when the response comes
+    /// (`NodeConfig::native_refuses_decisions`). `false` in production.
+    refuses_decisions: bool,
     /// This node's QUIC endpoint, set when its transport opens. Until then,
     /// and when it is not up, the node cannot dial native. Read per node, not
     /// from the process-wide endpoint metric, which several simulated nodes
     /// in one process share.
-    endpoint: std::sync::OnceLock<crate::transport::QuicAvailabilityWatch>,
+    endpoint: std::sync::OnceLock<(crate::transport::QuicAvailabilityWatch, bool)>,
+    /// Simulation only: native gateway joins on, at this percent, in place of
+    /// [`NATIVE_DIAL_READY`] and [`GATEWAY_NATIVE_JOIN_PERCENT`]
+    /// (`NodeConfig::native_gateway_join_override`). `None` in production.
+    gateway_join_override: Option<u8>,
+    /// The addresses of the configured gateways the gateway index marks
+    /// native, set once when the node is built. Empty until then.
+    native_gateways: std::sync::OnceLock<std::collections::HashSet<std::net::SocketAddr>>,
+    /// Marked gateways whose last native join failed, and when. At most one
+    /// entry per marked gateway, so bounded by the index.
+    gateway_failures: parking_lot::Mutex<std::collections::HashMap<std::net::SocketAddr, Instant>>,
 }
 
 impl NativeConnectState {
     pub(crate) fn new(release_override: Option<u8>) -> Self {
         Self {
             release_override,
-            demotion: parking_lot::Mutex::new(NativeDemotion::new()),
+            demotion: parking_lot::Mutex::new(NativeDemotion::new(DEMOTION_FAILURES)),
+            acceptor_demotion: parking_lot::Mutex::new(NativeDemotion::new(
+                ACCEPTOR_DEMOTION_FAILURES,
+            )),
+            setup_admission: std::sync::Arc::new(parking_lot::Mutex::new(
+                NativeSetupAdmission::new(acceptor_pending_setups_max(
+                    crate::transport::NATIVE_SETUPS_MAX,
+                )),
+            )),
+            joiner_off: false,
+            refuses_decisions: false,
             endpoint: std::sync::OnceLock::new(),
+            gateway_join_override: None,
+            native_gateways: std::sync::OnceLock::new(),
+            gateway_failures: parking_lot::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
-    /// The node's transport opened with this QUIC endpoint. Only the first
-    /// call counts: a node opens one transport.
-    pub(crate) fn set_endpoint(&self, endpoint: crate::transport::QuicAvailabilityWatch) {
-        self.endpoint.get_or_init(|| endpoint);
+    /// Simulation only: offering native as joiner but refusing every `Native`
+    /// decision when `refuses` (`NodeConfig::native_refuses_decisions`).
+    pub(crate) fn with_refuses_decisions(mut self, refuses: bool) -> Self {
+        self.refuses_decisions = refuses;
+        self
     }
 
-    /// This node's readiness now, as joiner and as acceptor.
-    pub(crate) fn readiness(&self) -> NativeReadiness {
-        let endpoint_up = self
-            .endpoint
+    /// Whether this node, as joiner, can dial native for a `Native` decision
+    /// that arrives now: its readiness now, as a demotion or an endpoint that
+    /// went down since the offer would have lowered it.
+    pub(crate) fn joiner_can_dial_now(&self) -> bool {
+        self.readiness().ready && !self.refuses_decisions
+    }
+
+    /// Simulation only: as [`Self::new`], never offering native as joiner
+    /// when `joiner_off` (`NodeConfig::native_joiner_off`).
+    pub(crate) fn with_joiner_off(mut self, joiner_off: bool) -> Self {
+        self.joiner_off = joiner_off;
+        self
+    }
+
+    /// [`Self::new`], with native gateway joins at `percent` in a simulation
+    /// (`NodeConfig::native_gateway_join_override`).
+    pub(crate) fn with_gateway_join_override(mut self, percent: Option<u8>) -> Self {
+        self.gateway_join_override = percent;
+        self
+    }
+
+    /// The configured gateways the index marks native. Only the first call
+    /// counts: a node is built once.
+    pub(crate) fn set_native_gateways(
+        &self,
+        gateways: impl IntoIterator<Item = std::net::SocketAddr>,
+    ) {
+        self.native_gateways.get_or_init(|| {
+            gateways
+                .into_iter()
+                .map(crate::transport::normalize_mapped_addr)
+                .collect()
+        });
+    }
+
+    /// How this node's join to the gateway at `addr`, with key `gateway`,
+    /// connects. Never [`GatewayJoinPlan::NativeFirst`] unless the node can
+    /// dial native now, the gateway is marked native, and the pair is in the
+    /// slice ([`gateway_join_native`]); counted
+    /// `gateway_native_join_skipped_cooldown` when a recent failure with the
+    /// gateway holds it back.
+    pub(crate) fn plan_gateway_join(
+        &self,
+        own: &TransportPublicKey,
+        addr: std::net::SocketAddr,
+        gateway: &TransportPublicKey,
+    ) -> GatewayJoinPlan {
+        let addr = crate::transport::normalize_mapped_addr(addr);
+        let (dial_ready, percent) = match self.gateway_join_override {
+            Some(percent) => (true, percent),
+            None => (NATIVE_DIAL_READY, GATEWAY_NATIVE_JOIN_PERCENT),
+        };
+        let now = Instant::now();
+        let ready = dial_ready && self.endpoint_up() && !self.demotion.lock().is_demoted(now);
+        let marked = self
+            .native_gateways
             .get()
-            .is_some_and(|e| e.get() == crate::transport::QuicAvailability::Up);
+            .is_some_and(|gateways| gateways.contains(&addr));
+        if !gateway_join_native(ready, marked, native_bucket(own, gateway), percent) {
+            return GatewayJoinPlan::Legacy;
+        }
+        let mut failures = self.gateway_failures.lock();
+        match failures.get(&addr) {
+            Some(failed)
+                if now.saturating_duration_since(*failed) < GATEWAY_NATIVE_FAILURE_COOLDOWN =>
+            {
+                TRANSPORT_METRICS.record_gateway_native_join(
+                    crate::transport::metrics::GatewayNativeJoin::SkippedCooldown,
+                    addr,
+                );
+                #[cfg(any(test, feature = "testing"))]
+                crate::operations::connect::native_wire_trace::record_at(
+                    addr,
+                    crate::operations::connect::native_wire_trace::NativeWireEvent::GatewayJoinSkippedCooldown,
+                );
+                GatewayJoinPlan::LegacyCoolingDown
+            }
+            Some(_) => {
+                failures.remove(&addr);
+                GatewayJoinPlan::NativeFirst
+            }
+            None => GatewayJoinPlan::NativeFirst,
+        }
+    }
+
+    /// A native join with the gateway at `addr` ended: a failure starts its
+    /// cooldown ([`GATEWAY_NATIVE_FAILURE_COOLDOWN`]), a success ends it. Only
+    /// marked gateways are remembered. Does not touch the demotion, which
+    /// counts peer-to-peer failures only.
+    pub(crate) fn record_gateway_join(&self, addr: std::net::SocketAddr, established: bool) {
+        let addr = crate::transport::normalize_mapped_addr(addr);
+        let mut failures = self.gateway_failures.lock();
+        if established {
+            failures.remove(&addr);
+        } else if self
+            .native_gateways
+            .get()
+            .is_some_and(|gateways| gateways.contains(&addr))
+        {
+            failures.insert(addr, Instant::now());
+        }
+    }
+
+    /// A transport to `addr` was removed from the node's connection map.
+    /// A native connection that closed before it carried one frame from the
+    /// peer never worked: the setup and Hello completed, but nothing came
+    /// back (a middlebox that lets the QUIC handshake through and drops the
+    /// rest, or a gateway that closes an admitted join). That is a failed
+    /// gateway join, so it starts the gateway's cooldown and the next join
+    /// goes over UDP, as a failed setup does. Without this the setup's
+    /// success is the only thing recorded, and a joiner could redial the same
+    /// dead native link forever. A link that did carry a frame, or a UDP
+    /// one, says nothing about native and is ignored.
+    ///
+    /// It cannot tell why the link went: a local removal before the first
+    /// frame (shutdown, dropping all connections, a dedup or eviction just
+    /// after the join, or `promote_held_native`, which installs a held
+    /// connection with `frame_seen` false) counts the same. The cost is
+    /// bounded: that gateway's next joins within
+    /// [`GATEWAY_NATIVE_FAILURE_COOLDOWN`] go over UDP, as they do today. A
+    /// join that completes is not affected, since the gateway's probe or its
+    /// CONNECT answer marks the frame first.
+    pub(crate) fn gateway_link_closed(
+        &self,
+        addr: std::net::SocketAddr,
+        native: bool,
+        frame_seen: bool,
+    ) {
+        if native && !frame_seen {
+            #[cfg(any(test, feature = "testing"))]
+            if self.native_gateways.get().is_some_and(|gateways| {
+                gateways.contains(&crate::transport::normalize_mapped_addr(addr))
+            }) {
+                crate::operations::connect::native_wire_trace::record_at(
+                    addr,
+                    crate::operations::connect::native_wire_trace::NativeWireEvent::GatewayLinkDeadBeforeFrame,
+                );
+            }
+            self.record_gateway_join(addr, false);
+        }
+    }
+
+    fn endpoint_up(&self) -> bool {
+        self.endpoint
+            .get()
+            .is_some_and(|(e, prefer)| *prefer && e.get() == crate::transport::QuicAvailability::Up)
+    }
+
+    /// The node's transport opened with this QUIC endpoint. Only the first
+    /// call counts: a node opens one transport. `prefer` is whether the
+    /// configured `transport-quic` mode is `prefer`: a native connection
+    /// carries application data, which `shadow` promises to keep on UDP, so a
+    /// node in any other mode is never ready, as joiner, acceptor or gateway
+    /// joiner, however up its endpoint is.
+    pub(crate) fn set_endpoint(
+        &self,
+        endpoint: crate::transport::QuicAvailabilityWatch,
+        prefer: bool,
+    ) {
+        self.endpoint.get_or_init(|| (endpoint, prefer));
+    }
+
+    /// This node's readiness now, as joiner: the offer it sends and whether
+    /// it can dial a `Native` decision. Demoted only by its joiner failures.
+    pub(crate) fn readiness(&self) -> NativeReadiness {
+        self.readiness_with(false)
+    }
+
+    /// This node's readiness now, as acceptor, read when it decides: as
+    /// [`Self::readiness`], and also off while its acceptor demotion runs.
+    pub(crate) fn acceptor_readiness(&self) -> NativeReadiness {
+        self.readiness_with(true)
+    }
+
+    fn readiness_with(&self, as_acceptor: bool) -> NativeReadiness {
+        let endpoint_up = self.endpoint_up();
         let (dial_ready, release_percent) = match self.release_override {
             Some(percent) => (true, percent),
             None => (NATIVE_DIAL_READY, QUIC_NATIVE_PERCENT),
         };
-        let demoted = self.demotion.lock().is_demoted(Instant::now());
-        NativeReadiness::from_parts(dial_ready, endpoint_up, demoted, release_percent)
+        let dial_ready = dial_ready && (as_acceptor || !self.joiner_off);
+        let now = Instant::now();
+        let joiner_demoted = self.demotion.lock().is_demoted(now);
+        let acceptor_demoted = as_acceptor && self.acceptor_demotion.lock().is_demoted(now);
+        NativeReadiness::from_parts(
+            dial_ready,
+            endpoint_up,
+            joiner_demoted || acceptor_demoted,
+            release_percent,
+        )
     }
 
-    /// A native setup with `peer` failed in a way that says native does not
-    /// work on that path; the caller falls back to UDP. Returns whether this
-    /// failure demoted the node, which is counted.
+    /// A strike in the joiner streak with `peer`: a rescue (a native setup
+    /// that failed on the path, then UDP to `peer` connected;
+    /// [`DEMOTION_FAILURES`]). Returns whether it demoted the node, which is
+    /// counted.
     pub(crate) fn record_failure(&self, peer: &TransportPublicKey) -> bool {
         let demoted = self.demotion.lock().record_failure(peer, Instant::now());
         if demoted {
@@ -522,50 +1036,150 @@ impl NativeConnectState {
         self.demotion.lock().record_success();
     }
 
+    /// A strike in the acceptor streak with `joiner`: a rescue (a native
+    /// setup this node made as ACCEPTOR failed on the path, then UDP to
+    /// `joiner` connected; [`ACCEPTOR_DEMOTION_FAILURES`]). Counted apart from
+    /// the joiner streak, across distinct joiners, so one joiner counts once.
+    /// Returns whether it demoted the acceptor role, which is counted.
+    pub(crate) fn record_acceptor_failure(&self, joiner: &TransportPublicKey) -> bool {
+        let demoted = self
+            .acceptor_demotion
+            .lock()
+            .record_failure(joiner, Instant::now());
+        if demoted {
+            TRANSPORT_METRICS.record_connect_native_acceptor_demotion();
+            tracing::info!(
+                cooldown_secs = DEMOTION_COOLDOWN.as_secs(),
+                "QUIC-native decisions off as acceptor after native failures with distinct joiners"
+            );
+        }
+        demoted
+    }
+
+    /// Sizes the acceptor's pending setups for a node whose connection
+    /// limit is `max_connections` ([`acceptor_pending_setups_max`]).
+    pub(crate) fn with_acceptor_setup_limit(self, max_connections: usize) -> Self {
+        self.setup_admission.lock().cap = acceptor_pending_setups_max(max_connections);
+        self
+    }
+
+    /// Admits a native setup with the joiner at `addr` before this node, as
+    /// acceptor, decides `Native` for it; on a refusal it decides `Udp`,
+    /// which is counted. The ticket holds the admission until it is dropped,
+    /// at the acceptor's native dial deadline.
+    pub(crate) fn admit_acceptor_setup(
+        &self,
+        addr: Option<std::net::SocketAddr>,
+    ) -> Result<SetupTicket, SetupAdmissionRefusal> {
+        let result = self.setup_admission.lock().admit(addr);
+        match result {
+            Ok(addr) => Ok(SetupTicket {
+                admission: Some(std::sync::Arc::clone(&self.setup_admission)),
+                addr,
+            }),
+            Err(refusal) => {
+                TRANSPORT_METRICS.record_connect_native_admission_refused();
+                tracing::debug!(
+                    ?addr,
+                    ?refusal,
+                    "QUIC-native setup not admitted; deciding UDP"
+                );
+                Err(refusal)
+            }
+        }
+    }
+
+    /// Whether a native setup with the joiner at `addr` would be admitted
+    /// now, without taking one: a control pair at an acceptor with no room
+    /// is left out of the arms, as a refused treated pair is.
+    pub(crate) fn acceptor_setup_room(
+        &self,
+        addr: Option<std::net::SocketAddr>,
+    ) -> Result<(), SetupAdmissionRefusal> {
+        self.setup_admission.lock().check(addr)
+    }
+
+    /// Joiner addresses with an admitted native setup as acceptor.
+    #[cfg(test)]
+    pub(crate) fn pending_acceptor_setups(&self) -> usize {
+        self.setup_admission.lock().len()
+    }
+
+    /// A native setup this node made as acceptor succeeded: the acceptor
+    /// streak starts over.
+    pub(crate) fn record_acceptor_success(&self) {
+        self.acceptor_demotion.lock().record_success();
+    }
+
     /// How many times this node was demoted.
     #[cfg(test)]
     pub(crate) fn demotions(&self) -> u64 {
         self.demotion.lock().demotions()
     }
+
+    /// How many times this node's acceptor role was demoted.
+    #[cfg(test)]
+    pub(crate) fn acceptor_demotions(&self) -> u64 {
+        self.acceptor_demotion.lock().demotions()
+    }
+
+    /// Distinct joiners in the acceptor role's current failure streak.
+    #[cfg(any(test, feature = "testing"))]
+    pub(crate) fn acceptor_streak(&self) -> usize {
+        self.acceptor_demotion.lock().streak.len()
+    }
+
+    /// Distinct acceptors in the joiner role's current strike streak.
+    #[cfg(test)]
+    pub(crate) fn joiner_streak(&self) -> usize {
+        self.demotion.lock().streak.len()
+    }
 }
 
-/// Lowers a node's native offer (or, on an acceptor, its decisions) after
-/// repeated native failures, as joiner or as acceptor
-/// ([`NativeConnectState`]). A failure is always followed by a UDP dial to
-/// the same peer, so demotion only stops new native attempts.
+/// One role's demotion after repeated native failures
+/// ([`NativeConnectState`] holds one for the joiner role and one for the
+/// acceptor role). A failure is always followed by a UDP dial to the same
+/// peer, so demotion only stops new native attempts.
 ///
-/// [`DEMOTION_FAILURES`] failures in a row, each with a different acceptor,
-/// demote the node for [`DEMOTION_COOLDOWN`]; a success resets the streak.
-/// Repeated failures with one acceptor count once, so one broken peer cannot
-/// demote a node. It only ever lowers: it can make a node offer 0, never more.
+/// `threshold` failures in a row ([`DEMOTION_FAILURES`] as joiner,
+/// [`ACCEPTOR_DEMOTION_FAILURES`] as acceptor), each with a different peer,
+/// demote the role for [`DEMOTION_COOLDOWN`]; a success in that role resets
+/// the streak. Repeated failures with one peer count once, so one broken peer
+/// cannot demote a node. It only ever lowers: it can make a node offer 0 or
+/// decide `Udp`, never more.
 #[derive(Debug)]
 pub(crate) struct NativeDemotion {
-    /// Distinct acceptors in the current failure streak, at most
-    /// [`DEMOTION_FAILURES`].
-    streak: Vec<TransportPublicKey>,
+    /// Distinct peers in the current streak, each with when its strike was
+    /// counted; strikes older than [`STRIKE_WINDOW`] are dropped. At most
+    /// `threshold`.
+    streak: Vec<(TransportPublicKey, Instant)>,
+    threshold: usize,
     demoted_until: Option<Instant>,
     demotions: u64,
 }
 
 impl NativeDemotion {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(threshold: usize) -> Self {
         Self {
-            streak: Vec::with_capacity(DEMOTION_FAILURES),
+            streak: Vec::with_capacity(threshold),
+            threshold,
             demoted_until: None,
             demotions: 0,
         }
     }
 
-    /// A native attempt with `acceptor` failed. Returns whether it demoted
-    /// the node.
-    pub(crate) fn record_failure(&mut self, acceptor: &TransportPublicKey, now: Instant) -> bool {
+    /// A strike with `peer` (a rescue, see [`DEMOTION_FAILURES`]). Returns
+    /// whether it demoted the role.
+    pub(crate) fn record_failure(&mut self, peer: &TransportPublicKey, now: Instant) -> bool {
         if self.is_demoted(now) {
             return false;
         }
-        if !self.streak.contains(acceptor) {
-            self.streak.push(acceptor.clone());
+        self.streak
+            .retain(|(_, at)| now.saturating_duration_since(*at) < STRIKE_WINDOW);
+        if !self.streak.iter().any(|(key, _)| key == peer) {
+            self.streak.push((peer.clone(), now));
         }
-        if self.streak.len() >= DEMOTION_FAILURES {
+        if self.streak.len() >= self.threshold {
             self.streak.clear();
             self.demoted_until = Some(now + DEMOTION_COOLDOWN);
             self.demotions += 1;
@@ -669,6 +1283,7 @@ mod tests {
 
     fn ready(percent: u8) -> NativeReadiness {
         NativeReadiness {
+            demoted: false,
             ready: true,
             percent,
         }
@@ -722,6 +1337,7 @@ mod tests {
             ready(25),
             ready(100),
             NativeReadiness {
+                demoted: false,
                 ready: false,
                 percent: 25,
             },
@@ -778,6 +1394,7 @@ mod tests {
         assert_eq!(acceptor_arm(offer, ready(100), 0, true), None);
         // Below the percent but not ready to dial: in neither arm.
         let not_ready = NativeReadiness {
+            demoted: false,
             ready: false,
             percent: 50,
         };
@@ -860,6 +1477,7 @@ mod tests {
         );
         // Not ready, even with a percent.
         let not_ready = NativeReadiness {
+            demoted: false,
             ready: false,
             percent: 50,
         };
@@ -926,23 +1544,35 @@ mod tests {
         );
     }
 
-    /// This build cannot dial native, so it offers 0 and never decides
-    /// `Native`, whatever the endpoint state.
+    /// A+ step 1: this build dials native and offers 25 once its endpoint is
+    /// up. A node whose endpoint is down offers 0 and decides UDP; an up node
+    /// decides `Native` exactly for buckets below 25.
     #[test]
-    fn this_release_offers_zero_and_decides_udp() {
-        const { assert!(!NATIVE_DIAL_READY) };
-        for endpoint_up in [false, true] {
-            let own = NativeReadiness::from_inputs(NATIVE_DIAL_READY, endpoint_up, false);
-            assert!(!own.ready);
-            assert_eq!(own.offer(), NativeOffer::capable(0));
-            for bucket in 0..100 {
-                assert_eq!(
-                    decide_native(Some(NativeOffer::capable(100)), own, bucket, false),
-                    NativeDecision::Udp
-                );
-            }
+    fn this_release_offers_25_when_up_and_decides_native_below_25() {
+        const { assert!(NATIVE_DIAL_READY) };
+        const { assert!(QUIC_NATIVE_PERCENT == 25) };
+        let down = NativeReadiness::from_inputs(NATIVE_DIAL_READY, false, false);
+        assert!(!down.ready);
+        assert_eq!(down.offer(), NativeOffer::capable(0));
+        let up = NativeReadiness::from_inputs(NATIVE_DIAL_READY, true, false);
+        assert!(up.ready);
+        assert_eq!(up.offer(), NativeOffer::capable(25));
+        for bucket in 0..100 {
+            assert_eq!(
+                decide_native(Some(NativeOffer::capable(100)), down, bucket, false),
+                NativeDecision::Udp
+            );
+            let want = if bucket < 25 {
+                NativeDecision::Native
+            } else {
+                NativeDecision::Udp
+            };
+            assert_eq!(
+                decide_native(Some(NativeOffer::capable(100)), up, bucket, false),
+                want,
+                "bucket {bucket}"
+            );
         }
-        assert_eq!(NativeReadiness::current().offer().percent, 0);
     }
 
     #[test]
@@ -1002,12 +1632,22 @@ mod tests {
         use crate::transport::{QuicAvailability, QuicAvailabilityWatch};
         let (endpoint, watch) = QuicAvailabilityWatch::for_test(QuicAvailability::Up);
         let off = NativeConnectState::new(None);
-        off.set_endpoint(watch.clone());
-        assert!(!off.readiness().ready, "production: not ready to dial");
+        off.set_endpoint(watch.clone(), true);
+        assert!(
+            off.readiness().ready,
+            "production: ready once the endpoint is up"
+        );
+        assert_eq!(off.readiness().percent, QUIC_NATIVE_PERCENT);
+        let no_endpoint = NativeConnectState::new(None);
+        assert!(
+            !no_endpoint.readiness().ready,
+            "production: no transport yet"
+        );
+        assert_eq!(no_endpoint.readiness().percent, 0);
         let on = NativeConnectState::new(Some(100));
         assert!(!on.readiness().ready, "no transport yet");
         assert_eq!(on.readiness().percent, 0);
-        on.set_endpoint(watch);
+        on.set_endpoint(watch, true);
         assert!(on.readiness().ready);
         assert_eq!(on.readiness().percent, 100);
         endpoint.send(QuicAvailability::Down).unwrap();
@@ -1020,6 +1660,652 @@ mod tests {
         assert_eq!(on.demotions(), 1);
         assert!(!on.readiness().ready, "demoted");
         assert_eq!(on.readiness().percent, 0);
+        assert!(
+            !on.acceptor_readiness().ready,
+            "a demoted joiner does not decide native as acceptor either"
+        );
+    }
+
+    fn up_state(release: u8) -> NativeConnectState {
+        use crate::transport::{QuicAvailability, QuicAvailabilityWatch};
+        // A watch keeps its last value after its sender drops.
+        let (_endpoint, watch) = QuicAvailabilityWatch::for_test(QuicAvailability::Up);
+        let state = NativeConnectState::new(Some(release));
+        state.set_endpoint(watch, true);
+        state
+    }
+
+    /// The acceptor role has its own streak (10.2 item 2). Failures as
+    /// acceptor with `ACCEPTOR_DEMOTION_FAILURES` distinct joiners stop the
+    /// node DECIDING native (its acceptor readiness, which `decide_native`
+    /// reads, goes to percent 0 and counts as demoted) while its own offer as
+    /// joiner is untouched; repeats with one joiner count once; one failure
+    /// fewer does not demote; a joiner success does not touch the acceptor
+    /// streak, and an acceptor success restarts it. The two streaks never feed
+    /// each other.
+    #[test]
+    fn acceptor_failures_turn_off_only_the_acceptor_decision() {
+        let on = up_state(100);
+        for _ in 0..5 {
+            assert!(!on.record_acceptor_failure(&key(9)));
+        }
+        for i in 10..(10 + ACCEPTOR_DEMOTION_FAILURES as u32 - 2) {
+            assert!(!on.record_acceptor_failure(&key(i)));
+        }
+        assert!(
+            on.acceptor_readiness().ready,
+            "one failure short: one joiner counted once"
+        );
+        on.record_success();
+        let counted =
+            || crate::transport::metrics::ACCEPTOR_DEMOTIONS_ON_THIS_THREAD.with(|c| c.get());
+        let before = counted();
+        assert!(
+            on.record_acceptor_failure(&key(100)),
+            "a joiner success does not reset the acceptor streak, so this is the last"
+        );
+        assert_eq!(on.acceptor_demotions(), 1);
+        assert_eq!(
+            counted(),
+            before + 1,
+            "the demotion is counted for telemetry"
+        );
+        assert_eq!(on.demotions(), 0, "the joiner streak saw nothing");
+        let joiner = on.readiness();
+        assert!(joiner.ready, "its own offer is untouched");
+        assert_eq!(joiner.percent, 100);
+        assert!(!joiner.demoted);
+        let acceptor = on.acceptor_readiness();
+        assert!(!acceptor.ready);
+        assert_eq!(acceptor.percent, 0);
+        assert!(acceptor.demoted);
+        for bucket in [0u8, 50, 99] {
+            assert_eq!(
+                decide_native(Some(NativeOffer::capable(100)), acceptor, bucket, false),
+                NativeDecision::Udp
+            );
+        }
+
+        let fresh = up_state(100);
+        for i in 1..ACCEPTOR_DEMOTION_FAILURES as u32 {
+            fresh.record_acceptor_failure(&key(i));
+        }
+        fresh.record_acceptor_success();
+        fresh.record_acceptor_failure(&key(50));
+        assert_eq!(fresh.acceptor_demotions(), 0, "an acceptor success resets");
+        assert!(fresh.acceptor_readiness().ready);
+        for i in 20..23 {
+            fresh.record_failure(&key(i));
+        }
+        assert_eq!(fresh.acceptor_demotions(), 0, "joiner failures never count");
+        assert!(
+            fresh.acceptor_readiness().demoted,
+            "but they stop decisions"
+        );
+    }
+
+    /// Both roles demote on three strikes (rescues), strikes count for one
+    /// cooldown, and a demotion lasts six hours.
+    #[test]
+    fn demotion_thresholds_have_these_values() {
+        assert_eq!(DEMOTION_FAILURES, 3);
+        assert_eq!(ACCEPTOR_DEMOTION_FAILURES, 3);
+        assert_eq!(DEMOTION_COOLDOWN, Duration::from_secs(6 * 3600));
+        assert_eq!(STRIKE_WINDOW, DEMOTION_COOLDOWN);
+    }
+
+    /// A strike older than `STRIKE_WINDOW` no longer counts: strikes spread
+    /// over longer than the window never demote, while the same strikes
+    /// inside it do. Applies to both roles (one `NativeDemotion` type).
+    #[test]
+    fn strikes_older_than_the_window_age_out() {
+        let start = Instant::now();
+        let mut spread = NativeDemotion::new(DEMOTION_FAILURES);
+        for i in 0..10u32 {
+            let at = start + (STRIKE_WINDOW / 2 + Duration::from_secs(1)) * i;
+            assert!(!spread.record_failure(&key(i), at), "strike {i}");
+        }
+        assert_eq!(spread.demotions(), 0, "never three inside one window");
+        let mut close = NativeDemotion::new(DEMOTION_FAILURES);
+        let last = start + STRIKE_WINDOW - Duration::from_secs(1);
+        assert!(!close.record_failure(&key(0), start));
+        assert!(!close.record_failure(&key(1), start + Duration::from_secs(60)));
+        assert!(
+            close.record_failure(&key(2), last),
+            "three inside the window"
+        );
+    }
+
+    /// A joiner that offered and lost native dials the acceptor over UDP at
+    /// the fallback time; a decision that answered no offer is reported.
+    #[test]
+    fn a_refused_native_decision_dials_udp_only_when_the_joiner_offered() {
+        let answered_at = Instant::now();
+        assert_eq!(
+            refused_decision_plan(JoinerDecisionFailure::NativeUnsupported, answered_at),
+            RefusedDecisionPlan::DialUdpAt(answered_at + crate::transport::NATIVE_FALLBACK_AFTER),
+            "an offer it can no longer honour: UDP at the acceptor's fallback time"
+        );
+        assert_eq!(
+            refused_decision_plan(JoinerDecisionFailure::DecisionWithoutOffer, answered_at),
+            RefusedDecisionPlan::ReportFailed,
+            "a decision that answered no offer is reported"
+        );
+    }
+
+    /// An acceptor whose readiness is demoted (by either role's streak)
+    /// counts its pairs in neither arm, so
+    /// the control arm does not collect the pairs where native failed; one
+    /// at release percent 0 is control as before.
+    #[test]
+    fn a_demoted_acceptor_is_in_neither_arm() {
+        let offer = Some(NativeOffer::capable(100));
+        let demoted = NativeReadiness::from_parts(true, true, true, 100);
+        assert!(demoted.demoted);
+        for bucket in [0u8, 24, 50, 99] {
+            assert_eq!(acceptor_arm(offer, demoted, bucket, false), None);
+        }
+        let at_zero = NativeReadiness::from_parts(true, true, false, 0);
+        assert_eq!(
+            acceptor_arm(offer, at_zero, 10, false),
+            Some(ConnectArm::Control)
+        );
+    }
+
+    /// The acceptor demotion lasts `DEMOTION_COOLDOWN` and then ends on its
+    /// own, while a joiner demotion started later still holds decisions off:
+    /// each role's cooldown is read separately.
+    #[tokio::test(start_paused = true)]
+    async fn each_roles_cooldown_ends_on_its_own() {
+        let on = up_state(100);
+        for i in 0..ACCEPTOR_DEMOTION_FAILURES as u32 {
+            on.record_acceptor_failure(&key(i));
+        }
+        assert!(!on.acceptor_readiness().ready);
+        tokio::time::advance(DEMOTION_COOLDOWN - Duration::from_secs(1)).await;
+        assert!(!on.acceptor_readiness().ready, "still in the cooldown");
+        for i in 40..43 {
+            on.record_failure(&key(i));
+        }
+        assert_eq!(on.demotions(), 1);
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert!(
+            !on.acceptor_readiness().ready,
+            "the acceptor cooldown ended, the joiner one holds"
+        );
+        // The acceptor streak counts again, which it does not while demoted.
+        for i in 100..(100 + ACCEPTOR_DEMOTION_FAILURES as u32) {
+            on.record_acceptor_failure(&key(i));
+        }
+        assert_eq!(
+            on.acceptor_demotions(),
+            2,
+            "the acceptor cooldown had ended"
+        );
+        tokio::time::advance(DEMOTION_COOLDOWN + Duration::from_secs(1)).await;
+        assert!(on.acceptor_readiness().ready, "both ended");
+        assert!(on.readiness().ready);
+    }
+
+    /// A node with its joiner role off (simulation only) offers 0 and cannot
+    /// dial a `Native` decision, but still decides as acceptor at its
+    /// release percent.
+    #[test]
+    fn joiner_off_keeps_the_acceptor_deciding() {
+        use crate::transport::{QuicAvailability, QuicAvailabilityWatch};
+        let (_endpoint, watch) = QuicAvailabilityWatch::for_test(QuicAvailability::Up);
+        let state = NativeConnectState::new(Some(100)).with_joiner_off(true);
+        state.set_endpoint(watch, true);
+        assert!(!state.readiness().ready);
+        assert_eq!(state.readiness().offer().percent, 0);
+        assert!(!state.readiness().demoted);
+        assert!(state.acceptor_readiness().ready);
+        assert_eq!(state.acceptor_readiness().percent, 100);
+    }
+
+    fn v4(a: u8, b: u8, port: u16) -> std::net::SocketAddr {
+        std::net::SocketAddr::from(([198, 51, a, b], port))
+    }
+
+    /// The acceptor admits native setups up to its cap and its per-source
+    /// cap, by joiner address, only with a known address. Holds on one
+    /// address share its entry; the entry goes with the last hold.
+    #[test]
+    fn native_setup_admission_bounds_pending_setups() {
+        let cap = 8;
+        let mut admission = NativeSetupAdmission::new(cap);
+        let per = ACCEPTOR_PENDING_SETUPS_PER_SOURCE as u16;
+        // One source: up to the per-source cap, any ports.
+        for port in 0..per {
+            assert!(admission.admit(Some(v4(0, 1, 1000 + port))).is_ok());
+        }
+        assert_eq!(
+            admission.admit(Some(v4(0, 1, 2000))),
+            Err(SetupAdmissionRefusal::SourceFull)
+        );
+        assert_eq!(admission.admit(None), Err(SetupAdmissionRefusal::NoAddress));
+        // Another hold on a pending address shares its entry, whatever the
+        // caps say.
+        assert!(admission.admit(Some(v4(0, 1, 1000))).is_ok());
+        assert_eq!(admission.len(), per as usize);
+        // The first release leaves the shared entry; the second removes it.
+        admission.release(v4(0, 1, 1000));
+        assert_eq!(admission.len(), per as usize);
+        admission.release(v4(0, 1, 1000));
+        assert_eq!(admission.len(), per as usize - 1);
+        assert!(admission.admit(Some(v4(0, 1, 2000))).is_ok(), "room again");
+        // Fill the cap from distinct sources.
+        let mut b = 0u8;
+        while admission.len() < cap {
+            assert!(admission.admit(Some(v4(1, b, 1))).is_ok());
+            b += 1;
+        }
+        assert_eq!(
+            admission.admit(Some(v4(2, 1, 1))),
+            Err(SetupAdmissionRefusal::Full)
+        );
+        assert_eq!(
+            admission.check(Some(v4(2, 1, 1))),
+            Err(SetupAdmissionRefusal::Full)
+        );
+        assert_eq!(
+            admission.check(Some(v4(1, 0, 1))),
+            Ok(()),
+            "a pending address"
+        );
+        // A release of an address with no entry changes nothing.
+        admission.release(v4(9, 9, 9));
+        assert_eq!(admission.len(), cap);
+    }
+
+    /// The acceptor's cap is half its native setup slots, which are
+    /// `NATIVE_SETUPS_MAX` lowered to the connection limit, and at least 1.
+    #[test]
+    fn the_acceptor_setup_cap_follows_the_connection_limit() {
+        let max = crate::transport::NATIVE_SETUPS_MAX;
+        assert_eq!(acceptor_pending_setups_max(200), max / 2);
+        assert_eq!(acceptor_pending_setups_max(max), max / 2);
+        assert_eq!(acceptor_pending_setups_max(16), 8);
+        assert_eq!(acceptor_pending_setups_max(1), 1);
+        let state = NativeConnectState::new(Some(100)).with_acceptor_setup_limit(4);
+        let _first = state
+            .admit_acceptor_setup(Some(v4(3, 1, 1)))
+            .expect("first");
+        let _second = state
+            .admit_acceptor_setup(Some(v4(3, 2, 1)))
+            .expect("second");
+        assert_eq!(
+            state.acceptor_setup_room(Some(v4(3, 3, 1))),
+            Err(SetupAdmissionRefusal::Full),
+            "a connection limit of 4 gives 2 acceptor setups"
+        );
+    }
+
+    /// IPv6 joiners in one /64 share the per-source cap and another /64 does
+    /// not; IPv4-mapped addresses count as IPv4; loopback (a local test
+    /// network) is counted per port.
+    #[test]
+    fn native_setup_sources_group_by_v4_address_and_v6_prefix() {
+        let v6 = |s: &str| std::net::SocketAddr::new(s.parse().unwrap(), 1);
+        assert_eq!(
+            SetupSource::of(v6("2001:db8:1:2::1")),
+            SetupSource::of(v6("2001:db8:1:2:ffff::9"))
+        );
+        assert_ne!(
+            SetupSource::of(v6("2001:db8:1:2::1")),
+            SetupSource::of(v6("2001:db8:1:3::1"))
+        );
+        assert_eq!(
+            SetupSource::of(v6("::ffff:198.51.0.1")),
+            SetupSource::of(v4(0, 1, 7))
+        );
+        assert_eq!(SetupSource::of(v4(0, 1, 7)), SetupSource::of(v4(0, 1, 8)));
+        let lo = |port| std::net::SocketAddr::from(([127, 0, 0, 1], port));
+        assert_ne!(SetupSource::of(lo(1)), SetupSource::of(lo(2)));
+        assert_ne!(
+            SetupSource::of("[::1]:1".parse().unwrap()),
+            SetupSource::of("[::1]:2".parse().unwrap())
+        );
+    }
+
+    /// A ticket holds its admission until it is dropped; a refusal is
+    /// counted for telemetry.
+    #[test]
+    fn a_ticket_holds_its_admission_and_a_refusal_is_counted() {
+        let state = NativeConnectState::new(Some(100));
+        let counted = || {
+            crate::transport::metrics::NATIVE_ADMISSIONS_REFUSED_ON_THIS_THREAD.with(|c| c.get())
+        };
+        let before = counted();
+        let ticket = state
+            .admit_acceptor_setup(Some(v4(9, 9, 1)))
+            .expect("admitted");
+        let shared = state
+            .admit_acceptor_setup(Some(v4(9, 9, 1)))
+            .expect("shared");
+        assert_eq!(counted(), before);
+        assert_eq!(state.pending_acceptor_setups(), 1);
+        drop(ticket);
+        assert_eq!(
+            state.pending_acceptor_setups(),
+            1,
+            "still held by the other"
+        );
+        drop(shared);
+        assert_eq!(state.pending_acceptor_setups(), 0);
+        assert_eq!(
+            state.admit_acceptor_setup(None).map(|_| ()),
+            Err(SetupAdmissionRefusal::NoAddress)
+        );
+        assert_eq!(counted(), before + 1);
+        assert_eq!(state.pending_acceptor_setups(), 0);
+    }
+
+    /// Phase B ships dark: no join tries native in this release.
+    #[test]
+    fn this_release_joins_no_gateway_natively() {
+        const { assert!(GATEWAY_NATIVE_JOIN_PERCENT == 0) };
+        use crate::transport::{QuicAvailability, QuicAvailabilityWatch};
+        let (_endpoint, watch) = QuicAvailabilityWatch::for_test(QuicAvailability::Up);
+        // Production state, with every other condition met.
+        let state = NativeConnectState::new(None);
+        state.set_endpoint(watch, true);
+        let gateway = "192.0.2.1:31337".parse().unwrap();
+        state.set_native_gateways([gateway]);
+        for seed in 0..200 {
+            assert_eq!(
+                state.plan_gateway_join(&key(seed), gateway, &key(10_000)),
+                GatewayJoinPlan::Legacy
+            );
+        }
+    }
+
+    /// A native connection carries application data, which `transport-quic =
+    /// shadow` promises to keep on UDP. A shadow (or off) node's endpoint can
+    /// be up, yet it must offer 0, decide UDP and join gateways over UDP, in
+    /// production state (no percent override), while a `prefer` node with the
+    /// same endpoint does not.
+    #[test]
+    fn a_node_not_in_prefer_mode_never_goes_native() {
+        use crate::transport::{QuicAvailability, QuicAvailabilityWatch};
+        let (_endpoint, watch) = QuicAvailabilityWatch::for_test(QuicAvailability::Up);
+        let gateway = "192.0.2.1:31337".parse().unwrap();
+        let build = |prefer: bool| {
+            let state = NativeConnectState::new(None).with_gateway_join_override(Some(100));
+            state.set_endpoint(watch.clone(), prefer);
+            state.set_native_gateways([gateway]);
+            state
+        };
+        let shadow = build(false);
+        for readiness in [shadow.readiness(), shadow.acceptor_readiness()] {
+            assert!(!readiness.ready);
+            assert_eq!(readiness.offer(), NativeOffer::capable(0));
+            for bucket in 0..100 {
+                assert_eq!(
+                    decide_native(Some(NativeOffer::capable(100)), readiness, bucket, false),
+                    NativeDecision::Udp
+                );
+            }
+        }
+        for seed in 0..100 {
+            assert_eq!(
+                shadow.plan_gateway_join(&key(seed), gateway, &key(10_000)),
+                GatewayJoinPlan::Legacy
+            );
+        }
+        let prefer = build(true);
+        assert!(prefer.readiness().ready, "premise: prefer, same endpoint");
+        assert!(
+            (0..100).any(|seed| {
+                prefer.plan_gateway_join(&key(seed), gateway, &key(10_000))
+                    != GatewayJoinPlan::Legacy
+            }),
+            "premise: the gateway override reaches native for a prefer node"
+        );
+    }
+
+    /// A join tries native only when the node can dial, the gateway is
+    /// marked and the pair is in the slice; each condition alone is enough to
+    /// keep today's join.
+    #[test]
+    fn a_gateway_join_needs_readiness_a_mark_and_the_slice() {
+        for (ready, marked) in [(false, true), (true, false), (false, false)] {
+            for bucket in 0..100 {
+                assert!(!gateway_join_native(ready, marked, bucket, 100));
+            }
+        }
+        for bucket in 0..100 {
+            assert!(gateway_join_native(true, true, bucket, 100));
+            assert!(!gateway_join_native(true, true, bucket, 0));
+            assert_eq!(gateway_join_native(true, true, bucket, 30), bucket < 30);
+            // A percent above 100 reads as 100.
+            assert!(gateway_join_native(true, true, bucket, 250));
+        }
+    }
+
+    /// The state reads the override, its endpoint, the gateways marked in
+    /// the index (only those) and the demotion; the slice is the connect
+    /// slice of the (joiner, gateway) pair.
+    #[test]
+    fn plan_gateway_join_reads_endpoint_marks_slice_and_demotion() {
+        use crate::transport::{QuicAvailability, QuicAvailabilityWatch};
+        let (endpoint, watch) = QuicAvailabilityWatch::for_test(QuicAvailability::Up);
+        let marked: std::net::SocketAddr = "192.0.2.1:31337".parse().unwrap();
+        let unmarked: std::net::SocketAddr = "192.0.2.2:31337".parse().unwrap();
+        let gateway = key(10_000);
+        let state = NativeConnectState::new(None).with_gateway_join_override(Some(100));
+        state.set_native_gateways([marked]);
+        assert_eq!(
+            state.plan_gateway_join(&key(1), marked, &gateway),
+            GatewayJoinPlan::Legacy,
+            "no transport yet"
+        );
+        state.set_endpoint(watch, true);
+        assert_eq!(
+            state.plan_gateway_join(&key(1), marked, &gateway),
+            GatewayJoinPlan::NativeFirst
+        );
+        // An IPv4-mapped address is the same gateway.
+        let mapped = std::net::SocketAddr::new(
+            std::net::Ipv4Addr::new(192, 0, 2, 1)
+                .to_ipv6_mapped()
+                .into(),
+            31337,
+        );
+        assert_eq!(
+            state.plan_gateway_join(&key(1), mapped, &gateway),
+            GatewayJoinPlan::NativeFirst
+        );
+        assert_eq!(
+            state.plan_gateway_join(&key(1), unmarked, &gateway),
+            GatewayJoinPlan::Legacy
+        );
+        endpoint.send(QuicAvailability::Down).unwrap();
+        assert_eq!(
+            state.plan_gateway_join(&key(1), marked, &gateway),
+            GatewayJoinPlan::Legacy,
+            "the endpoint went down"
+        );
+        endpoint.send(QuicAvailability::Up).unwrap();
+        for i in 1..=3 {
+            state.record_failure(&key(i));
+        }
+        assert_eq!(
+            state.plan_gateway_join(&key(1), marked, &gateway),
+            GatewayJoinPlan::Legacy,
+            "demoted"
+        );
+
+        // At 50%, exactly the joiners whose pair bucket is below 50.
+        let (_endpoint, watch) = QuicAvailabilityWatch::for_test(QuicAvailability::Up);
+        let half = NativeConnectState::new(None).with_gateway_join_override(Some(50));
+        half.set_endpoint(watch, true);
+        half.set_native_gateways([marked]);
+        let mut native = 0;
+        for seed in 0..400 {
+            let own = key(seed);
+            let plan = half.plan_gateway_join(&own, marked, &gateway);
+            let want = if native_bucket(&own, &gateway) < 50 {
+                native += 1;
+                GatewayJoinPlan::NativeFirst
+            } else {
+                GatewayJoinPlan::Legacy
+            };
+            assert_eq!(plan, want);
+        }
+        assert!((100..300).contains(&native), "premise: both arms seen");
+    }
+
+    /// A gateway the index gives as an IPv4-mapped address is the gateway
+    /// dialled at its IPv4 address: marks are stored, not only looked up,
+    /// without the mapping.
+    #[test]
+    fn a_mark_given_as_an_ipv4_mapped_address_matches_the_ipv4_dial() {
+        use crate::transport::{QuicAvailability, QuicAvailabilityWatch};
+        let (_endpoint, watch) = QuicAvailabilityWatch::for_test(QuicAvailability::Up);
+        let mapped = std::net::SocketAddr::new(
+            std::net::Ipv4Addr::new(192, 0, 2, 1)
+                .to_ipv6_mapped()
+                .into(),
+            31337,
+        );
+        let v4: std::net::SocketAddr = "192.0.2.1:31337".parse().unwrap();
+        let state = NativeConnectState::new(None).with_gateway_join_override(Some(100));
+        state.set_endpoint(watch, true);
+        state.set_native_gateways([mapped]);
+        assert_eq!(
+            state.plan_gateway_join(&key(1), v4, &key(10_000)),
+            GatewayJoinPlan::NativeFirst
+        );
+    }
+
+    /// A failed native join sends joins to that gateway straight to today's
+    /// join for the cooldown; a success, or the cooldown passing,
+    /// ends it. Failures with an unmarked gateway are not remembered, and a
+    /// gateway failure never counts toward the demotion.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_gateway_join_cools_that_gateway_down() {
+        use crate::transport::{QuicAvailability, QuicAvailabilityWatch};
+        let (_endpoint, watch) = QuicAvailabilityWatch::for_test(QuicAvailability::Up);
+        let marked: std::net::SocketAddr = "192.0.2.1:31337".parse().unwrap();
+        let other: std::net::SocketAddr = "192.0.2.3:31337".parse().unwrap();
+        let gateway = key(10_000);
+        let state = NativeConnectState::new(None).with_gateway_join_override(Some(100));
+        state.set_endpoint(watch, true);
+        state.set_native_gateways([marked, other]);
+        state.record_gateway_join(marked, false);
+        assert_eq!(
+            state.plan_gateway_join(&key(1), marked, &gateway),
+            GatewayJoinPlan::LegacyCoolingDown
+        );
+        assert_eq!(
+            state.plan_gateway_join(&key(1), other, &gateway),
+            GatewayJoinPlan::NativeFirst,
+            "only that gateway cools down"
+        );
+        tokio::time::advance(GATEWAY_NATIVE_FAILURE_COOLDOWN - Duration::from_secs(1)).await;
+        assert_eq!(
+            state.plan_gateway_join(&key(1), marked, &gateway),
+            GatewayJoinPlan::LegacyCoolingDown
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(
+            state.plan_gateway_join(&key(1), marked, &gateway),
+            GatewayJoinPlan::NativeFirst,
+            "the cooldown passed"
+        );
+        state.record_gateway_join(marked, false);
+        state.record_gateway_join(marked, true);
+        assert_eq!(
+            state.plan_gateway_join(&key(1), marked, &gateway),
+            GatewayJoinPlan::NativeFirst,
+            "a success ends the cooldown"
+        );
+        for _ in 0..DEMOTION_FAILURES + 1 {
+            state.record_gateway_join(other, false);
+        }
+        assert_eq!(state.demotions(), 0, "gateway joins never demote");
+        let unmarked: std::net::SocketAddr = "192.0.2.9:31337".parse().unwrap();
+        state.record_gateway_join(unmarked, false);
+        assert_eq!(
+            state.gateway_failures.lock().len(),
+            1,
+            "only marked gateways"
+        );
+    }
+
+    /// A failure recorded under the IPv4-mapped spelling of a gateway's
+    /// address cools down the IPv4 dial: `record_gateway_join` normalises
+    /// the address as `plan_gateway_join` and `set_native_gateways` do.
+    #[test]
+    fn a_failure_recorded_under_the_mapped_address_cools_down_the_ipv4_dial() {
+        use crate::transport::{QuicAvailability, QuicAvailabilityWatch};
+        let (_endpoint, watch) = QuicAvailabilityWatch::for_test(QuicAvailability::Up);
+        let v4: std::net::SocketAddr = "192.0.2.1:31337".parse().unwrap();
+        let mapped = std::net::SocketAddr::new(
+            std::net::Ipv4Addr::new(192, 0, 2, 1)
+                .to_ipv6_mapped()
+                .into(),
+            31337,
+        );
+        let state = NativeConnectState::new(None).with_gateway_join_override(Some(100));
+        state.set_endpoint(watch, true);
+        state.set_native_gateways([v4]);
+        state.record_gateway_join(mapped, false);
+        assert_eq!(
+            state.plan_gateway_join(&key(1), v4, &key(10_000)),
+            GatewayJoinPlan::LegacyCoolingDown
+        );
+    }
+
+    /// A native gateway link that closes before it carried a frame from the
+    /// gateway never worked, whatever its setup said: it cools the gateway
+    /// down, so the next join goes over UDP. A link that carried a frame, and
+    /// a UDP link, say nothing about native.
+    #[test]
+    fn a_native_gateway_link_that_closes_before_a_frame_cools_the_gateway_down() {
+        use crate::transport::{QuicAvailability, QuicAvailabilityWatch};
+        let (_endpoint, watch) = QuicAvailabilityWatch::for_test(QuicAvailability::Up);
+        let marked: std::net::SocketAddr = "192.0.2.1:31337".parse().unwrap();
+        let gateway = key(10_000);
+        let state = NativeConnectState::new(None).with_gateway_join_override(Some(100));
+        state.set_endpoint(watch, true);
+        state.set_native_gateways([marked]);
+        for (native, frame_seen) in [(true, true), (false, false), (false, true)] {
+            state.gateway_link_closed(marked, native, frame_seen);
+            assert_eq!(
+                state.plan_gateway_join(&key(1), marked, &gateway),
+                GatewayJoinPlan::NativeFirst,
+                "native {native}, frame seen {frame_seen}"
+            );
+        }
+        state.gateway_link_closed(marked, true, false);
+        assert_eq!(
+            state.plan_gateway_join(&key(1), marked, &gateway),
+            GatewayJoinPlan::LegacyCoolingDown
+        );
+    }
+
+    /// `P2pConnManager::remove_connection`, the one place a transport leaves
+    /// the connection map, tells the native state about the closed link.
+    #[test]
+    fn removing_a_connection_reports_the_closed_link_to_the_native_state() {
+        const SOURCE: &str = include_str!("../../node/network_bridge/p2p_protoc.rs");
+        let start = SOURCE
+            .find("fn remove_connection(&mut self, addr: SocketAddr)")
+            .expect("remove_connection renamed");
+        let body = &SOURCE[start..start + 900];
+        let body: String = body.split_whitespace().collect();
+        assert!(
+            body.contains(
+                ".native_connect().gateway_link_closed(addr,entry.native,entry.frame_seen)"
+            ),
+            "remove_connection must report the closed link: {body}"
+        );
+        assert!(
+            body.find("gateway_link_closed").unwrap() < body.find("held_native.remove").unwrap(),
+            "reported before the entry's session state goes"
+        );
     }
 
     /// Every level and percent decodes and re-encodes to the same bytes, so a
@@ -1078,7 +2364,7 @@ mod tests {
     #[test]
     fn demotion_after_three_distinct_acceptors() {
         let now = Instant::now();
-        let mut demotion = NativeDemotion::new();
+        let mut demotion = NativeDemotion::new(DEMOTION_FAILURES);
         demotion.record_failure(&key(1), now);
         demotion.record_failure(&key(2), now);
         assert!(!demotion.is_demoted(now));
@@ -1093,7 +2379,7 @@ mod tests {
     #[test]
     fn one_acceptor_repeated_counts_once() {
         let now = Instant::now();
-        let mut demotion = NativeDemotion::new();
+        let mut demotion = NativeDemotion::new(DEMOTION_FAILURES);
         for _ in 0..10 {
             demotion.record_failure(&key(1), now);
         }
@@ -1106,7 +2392,7 @@ mod tests {
     #[test]
     fn a_success_resets_the_streak() {
         let now = Instant::now();
-        let mut demotion = NativeDemotion::new();
+        let mut demotion = NativeDemotion::new(DEMOTION_FAILURES);
         demotion.record_failure(&key(1), now);
         demotion.record_failure(&key(2), now);
         demotion.record_success();
@@ -1122,7 +2408,7 @@ mod tests {
     #[test]
     fn failures_during_the_cooldown_do_not_carry_over() {
         let now = Instant::now();
-        let mut demotion = NativeDemotion::new();
+        let mut demotion = NativeDemotion::new(DEMOTION_FAILURES);
         for i in 1..=3 {
             demotion.record_failure(&key(i), now);
         }

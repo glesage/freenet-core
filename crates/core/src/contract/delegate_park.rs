@@ -130,8 +130,8 @@ use either::Either;
 use freenet_stdlib::client_api::DelegateRequest;
 use freenet_stdlib::prelude::{
     ContractContainer, ContractInstanceId, ContractKey, DelegateContext, DelegateKey,
-    InboundDelegateMsg, OutboundDelegateMsg, Parameters, RelatedContracts, StateDelta, UpdateData,
-    WrappedState,
+    DelegateMessage, InboundDelegateMsg, OutboundDelegateMsg, Parameters, RelatedContracts,
+    StateDelta, UpdateData, WrappedState,
 };
 
 use super::executor::ExecutorError;
@@ -415,6 +415,17 @@ pub(super) fn continuation_bytes(continuation: &Continuation) -> ByteCount {
             .sum::<ByteCount>()
         // `params` is delegate-supplied and retained for the life of the park.
         // Omitting it was one of three ways this "byte bound" failed to bound.
+        // Hop replies awaiting the resumed iteration: delegate-supplied
+        // payloads (and contexts), held for the life of the park.
+        + continuation
+            .pending_replies
+            .iter()
+            .map(|r| {
+                ELEMENT_OVERHEAD_BYTES
+                    + ByteCount::new(r.msg.payload.len())
+                    + ByteCount::new(r.msg.context.as_ref().len())
+            })
+            .sum::<ByteCount>()
         + ByteCount::new(continuation.params.as_ref().len())
         // The parked run's delegate context, held here while it waits.
         + ByteCount::new(continuation.context.as_ref().map_or(0, Vec::len))
@@ -1072,6 +1083,18 @@ pub(super) enum Delivery {
     Apps,
 }
 
+/// A hop target's reply waiting for its caller's next iteration
+/// (`split_hop_output` in `contract.rs`).
+///
+/// `from` is the delegate the node ran, recorded by the node when the hop
+/// returned. It is carried BESIDE the message, never read back out of it, so
+/// the origin a reply is delivered under (`MessageOrigin::Delegate(from)`)
+/// does not depend on any field of the message.
+pub(super) struct PendingReply {
+    pub from: DelegateKey,
+    pub msg: DelegateMessage,
+}
+
 /// Everything needed to re-enter a parked delegate on a later loop iteration.
 ///
 /// `params` is carried explicitly and is NOT optional: `DelegateKey` identity
@@ -1106,17 +1129,27 @@ pub(super) struct Continuation {
     /// lets the loop continue, so nothing serialises it and the count has to be
     /// carried explicitly.
     pub self_heal_fetches_started: usize,
+    /// Inter-delegate hops the run has attempted, so
+    /// `MAX_UNPROMPTED_HOPS_PER_RUN` bounds the whole run, not each leg.
+    pub hops_attempted: usize,
+    /// Payload bytes of hop replies the run has accepted, so
+    /// `MAX_HOP_REPLY_BYTES_PER_RUN` bounds the whole run, not each leg.
+    pub reply_bytes_accepted: usize,
     pub params: Parameters<'static>,
     pub origin_contract: Option<ContractInstanceId>,
     pub connection_scope: ConnectionScope,
     pub user_context: Option<UserSecretContext>,
-    pub inter_delegate: super::InterDelegateDispatch,
+    pub trigger: super::RunTrigger,
     /// Outbound messages the delegate produced before it parked. Carried so the
     /// client sees ONE response covering the whole round-trip rather than a
     /// partial one now and the rest out-of-band.
     pub accumulated: Vec<OutboundDelegateMsg>,
     /// Responses already computed for this iteration, awaiting the parked one.
     pub inbound_so_far: Vec<InboundDelegateMsg<'static>>,
+    /// Hop replies produced in the parked iteration, delivered in the resumed
+    /// run's first iteration (each in a call of its own, under its sender's
+    /// origin).
+    pub pending_replies: Vec<PendingReply>,
     /// The parked client's responder, if this run descends from a client
     /// request. Attached by the caller immediately after parking (it owns the
     /// channel the responder is taken from), and re-attached by the resume
@@ -1763,6 +1796,27 @@ pub(super) struct DelegateParkCtx {
     /// (parked, or nested in the hop that delivers it). Counted, not only
     /// logged.
     dropped_hops: u64,
+    /// Inter-delegate messages refused because an unprompted run reached
+    /// `MAX_UNPROMPTED_HOPS_PER_RUN`.
+    refused_unprompted_hops: u64,
+    /// Messages in hop targets' output, other than `SendDelegateMessage`s,
+    /// dropped because the hop came from an unprompted run (which has no
+    /// client to return them to).
+    dropped_hop_outputs: u64,
+    /// `SendDelegateMessage`s in hop targets' output that were not delivered:
+    /// every one except the first addressed back to the caller (the reply).
+    /// It counts every `SendDelegateMessage` variant in the output, whatever
+    /// its flags, so it is an upper bound on real sends the target attempted.
+    /// Counted for every run kind. Disjoint from `dropped_hop_outputs`.
+    dropped_hop_sends: u64,
+    /// Replies from hop targets that were not delivered or not handled: over
+    /// `MAX_HOP_REPLY_BYTES` or `MAX_HOP_REPLY_BYTES_PER_RUN`, still waiting
+    /// when the run reached `MAX_CONTRACT_REQUEST_ITERATIONS`, the caller
+    /// failed while handling it, or the caller failed on the batch before it.
+    dropped_hop_replies: u64,
+    /// Inter-delegate messages refused because a delegate addressed them to
+    /// itself.
+    refused_self_hops: u64,
 }
 
 /// See [`DelegateParkCtx::enter_hop_unit`]. Derefs to the park context, so the
@@ -1820,6 +1874,11 @@ impl DelegateParkCtx {
             gate: None,
             hop_unit_stack: Vec::new(),
             dropped_hops: 0,
+            refused_unprompted_hops: 0,
+            dropped_hop_outputs: 0,
+            dropped_hop_sends: 0,
+            dropped_hop_replies: 0,
+            refused_self_hops: 0,
         }
     }
 
@@ -1866,6 +1925,65 @@ impl DelegateParkCtx {
     #[cfg(test)]
     pub(super) fn dropped_hops(&self) -> u64 {
         self.dropped_hops
+    }
+
+    /// Count `n` inter-delegate messages refused at the unprompted per-run hop
+    /// cap; returns the new total.
+    pub(super) fn count_refused_unprompted_hops(&mut self, n: u64) -> u64 {
+        self.refused_unprompted_hops = self.refused_unprompted_hops.saturating_add(n);
+        self.refused_unprompted_hops
+    }
+
+    #[cfg(test)]
+    pub(super) fn refused_unprompted_hops(&self) -> u64 {
+        self.refused_unprompted_hops
+    }
+
+    /// Count `n` messages (other than `SendDelegateMessage`s) dropped from a
+    /// hop target's output on an unprompted run; returns the new total.
+    pub(super) fn count_dropped_hop_output(&mut self, n: usize) -> u64 {
+        self.dropped_hop_outputs = self.dropped_hop_outputs.saturating_add(n as u64);
+        self.dropped_hop_outputs
+    }
+
+    #[cfg(test)]
+    pub(super) fn dropped_hop_outputs(&self) -> u64 {
+        self.dropped_hop_outputs
+    }
+
+    /// Count `n` `SendDelegateMessage`s from hop targets that were not
+    /// delivered (not the one reply to the caller); returns the new total.
+    pub(super) fn count_dropped_hop_sends(&mut self, n: u64) -> u64 {
+        self.dropped_hop_sends = self.dropped_hop_sends.saturating_add(n);
+        self.dropped_hop_sends
+    }
+
+    #[cfg(test)]
+    pub(super) fn dropped_hop_sends(&self) -> u64 {
+        self.dropped_hop_sends
+    }
+
+    /// Count `n` hop replies that were not delivered; returns the new total.
+    pub(super) fn count_dropped_hop_replies(&mut self, n: u64) -> u64 {
+        self.dropped_hop_replies = self.dropped_hop_replies.saturating_add(n);
+        self.dropped_hop_replies
+    }
+
+    #[cfg(test)]
+    pub(super) fn dropped_hop_replies(&self) -> u64 {
+        self.dropped_hop_replies
+    }
+
+    /// Count `n` inter-delegate messages a delegate addressed to itself;
+    /// returns the new total.
+    pub(super) fn count_refused_self_hops(&mut self, n: u64) -> u64 {
+        self.refused_self_hops = self.refused_self_hops.saturating_add(n);
+        self.refused_self_hops
+    }
+
+    #[cfg(test)]
+    pub(super) fn refused_self_hops(&self) -> u64 {
+        self.refused_self_hops
     }
 
     /// The byte budget this registry is enforcing. Tests assert against THIS
@@ -3226,13 +3344,16 @@ mod tests {
     fn continuation() -> Continuation {
         Continuation {
             self_heal_fetches_started: 0,
+            hops_attempted: 0,
+            reply_bytes_accepted: 0,
             params: Parameters::from(Vec::new()),
             origin_contract: None,
             connection_scope: ConnectionScope::Local,
             user_context: None,
-            inter_delegate: super::super::InterDelegateDispatch::Allowed,
+            trigger: super::super::RunTrigger::Client,
             accumulated: Vec::new(),
             inbound_so_far: Vec::new(),
+            pending_replies: Vec::new(),
             responder: None,
             delivery: Delivery::Client,
             node_wide_duty: false,
