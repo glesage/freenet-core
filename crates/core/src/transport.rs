@@ -7,7 +7,7 @@
 //! See `architecture.md`.
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::{borrow::Cow, io, net::SocketAddr};
 
@@ -184,6 +184,22 @@ pub fn set_open_connection_count(count: usize) {
 /// Get the current open connection count.
 pub fn get_open_connection_count() -> usize {
     OPEN_CONNECTION_COUNT.load(Ordering::SeqCst)
+}
+
+/// Bootstrap rounds issued in a row with no ring connection in between,
+/// published by `connection_maintenance` for the update check on handshake
+/// failure (#5940 phase D prerequisite). Like [`OPEN_CONNECTION_COUNT`] it is
+/// process-wide.
+static BOOTSTRAP_ROUNDS_WITHOUT_CONNECTION: AtomicU32 = AtomicU32::new(0);
+
+/// Publish the number of consecutive bootstrap rounds with no connection.
+pub fn set_bootstrap_rounds_without_connection(rounds: u32) {
+    BOOTSTRAP_ROUNDS_WITHOUT_CONNECTION.store(rounds, Ordering::SeqCst);
+}
+
+/// Bootstrap rounds issued in a row with no ring connection in between.
+pub fn get_bootstrap_rounds_without_connection() -> u32 {
+    BOOTSTRAP_ROUNDS_WITHOUT_CONNECTION.load(Ordering::SeqCst)
 }
 
 mod boundary;
@@ -406,6 +422,11 @@ pub enum TransportError {
         "Version incompatibility with gateway\n  Your client version: {actual}\n  Gateway version: {expected}\n  \n  To fix this, update your Freenet client:\n    cargo install --force freenet --version {expected}\n  \n  Or if building from source:\n    git pull && cargo install --path crates/core"
     )]
     ProtocolVersionMismatch { expected: String, actual: String },
+    /// The remote peer runs an OLDER release that refused us. We do not need
+    /// to update, so this must never be shown as "update required". Local
+    /// classification only: never serialized onto the wire.
+    #[error("peer runs an outdated version {peer_version} and refused this connection")]
+    PeerVersionOutdated { peer_version: String },
     #[error("outbound stream to {0} failed (stream-scoped, connection survives)")]
     OutboundStreamFailed(SocketAddr),
     /// An outbound stream was not started because its length is outside
@@ -694,6 +715,7 @@ impl TransportError {
             | TransportError::ConnectionClosed(_)
             | TransportError::ConnectionEstablishmentFailure { .. }
             | TransportError::ProtocolVersionMismatch { .. }
+            | TransportError::PeerVersionOutdated { .. }
             | TransportError::Other(_)
             | TransportError::Udp(UdpError(
                 UdpErrorKind::IO(_)
@@ -1227,6 +1249,7 @@ mod tests {
                 TransportError::ProtocolVersionMismatch { .. } => {
                     (ErrorScope::Connection, false, true)
                 }
+                TransportError::PeerVersionOutdated { .. } => (ErrorScope::Connection, false, true),
                 TransportError::Udp(UdpError(UdpErrorKind::SendFailed(..))) => {
                     (ErrorScope::Transient, true, false)
                 }
@@ -1279,6 +1302,9 @@ mod tests {
             TransportError::ProtocolVersionMismatch {
                 expected: "1".into(),
                 actual: "2".into(),
+            },
+            TransportError::PeerVersionOutdated {
+                peer_version: "1".into(),
             },
             TransportError::send_failed(addr, io::ErrorKind::NetworkUnreachable),
             TransportError::OutboundStreamFailed(addr),

@@ -222,8 +222,11 @@ pub(crate) const UNANNOUNCED_CREDIT_SLACK: u32 = MAX_UNI_STREAMS / 8;
 ///   at [`DATA_START_UNI_STREAMS`] and raises only once all its streams are
 ///   busy, so capping the permits below its limit would stop the raise.
 ///   Until it raises, the reserve does not hold: a send past its limit waits
-///   in `open_uni` until its open deadline and ends `NotOpened` (on UDP),
-///   never `MaybeDelivered`, counted `quic_data_event_stream_limit_full`.
+///   in `open_uni` until its open deadline and ends `NotOpened`, never
+///   `MaybeDelivered`, counted `quic_data_event_stream_limit_full`. An upgraded
+///   path then sends it on UDP. A native path has no UDP session, so it sends it
+///   again on the same path (`route::NOT_OPENED_RETRIES` times) and drops it only
+///   after that.
 pub(crate) const STREAMED_SEND_LIMIT: u32 =
     MAX_UNI_STREAMS - RESERVED_UNI_STREAMS - UNANNOUNCED_CREDIT_SLACK;
 const _: () = assert!(RESERVED_UNI_STREAMS > 0 && STREAMED_SEND_LIMIT > 0);
@@ -246,7 +249,7 @@ pub(crate) const INCOMING_BUFFER_TOTAL_BYTES: u64 = 1024 * 1024;
 
 // Measured terms of the memory one QUIC connection holds, per side, from
 // `quic::memory_tests` with quinn 0.11.12 / quinn-proto 0.11.19 / rustls
-// 0.23.45, in bytes rounded up to jemalloc's size classes as the node's
+// 0.23.45 (re-checked on 0.23.46, see `QUIC_MEMORY_MEASURED_WITH`), in bytes rounded up to jemalloc's size classes as the node's
 // linux-gnu build allocates them (`util::alloc_count`). The committed tree
 // links freenet-quinn / freenet-quinn-proto 0.11.13 (see
 // `QUIC_MEMORY_MEASURED_WITH`); every pin test passes against it, so the
@@ -566,7 +569,7 @@ pub(crate) fn quic_memory_ceiling(memory_limit: usize) -> usize {
 pub(crate) const QUIC_MEMORY_MEASURED_WITH: [(&str, &str); 3] = [
     ("freenet-quinn", "0.11.13"),
     ("freenet-quinn-proto", "0.11.13"),
-    ("rustls", "0.23.45"),
+    ("rustls", "0.23.46"),
 ];
 
 /// The rate a QUIC connection's window is capped at

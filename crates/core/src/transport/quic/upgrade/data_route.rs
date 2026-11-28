@@ -28,6 +28,7 @@ use super::driver::PathClock;
 use crate::simulation::TimeSource;
 use crate::transport::TransportError;
 use crate::transport::connection_handler::SerializedMessage;
+use crate::transport::metrics::ShortDropCause;
 use crate::transport::quic::config::MAX_UNI_STREAMS;
 use crate::transport::quic::path::{
     BoundedSend, NextStep, QuicPath, QuicSendEvent, SendDeadlines, SendKind,
@@ -159,7 +160,7 @@ impl DataRoute {
 
     /// Take `payload` for a native connection's path, which has no UDP
     /// session to hand it to. Never waits. A message refused because the queue
-    /// is full is counted as a dropped short; one refused because the path has
+    /// is full is counted as `native_short_queue_full`, not as a dropped short; one refused because the path has
     /// ended is not, since the connection is over.
     pub(in crate::transport) fn queue_native_short(
         &self,
@@ -168,7 +169,9 @@ impl DataRoute {
         match self.shorts.try_send(payload) {
             Ok(()) => Ok(()),
             Err(mpsc::error::TrySendError::Full(_)) => {
-                self.path.stats().record_send_dropped(SendKind::Short);
+                self.path
+                    .stats()
+                    .record_send_event(QuicSendEvent::NativeShortQueueFull);
                 Err(ShortRefused::Full)
             }
             Err(mpsc::error::TrySendError::Closed(_)) => Err(ShortRefused::Closed),
@@ -176,21 +179,37 @@ impl DataRoute {
     }
 
     /// Take `payload` for the path, or hand it back for UDP: the queue is full,
-    /// or the path has ended. Never waits.
+    /// or the path has ended. Never waits. On a path with no UDP fallback
+    /// (`QuicPathLimits::effective_udp_fallback`) nothing is handed back: a
+    /// payload the queue cannot take is dropped and counted, as every other
+    /// send the path cannot carry is, and the caller sees it taken.
     pub(in crate::transport) fn queue_short(
         &self,
         payload: SerializedMessage,
     ) -> Result<(), SerializedMessage> {
-        match self.shorts.try_send(payload) {
-            Ok(()) => Ok(()),
+        let refused = match self.shorts.try_send(payload) {
+            Ok(()) => return Ok(()),
             Err(mpsc::error::TrySendError::Full(payload)) => {
-                self.path
-                    .stats()
-                    .record_send_event(QuicSendEvent::ShortOverflowUdp);
-                Err(payload)
+                if self.path.udp_fallback() {
+                    self.path
+                        .stats()
+                        .record_send_event(QuicSendEvent::ShortOverflowUdp);
+                }
+                (payload, ShortDropCause::QueueFull)
             }
-            Err(mpsc::error::TrySendError::Closed(payload)) => Err(payload),
+            Err(mpsc::error::TrySendError::Closed(payload)) => (payload, ShortDropCause::PathEnded),
+        };
+        let (refused, cause) = refused;
+        if self.path.udp_fallback() {
+            return Err(refused);
         }
+        self.path.stats().record_short_dropped(cause);
+        self.note(|| {
+            "dropped a short: the queue is full or the path has ended, and there is no UDP \
+             fallback"
+                .to_string()
+        });
+        Ok(())
     }
 }
 
@@ -203,7 +222,7 @@ pub(in crate::transport) enum ShortRefused {
     Closed,
 }
 
-type ShortSend = Pin<Box<dyn Future<Output = (SerializedMessage, BoundedSend)> + Send>>;
+type ShortSend = Pin<Box<dyn Future<Output = (SerializedMessage, BoundedSend, u32)> + Send>>;
 
 /// Send what the queue takes until the path has ended and nothing is left.
 /// A task, and no reference to the connection's receive state.
@@ -233,20 +252,38 @@ async fn run_worker(
                 queue.close();
             },
             settled = in_flight.next(), if !in_flight.is_empty() => {
-                if let Some((payload, outcome)) = settled {
+                if let Some((payload, outcome, attempt)) = settled {
                     note.note(|| format!("sent a short on the path: {outcome:?}"));
-                    let step = path.settle(SendKind::Short, &outcome, false, clock.now_nanos());
-                    if step == NextStep::SendOnUdp {
-                        send_elsewhere(&path, udp.as_deref(), &note, payload).await;
+                    if connected && path.sends_data() && path.retry_not_opened(&outcome, attempt) {
+                        // A native path has no UDP session: send it again on the
+                        // path rather than drop it. Not settled, so the attempt
+                        // that did not open is not counted as a drop.
+                        in_flight.push(send_on_path(&path, &clock, payload, attempt + 1));
+                    } else {
+                        path.note_retry_outcome(&outcome, attempt);
+                        let step = path.settle(SendKind::Short, &outcome, false, clock.now_nanos());
+                        if step == NextStep::SendOnUdp {
+                            send_elsewhere(
+                                &path,
+                                udp.as_deref(),
+                                &note,
+                                payload,
+                                ShortDropCause::NoUdpSession,
+                            )
+                            .await;
+                        }
                     }
                 }
             },
             message = queue.recv(), if queue_open && in_flight.len() < SHORTS_IN_FLIGHT => {
                 match message {
                     Some(payload) if connected && path.sends_data() && !path.is_suspect() => {
-                        in_flight.push(send_on_path(&path, &clock, payload));
+                        in_flight.push(send_on_path(&path, &clock, payload, 0));
                     }
-                    Some(payload) => send_elsewhere(&path, udp.as_deref(), &note, payload).await,
+                    Some(payload) => {
+                        let why = unsent_cause(connected, path.sends_data());
+                        send_elsewhere(&path, udp.as_deref(), &note, payload, why).await;
+                    }
                     None => queue_open = false,
                 }
             },
@@ -254,13 +291,32 @@ async fn run_worker(
     }
 }
 
-fn send_on_path(path: &Arc<QuicPath>, clock: &PathClock, payload: SerializedMessage) -> ShortSend {
+/// Why the worker did not send a queued Short on the path, from what its test
+/// for sending read (`connected && sends_data() && !is_suspect()`): the path
+/// ended, the peer refused data, or the path is suspect with no UDP session to
+/// take the message (suspect is entered only where UDP is the fallback).
+fn unsent_cause(connected: bool, sends_data: bool) -> ShortDropCause {
+    if !connected {
+        ShortDropCause::PathEnded
+    } else if !sends_data {
+        ShortDropCause::PeerRefusedData
+    } else {
+        ShortDropCause::NoUdpSession
+    }
+}
+
+fn send_on_path(
+    path: &Arc<QuicPath>,
+    clock: &PathClock,
+    payload: SerializedMessage,
+    attempt: u32,
+) -> ShortSend {
     let path = Arc::clone(path);
     let clock = clock.clone();
     Box::pin(async move {
         let deadlines = SendDeadlines::short(payload.len() as u64);
         let outcome = path.send_short_bounded(&clock, deadlines, &payload).await;
-        (payload, outcome)
+        (payload, outcome, attempt)
     })
 }
 
@@ -271,18 +327,24 @@ async fn send_elsewhere(
     udp: Option<&dyn UdpShorts>,
     note: &RouteNote,
     payload: SerializedMessage,
+    why: ShortDropCause,
 ) {
     match udp {
-        Some(udp) => send_on_udp(path, udp, note, payload).await,
-        None => {
-            path.stats().record_send_dropped(SendKind::Short);
-            note.note(|| {
-                "dropped a short: the native path does not take it (ended, or the peer \
-                 refused data) and there is no UDP session"
-                    .to_string()
-            });
-        }
+        // A path with no UDP fallback (`QuicPathLimits::effective_udp_fallback`)
+        // gives up what it cannot carry, whether or not a session exists.
+        Some(udp) if path.udp_fallback() => send_on_udp(path, udp, note, payload).await,
+        _ => drop_short(path, note, why),
     }
+}
+
+/// Give up a Short the native path does not take, and count why.
+fn drop_short(path: &QuicPath, note: &RouteNote, cause: ShortDropCause) {
+    path.stats().record_short_dropped(cause);
+    note.note(|| {
+        "dropped a short: the native path does not take it (ended, or the peer \
+         refused data) and there is no UDP fallback"
+            .to_string()
+    });
 }
 
 /// Hand a message to the UDP session, once. A send error there costs what a lost
@@ -300,5 +362,21 @@ async fn send_on_udp(
             path.stats().record_send_event(QuicSendEvent::UdpSendFailed);
             tracing::debug!(%error, "A short message from a QUIC path was not sent on UDP");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Each reason the worker's test for sending on the path can fail has its own
+    /// cause, in the test's own order: a suspect path (connected, sending data)
+    /// is not labelled as the peer having refused data.
+    #[test]
+    fn an_unsent_short_is_labelled_by_the_reason_it_was_not_sent() {
+        assert_eq!(unsent_cause(false, true), ShortDropCause::PathEnded);
+        assert_eq!(unsent_cause(false, false), ShortDropCause::PathEnded);
+        assert_eq!(unsent_cause(true, false), ShortDropCause::PeerRefusedData);
+        assert_eq!(unsent_cause(true, true), ShortDropCause::NoUdpSession);
     }
 }

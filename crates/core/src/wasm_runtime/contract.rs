@@ -32,6 +32,13 @@ pub(crate) trait ContractRuntimeInterface {
         update_data: &[UpdateData<'_>],
     ) -> RuntimeResult<UpdateModification<'static>>;
 
+    /// Whether this contract declares, by exporting `__frnt__update_validates`
+    /// with type `() -> i32`, that its `update_state` validates its own input
+    /// and output. Any failure to find the module answers `false`.
+    fn update_validates(&mut self, _key: &ContractKey, _parameters: &Parameters<'_>) -> bool {
+        false
+    }
+
     /// Generate a concise summary of a state.
     fn summarize_state(
         &mut self,
@@ -216,6 +223,16 @@ impl super::Runtime {
 }
 
 impl ContractRuntimeInterface for super::Runtime {
+    fn update_validates(&mut self, key: &ContractKey, parameters: &Parameters<'_>) -> bool {
+        match self.contract_module(key, parameters) {
+            Ok(module) => self.engine.module_declares_update_validates(&module),
+            Err(err) => {
+                tracing::debug!(contract = %key, error = %err, "update_validates: no module");
+                false
+            }
+        }
+    }
+
     fn validate_state(
         &mut self,
         key: &ContractKey,
@@ -397,5 +414,57 @@ pub(crate) fn classify_result<T>(result: Result<T, WasmError>) -> RuntimeResult<
         // quarantined contract-wide the way a real Timeout is.
         Err(WasmError::SchedulerOverloaded) => Err(ContractExecError::SchedulerOverloaded.into()),
         Err(e) => Err(e.into()),
+    }
+}
+
+/// Classify the result of compiling a module. A refusal is a property of the
+/// code (outside the limits, or invalid), so it maps to the permanent
+/// [`ContractExecError::InvalidModule`]. Every other error, including a compile
+/// failure that is not a property of the code, keeps its generic conversion, so
+/// a transient fault is never reported as a bad module. Compile sites call this
+/// rather than `?` so the class reaches the caller.
+pub(crate) fn classify_compile_result<T>(result: Result<T, WasmError>) -> RuntimeResult<T> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(e @ WasmError::CompileRefused(_)) => {
+            Err(ContractExecError::InvalidModule(e.to_string()).into())
+        }
+        Err(e) => classify_result(Err(e)),
+    }
+}
+
+#[cfg(test)]
+mod compile_classification_tests {
+    use super::*;
+    use crate::wasm_runtime::RuntimeInnerError;
+    use crate::wasm_runtime::engine::compile_limits::CompileRefusal;
+
+    fn class(error: WasmError) -> crate::wasm_runtime::ContractError {
+        classify_compile_result::<()>(Err(error)).expect_err("an error was passed in")
+    }
+
+    #[test]
+    fn a_refusal_is_an_invalid_module() {
+        assert!(matches!(
+            class(WasmError::CompileRefused(CompileRefusal::NestingTooDeep {
+                limit: 1
+            }))
+            .deref(),
+            RuntimeInnerError::ContractExecError(ContractExecError::InvalidModule(_))
+        ));
+    }
+
+    /// A compile failure that is not a property of the bytes (an allocation or
+    /// disk error) must not read as a bad module.
+    #[test]
+    fn another_compile_failure_is_not_an_invalid_module() {
+        assert!(!matches!(
+            class(WasmError::Compile("out of memory".into())).deref(),
+            RuntimeInnerError::ContractExecError(ContractExecError::InvalidModule(_))
+        ));
+        assert!(matches!(
+            class(WasmError::Timeout).deref(),
+            RuntimeInnerError::ContractExecError(ContractExecError::MaxComputeTimeExceeded)
+        ));
     }
 }

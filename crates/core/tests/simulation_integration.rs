@@ -70,6 +70,9 @@ struct TestConfig {
     /// Send states larger than this many bytes as streams (`run_direct` only).
     /// `None` keeps the simulation default (streaming off).
     streaming_threshold: Option<usize>,
+    /// Run on the legacy UDP transport (`transport-quic = off`) instead of the
+    /// simulation default of QUIC data (`run_direct` only).
+    legacy_udp: bool,
 }
 
 impl TestConfig {
@@ -94,6 +97,7 @@ impl TestConfig {
             message_loss_rate: 0.0,
             use_mock_wasm: false,
             streaming_threshold: None,
+            legacy_udp: false,
         }
     }
 
@@ -118,6 +122,7 @@ impl TestConfig {
             message_loss_rate: 0.0,
             use_mock_wasm: false,
             streaming_threshold: None,
+            legacy_udp: false,
         }
     }
 
@@ -142,6 +147,7 @@ impl TestConfig {
             message_loss_rate: 0.0,
             use_mock_wasm: false,
             streaming_threshold: None,
+            legacy_udp: false,
         }
     }
 
@@ -186,6 +192,7 @@ impl TestConfig {
             message_loss_rate: 0.0,
             use_mock_wasm: false,
             streaming_threshold: None,
+            legacy_udp: false,
         }
     }
 
@@ -279,6 +286,14 @@ impl TestConfig {
     /// Stream states larger than `bytes` (`run_direct` only).
     fn with_streaming_threshold(mut self, bytes: usize) -> Self {
         self.streaming_threshold = Some(bytes);
+        self
+    }
+
+    /// Keep this test on the legacy UDP transport (`run_direct` only), for a
+    /// test whose subject is not the transport and whose QUIC run exceeds its
+    /// CI time cap.
+    fn with_legacy_udp(mut self) -> Self {
+        self.legacy_udp = true;
         self
     }
 
@@ -403,6 +418,9 @@ impl TestConfig {
             sim.skip_convergence_wait = skip_convergence_wait;
             if let Some(bytes) = self.streaming_threshold {
                 sim.with_streaming_threshold(bytes);
+            }
+            if self.legacy_udp {
+                sim.with_transport_quic("off");
             }
 
             // Apply fault injection if configured (latency and/or message loss)
@@ -6596,6 +6614,7 @@ fn test_subscription_renewal_at_scale() {
         message_loss_rate: 0.0,
         use_mock_wasm: false,
         streaming_threshold: None,
+        legacy_udp: false,
     };
 
     let max_contracts = config.max_contracts; // Save before config.run() moves it
@@ -16005,6 +16024,11 @@ fn run_subscription_mesh(
     let sim = rt.block_on(async {
         let mut sim = SimNetwork::new(network, 1, 15, 10, 3, 5, 3, seed).await;
         sim.enable_hosting_time_control();
+        // Kept on the legacy UDP transport: the subscription tree does not
+        // depend on the transport, and the callers (six meshes per test) take
+        // about 1.6x as long under QUIC data (measured alone: 288 s off, 452 s
+        // on, loaded host), past the 240 s CI cap with a 95 s QUIC-off baseline.
+        sim.with_transport_quic("off");
         sim
     });
 
@@ -21053,11 +21077,17 @@ struct QuicSimTrace {
     /// (`SimNetwork::probe_quic_endpoints_at`): `["not_allowed"]` when the
     /// node had a live QUIC endpoint, `["no_ingress"]` when it had none.
     endpoint_probe: Vec<(SocketAddr, Vec<&'static str>)>,
+    /// The gateways' addresses: with native admission on in production, a
+    /// gateway's endpoint takes a stranger's datagram into the admission
+    /// queue (`"forwarded"`) where every other node refuses it.
+    gateway_addrs: Vec<SocketAddr>,
 }
 
 impl QuicSimTrace {
     /// Asserts the probe covered all `QUIC_HARNESS_NODES` and every one
-    /// answered it with `expected`.
+    /// answered it with `expected`; a gateway, which admits native joins
+    /// from unknown sources, answers `"forwarded"` instead when `expected`
+    /// is `"not_allowed"` (a live endpoint).
     fn assert_probe(&self, expected: &str) {
         assert_eq!(
             self.endpoint_probe.len(),
@@ -21065,7 +21095,12 @@ impl QuicSimTrace {
             "the probe covered every node"
         );
         for (node, outcomes) in &self.endpoint_probe {
-            assert_eq!(outcomes.as_slice(), [expected], "probe of {node}");
+            let want = if expected == "not_allowed" && self.gateway_addrs.contains(node) {
+                "forwarded"
+            } else {
+                expected
+            };
+            assert_eq!(outcomes.as_slice(), [want], "probe of {node}");
         }
     }
 }
@@ -21079,14 +21114,18 @@ const QUIC_HARNESS_NODES: usize = 6;
 fn run_quic_harness_sim(name: &str, seed: u64, quic: Option<&str>) -> QuicSimTrace {
     setup_deterministic_state(seed);
     let rt = create_runtime();
-    let (sim, logs_handle, probe) = rt.block_on(async {
+    let (sim, logs_handle, probe, gateway_addrs) = rt.block_on(async {
         let mut sim = SimNetwork::new(name, 2, 4, 10, 3, 10, 3, seed).await;
-        if let Some(value) = quic {
-            sim.with_transport_quic(value);
-        }
+        sim.with_transport_quic(quic.unwrap_or("off"));
         let probe = sim.probe_quic_endpoints_at(Duration::from_secs(2));
+        let gateway_addrs: Vec<SocketAddr> = sim
+            .all_node_addresses()
+            .iter()
+            .filter(|(label, _)| label.is_gateway())
+            .map(|(_, addr)| *addr)
+            .collect();
         let logs_handle = sim.event_logs_handle();
-        (sim, logs_handle, probe)
+        (sim, logs_handle, probe, gateway_addrs)
     });
     drop(rt);
     sim.run_simulation_direct::<rand::rngs::SmallRng>(seed, 6, 20, Duration::from_millis(200))
@@ -21122,6 +21161,7 @@ fn run_quic_harness_sim(name: &str, seed: u64, quic: Option<&str>) -> QuicSimTra
             event_sequence,
             event_keys,
             endpoint_probe: probe.outcomes(),
+            gateway_addrs,
         }
     })
 }
@@ -21472,6 +21512,11 @@ fn run_quic_shadow_sim_waiting(
         // native wire fields but decides none, isolating the upgrade path;
         // native connects are covered by the `test_quic_native_*` sims.
         sim.with_native_connect(0);
+        // These runs exercise the negotiation itself, so every node starts with
+        // QUIC off and `set_up` turns it on where the test wants it. The harness
+        // default is `prefer` at 100%.
+        sim.with_transport_quic("off")
+            .with_release_quic_data_share();
         let trace = sim.quic_upgrade_trace();
         let mut labels: Vec<_> = sim.all_node_addresses().keys().cloned().collect();
         labels.sort_by_key(|label| (!label.is_gateway(), label.number()));
@@ -21775,7 +21820,8 @@ fn run_quic_data_ramp(
         let mut sim = SimNetwork::new(network, 1, 3, 7, 3, 10, 2, seed).await;
         sim.enable_gateway_ack_version();
         let trace = sim.quic_upgrade_trace();
-        sim.with_transport_quic("prefer");
+        sim.with_transport_quic("prefer")
+            .with_release_quic_data_share();
         trace.ramp_data_started_before(started_before);
         run_as_first_negotiating_release(&trace);
         let nodes: Vec<_> = sim.all_node_addresses().values().copied().collect();
@@ -23560,10 +23606,14 @@ fn test_quic_native_zero_percent_forms_the_same_mesh() {
     let off = run_native_wire_sim("native-wire-off", SEED, |sim| {
         sim.enable_gateway_ack_version();
         sim.with_quic_native_floor(native_floor_above_binary());
+        // The test's subject is 0%: with QUIC on (the simulation default) the
+        // production 25% share would decide native connects in the "on" run.
+        sim.with_native_connect(0);
     });
     let on = run_native_wire_sim("native-wire-on", SEED, |sim| {
         sim.enable_gateway_ack_version();
         sim.with_quic_native_floor(native_floor_for_tests());
+        sim.with_native_connect(0);
     });
     assert_eq!(off.trace.requests_native(), 0, "premise: off sends none");
     assert!(on.trace.requests_native() > 0, "premise: on sends them");
@@ -23625,6 +23675,9 @@ fn run_native_connect_sim_with(
         sim.enable_gateway_ack_version();
         sim.with_quic_native_floor(native_floor_for_tests());
         sim.with_transport_quic("prefer");
+        // These sims start from this release's own native shares; a test sets
+        // its own with `with_native_connect` / `with_native_gateway_join`.
+        sim.with_release_native_share();
         configure(&mut sim);
         let trace = sim.native_wire_trace();
         let upgrades = sim.quic_upgrade_trace();
@@ -23682,13 +23735,33 @@ fn native_shorts_sent(upgrades: &freenet::dev_tool::QuicUpgradeTrace) -> usize {
         .count()
 }
 
+/// Every acceptor decision that was UDP although its pair was in the slice
+/// came from a refused setup (the acceptor had no room), and from nothing
+/// else. In particular none is `not_ready` or `outside_slice`: nothing lowers
+/// a node's native offer or decisions after native failures.
+fn assert_in_slice_udp_only_from_refused_setups(
+    t: &freenet::dev_tool::NativeWireTrace,
+    what: &str,
+) {
+    let in_slice_udp = t
+        .decisions()
+        .iter()
+        .filter(|(_, _, native, in_slice)| *in_slice && !*native)
+        .count() as u64;
+    let causes = t.decision_causes();
+    let refused = causes.get("setup_refused").copied().unwrap_or(0);
+    assert_eq!(
+        in_slice_udp, refused,
+        "{what}: in-slice UDP decisions must all be refused setups; causes {causes:?}"
+    );
+}
+
 fn log_native_connect(name: &str, run: &NativeConnectRun) {
     let t = &run.wire.trace;
     tracing::info!(
         name,
         established = t.native_established(),
         failed = t.native_failed(),
-        demotions = t.native_demotions(),
         responses_native = t.responses_native(),
         native_shorts = native_shorts_sent(&run.upgrades),
         "native connect trace"
@@ -23726,8 +23799,9 @@ fn test_quic_native_connections_form_and_carry_messages() {
     assert!(connected);
 }
 
-/// A gateway the index marks native, whose side is not built yet (native
-/// admission is off, so it ignores a joiner it does not know): each joiner's
+/// A gateway the index marks native, on a release before native admission
+/// (forced off here, since it is on in production, so it ignores a joiner it
+/// does not know): each joiner's
 /// native join times out in its window and falls back to the UDP join, which
 /// joins as it does today, and every fallback that connects is counted as a
 /// rescue. Fails closed: native joins must have been tried and failed, and
@@ -23738,6 +23812,16 @@ fn test_quic_native_gateway_join_without_admission_falls_back_to_udp() {
     // Longer than the native window (8 s), which every join pays once.
     let run = run_native_connect_sim("native-gateway-join-off", SEED, 300, |sim| {
         sim.with_native_gateway_join(100);
+        let gateways: Vec<_> = sim
+            .all_node_addresses()
+            .keys()
+            .filter(|label| label.is_gateway())
+            .cloned()
+            .collect();
+        assert!(!gateways.is_empty(), "premise: the sim has a gateway");
+        for gateway in &gateways {
+            sim.with_gateway_native_admission_off(gateway);
+        }
     });
     let t = &run.wire.trace;
     tracing::info!(
@@ -23771,14 +23855,16 @@ fn test_quic_native_gateway_join_without_admission_falls_back_to_udp() {
 }
 
 /// The shipped default: no override, so each node runs this release's
-/// `QUIC_NATIVE_PERCENT` (25) with its endpoint up. Native-decided and
+/// `QUIC_NATIVE_PERCENT` (100) with its endpoint up. Native-decided and
 /// UDP-decided connects coexist in one mesh, and every node joins. The treated
 /// share is read from the sim: each native pair is two native dials
 /// (`established + failed`, one per side), against `joiner_decisions` decided
-/// joins. It is compared with the 25% bucket share loosely, since a pair that
-/// already holds a transport is decided UDP whatever its bucket.
+/// joins, which differs from the decision share: seeded, 33 of 45 decisions
+/// are native and the 12 UDP ones are pairs that already held a transport
+/// (`decision_causes`), while `treated` is half the native dials (each pair is two dials,
+/// established or failed), so the read share is `treated / decided`, not the 33/45 decision share.
 #[test_log::test]
-fn test_quic_native_at_the_shipped_percent_mixes_native_and_udp() {
+fn test_quic_native_at_the_shipped_percent_decides_most_pairs_native() {
     const SEED: u64 = 0x0059_40A5_0010;
     let run = run_native_connect_sim("native-connect-shipped", SEED, 60, |_| {});
     log_native_connect("shipped", &run);
@@ -23789,10 +23875,34 @@ fn test_quic_native_at_the_shipped_percent_mixes_native_and_udp() {
     println!("SHIPPED decided={decided} native_dials={native_dials} treated={treated}");
     assert!(decided >= 20, "premise: enough decisions to read a share");
     assert!(native_dials > 0, "some pairs decided native");
+    // Every acceptor decision has a cause, produced where the arm is chosen
+    // (`native::acceptor_verdict`). At 100 percent the slice is the whole
+    // bucket range, and nothing in this sim refuses a setup
+    // or holds an endpoint down, so each decision is native or a pair that
+    // already held a transport: nothing else is counted.
+    let causes = t.decision_causes();
+    println!("SHIPPED decision causes: {causes:?}");
+    let all = t.decisions();
+    let held = causes.get("held").copied().unwrap_or(0);
+    let native_count = causes.get("native").copied().unwrap_or(0);
+    assert_eq!(
+        native_count + held,
+        all.len() as u64,
+        "every decision is native or held; any other cause is a regression: {causes:?}"
+    );
+    assert_eq!(
+        all.iter().filter(|(_, _, _, in_slice)| !in_slice).count() as u64,
+        held,
+        "the only decisions outside the slice are pairs that held a transport: {causes:?}"
+    );
+    assert_eq!(
+        all.iter().filter(|(_, _, native, _)| *native).count() as u64,
+        causes.get("native").copied().unwrap_or(0)
+    );
     let share = treated / decided as f64;
     assert!(
-        (0.05..=0.50).contains(&share),
-        "native share {share:.2} of {decided} decisions is far from the 25% bucket share"
+        (0.5..=1.0).contains(&share),
+        "native share {share:.2} of {decided} decisions: at 100% most decided pairs go native"
     );
     assert_eq!(t.undecodable_closes(), 0);
     let (peers, connected) = quic_mesh_peers_and_connected(&run.wire.mesh);
@@ -23803,8 +23913,8 @@ fn test_quic_native_at_the_shipped_percent_mixes_native_and_udp() {
 /// Until UDP is removed a failed native setup must never cost the join. Every
 /// QUIC datagram between every pair is dropped, so every native setup times
 /// out; each is followed by today's UDP dial and every node still joins. The
-/// timeouts are with distinct peers, so nodes demote themselves. Fails
-/// closed: native setups must have been tried and failed, and none formed.
+/// timeouts are with distinct peers, and no node stops trying native for it
+/// (the cause set below is `native` only). Fails closed: native setups must have been tried and failed, and none formed.
 #[test_log::test]
 fn test_quic_native_failed_setups_fall_back_to_udp() {
     use freenet::dev_tool::NodeLabel;
@@ -23828,7 +23938,9 @@ fn test_quic_native_failed_setups_fall_back_to_udp() {
     );
     assert!(t.native_failed() > 0, "premise: native setups failed");
     assert_eq!(t.native_established(), 0, "premise: no native setup worked");
-    assert!(t.native_demotions() > 0, "nodes demoted themselves");
+    // Nothing lowers a node's native offer or decisions, however many setups
+    // failed: every in-slice UDP decision is an admission refusal.
+    assert_in_slice_udp_only_from_refused_setups(t, "failed setups fall back to UDP");
     // Each side falls back: a joiner and an acceptor whose setup failed each
     // ask for a UDP dial to the same peer in the same CONNECT. With no NAT in
     // the simulation one side's dial would connect the pair alone, so the
@@ -23996,6 +24108,13 @@ fn test_quic_native_gateway_join_dead_before_a_frame_goes_legacy_next() {
     use freenet::dev_tool::NodeLabel;
     const SEED: u64 = 0x0059_40B0_0003;
     let run = run_native_connect_sim("native-gateway-join-closed", SEED, 300, |sim| {
+        // Peer-to-peer native connects at 0%, so every native link in the
+        // run is a gateway join and the assertion below reads only the
+        // closed joins. Since A+ step 1 (#6330) production decides 25% of
+        // ordinary CONNECTs native, and the two gateways' own CONNECT to
+        // each other drew native at this seed: a link the gateway does not
+        // close, since only its join hand-off is missing, not its connect op.
+        sim.with_native_connect(0);
         sim.with_native_gateway_join(100);
         let gateways: Vec<NodeLabel> = sim
             .all_node_addresses()
@@ -24044,32 +24163,24 @@ fn test_quic_native_gateway_join_dead_before_a_frame_goes_legacy_next() {
     assert!(connected);
 }
 
-/// 10.2 item 2: one node whose native path is broken (every QUIC datagram to
-/// and from it dropped, UDP working) collects a strike on every native setup
-/// UDP then rescues, and demotes its ACCEPTOR role after three with distinct
-/// joiners. The node offers nothing native as joiner
-/// (`with_node_native_joiner_off`), standing in for the node this streak is
-/// for: one that rarely joins (a gateway, a peer at its target). A node that
-/// joins natively demotes its joiner role on its own rescues first, which
-/// would hide the acceptor streak. Every other pair keeps native.
-///
-/// This pins the path from a rescue to the acceptor demotion end to end. That
-/// a demoted acceptor then decides `Udp` is pinned by
-/// `a_demoted_acceptor_decides_udp_through_the_relay_env` (connect driver
-/// tests): in a 10-node run the mesh has settled by the time a rescue-driven
-/// demotion lands (it waits for the UDP fallback), so no request reaches the
-/// node afterwards to decide. Fails closed: the broken node must have decided
-/// native at least 3 times before it demoted, and other pairs must still form
-/// native connections.
+/// One node whose native path is broken (every QUIC datagram to and from it
+/// dropped, UDP working) collects a rescue on every native setup UDP then
+/// rescues, and keeps deciding `Native` for every joiner the slice gives it:
+/// there is no demotion, and each such join costs the joiner one UDP
+/// fallback. The node offers nothing native as joiner
+/// (`with_node_native_joiner_off`), standing in for a node that rarely joins
+/// (a gateway, a peer at its target). Every other pair keeps native. Fails
+/// closed: the broken node must have decided native at least 3 times, and
+/// other pairs must still form native connections.
 #[test_log::test]
-fn test_quic_native_broken_acceptor_demotes_on_rescues() {
+fn test_quic_native_broken_acceptor_keeps_deciding_native() {
     use freenet::dev_tool::NodeLabel;
     const SEED: u64 = 0x0059_40A5_00F1;
     const THRESHOLD: usize = 3;
     let name = "native-broken-acceptor";
     // The third node by label (the first regular node after the two
     // gateways): on this seed it is the busiest acceptor of a healthy run,
-    // so with its path broken it meets enough distinct joiners to demote.
+    // so with its path broken it meets several joiners.
     let broken_index = 2;
     let mut broken = None;
     let run = run_native_connect_sim(name, SEED, 200, |sim| {
@@ -24094,40 +24205,29 @@ fn test_quic_native_broken_acceptor_demotes_on_rescues() {
     let broken = broken.expect("premise: the broken node was chosen");
     let t = &run.wire.trace;
     let decisions = t.decisions();
-    let demoted_at = t
-        .acceptor_demotions()
+    // The old rule demoted a node on its third rescue, so the broken node
+    // must have made at least three. Decisions AFTER the third rescue cannot
+    // be required here: in this harness (8 regular nodes; also tried 14 and
+    // 24) the mesh has settled before the rescues land, so no request reaches
+    // the node afterwards. That behaviour is pinned at the state level by
+    // `rescues_in_either_role_never_turn_native_off` (connection lifecycle),
+    // and every in-slice UDP decision must be an admission refusal.
+    let rescues = t.rescues_of(broken);
+    assert!(
+        rescues.len() >= THRESHOLD,
+        "premise: the broken node made at least {THRESHOLD} rescues ({})",
+        rescues.len()
+    );
+    let natives = decisions
         .iter()
-        .filter(|(own, _)| *own == broken)
-        .map(|(_, seq)| *seq)
-        .min();
-    let before = decisions
-        .iter()
-        .filter(|(own, seq, native, _)| {
-            *own == broken && *native && demoted_at.is_none_or(|at| *seq < at)
-        })
+        .filter(|(own, _, native, _)| *own == broken && *native)
         .count();
-    // (order, native, in the slice) for each decision after the demotion.
-    let after: Vec<(u64, bool, bool)> = decisions
-        .iter()
-        .filter(|(own, seq, _, _)| *own == broken && demoted_at.is_some_and(|at| *seq > at))
-        .map(|(_, seq, native, in_slice)| (*seq, *native, *in_slice))
-        .collect();
-    tracing::info!(%broken, before, ?after, ?demoted_at, "broken acceptor run");
+    tracing::info!(%broken, rescues = rescues.len(), natives, "broken acceptor run");
     assert!(
-        before >= THRESHOLD,
-        "premise: the broken node decided native at least {THRESHOLD} times before demoting ({before})"
+        natives >= THRESHOLD,
+        "premise: the broken node decided native at least {THRESHOLD} times ({natives})"
     );
-    assert!(
-        demoted_at.is_some(),
-        "the broken node demoted its acceptor role"
-    );
-    // Not decisive here (in this run no request reaches the node after its
-    // demotion, so `after` is usually empty); kept as a guard should one do
-    // so. The decisive check is the RelayEnv test named in the doc comment.
-    assert!(
-        after.iter().all(|(_, native, _)| !native),
-        "the broken node decided native after its acceptor role demoted: {after:?}"
-    );
+    assert_in_slice_udp_only_from_refused_setups(t, "broken acceptor");
     assert!(
         t.native_established() > 0,
         "premise: pairs without the broken node still connect natively"
@@ -24265,14 +24365,14 @@ fn test_quic_native_blocked_pairs_connect_over_udp_behind_nats() {
 }
 
 /// A joiner that offered QUIC-native but can no longer use a `Native` decision
-/// when the response comes (demoted, or its endpoint went down, in between)
+/// when the response comes (its endpoint went down, in between)
 /// must still meet the acceptor's UDP fallback. The acceptor cannot know: it
 /// waits out its native window and punches UDP. Behind port-restricted NATs a
 /// lone punch never gets through, so before the fix, when the joiner reported
 /// the acceptor failed and did not dial it, every such fallback missed. Every
 /// regular node here offers and then refuses every `Native` decision, which
-/// forces that ordering on every native CONNECT; in the field it needs a
-/// demotion inside a response's travel time (seen once, on nova, as a
+/// forces that ordering on every native CONNECT; in the field it needs the
+/// endpoint to go down inside a response's travel time (seen once, on nova, as a
 /// `missed` fallback in the blocked-pairs test). Fails closed: acceptors must
 /// have started native setups, the NATs must have dropped datagrams, and
 /// fallbacks between peers must have ended.
@@ -24306,38 +24406,6 @@ fn test_quic_native_refused_decision_still_meets_the_acceptors_udp_fallback() {
     assert!(
         t.native_failed() > 0,
         "premise: acceptors started native setups that failed"
-    );
-    // Known residual (connect.rs, `record_native_rescue_strike`): the
-    // acceptor cannot tell a refusal from a broken path, so each refused
-    // decision whose UDP fallback connects strikes the acceptor, and three
-    // distinct joiners demote its acceptor role. Logged and pinned, so a
-    // change in this effect shows up here.
-    let acceptor_demotions = t.acceptor_demotions().len();
-    let acceptor_streak_peak = t
-        .acceptor_streak_peaks()
-        .values()
-        .copied()
-        .max()
-        .unwrap_or(0);
-    tracing::info!(
-        decisions_refused = t.decisions_refused(),
-        acceptor_demotions,
-        acceptor_streak_peak,
-        "refused-decision residual: acceptor strikes"
-    );
-    println!(
-        "refused-decision residual: refused={} acceptor_demotions={acceptor_demotions} acceptor_streak_peak={acceptor_streak_peak}",
-        t.decisions_refused()
-    );
-    // Measured on this seed with every joiner refusing every decision (the
-    // worst case; in the field it needs a demotion inside a response's
-    // flight): 37 refusals, 7 acceptor demotions. Re-measure and update
-    // deliberately if the strike rules change.
-    assert_eq!(
-        acceptor_demotions,
-        7,
-        "acceptor demotions caused by refused decisions changed ({} refusals)",
-        t.decisions_refused()
     );
     assert_eq!(t.native_established(), 0, "premise: no native setup worked");
     assert!(
@@ -24386,7 +24454,181 @@ enum SurvivorOrder {
     NativeFirstInbound,
 }
 
-/// Gate 18: both ends of a pair keep the same transport, the native one, and
+/// A forced-order run's seed search may go this far before the run is reported
+/// as having drifted. A change that reorders simulation tasks moves every run to
+/// another trajectory; the search absorbs that, but each seed costs a full
+/// simulation, so a long search is a test about to time out. When this trips,
+/// move the listed seed of the run to the one it reports.
+const SURVIVOR_SEED_SEARCH_WARN: u64 = 8;
+
+/// One run of gate 18; see `test_quic_native_both_ends_keep_the_same_transport_*`.
+fn check_native_survivor_run(
+    run_id: u8,
+    seed: u64,
+    quic_delay: Option<u64>,
+    intro_delay: Option<u64>,
+    order: Option<SurvivorOrder>,
+    drop_some: bool,
+) {
+    use freenet::dev_tool::{NatFiltering, NodeLabel, SimNat};
+    let name = format!("native-survivor-{run_id}");
+    // The decision a run must produce depends on event order, which any
+    // change to connection setup shifts. Search a bounded range of fixed
+    // seeds, starting at the listed one, for the first that yields it;
+    // the search is deterministic and fails closed below.
+    let decided_by = |t: &freenet::dev_tool::NativeWireTrace, order: SurvivorOrder| -> u64 {
+        match order {
+            SurvivorOrder::UdpFirst => t.survivor_swapped(),
+            SurvivorOrder::NativeFirst => t.survivor_udp_dropped(),
+            SurvivorOrder::NativeFirstInbound => t.survivor_inbound_dropped(),
+        }
+    };
+    let seed_range = if order.is_some() {
+        SURVIVOR_SEED_SEARCH
+    } else {
+        1
+    };
+    let mut found = None;
+    for offset in 0..seed_range {
+        let seed = seed + offset;
+        let nat = SimNat::all(NatFiltering::PortRestricted);
+        let run = run_native_connect_sim_with(&name, seed, 200, Some(nat), |sim| {
+            sim.with_native_connect(100);
+            if let Some(ms) = quic_delay {
+                sim.delay_quic_datagrams(Duration::from_millis(ms));
+            }
+            if let Some(ms) = intro_delay {
+                sim.delay_udp_intros(Duration::from_millis(ms));
+            }
+            if let Some(order) = order {
+                sim.with_udp_dial_beside_every_native_dial(matches!(
+                    order,
+                    SurvivorOrder::NativeFirstInbound
+                ));
+            }
+            if drop_some {
+                let mut labels: Vec<NodeLabel> = sim.all_node_addresses().keys().cloned().collect();
+                labels.sort();
+                for (i, a) in labels.iter().enumerate() {
+                    for (j, b) in labels.iter().enumerate().skip(i + 1) {
+                        if (i + j) % 3 == 0 {
+                            sim.drop_quic_datagrams_between(a, b, Duration::ZERO);
+                        }
+                    }
+                }
+            }
+        });
+        let chose = order.is_none_or(|o| decided_by(&run.wire.trace, o) > 0);
+        if chose {
+            println!("{name}: seed {seed:#x} (offset {offset})");
+            assert!(
+                offset < SURVIVOR_SEED_SEARCH_WARN,
+                "{name}: the rule first chose {order:?} at seed {seed:#x} (offset {offset}); \
+                     trajectories shifted; re-seed the run to that seed, do not raise the timeout"
+            );
+            found = Some(run);
+            break;
+        }
+    }
+    let run = found.unwrap_or_else(|| {
+        panic!(
+            "{name}: premise: the rule chose {order:?} for none of the {seed_range} seeds \
+                 from {seed:#x}"
+        )
+    });
+    log_native_connect(&name, &run);
+    let t = &run.wire.trace;
+    let transports = t.transports();
+    let mut mismatched = Vec::new();
+    let mut one_ended_native = Vec::new();
+    let mut both = 0;
+    for (&(own, peer), &native) in &transports {
+        match transports.get(&(peer, own)) {
+            Some(&other) if own < peer => {
+                both += 1;
+                if other != native {
+                    mismatched.push((own, peer, native, other));
+                }
+            }
+            Some(_) => {}
+            None if native => one_ended_native.push((own, peer)),
+            None => {}
+        }
+    }
+    tracing::info!(
+        name,
+        swapped = t.survivor_swapped(),
+        udp_dropped = t.survivor_udp_dropped(),
+        held_at_both_ends = both,
+        native_at_both_ends = transports
+            .iter()
+            .filter(|((own, peer), native)| **native
+                && own < peer
+                && transports.get(&(*peer, *own)) == Some(&true))
+            .count(),
+        one_ended_native = one_ended_native.len(),
+        entries = transports.len(),
+        "survivor rule"
+    );
+    println!(
+        "{name}: swapped={} udp_dropped={} held_at_both_ends={both} \
+             one_ended_native={one_ended_native:?} entries={}",
+        t.survivor_swapped(),
+        t.survivor_udp_dropped(),
+        transports.len()
+    );
+    assert_eq!(
+        t.native_replaced_by_udp(),
+        Vec::new(),
+        "{name}: live native entries a UDP connection replaced"
+    );
+    assert!(
+        mismatched.is_empty(),
+        "{name}: pairs whose ends keep different transports (own, peer, own native, \
+             peer native): {mismatched:?}"
+    );
+    let held_both = both;
+    if let Some(order) = order {
+        let decided = decided_by(t, order);
+        assert!(decided > 0, "{name}: premise: the rule chose {order:?}");
+        // Keep-first instead of native-wins shows as a pair that holds
+        // UDP at both ends although a native setup completed at both
+        // ends after both UDP entries were made; an inbound UDP
+        // connection replacing a native entry shows directly.
+        let seqs = t.transport_seqs();
+        let mut checked = 0;
+        let mut kept_udp = Vec::new();
+        for (a, b, native_at) in t.native_established_at_both_ends() {
+            let (Some(x), Some(y)) = (seqs.get(&(a, b)), seqs.get(&(b, a))) else {
+                continue;
+            };
+            checked += 1;
+            let udp_at_both =
+                transports.get(&(a, b)) == Some(&false) && transports.get(&(b, a)) == Some(&false);
+            if udp_at_both && native_at > *x.max(y) {
+                kept_udp.push((a, b));
+            }
+        }
+        println!("{name}: pairs with native at both ends, held at both: {checked}");
+        assert!(checked > 0, "{name}: premise: such pairs exist");
+        assert!(
+            kept_udp.is_empty(),
+            "{name}: pairs that kept UDP after native connected at both ends: {kept_udp:?}"
+        );
+    }
+    let (pairs, one_sided) = t.native_setup_pairs();
+    println!("{name}: native setups with both ends ended: {pairs}, one-sided: {one_sided}");
+    let setups = (pairs, one_sided);
+    println!(
+        "one-sided native setups (10.2 item 20): {} of {} with both ends ended",
+        setups.1, setups.0
+    );
+    assert!(setups.0 > 0, "premise: native setups ended at both ends");
+    assert!(held_both > 0, "premise: pairs held at both ends");
+}
+
+/// Gate 18, one `#[test]` per run so each has its own time budget and the runs
+/// execute in parallel: both ends of a pair keep the same transport, the native one, and
 /// the rate of one-sided native setups (10.2 items 7 and 20). Behind
 /// port-restricted NATs with native on at 100%.
 ///
@@ -24408,191 +24650,59 @@ enum SurvivorOrder {
 /// In every run, every pair held at both ends when the run ends holds the
 /// same transport at both.
 #[test_log::test]
-fn test_quic_native_both_ends_keep_the_same_transport() {
-    use freenet::dev_tool::{NatFiltering, NodeLabel, SimNat};
-    let mut held_both = 0;
-    let mut setups = (0, 0);
-    for (run_id, seed, quic_delay, intro_delay, order, drop_some) in [
-        (0u8, 0x0059_40A5_00D1u64, None, None, None, false),
-        (1, 0x0059_40A5_00D2, None, None, None, true),
-        (2, 0x0059_40A5_00D3, Some(600), None, None, false),
-        (3, 0x0059_40A5_00D4, Some(1000), None, None, false),
-        (
-            4,
-            0x0059_40A5_00D6,
-            Some(600),
-            None,
-            Some(SurvivorOrder::UdpFirst),
-            false,
-        ),
-        (
-            5,
-            0x0059_40A5_00D7,
-            None,
-            Some(600),
-            Some(SurvivorOrder::NativeFirst),
-            false,
-        ),
-        (
-            6,
-            0x0059_40A5_00E0,
-            None,
-            Some(600),
-            Some(SurvivorOrder::NativeFirstInbound),
-            false,
-        ),
-    ] {
-        let name = format!("native-survivor-{run_id}");
-        // The decision a run must produce depends on event order, which any
-        // change to connection setup shifts. Search a bounded range of fixed
-        // seeds, starting at the listed one, for the first that yields it;
-        // the search is deterministic and fails closed below.
-        let decided_by = |t: &freenet::dev_tool::NativeWireTrace, order: SurvivorOrder| -> u64 {
-            match order {
-                SurvivorOrder::UdpFirst => t.survivor_swapped(),
-                SurvivorOrder::NativeFirst => t.survivor_udp_dropped(),
-                SurvivorOrder::NativeFirstInbound => t.survivor_inbound_dropped(),
-            }
-        };
-        let seed_range = if order.is_some() {
-            SURVIVOR_SEED_SEARCH
-        } else {
-            1
-        };
-        let mut found = None;
-        for offset in 0..seed_range {
-            let seed = seed + offset;
-            let nat = SimNat::all(NatFiltering::PortRestricted);
-            let run = run_native_connect_sim_with(&name, seed, 200, Some(nat), |sim| {
-                sim.with_native_connect(100);
-                if let Some(ms) = quic_delay {
-                    sim.delay_quic_datagrams(Duration::from_millis(ms));
-                }
-                if let Some(ms) = intro_delay {
-                    sim.delay_udp_intros(Duration::from_millis(ms));
-                }
-                if let Some(order) = order {
-                    sim.with_udp_dial_beside_every_native_dial(matches!(
-                        order,
-                        SurvivorOrder::NativeFirstInbound
-                    ));
-                }
-                if drop_some {
-                    let mut labels: Vec<NodeLabel> =
-                        sim.all_node_addresses().keys().cloned().collect();
-                    labels.sort();
-                    for (i, a) in labels.iter().enumerate() {
-                        for (j, b) in labels.iter().enumerate().skip(i + 1) {
-                            if (i + j) % 3 == 0 {
-                                sim.drop_quic_datagrams_between(a, b, Duration::ZERO);
-                            }
-                        }
-                    }
-                }
-            });
-            let chose = order.is_none_or(|o| decided_by(&run.wire.trace, o) > 0);
-            if chose {
-                println!("{name}: seed {seed:#x} (offset {offset})");
-                found = Some(run);
-                break;
-            }
-        }
-        let run = found.unwrap_or_else(|| {
-            panic!(
-                "{name}: premise: the rule chose {order:?} for none of the {seed_range} seeds \
-                 from {seed:#x}"
-            )
-        });
-        log_native_connect(&name, &run);
-        let t = &run.wire.trace;
-        let transports = t.transports();
-        let mut mismatched = Vec::new();
-        let mut one_ended_native = Vec::new();
-        let mut both = 0;
-        for (&(own, peer), &native) in &transports {
-            match transports.get(&(peer, own)) {
-                Some(&other) if own < peer => {
-                    both += 1;
-                    if other != native {
-                        mismatched.push((own, peer, native, other));
-                    }
-                }
-                Some(_) => {}
-                None if native => one_ended_native.push((own, peer)),
-                None => {}
-            }
-        }
-        tracing::info!(
-            name,
-            swapped = t.survivor_swapped(),
-            udp_dropped = t.survivor_udp_dropped(),
-            held_at_both_ends = both,
-            native_at_both_ends = transports
-                .iter()
-                .filter(|((own, peer), native)| **native
-                    && own < peer
-                    && transports.get(&(*peer, *own)) == Some(&true))
-                .count(),
-            one_ended_native = one_ended_native.len(),
-            entries = transports.len(),
-            "survivor rule"
-        );
-        println!(
-            "{name}: swapped={} udp_dropped={} held_at_both_ends={both} \
-             one_ended_native={one_ended_native:?} entries={}",
-            t.survivor_swapped(),
-            t.survivor_udp_dropped(),
-            transports.len()
-        );
-        assert_eq!(
-            t.native_replaced_by_udp(),
-            Vec::new(),
-            "{name}: live native entries a UDP connection replaced"
-        );
-        assert!(
-            mismatched.is_empty(),
-            "{name}: pairs whose ends keep different transports (own, peer, own native, \
-             peer native): {mismatched:?}"
-        );
-        held_both += both;
-        if let Some(order) = order {
-            let decided = decided_by(t, order);
-            assert!(decided > 0, "{name}: premise: the rule chose {order:?}");
-            // Keep-first instead of native-wins shows as a pair that holds
-            // UDP at both ends although a native setup completed at both
-            // ends after both UDP entries were made; an inbound UDP
-            // connection replacing a native entry shows directly.
-            let seqs = t.transport_seqs();
-            let mut checked = 0;
-            let mut kept_udp = Vec::new();
-            for (a, b, native_at) in t.native_established_at_both_ends() {
-                let (Some(x), Some(y)) = (seqs.get(&(a, b)), seqs.get(&(b, a))) else {
-                    continue;
-                };
-                checked += 1;
-                let udp_at_both = transports.get(&(a, b)) == Some(&false)
-                    && transports.get(&(b, a)) == Some(&false);
-                if udp_at_both && native_at > *x.max(y) {
-                    kept_udp.push((a, b));
-                }
-            }
-            println!("{name}: pairs with native at both ends, held at both: {checked}");
-            assert!(checked > 0, "{name}: premise: such pairs exist");
-            assert!(
-                kept_udp.is_empty(),
-                "{name}: pairs that kept UDP after native connected at both ends: {kept_udp:?}"
-            );
-        }
-        let (pairs, one_sided) = t.native_setup_pairs();
-        println!("{name}: native setups with both ends ended: {pairs}, one-sided: {one_sided}");
-        setups = (setups.0 + pairs, setups.1 + one_sided);
-    }
-    println!(
-        "one-sided native setups (10.2 item 20): {} of {} with both ends ended",
-        setups.1, setups.0
+fn test_quic_native_both_ends_keep_the_same_transport_plain() {
+    check_native_survivor_run(0u8, 0x0059_40A5_00D1u64, None, None, None, false);
+}
+
+#[test_log::test]
+fn test_quic_native_both_ends_keep_the_same_transport_quic_dropped_between_some_pairs() {
+    check_native_survivor_run(1, 0x0059_40A5_00D2, None, None, None, true);
+}
+
+#[test_log::test]
+fn test_quic_native_both_ends_keep_the_same_transport_quic_delayed_600() {
+    check_native_survivor_run(2, 0x0059_40A5_00D3, Some(600), None, None, false);
+}
+
+#[test_log::test]
+fn test_quic_native_both_ends_keep_the_same_transport_quic_delayed_1000() {
+    check_native_survivor_run(3, 0x0059_40A5_00D4, Some(1000), None, None, false);
+}
+
+#[test_log::test]
+fn test_quic_native_both_ends_keep_the_same_transport_udp_first() {
+    check_native_survivor_run(
+        4,
+        0x0059_40A5_00D6,
+        Some(600),
+        None,
+        Some(SurvivorOrder::UdpFirst),
+        false,
     );
-    assert!(setups.0 > 0, "premise: native setups ended at both ends");
-    assert!(held_both > 0, "premise: pairs held at both ends");
+}
+
+#[test_log::test]
+fn test_quic_native_both_ends_keep_the_same_transport_native_first() {
+    check_native_survivor_run(
+        5,
+        0x0059_40A5_00D7,
+        None,
+        Some(600),
+        Some(SurvivorOrder::NativeFirst),
+        false,
+    );
+}
+
+#[test_log::test]
+fn test_quic_native_both_ends_keep_the_same_transport_native_first_inbound() {
+    check_native_survivor_run(
+        6,
+        0x0059_40A5_00EB,
+        None,
+        Some(600),
+        Some(SurvivorOrder::NativeFirstInbound),
+        false,
+    );
 }
 
 /// Option (b), the timeout path (10.4 answer 2): a native connection that
@@ -24689,7 +24799,13 @@ fn test_quic_native_without_frames_keeps_udp() {
 #[test_log::test]
 fn test_quic_native_symmetric_nat_pairs_fail_and_nodes_still_join() {
     use freenet::dev_tool::{NatFiltering, SimNat};
-    const SEED: u64 = 0x0059_40A5_00E1;
+    // The premise below (a UDP dial connected after a native failure) holds
+    // for some trajectories and not others: on main, seeds 3 and 7 of 1..=8
+    // fail it and the rest pass. Any change that reorders simulation tasks
+    // (the heal send moving off the event loop did) moves this run to another
+    // trajectory, so the seed is one for which it holds on both sides of that
+    // change.
+    const SEED: u64 = 4;
     let name = "native-nat-symmetric";
     let nat = SimNat {
         classes: vec![NatFiltering::Symmetric, NatFiltering::PortRestricted],
@@ -24707,36 +24823,16 @@ fn test_quic_native_symmetric_nat_pairs_fail_and_nodes_still_join() {
         }
     });
     log_native_connect(name, &run);
-    // 10.2 item 2: no port-restricted node (nor a gateway) demotes its
-    // acceptor role, though half the regular nodes are symmetric and every
-    // native setup with one fails. UDP fails on those pairs too, so they are
-    // no rescue and no strike. Counting every path failure (the rule before
-    // rescue-only strikes) demoted port-restricted nodes here.
-    let healthy_demoted: Vec<_> = run
-        .wire
-        .trace
-        .acceptor_demotions()
-        .into_iter()
-        .filter(|(own, _)| !symmetric_ips.contains(&own.ip()))
-        .collect();
-    assert_eq!(
-        healthy_demoted,
-        Vec::<(SocketAddr, u64)>::new(),
-        "port-restricted acceptors demoted by joiners whose native setups fail"
-    );
-    // The same for the joiner role: native setups with symmetric peers fail,
-    // and UDP to them fails too, so no joiner takes a strike either.
+    // No port-restricted node (nor a gateway) stops deciding native, though
+    // half the regular nodes are symmetric and every native setup with one
+    // fails: every in-slice UDP decision is an admission refusal.
     assert!(
         run.wire.trace.native_failed() > 0,
         "premise: native setups failed"
     );
-    assert_eq!(
-        run.wire.trace.native_demotions(),
-        0,
-        "joiners demoted by native failures UDP did not rescue"
-    );
+    assert_in_slice_udp_only_from_refused_setups(&run.wire.trace, "symmetric NATs");
     // Premise: some port-restricted node failed native setups with three
-    // distinct symmetric peers, enough to demote it if those counted.
+    // distinct symmetric peers, so the node had many native failures.
     let gateway_ips_early: std::collections::BTreeSet<_> =
         run.gateways.iter().map(|a| a.ip()).collect();
     let mut symmetric_partners: std::collections::BTreeMap<
@@ -24857,7 +24953,6 @@ fn test_quic_native_connect_is_deterministic() {
             (
                 t.native_established(),
                 t.native_failed(),
-                t.native_demotions(),
                 t.responses_native(),
             ),
             shorts,
@@ -25017,7 +25112,12 @@ fn assert_non_settling_contract_is_bounded(streaming_threshold: Option<usize>, e
         .with_connections(4, 10)
         .with_event_wait(Duration::from_millis(200))
         .with_mock_wasm()
-        .no_convergence_wait();
+        .no_convergence_wait()
+        // Kept on the legacy UDP transport: this test counts merges against a
+        // budget and does not depend on the transport, and under QUIC data it
+        // takes about twice as long (measured alone: 409 s off, 815 s on), past
+        // its 600 s CI cap, which has no retries.
+        .with_legacy_udp();
     if let Some(bytes) = streaming_threshold {
         config = config.with_streaming_threshold(bytes);
     }
@@ -25959,5 +26059,582 @@ fn simulation_data_dirs_are_private_to_this_process() {
     assert!(
         private,
         "the gateway's data dir is not under this process's root {own_root}"
+    );
+}
+
+/// A GET that reaches the node holding the contract with no hops left (HTL 0)
+/// must be answered Found, not NotFound. HTL only bounds forwarding; the relay
+/// GET driver used to test `htl == 0` before it looked at its own store, so a
+/// holder reached at exactly HTL 0 answered NotFound.
+///
+/// One copy is seeded at the node closest to the key with scatter off (so it
+/// stays the only copy), and every other node GETs it. `ring_max_htl` is swept
+/// low so some request is spent exactly when it arrives at the holder. The GET
+/// terminus probe records `HtlZero` for an HTL-exhausted NotFound and `Found`
+/// for a local serve, so an `HtlZero` terminus AT the holder is the bug.
+///
+/// The probe record is written before the Found frame is sent, so it cannot
+/// show that the requester received the answer. The client-visible check does:
+/// a requester that was answered Found stores the state, and a GET attempt
+/// logs `GetSuccess` at the requester. With `ring_max_htl = 1` the only way a
+/// request reaches the holder is at HTL 0, so dropping the send leaves no
+/// requester with state and no successful attempt.
+///
+/// Two seedings are run: `SeedHostedContract` (the holder has no local interest,
+/// so HTL 0 serves it through the stale-but-hosted fallback) and
+/// `SeedDemandlessCopy` (the holder has local interest, which is what every
+/// hosted copy registers in production, so HTL 0 serves it through the fresh
+/// path).
+#[test_log::test]
+fn test_get_reaching_holder_at_htl_zero_is_answered_found() {
+    let mut served_at_htl_zero_total = 0usize;
+    for demandless in [false, true] {
+        for ring_max_htl in 1..=4usize {
+            let run = run_get_at_htl_zero_sim(ring_max_htl, demandless);
+            eprintln!(
+                "demandless={demandless} ring_max_htl={ring_max_htl}: holder \
+                 NotFound-at-HTL0={} Found-at-HTL0={} requesters_with_state={} \
+                 successful_attempts={}",
+                run.not_found_at_htl_zero,
+                run.found_at_htl_zero,
+                run.requesters_with_state,
+                run.successful_attempts,
+            );
+            assert_eq!(
+                run.not_found_at_htl_zero, 0,
+                "demandless={demandless} ring_max_htl={ring_max_htl}: a GET reached the \
+                 holder with HTL 0 and was answered NotFound although the holder hosts \
+                 the contract"
+            );
+            if run.found_at_htl_zero > 0 {
+                assert!(
+                    run.requesters_with_state >= 1 && run.successful_attempts >= 1,
+                    "demandless={demandless} ring_max_htl={ring_max_htl}: the holder served \
+                     {} GETs at HTL 0 but no requester received the contract \
+                     (requesters_with_state={}, successful_attempts={}): the Found frame \
+                     was not sent",
+                    run.found_at_htl_zero,
+                    run.requesters_with_state,
+                    run.successful_attempts,
+                );
+            }
+            if ring_max_htl == 1 {
+                // Every request that reaches the holder does so at HTL 0, so a
+                // holder with a servable copy next to any requester must have
+                // answered at least one.
+                assert!(
+                    run.found_at_htl_zero > 0 && run.requesters_with_state >= 1,
+                    "demandless={demandless}: with ring_max_htl=1 no GET was served by the \
+                     holder at HTL 0; the scenario no longer exercises the HTL-0 boundary"
+                );
+            }
+            served_at_htl_zero_total += run.found_at_htl_zero;
+        }
+    }
+    assert!(served_at_htl_zero_total > 0);
+}
+
+struct GetAtHtlZeroRun {
+    not_found_at_htl_zero: usize,
+    found_at_htl_zero: usize,
+    requesters_with_state: usize,
+    successful_attempts: usize,
+}
+
+/// One sweep point of `test_get_reaching_holder_at_htl_zero_is_answered_found`.
+fn run_get_at_htl_zero_sim(ring_max_htl: usize, demandless: bool) -> GetAtHtlZeroRun {
+    use freenet::dev_tool::{
+        Location, NodeLabel, ProbeOpKind, ProbeStopReason, ScheduledOperation, SimNetwork,
+        SimOperation,
+    };
+
+    const NUM_NODES: usize = 12;
+    let seed = 0x4854_4C30_0000_u64 + ring_max_htl as u64 + if demandless { 0x100 } else { 0 };
+    setup_deterministic_state(seed);
+    freenet::dev_tool::set_scatter_disabled(true);
+    freenet::dev_tool::clear_op_traces();
+    let _guard = NnLatticeTestGuard;
+
+    let network = format!("get-htl0-holder-{ring_max_htl}-{demandless}");
+    let contract = SimOperation::create_test_contract(0xA5);
+    let contract_id = *contract.key().id();
+    let contract_key = contract.key();
+    let key_loc = Location::from(&contract_key).as_f64();
+    let node_locations = nn_node_locations(key_loc, NUM_NODES);
+
+    let rt = create_runtime();
+    let sim = rt.block_on(async {
+        SimNetwork::new_with_node_locations(
+            &network,
+            1,
+            NUM_NODES,
+            ring_max_htl,
+            ring_max_htl,
+            4,
+            2,
+            seed,
+            &node_locations,
+        )
+        .await
+    });
+    let locs = sim.get_peer_locations();
+    let ranked = nodes_by_distance_to_key(&locs, NUM_NODES, key_loc);
+    let holder_no = ranked[0];
+    let holder_loc = locs[holder_no];
+    let holder = NodeLabel::node(&network, holder_no);
+
+    let state = SimOperation::create_test_state(1);
+    let seed_op = if demandless {
+        SimOperation::SeedDemandlessCopy {
+            contract: contract.clone(),
+            state,
+        }
+    } else {
+        SimOperation::SeedHostedContract {
+            contract: contract.clone(),
+            state,
+        }
+    };
+    let mut operations = vec![ScheduledOperation::new(holder.clone(), seed_op)];
+    let mut requesters = Vec::new();
+    for n in 1..=NUM_NODES {
+        if n != holder_no {
+            let label = NodeLabel::node(&network, n);
+            requesters.push(label.clone());
+            operations.push(ScheduledOperation::new(
+                label,
+                SimOperation::Get {
+                    contract_id,
+                    return_contract_code: true,
+                    subscribe: false,
+                },
+            ));
+        }
+    }
+    let logs_handle = sim.event_logs_handle();
+    let result = sim.run_controlled_simulation(
+        seed,
+        operations,
+        Duration::from_secs(240),
+        Duration::from_secs(60),
+    );
+    assert!(
+        result.turmoil_result.is_ok(),
+        "ring_max_htl={ring_max_htl}: sim failed: {:?}",
+        result.turmoil_result.err()
+    );
+    assert!(
+        result.is_node_hosting(&holder, &contract_key),
+        "ring_max_htl={ring_max_htl}: the seeded holder must still host"
+    );
+
+    let logs = rt.block_on(async { logs_handle.lock().await.clone() });
+    let traces = freenet::dev_tool::take_op_traces();
+    let at_holder = |t: &&freenet::dev_tool::OpTraceRecord| {
+        matches!(t.kind, ProbeOpKind::Get) && (t.own_loc - holder_loc).abs() < 1e-9
+    };
+    GetAtHtlZeroRun {
+        not_found_at_htl_zero: traces
+            .iter()
+            .filter(at_holder)
+            .filter(|t| matches!(t.stop_reason, ProbeStopReason::HtlZero))
+            .count(),
+        found_at_htl_zero: traces
+            .iter()
+            .filter(at_holder)
+            .filter(|t| matches!(t.stop_reason, ProbeStopReason::Found) && t.htl_remaining == 0)
+            .count(),
+        // Client-visible: a requester answered Found stores the contract.
+        requesters_with_state: requesters
+            .iter()
+            .filter(|r| {
+                result
+                    .node_storages
+                    .get(*r)
+                    .and_then(|s| s.get_stored_state(&contract_key))
+                    .is_some()
+            })
+            .count(),
+        successful_attempts: freenet::tracing::summarize_get_outcomes_per_tx(&logs).successes
+            as usize,
+    }
+}
+
+/// A subscriber that misses a 1 MiB contract's update (crashed while it was
+/// broadcast) is healed by anti-entropy, and the heal never holds a node's event
+/// loop. Before the fix, the simulation build awaited the heal's send inside the
+/// event loop, and that send waits for its stream's completion, which the blocked
+/// loop could not dispatch: each heal held the loop for `stream_completion_timeout`
+/// (270 s for this state), and every message the node received waited behind it.
+#[test_log::test]
+fn test_heal_of_a_streamed_state_does_not_block_the_event_loop() {
+    use freenet::dev_tool::{
+        NodeLabel, ScheduledOperation, SimOperation, register_crdt_contract,
+        stale_peer_heal_observations,
+    };
+    const NETWORK: &str = "heal-event-loop";
+    const SEED: u64 = 0x5842_E5B9_0001;
+    const STATE_LEN: usize = 1024 * 1024;
+    setup_deterministic_state(SEED);
+    let contract = SimOperation::create_test_contract(0x91);
+    let key = contract.key();
+    register_crdt_contract(*key.id());
+    stale_peer_heal_observations::clear(&key);
+    let state = |version: u64| {
+        let mut bytes = version.to_le_bytes().to_vec();
+        bytes.extend((0..STATE_LEN).map(|i| (i % 251) as u8 ^ version as u8));
+        bytes
+    };
+    let (initial, updated) = (state(1), state(2));
+
+    let rt = create_runtime();
+    let sim = rt.block_on(async {
+        let mut sim = SimNetwork::new(NETWORK, 1, 2, 7, 3, 10, 2, SEED).await;
+        sim.with_streaming_threshold(64 * 1024);
+        sim.with_controlled_op_interval(Duration::from_secs(10));
+        sim.wait_for_join_convergence_before_ops(1.0, Duration::from_secs(60));
+        sim
+    });
+    drop(rt);
+    let gateway = NodeLabel::gateway(NETWORK, 0);
+    let stale = NodeLabel::node(NETWORK, 1);
+    let other = NodeLabel::node(NETWORK, 2);
+    let subscribe = |label: &NodeLabel| {
+        ScheduledOperation::new(
+            label.clone(),
+            SimOperation::Get {
+                contract_id: *key.id(),
+                return_contract_code: true,
+                subscribe: true,
+            },
+        )
+    };
+    let operations = vec![
+        ScheduledOperation::new(
+            gateway.clone(),
+            SimOperation::Put {
+                contract: contract.clone(),
+                state: initial,
+                subscribe: true,
+            },
+        ),
+        subscribe(&stale),
+        subscribe(&other),
+        ScheduledOperation::new(stale.clone(), SimOperation::CrashNode),
+        ScheduledOperation::new(
+            gateway.clone(),
+            SimOperation::Update {
+                key,
+                data: updated.clone(),
+            },
+        ),
+        ScheduledOperation::new(stale.clone(), SimOperation::RecoverNode),
+    ];
+    // Long enough for anti-entropy (about 5 minutes) to find and heal the
+    // stale copy.
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(1200),
+        Duration::from_secs(600),
+    );
+    assert!(
+        result.turmoil_result.is_ok(),
+        "simulation failed: {:?}",
+        result.turmoil_result.err()
+    );
+    let longest = GlobalTestMetrics::longest_event_loop_event();
+    let heals = stale_peer_heal_observations::get(&key).heals_emitted;
+    stale_peer_heal_observations::clear(&key);
+    let stored = |label: &NodeLabel| {
+        result
+            .node_storages
+            .get(label)
+            .and_then(|storage| storage.get_stored_state(&key))
+            .map(|state| state.as_ref().to_vec())
+    };
+    assert!(
+        stored(&other).as_deref() == Some(updated.as_slice()),
+        "premise: the subscriber that stayed up got the update"
+    );
+    assert!(
+        heals >= 1,
+        "premise: anti-entropy emitted a heal, so the path under test ran"
+    );
+    assert!(
+        stored(&stale).as_deref() == Some(updated.as_slice()),
+        "the crashed subscriber was healed (longest event-loop event {longest:?})"
+    );
+    // Virtual time only moves when something awaits a timer, so an event that
+    // does not wait reads as zero: zero is the healthy value. The bound has
+    // teeth because the inline await it guards against reads 120 s or more.
+    assert!(
+        longest < Duration::from_secs(10),
+        "a node's event loop was held for {longest:?} by one event"
+    );
+}
+
+/// Every node's second large PUT starts. Before the fix, the simulation build
+/// healed a stale peer by awaiting the send inside the node's event loop, and
+/// that send waits for its stream's completion, which the same loop has to
+/// dispatch. A node that had healed a peer was wedged from then on, so its next
+/// client PUT was never dequeued: it logged "client request received" and
+/// nothing after, and the harness read the sweep's PUT failures and GET misses
+/// from it. The schedule is the one that exposed it: 30 nodes, 24 PUTs of 1.2 MB
+/// 4 s apart from a rotation of 12 origins (so each origin issues two), filler
+/// GETs in between, and a GET of each PUT's contract 10 s later.
+///
+/// It takes about six minutes (30 nodes, 24 streamed PUTs), so it runs in the
+/// nightly simulation job (`nightly_tests`), not in PR CI;
+/// `test_heal_of_a_streamed_state_does_not_block_the_event_loop` is the PR-CI
+/// guard for the same defect.
+#[cfg(feature = "nightly_tests")]
+#[test_log::test]
+fn test_every_origins_second_large_put_starts() {
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation};
+    const NETWORK: &str = "second-big-put";
+    const SEED: u64 = 0xB16_9071;
+    const NODES: usize = 30;
+    const ORIGINS: usize = 12;
+    const PUTS: usize = 24;
+    const PUT_EVERY_SLOTS: usize = 80;
+    const GET_AFTER_SLOTS: usize = 200;
+    const STATE_LEN: usize = 1_200_000;
+    setup_deterministic_state(SEED);
+    let rt = create_runtime();
+    let sim = rt.block_on(async {
+        let mut sim = SimNetwork::new(NETWORK, 1, NODES, 7, 3, 10, 2, SEED).await;
+        sim.with_streaming_threshold(64 * 1024);
+        sim.wait_for_join_convergence_before_ops(0.95, Duration::from_secs(300));
+        sim.with_controlled_op_interval(Duration::from_millis(50));
+        sim
+    });
+    drop(rt);
+    let origin_of = |i: usize| NodeLabel::node(NETWORK, 1 + i % ORIGINS);
+    let contracts: Vec<_> = (0..PUTS)
+        .map(|i| SimOperation::create_test_contract(0x70 + i as u8))
+        .collect();
+    let warm = SimOperation::create_test_contract(0x10);
+    let filler = || {
+        ScheduledOperation::new(
+            NodeLabel::gateway(NETWORK, 0),
+            SimOperation::Get {
+                contract_id: *warm.key().id(),
+                return_contract_code: false,
+                subscribe: false,
+            },
+        )
+    };
+    let mut operations = vec![ScheduledOperation::new(
+        NodeLabel::gateway(NETWORK, 0),
+        SimOperation::Put {
+            contract: warm.clone(),
+            state: vec![7u8; 64],
+            subscribe: false,
+        },
+    )];
+    operations.extend((0..40).map(|_| filler()));
+    let mut gets_due: Vec<(usize, usize)> = Vec::new();
+    let (mut next_put, mut slot) = (0usize, 0usize);
+    while next_put < PUTS || !gets_due.is_empty() {
+        if let Some(pos) = gets_due.iter().position(|(due, _)| *due <= slot) {
+            let (_, i) = gets_due.remove(pos);
+            operations.push(ScheduledOperation::new(
+                NodeLabel::node(NETWORK, ORIGINS + 1 + i % (NODES - ORIGINS)),
+                SimOperation::Get {
+                    contract_id: *contracts[i].key().id(),
+                    return_contract_code: true,
+                    subscribe: false,
+                },
+            ));
+        } else if next_put < PUTS && slot % PUT_EVERY_SLOTS == 0 {
+            let mut state = vec![(next_put % 251) as u8; STATE_LEN];
+            state[..8].copy_from_slice(&(next_put as u64).to_le_bytes());
+            operations.push(ScheduledOperation::new(
+                origin_of(next_put),
+                SimOperation::Put {
+                    contract: contracts[next_put].clone(),
+                    state,
+                    subscribe: false,
+                },
+            ));
+            gets_due.push((slot + GET_AFTER_SLOTS, next_put));
+            next_put += 1;
+        } else {
+            operations.push(filler());
+        }
+        slot += 1;
+    }
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(900),
+        Duration::from_secs(120),
+    );
+    assert!(
+        result.turmoil_result.is_ok(),
+        "simulation failed: {:?}",
+        result.turmoil_result.err()
+    );
+    // A PUT that never left its origin's operation queue never stored its
+    // state at the origin either.
+    let never_started: Vec<usize> = (0..PUTS)
+        .filter(|&i| {
+            result
+                .node_storages
+                .get(&origin_of(i))
+                .and_then(|storage| storage.get_stored_state(&contracts[i].key()))
+                .is_none()
+        })
+        .collect();
+    let longest = GlobalTestMetrics::longest_event_loop_event();
+    assert!(
+        never_started.is_empty(),
+        "PUTs that never started at their origin: {never_started:?} (longest event-loop event {longest:?})"
+    );
+    assert!(
+        longest < Duration::from_secs(10),
+        "a node's event loop was held for {longest:?} by one event"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// PUT stops only when no connected peer is strictly closer to the key
+// (hosting invariant 4; the gw1 live repro).
+// ---------------------------------------------------------------------------
+
+/// What a streamed-PUT run left behind.
+struct PutStopRun {
+    /// Ring distance from the key of each node hosting it, nearest first.
+    host_distances: Vec<f64>,
+    /// Ring distance of the nearest-to-key node in the network.
+    nearest_node_distance: f64,
+}
+
+/// A 1.2 MB PUT from the node farthest from the key. With
+/// `cost_window = Some(w)` the router's cost pick for every PUT hop is forced
+/// to the farthest of the `w` geometrically closest candidates, which stands in
+/// for a router whose learned cost prefers a peer that is not the closest to
+/// the key. No GETs are issued: a GET caches copies along its path, which
+/// would hide where the PUT stopped.
+fn run_put_stop_sim(seed: u64, cost_window: Option<usize>) -> PutStopRun {
+    use freenet::dev_tool::{Location, NodeLabel, ScheduledOperation, SimNetwork, SimOperation};
+    const NUM_NODES: usize = 24;
+    const STATE_LEN: usize = 1_200_000;
+
+    setup_deterministic_state(seed);
+    let network = format!("put-stop-{seed:x}");
+    let contract = SimOperation::create_test_contract(0xC3);
+    let contract_key = contract.key();
+    let key_loc = Location::from(&contract_key).as_f64();
+    let state = SimOperation::create_large_state(STATE_LEN, 0x5A);
+
+    let wrap = |x: f64| x.rem_euclid(1.0);
+    let node_locations: Vec<f64> = (0..NUM_NODES)
+        .map(|i| wrap(key_loc + (i as f64 + 0.5) / NUM_NODES as f64))
+        .collect();
+
+    let _hook = cost_window.map(freenet::dev_tool::PutCostPickGuard::farthest_of_closest);
+
+    let rt = create_runtime();
+    let mut sim = rt.block_on(async {
+        SimNetwork::new_with_node_locations(
+            &network,
+            1,
+            NUM_NODES,
+            10,
+            7,
+            6,
+            3,
+            seed,
+            &node_locations,
+        )
+        .await
+    });
+    sim.disable_placement_migration();
+    sim.with_streaming_threshold(64 * 1024);
+    sim.with_controlled_op_interval(Duration::from_secs(5));
+    sim.wait_for_join_convergence_before_ops(1.0, Duration::from_secs(120));
+
+    let locs = sim.get_peer_locations();
+    let ranked = nodes_by_distance_to_key(&locs, NUM_NODES, key_loc);
+    let ring_dist = |a: f64| {
+        let d = (a - key_loc).abs();
+        d.min(1.0 - d)
+    };
+    let origin = NodeLabel::node(&network, ranked[NUM_NODES - 1]);
+    let operations = vec![ScheduledOperation::new(
+        origin,
+        SimOperation::Put {
+            contract: contract.clone(),
+            state,
+            subscribe: false,
+        },
+    )];
+
+    let result = sim.run_controlled_simulation(
+        seed,
+        operations,
+        Duration::from_secs(600),
+        Duration::from_secs(120),
+    );
+    assert!(
+        result.turmoil_result.is_ok(),
+        "seed={seed:x}: sim failed: {:?}",
+        result.turmoil_result.err()
+    );
+
+    let mut host_distances: Vec<f64> = (1..=NUM_NODES)
+        .filter(|n| result.is_node_hosting(&NodeLabel::node(&network, *n), &contract_key))
+        .map(|n| ring_dist(locs[n]))
+        .collect();
+    host_distances.sort_by(f64::total_cmp);
+    PutStopRun {
+        host_distances,
+        nearest_node_distance: ring_dist(locs[ranked[0]]),
+    }
+}
+
+/// A streamed PUT whose router cost pick is farther from the key than the hop
+/// it is at, while a strictly closer peer is connected, must continue to a
+/// closer peer until none is closer, so a copy lands at the nearest-to-key
+/// node. The old rule tested the cost-ranked pick, stopped at the first
+/// descended hop and left the copy far from the key (red on main: hosts only
+/// at 0.104 and 0.479, nearest node 0.021). The control run, with the router's
+/// pick left alone, reaches the nearest node, so the forced cost pick is what
+/// the assertion tests.
+///
+/// Far GETs finding the copy is deliberately not asserted here: on main a far
+/// GET also succeeds (the PUT origin and first hop still hold copies, and a GET
+/// caches along its path), so such an assertion does not discriminate.
+#[test_log::test]
+fn test_streamed_put_continues_while_a_closer_peer_exists() {
+    let seed = 0x6D57_0001_u64;
+    let reaches_nearest = |run: &PutStopRun| {
+        run.host_distances
+            .first()
+            // Two nodes can sit at the same distance on either side of the key.
+            .is_some_and(|d| (d - run.nearest_node_distance).abs() < 1e-3)
+    };
+
+    let control = run_put_stop_sim(seed, None);
+    assert!(
+        reaches_nearest(&control),
+        "control: with no forced cost pick the PUT must reach the nearest node (hosts {:?}, \
+         nearest node {:.4}); the scenario no longer isolates the stop rule",
+        control.host_distances,
+        control.nearest_node_distance
+    );
+
+    let forced = run_put_stop_sim(seed, Some(3));
+    eprintln!(
+        "seed={seed:x}: PUT hosts at {:?} (nearest node {:.4})",
+        forced.host_distances, forced.nearest_node_distance
+    );
+    assert!(
+        reaches_nearest(&forced),
+        "seed={seed:x}: the PUT stopped with a closer peer connected: hosts {:?}, nearest node {:.4}",
+        forced.host_distances,
+        forced.nearest_node_distance
     );
 }

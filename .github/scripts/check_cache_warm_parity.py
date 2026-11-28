@@ -43,7 +43,10 @@ Against the ci.yml job with the SAME id it checks:
 
 It also DISCOVERS which ci.yml jobs need a twin: a job (Ubicloud or macOS) whose
 rust-cache has a conditional ``save-if`` and whose ``if:`` gates on
-``github.event_name`` without ever admitting ``== 'push'``. It fails if such a
+``github.event_name`` without ever admitting ``== 'push'`` (a push admitted only
+for a non-main branch, like the release gate's
+``github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release/v')``,
+does not count: that run cannot save a main-scoped entry). It fails if such a
 job has no twin, or if a warm job's twin no longer needs one.
 
 Standard library only, like the other Rule Lint scripts: the subset of YAML
@@ -298,9 +301,21 @@ def needs_warm_twin(job: list[str]) -> bool:
                             for _, w, _ in steps):
         return False
     cond = _job_if(job) or ""
+    # A push admitted only for a named non-main branch (the release gate on
+    # `release/v*`) never runs on main, so it cannot write the main-scoped
+    # entry either. Drop those terms before looking for a push admission.
+    cond = NON_MAIN_PUSH_RE.sub("", cond)
     # `== 'push'` admits a push; `!= 'push'` (a guard) does not.
     return ("event_name" in cond
             and not re.search(r"event_name\s*==\s*['\"]push['\"]", cond))
+
+
+# `github.event_name == 'push' && startsWith(github.ref, 'refs/heads/<x>')`
+# where <x> is not main or a prefix of it: a push to some other branch only.
+NON_MAIN_PUSH_RE = re.compile(
+    r"github\.event_name\s*==\s*['\"]push['\"]\s*&&\s*"
+    r"startsWith\(\s*github\.ref\s*,\s*['\"]refs/heads/(?!(?:m|ma|mai|main)['\"])[^'\"]+['\"]\s*\)"
+)
 
 
 def _step_compile_env(step: list[str]) -> dict[str, str]:
@@ -618,7 +633,7 @@ jobs:
         run: sudo apt-get install -y mold
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.93.0
+          toolchain: 1.95.0
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
         # a comment inside the step
@@ -663,7 +678,7 @@ jobs:
           sudo apt-get install -y mold
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.93.0
+          toolchain: 1.95.0
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
         with:
@@ -737,7 +752,7 @@ def _cases() -> list[tuple[str, str, str, str | None]]:
     ("rust-cache moved before the toolchain step in warm only",
      _CI, _sub(_WARM, """      - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.93.0
+          toolchain: 1.95.0
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
         with:
@@ -749,7 +764,7 @@ def _cases() -> list[tuple[str, str, str, str | None]]:
           key: ci-${{ hashFiles('.github/workflows/ci-cache-warm.yml') }}
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.93.0
+          toolchain: 1.95.0
           targets: wasm32-unknown-unknown
 """), "in order"),
     ("checkout and toolchain swapped in warm only (same set, new order)",
@@ -764,13 +779,13 @@ def _cases() -> list[tuple[str, str, str, str | None]]:
      _sub(_WARM, "          save-if: ${{ github.ref == 'refs/heads/main' }}\n          key: ci-",
           "          key: ci-"),
      "does not need from it"),
-    ("toolchain bumped in CI only", _sub(_CI, "1.93.0", "1.94.0"), _WARM,
+    ("toolchain bumped in CI only", _sub(_CI, "1.95.0", "1.94.0"), _WARM,
      "rust-toolchain inputs"),
     ("toolchain target dropped from warm",
      _CI, _sub(_WARM, "          targets: wasm32-unknown-unknown\n", ""),
      "rust-toolchain inputs"),
     ("CI job lost its toolchain step",
-     _sub(_CI, "      - uses: dtolnay/rust-toolchain@stable\n        with:\n          toolchain: 1.93.0\n          targets: wasm32-unknown-unknown\n", ""),
+     _sub(_CI, "      - uses: dtolnay/rust-toolchain@stable\n        with:\n          toolchain: 1.95.0\n          targets: wasm32-unknown-unknown\n", ""),
      _WARM, "no dtolnay/rust-toolchain step"),
     ("rust-cache key changed in CI only",
      _sub(_CI, "key: ci-", "key: v2-"), _WARM, "rust-cache reference"),
@@ -847,6 +862,14 @@ def _cases() -> list[tuple[str, str, str, str | None]]:
     ("CI twin now runs on push (warm job is dead weight)",
      _sub(_CI, "      github.event_name == 'pull_request'\n",
           "      github.event_name == 'pull_request' || github.event_name == 'push'\n"),
+     _WARM, "does not need from it"),
+    ("a push admitted only for release/v* still needs a twin",
+     _sub(_CI, "      github.event_name == 'pull_request'\n",
+          "      github.event_name == 'pull_request' || (github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release/v'))\n"),
+     _WARM, None),
+    ("a push admitted for refs/heads/main via startsWith is a push to main",
+     _sub(_CI, "      github.event_name == 'pull_request'\n",
+          "      github.event_name == 'pull_request' || (github.event_name == 'push' && startsWith(github.ref, 'refs/heads/main'))\n"),
      _WARM, "does not need from it"),
     ("an `!= 'push'` guard still needs a twin",
      _sub(_CI, "      github.event_name == 'pull_request'\n",

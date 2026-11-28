@@ -119,7 +119,7 @@ pub(crate) mod testing_impl;
 
 #[doc(hidden)]
 pub use p2p_impl::QUIC_RESTART_EXIT_CODE;
-pub(crate) use p2p_impl::abort_process_on_redb_poison;
+pub(crate) use p2p_impl::{abort_process_on_redb_poison, exit_for_quic_bind_failure};
 pub use p2p_impl::{
     enable_abort_on_fatal_listener_exit, enable_abort_on_redb_poison, enable_fast_crash_exit_code,
     listener_exit_is_graceful,
@@ -542,7 +542,7 @@ pub struct NodeConfig {
     pub(crate) quic_native_floor_override: Option<(u8, u8, u16)>,
     /// Simulation-only: QUIC-native connects on, at this release percent, in
     /// place of `NATIVE_DIAL_READY` and `QUIC_NATIVE_PERCENT`, in production
-    /// they are true and 25 (A+ step 1; `SimNetwork::with_native_connect`). Read
+    /// they are true and 100 (the floor release; `SimNetwork::with_native_connect`). Read
     /// into the node's `NativeConnectState`. `None` in production.
     /// `#[serde(skip)]`.
     #[serde(skip)]
@@ -562,8 +562,9 @@ pub struct NodeConfig {
     /// Simulation-only: native gateway joins on, at this percent, in place of
     /// `NATIVE_DIAL_READY` and `GATEWAY_NATIVE_JOIN_PERCENT`. In production
     /// `NATIVE_DIAL_READY` is true since A+ step 1, and only
-    /// `GATEWAY_NATIVE_JOIN_PERCENT` (0) keeps gateway-native off until
-    /// phase B (`SimNetwork::with_native_gateway_join`).
+    /// `GATEWAY_NATIVE_JOIN_PERCENT` (100 since the floor release) sets the
+    /// share of joins to a gateway marked native that try native first
+    /// (`SimNetwork::with_native_gateway_join`).
     /// Read into the node's `NativeConnectState`. `None` in production.
     /// `#[serde(skip)]`.
     #[serde(skip)]

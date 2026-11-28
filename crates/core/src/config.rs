@@ -284,6 +284,19 @@ pub struct ConfigArgs {
     /// run it and to `pulley` elsewhere (iOS, 32-bit ARM and 32-bit x86).
     #[arg(long = "wasm-backend", env = "FREENET_WASM_BACKEND", value_enum)]
     pub wasm_backend: Option<WasmBackend>,
+    /// Bound the CPU time and memory of compiling contract code: `off`
+    /// (default), `dry-run` or `enforce`. In `dry-run` a hard-capped helper
+    /// process checks a module on a thread of its own while the normal compile
+    /// proceeds without waiting for it, and the node logs what it would refuse
+    /// (a module is skipped when another dry-run check is running or memory is
+    /// short); no outcome changes. `enforce` refuses what the check refuses.
+    /// Delegate code is covered in `enforce` only on a node run with
+    /// `--hosted-mode`. `enforce` needs a systemd `MemoryMax` of at least 4 GiB
+    /// (or none): on a smaller limit the node cannot spare a worker beside its
+    /// own memory, the startup check marks isolation degraded, and compiles are
+    /// not checked. Linux only; other platforms ignore it.
+    #[arg(long, env = "FREENET_COMPILE_ISOLATION", value_enum)]
+    pub compile_isolation: Option<CompileIsolationMode>,
 
     /// Write the local append-only diagnostic event log (`_EVENT_LOG`).
     ///
@@ -411,6 +424,7 @@ impl Default for ConfigArgs {
             inactive_user_sweep_interval_secs: None,
             module_cache_budget_bytes: None,
             wasm_backend: None,
+            compile_isolation: None,
             enable_event_log: None,
             shutdown_drain_secs: None,
             disable_auto_update: false,
@@ -1182,6 +1196,7 @@ impl ConfigArgs {
             if let Some(backend) = cfg.wasm_backend {
                 self.wasm_backend.get_or_insert(backend);
             }
+            self.compile_isolation.get_or_insert(cfg.compile_isolation);
             self.shutdown_drain_secs
                 .get_or_insert(cfg.shutdown_drain_secs);
             self.max_blocking_threads
@@ -1769,6 +1784,7 @@ impl ConfigArgs {
                 .module_cache_budget_bytes
                 .unwrap_or_else(crate::wasm_runtime::default_module_cache_budget_bytes),
             wasm_backend: self.wasm_backend,
+            compile_isolation: self.compile_isolation.unwrap_or_default(),
             shutdown_drain_secs: self
                 .shutdown_drain_secs
                 .unwrap_or_else(default_shutdown_drain_secs),
@@ -2018,6 +2034,11 @@ pub struct Config {
         skip_serializing_if = "Option::is_none"
     )]
     pub wasm_backend: Option<WasmBackend>,
+    /// How the node bounds the compile of contract code (`off`, `dry-run`,
+    /// `enforce`). See [`CompileIsolationMode`]. A release that does not know
+    /// the key ignores it.
+    #[serde(default, rename = "compile-isolation")]
+    pub compile_isolation: CompileIsolationMode,
 
     /// Whether to write the local append-only diagnostic event log
     /// (`_EVENT_LOG`). Resolved in [`ConfigArgs::build`], where the operation
@@ -3923,6 +3944,22 @@ pub enum OtelAuthMode {
     Freenet,
     #[default]
     Disabled,
+}
+
+/// How a node bounds the CPU time and memory of compiling contract code.
+///
+/// `off` is the DEFAULT: compiles behave as before this option existed.
+/// `dry-run` runs the bounded compile check beside every compile and records
+/// what it would have decided, without changing any outcome. `enforce` refuses
+/// code the check refuses. Linux only; other platforms behave as `off`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+#[clap(rename_all = "kebab-case")]
+pub enum CompileIsolationMode {
+    #[default]
+    Off,
+    DryRun,
+    Enforce,
 }
 
 /// CLI/file args for the OpenTelemetry SDK metrics exporter.
@@ -6144,6 +6181,7 @@ std::thread_local! {
     static GLOBAL_FULL_STATE_SEND_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GLOBAL_PENDING_OP_INSERTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GLOBAL_PENDING_OP_REMOVES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static GLOBAL_LONGEST_EVENT_LOOP_EVENT_NANOS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GLOBAL_PENDING_OP_HWM: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GLOBAL_PENDING_OP_SKIPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GLOBAL_NEIGHBOR_HOSTING_UPDATES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -6261,6 +6299,7 @@ impl GlobalTestMetrics {
         GLOBAL_PENDING_OP_INSERTS.with(|c| c.set(0));
         GLOBAL_PENDING_OP_SKIPS.with(|c| c.set(0));
         GLOBAL_PENDING_OP_REMOVES.with(|c| c.set(0));
+        GLOBAL_LONGEST_EVENT_LOOP_EVENT_NANOS.with(|c| c.set(0));
         GLOBAL_PENDING_OP_HWM.with(|c| c.set(0));
         GLOBAL_NEIGHBOR_HOSTING_UPDATES.with(|c| c.set(0));
         GLOBAL_NOTIFICATION_COHOSTS_SKIPPED.with(|c| c.set(0));
@@ -6540,6 +6579,19 @@ impl GlobalTestMetrics {
 
     pub fn pending_op_inserts() -> u64 {
         GLOBAL_PENDING_OP_INSERTS.with(|c| c.get())
+    }
+
+    /// Records how long a node's event loop spent handling one event, keeping
+    /// the longest. Every node's event loop on this thread shares the figure.
+    pub fn record_event_loop_event(elapsed: std::time::Duration) {
+        let nanos = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+        GLOBAL_LONGEST_EVENT_LOOP_EVENT_NANOS.with(|c| c.set(c.get().max(nanos)));
+    }
+
+    /// The longest time any node's event loop on this thread spent on one event
+    /// since the last reset. A loop busy that long received nothing else.
+    pub fn longest_event_loop_event() -> std::time::Duration {
+        std::time::Duration::from_nanos(GLOBAL_LONGEST_EVENT_LOOP_EVENT_NANOS.with(|c| c.get()))
     }
 
     pub fn record_pending_op_remove() {
@@ -7681,6 +7733,7 @@ per-user-secret-quota = 4194305
 per-user-inactive-ttl = 2592001
 inactive-user-sweep-interval = 3601
 module-cache-budget-bytes = 4294967296
+compile-isolation = "dry-run"
 enable-event-log = true
 telemetry-enabled = true
 telemetry-endpoint = "http://127.0.0.1:14318"
@@ -10864,6 +10917,7 @@ shutdown-drain-secs = 42
             inactive_user_sweep_interval_secs: None,
             module_cache_budget_bytes: None,
             wasm_backend: None,
+            compile_isolation: None,
             enable_event_log: None,
             shutdown_drain_secs: None,
             disable_auto_update: false,
@@ -11024,6 +11078,7 @@ shutdown-drain-secs = 42
             // Explicit on purpose: `None` never reaches config.toml, so only a
             // chosen backend proves the merge keeps it.
             wasm_backend: Some(WasmBackend::Pulley),
+            compile_isolation: CompileIsolationMode::DryRun,
             // Non-default on purpose: the seed is Local mode, where the #4968
             // default is ON, so `Some(false)` fails this test if the merge
             // drops the field (it would come back as `None`).
@@ -11095,6 +11150,7 @@ shutdown-drain-secs = 42
             inactive_user_sweep_interval_secs,
             module_cache_budget_bytes,
             wasm_backend,
+            compile_isolation,
             enable_event_log,
             telemetry,
             otel,
@@ -11140,6 +11196,10 @@ shutdown-drain-secs = 42
             "module_cache_budget_bytes"
         );
         assert_eq!(wasm_backend, seed.wasm_backend, "wasm_backend");
+        assert_eq!(
+            compile_isolation, seed.compile_isolation,
+            "compile_isolation"
+        );
         assert_eq!(
             enable_event_log, seed.enable_event_log,
             "enable_event_log (#4968) — an explicit setting must survive the \

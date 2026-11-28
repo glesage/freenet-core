@@ -156,11 +156,27 @@ use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use wasmtime::{
-    Cache, CacheConfig, Caller, Config, Engine, EngineWeak, Error as WasmtimeError, Instance,
-    Linker, Module, OptLevel, ResourceLimiter, Store,
+    AsContextMut, Cache, CacheConfig, Caller, Config, Engine, EngineWeak, Error as WasmtimeError,
+    Instance, Linker, Module, OptLevel, ResourceLimiter, Store,
 };
 
+use super::compile_verdicts::CompileVerdictCache;
+use super::compile_worker::metrics::Outcome;
+use super::compile_worker::{CodeKind, Isolation};
+
+/// Identity of the compiler behind `engine`: wasmtime's own compatibility hash,
+/// which covers the wasmtime version, the compiler target and flags and the
+/// enabled WebAssembly features. Remembered compile refusals are keyed by it, so
+/// a wasmtime upgrade or a changed engine configuration never answers from a
+/// verdict another compiler recorded.
+pub(crate) fn engine_compat_id(engine: &Engine) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    engine.precompile_compatibility_hash().hash(&mut hasher);
+    hasher.finish()
+}
 use super::{InstanceHandle, WasmEngine, WasmError};
+use crate::util::time_source::{DynTimeSource, InstantTimeSrc};
 use crate::wasm_runtime::ContractError;
 use crate::wasm_runtime::native_api::{self, MEM_ADDR};
 use crate::wasm_runtime::runtime::RuntimeConfig;
@@ -191,13 +207,341 @@ fn compile_coalesce_map() -> &'static DashMap<[u8; 32], Arc<Mutex<()>>> {
 /// then get a near-instant disk-cache hit from `Module::new()`. Runs
 /// synchronously on the calling thread — the offload decision is made one level
 /// up in `compile()`.
-fn compile_coalesced(engine: &Engine, code: &[u8]) -> Result<Module, WasmError> {
-    let hash = *blake3::hash(code).as_bytes();
+fn compile_coalesced(
+    engine: &Engine,
+    verdicts: &CompileVerdictCache,
+    isolation: &Isolation,
+    kind: CodeKind,
+    code: &[u8],
+) -> Result<Module, WasmError> {
+    compile_coalesced_with(engine, verdicts, isolation, kind, code, &|engine, code| {
+        #[cfg(test)]
+        MODULE_NEW_CALLS.with(|calls| calls.set(calls.get() + 1));
+        run_in_compile_pool(|| {
+            #[cfg(test)]
+            POOL_THREADS_SEEN.store(rayon::current_num_threads(), Ordering::SeqCst);
+            Module::new(engine, code)
+        })
+        .and_then(|compiled| compiled)
+    })
+}
+
+/// Threads of the pool every compile runs on: the cores, at most 4. wasmtime
+/// compiles a module's functions in parallel and each thread holds one
+/// function's compiler state, so the pool size, not the machine's core count,
+/// bounds the compiler's working memory.
+pub(crate) fn compile_threads() -> usize {
+    std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .clamp(1, 4)
+}
+
+/// The pool all compiles share, or why it could not be started.
+fn compile_pool() -> &'static Result<rayon::ThreadPool, String> {
+    static POOL: OnceLock<Result<rayon::ThreadPool, String>> = OnceLock::new();
+    POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(compile_threads())
+            .thread_name(|i| format!("wasm-compile-{i}"))
+            .build()
+            .map_err(|e| format!("the compile thread pool did not start: {e}"))
+    })
+}
+
+/// Run `f` on `pool`, or report why there is no pool.
+fn install_in<R: Send>(
+    pool: &Result<rayon::ThreadPool, String>,
+    f: impl FnOnce() -> R + Send,
+) -> wasmtime::Result<R> {
+    match pool {
+        Ok(pool) => Ok(pool.install(f)),
+        Err(reason) => Err(wasmtime::Error::msg(reason.clone())),
+    }
+}
+
+/// Compile `code` on the shared compile pool, exactly as the node does.
+#[cfg(target_os = "linux")]
+pub(crate) fn compile_module_in_pool(engine: &Engine, code: &[u8]) -> wasmtime::Result<Module> {
+    run_in_compile_pool(|| Module::new(engine, code)).and_then(|compiled| compiled)
+}
+
+/// The engine the compile worker process uses (see
+/// [`WasmtimeEngine::create_worker_engine`]). Named here so code outside this
+/// file does not name the backend crate.
+#[cfg(target_os = "linux")]
+pub(crate) type WorkerEngine = Engine;
+
+/// How compiling one module on a [`WorkerEngine`] ended. The texts are bounded.
+#[cfg(target_os = "linux")]
+pub(crate) enum WorkerCompile {
+    /// The module compiled.
+    Compiled,
+    /// The system ran out of memory while compiling.
+    OutOfMemory(String),
+    /// The module is not valid WebAssembly.
+    Invalid(String),
+    /// Compiling failed although the module validates.
+    Internal(String),
+}
+
+/// Whether `error` (or anything in its chain) says the system ran out of memory.
+#[cfg(target_os = "linux")]
+fn is_out_of_memory(error: &wasmtime::Error) -> bool {
+    error.chain().any(|cause| {
+        if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+            if io.raw_os_error() == Some(12) {
+                return true;
+            }
+        }
+        let text = cause.to_string();
+        text.contains("Cannot allocate memory")
+            || text.contains("out of memory")
+            || text.contains("memory allocation of")
+    })
+}
+
+/// Compile `code` on the shared compile pool and classify how it ended; the
+/// compiled module is dropped.
+#[cfg(target_os = "linux")]
+pub(crate) fn compile_and_classify(engine: &WorkerEngine, code: &[u8]) -> WorkerCompile {
+    use super::compile_limits::bounded_text;
+    match compile_module_in_pool(engine, code) {
+        Ok(module) => {
+            drop(module);
+            WorkerCompile::Compiled
+        }
+        Err(error) => {
+            if is_out_of_memory(&error) {
+                return WorkerCompile::OutOfMemory(bounded_text(&error));
+            }
+            match Module::validate(engine, code) {
+                Err(invalid) => WorkerCompile::Invalid(bounded_text(&invalid)),
+                Ok(()) => WorkerCompile::Internal(bounded_text(&error)),
+            }
+        }
+    }
+}
+
+/// Run `f` so that wasmtime's parallel compilation uses [`compile_pool`].
+fn run_in_compile_pool<R: Send>(f: impl FnOnce() -> R + Send) -> wasmtime::Result<R> {
+    install_in(compile_pool(), f)
+}
+
+// Test seam: the size of the pool the last compile ran in.
+#[cfg(test)]
+static POOL_THREADS_SEEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Most Cranelift compiles allowed to run at once on this node: a quarter of
+/// the cores, at least 1 and at most 4. Each compile may itself use every core
+/// (wasmtime compiles a module's functions in parallel), so this bounds the
+/// node-wide CPU and memory that compiles use.
+pub(crate) fn compile_concurrency() -> usize {
+    std::thread::available_parallelism()
+        .map_or(1, |n| n.get() / 4)
+        .clamp(1, 4)
+}
+
+/// A counting semaphore over compiles.
+pub(crate) struct CompileGate {
+    free: Mutex<usize>,
+    freed: std::sync::Condvar,
+}
+
+/// Held while a compile runs; releases its slot on drop.
+pub(crate) struct CompilePermit<'a>(&'a CompileGate);
+
+impl CompileGate {
+    pub(crate) fn new(permits: usize) -> Self {
+        Self {
+            free: Mutex::new(permits),
+            freed: std::sync::Condvar::new(),
+        }
+    }
+
+    /// Wait for a free slot.
+    pub(crate) fn acquire(&self) -> CompilePermit<'_> {
+        let mut free = self.free.lock().unwrap_or_else(|e| e.into_inner());
+        while *free == 0 {
+            free = self.freed.wait(free).unwrap_or_else(|e| e.into_inner());
+        }
+        *free -= 1;
+        CompilePermit(self)
+    }
+
+    /// Take a free slot if there is one.
+    #[cfg(test)]
+    pub(crate) fn try_acquire(&self) -> Option<CompilePermit<'_>> {
+        let mut free = self.free.lock().unwrap_or_else(|e| e.into_inner());
+        if *free == 0 {
+            return None;
+        }
+        *free -= 1;
+        Some(CompilePermit(self))
+    }
+}
+
+impl Drop for CompilePermit<'_> {
+    fn drop(&mut self) {
+        *self.0.free.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+        self.0.freed.notify_one();
+    }
+}
+
+/// The node-wide compile gate.
+fn compile_gate() -> &'static CompileGate {
+    static GATE: OnceLock<CompileGate> = OnceLock::new();
+    GATE.get_or_init(|| CompileGate::new(compile_concurrency()))
+}
+
+/// How a failed compile of an accepted module is handled.
+enum CompileFailure {
+    /// The engine finds the module invalid: a property of the bytes.
+    Invalid(super::compile_limits::CompileRefusal),
+    /// Any other failure (an allocation or disk error while compiling).
+    Other(String),
+}
+
+/// `validated` is the engine's own validation of the module whose compile
+/// failed with `error`. Only an invalid module is a property of the bytes; every
+/// other failure may be transient and is not remembered.
+fn classify_compile_failure(
+    validated: wasmtime::Result<()>,
+    error: &wasmtime::Error,
+) -> CompileFailure {
+    use super::compile_limits::{CompileRefusal, bounded_text};
+    match validated {
+        Err(invalid) => CompileFailure::Invalid(CompileRefusal::Malformed(bounded_text(&invalid))),
+        Ok(()) => CompileFailure::Other(bounded_text(error)),
+    }
+}
+
+/// The counter a scan refusal falls under. The other forty-odd variants are
+/// structural limits and count together.
+#[allow(clippy::wildcard_enum_match_arm)]
+fn prefilter_outcome(refusal: &super::compile_limits::CompileRefusal) -> Outcome {
+    use super::compile_limits::CompileRefusal as R;
+    match refusal {
+        R::ModuleTooLarge { .. } => Outcome::RefusedSize,
+        R::NotBinary(_) => Outcome::RefusedText,
+        R::Malformed(_) => Outcome::RefusedFeature,
+        _ => Outcome::RefusedLimit,
+    }
+}
+
+// Test seam: counts calls to the compiler on this thread.
+#[cfg(test)]
+thread_local! {
+    static MODULE_NEW_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// [`compile_coalesced`] with the compiler call supplied by the caller (the
+/// tests substitute a failing one).
+fn compile_coalesced_with(
+    engine: &Engine,
+    verdicts: &CompileVerdictCache,
+    isolation: &Isolation,
+    kind: CodeKind,
+    code: &[u8],
+    new_module: &dyn Fn(&Engine, &[u8]) -> wasmtime::Result<Module>,
+) -> Result<Module, WasmError> {
+    use super::compile_limits::{check_input_size, check_module};
+    // The coarse acceptance check covers contract code always and delegate code
+    // only on hosted nodes; any other delegate is compiled as it always was.
+    let checked = isolation.coarse_check_applies(kind);
+    // Bound the input before hashing or converting it.
+    if checked {
+        if let Err(refusal) = check_input_size(code) {
+            isolation.metrics().count(Outcome::RefusedSize);
+            return Err(refusal.into());
+        }
+    }
+    let input_hash = *blake3::hash(code).as_bytes();
+    // Refusals are remembered by code hash alone, and are recorded only for code
+    // the acceptance check covers. Code it does not cover (a delegate on a
+    // non-hosted node) must not be refused by a verdict a contract compile of
+    // the same bytes left behind.
+    if checked {
+        if let Some(refusal) = verdicts.get(&input_hash) {
+            isolation.metrics().count_cached_refusal(&refusal);
+            return Err(WasmError::CompileRefused(refusal));
+        }
+    }
+    // Refuse modules outside the acceptance rule before any compile work (see
+    // `compile_limits`). Only the binary format is accepted from here on: the
+    // text format is converted by a parser that runs before any limit, so it is
+    // not taken from this path. A caller that holds text converts it first.
+    let coarse = if checked {
+        check_module(code).map(Some)
+    } else {
+        Ok(None)
+    };
+    match coarse {
+        Ok(None) => {}
+        Ok(Some(shape)) => {
+            // Early warning, once per code hash: a module this close to a
+            // limit may be refused by a release that tightens it.
+            if let Some((limit_name, value, limit)) = super::compile_limits::nearest_limit(&shape) {
+                if verdicts.first_near_limit_report(&input_hash) {
+                    tracing::info!(
+                        code_hash = %blake3::Hash::from(input_hash),
+                        limit_name,
+                        value,
+                        limit,
+                        "WASM module is close to a compile limit"
+                    );
+                }
+            }
+        }
+        Err(refusal) => {
+            tracing::info!(reason = %refusal, "WASM module refused before compilation");
+            isolation.metrics().count(prefilter_outcome(&refusal));
+            verdicts.insert(input_hash, refusal.clone());
+            return Err(WasmError::CompileRefused(refusal));
+        }
+    }
+    // The input is the binary that is compiled, so one hash serves both the
+    // verdict cache and the coalescing map.
+    let hash = input_hash;
     let map = compile_coalesce_map();
     let mutex = map.entry(hash).or_default().clone();
     let _guard = mutex.lock().unwrap_or_else(|e| e.into_inner());
+    // At most `compile_concurrency()` compiles run at once on this node, so they
+    // cannot take every core. The permit is
+    // taken after the per-hash mutex: a thread waiting on a sibling compile of
+    // the same bytes holds no permit, and a permit holder never waits on
+    // another, so the two cannot deadlock.
+    //
+    // The compile worker, when the node runs one, judges the module first and
+    // holds its own slot (taken before this one, always in this order) until the
+    // node's compile below has ended. It never changes what is compiled: a module
+    // it accepts is compiled here exactly as without it.
+    let ticket = match isolation.admit(&hash, code, kind, verdicts) {
+        Ok(ticket) => ticket,
+        Err(refusal) => {
+            if Arc::strong_count(&mutex) == 1 {
+                map.remove(&hash);
+            }
+            return Err(refusal);
+        }
+    };
+    let _permit = compile_gate().acquire();
 
-    let result = Module::new(engine, code).map_err(|e| WasmError::Compile(e.to_string()));
+    let result = match new_module(engine, code) {
+        Ok(module) => Ok(module),
+        // Only a module the engine itself finds invalid is remembered: that is a
+        // property of the bytes. Any other failure is not, so a transient fault
+        // never refuses valid code.
+        Err(error) => match classify_compile_failure(Module::validate(engine, code), &error) {
+            CompileFailure::Invalid(refusal) => {
+                tracing::info!(reason = %refusal, "WASM module refused before compilation");
+                verdicts.insert(input_hash, refusal.clone());
+                Err(WasmError::CompileRefused(refusal))
+            }
+            CompileFailure::Other(message) => Err(WasmError::Compile(message)),
+        },
+    };
+
+    ticket.finish(result.is_ok());
 
     // Clean up when no other thread holds or is waiting on this entry.
     // If another thread grabbed a clone between our entry() and lock(),
@@ -244,14 +588,22 @@ fn compile_coalesced(engine: &Engine, code: &[u8]) -> Result<Module, WasmError> 
 /// The result is the same compiled `Module` regardless of which path runs; only
 /// *where* the Cranelift work happens differs. This means offload can never
 /// panic and is inherently inline off the multi-thread path.
-fn compile_offloaded(engine: Engine, code: Vec<u8>) -> Result<Module, WasmError> {
+fn compile_offloaded(
+    engine: Engine,
+    verdicts: Arc<CompileVerdictCache>,
+    isolation: Arc<Isolation>,
+    kind: CodeKind,
+    code: Vec<u8>,
+) -> Result<Module, WasmError> {
     use tokio::runtime::RuntimeFlavor;
 
     match tokio::runtime::Handle::try_current() {
         // Only a multi-threaded runtime can legally run `block_in_place`; it is
         // also the only context (production) where offloading actually helps.
         Ok(handle) if handle.runtime_flavor() == RuntimeFlavor::MultiThread => {
-            let join = tokio::task::spawn_blocking(move || compile_coalesced(&engine, &code));
+            let join = tokio::task::spawn_blocking(move || {
+                compile_coalesced(&engine, &verdicts, &isolation, kind, &code)
+            });
             match tokio::task::block_in_place(|| handle.block_on(join)) {
                 Ok(result) => result,
                 Err(e) if e.is_panic() => {
@@ -264,7 +616,7 @@ fn compile_offloaded(engine: Engine, code: Vec<u8>) -> Result<Module, WasmError>
         // No runtime, or a current_thread runtime: compile inline on the calling
         // thread. block_in_place would PANIC on a current_thread runtime, and
         // both this and the no-runtime case want a deterministic inline compile.
-        _ => compile_coalesced(&engine, &code),
+        _ => compile_coalesced(&engine, &verdicts, &isolation, kind, &code),
     }
 }
 
@@ -749,10 +1101,37 @@ fn arm_epoch_deadline(
     calling_instance: Option<native_api::InstanceId>,
 ) {
     store.data_mut().calling_instance = calling_instance;
+    let meter = Arc::clone(&store.data().meter);
+    // `ticks` is `ceil(budget / tick) + 1`; the guest budget is the part
+    // before the phase-safety `+ 1`.
+    meter.arm(
+        EPOCH_TICK_PERIOD.saturating_mul(ticks.saturating_sub(1).try_into().unwrap_or(u32::MAX)),
+    );
     store.set_epoch_deadline(ticks);
-    store.epoch_deadline_trap();
+    // At the deadline, trap only if the guest has used its budget EXCLUDING
+    // time spent in host functions; otherwise extend (river#1017).
+    store.epoch_deadline_callback(move |_| Ok(meter.on_deadline()));
     // Piggyback a cheap dead-ticker health check on this already-per-call site.
     detect_stale_epoch_ticker();
+}
+
+/// The backend engine shared by every executor of a pool, with the cache of
+/// remembered refusals that goes with it. Compiled modules belong to the engine
+/// that compiled them, and a refusal is a property of the bytes, so both are
+/// shared: one compile, one refusal, one memory bound for the whole pool.
+#[derive(Clone)]
+pub(crate) struct SharedBackend {
+    engine: Engine,
+    verdicts: Arc<CompileVerdictCache>,
+    isolation: Arc<Isolation>,
+}
+
+#[cfg(test)]
+impl SharedBackend {
+    /// The wasmtime engine, for tests that compile or load artifacts directly.
+    pub(crate) fn engine(&self) -> &Engine {
+        &self.engine
+    }
 }
 
 /// Wasmtime 27.x backend implementation.
@@ -819,6 +1198,12 @@ pub(crate) struct WasmtimeEngine {
     /// offload can never panic regardless of this flag. See
     /// `RuntimeConfig::offload_compilation`.
     offload_compilation: bool,
+    /// Remembered refusals and failures, so a repeat of the same code bytes is
+    /// answered without scanning again. Shared by every engine built on the
+    /// same backend (see [`SharedBackend`]).
+    verdicts: Arc<CompileVerdictCache>,
+    /// The compile worker of this node (see `compile_worker`).
+    isolation: Arc<Isolation>,
 }
 
 /// Host state for wasmtime Store, implementing ResourceLimiter for memory limits.
@@ -839,14 +1224,295 @@ pub(crate) struct HostState {
     /// abandoned thread keeps its own store, so its value stays its own.
     /// `None` until the first entry.
     calling_instance: Option<native_api::InstanceId>,
+    /// Time this store's guest spends inside host functions, kept out of its
+    /// guest budget and bounded by its own cap. See [`HostCallMeter`].
+    meter: Arc<HostCallMeter>,
 }
 
 impl HostState {
+    /// A state with the default 5 s budget's host-call cap (tests that build
+    /// a store directly; the engine uses [`Self::with_meter`]).
+    #[cfg(test)]
     fn new(memory_limit_pages: u32) -> Self {
+        Self::with_meter(
+            memory_limit_pages,
+            HostCallMeter::new(host_call_cap_for(5.0)),
+        )
+    }
+
+    fn with_meter(memory_limit_pages: u32, meter: Arc<HostCallMeter>) -> Self {
         Self {
             memory_limit_bytes: memory_limit_pages as usize * WASM_PAGE_SIZE,
             calling_instance: None,
+            meter,
         }
+    }
+}
+
+/// Host-call cap, as a multiple of the guest budget (`max_execution_seconds`).
+///
+/// The guest budget measures guest time only: wall time the guest spends INSIDE
+/// a blocking host function (a secret read, a contract-state read) is not
+/// charged to it (river#1017). So that a delegate cannot stall forever inside
+/// host calls, the time it spends in them is capped SEPARATELY, at this
+/// multiple of the budget (7.5 s for the default 5 s budget). Total wall time
+/// for one execution is therefore bounded by `budget + cap` plus trap/backstop
+/// slack, about 12.7 s at the default (about 5.15 s before river#1017).
+///
+/// RESIDUAL, stated honestly: the discount is of WALL time, and a "blocking"
+/// host function also does CPU with no I/O (`get_contract_state` copies the
+/// state, `get_secret` on a memo hit is a memcpy, `set_secret` encrypts). A
+/// guest that loops on those can spend up to the cap in node CPU without
+/// timing out, so the worst case is `budget + cap` of CPU per execution, not
+/// `budget`. Discounting only off-CPU time needs a per-thread CPU clock on
+/// Linux, macOS and Windows, which this crate does not have; the factor is
+/// kept small instead, so the exposure is 1.5x the budget in extra CPU.
+const HOST_CALL_CAP_FACTOR: f64 = 1.5;
+
+/// The host-call cap for a guest budget of `max_execution_seconds`.
+fn host_call_cap_for(max_execution_seconds: f64) -> Duration {
+    Duration::from_secs_f64(max_execution_seconds.max(0.0) * HOST_CALL_CAP_FACTOR)
+}
+
+/// Which of the two separate limits ended a guest execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimeoutCause {
+    /// The guest ran past its CPU budget (wall time minus host-call time).
+    GuestBudget,
+    /// The guest spent more than the host-call cap inside host functions.
+    HostCallCap,
+}
+
+impl TimeoutCause {
+    fn as_str(self) -> &'static str {
+        match self {
+            TimeoutCause::GuestBudget => "guest_budget",
+            TimeoutCause::HostCallCap => "host_call_cap",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct MeterInner {
+    /// Cap on host-call time per guest entry; set per job by
+    /// [`HostCallMeter::reset`] from the engine's current budget.
+    cap: Duration,
+    /// Host-call time since [`HostCallMeter::reset`], completed calls only.
+    host_total: Duration,
+    host_calls: u64,
+    /// Start of the host call in flight, if any.
+    in_flight: Option<Instant>,
+    /// Wall time, host-call time and guest budget at the most recent
+    /// [`arm_epoch_deadline`].
+    armed_at: Instant,
+    armed_host: Duration,
+    armed_budget: Duration,
+    /// Set by whichever mechanism ended the execution.
+    fired: Option<TimeoutCause>,
+}
+
+impl MeterInner {
+    /// Host-call time so far, including a call still in flight.
+    fn host_time(&self, now: Instant) -> Duration {
+        self.host_total
+            + self
+                .in_flight
+                .map_or(Duration::ZERO, |t| now.saturating_duration_since(t))
+    }
+}
+
+/// Measures the wall time one store's guest spends inside host functions.
+///
+/// Shared (`Arc`) between the store's [`HostState`] (host functions and the
+/// epoch-deadline callback write it) and the wall-clock waiter (reads it), so
+/// the waiter can discount a host call still in flight. One meter per `Store`:
+/// a guest abandoned by the backstop keeps its own store, and its own meter,
+/// so it cannot disturb the replacement store's accounting.
+#[derive(Debug)]
+pub(crate) struct HostCallMeter {
+    inner: Mutex<MeterInner>,
+}
+
+/// Snapshot of a [`HostCallMeter`] for timeout diagnostics.
+#[derive(Debug, Clone, Copy)]
+struct MeterSnapshot {
+    host_time: Duration,
+    host_calls: u64,
+    cap: Duration,
+    fired: Option<TimeoutCause>,
+}
+
+impl HostCallMeter {
+    fn new(cap: Duration) -> Arc<Self> {
+        let now = Instant::now();
+        Arc::new(Self {
+            inner: Mutex::new(MeterInner {
+                cap,
+                host_total: Duration::ZERO,
+                host_calls: 0,
+                in_flight: None,
+                armed_at: now,
+                armed_host: Duration::ZERO,
+                armed_budget: Duration::ZERO,
+                fired: None,
+            }),
+        })
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, MeterInner> {
+        // Plain counters: a panic while holding the lock cannot leave them
+        // inconsistent, and a guest must not be able to wedge the meter.
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Start accounting a new job (one `execute_wasm_blocking`) under `cap`.
+    fn reset(&self, cap: Duration) {
+        let mut g = self.lock();
+        g.cap = cap;
+        g.host_total = Duration::ZERO;
+        g.host_calls = 0;
+        g.in_flight = None;
+        g.fired = None;
+    }
+
+    /// Record the start of one guest entry with `budget` of guest time.
+    fn arm(&self, budget: Duration) {
+        self.arm_at(Instant::now(), budget);
+    }
+
+    fn arm_at(&self, now: Instant, budget: Duration) {
+        let mut g = self.lock();
+        g.armed_at = now;
+        g.armed_host = g.host_time(now);
+        g.armed_budget = budget;
+    }
+
+    /// Host-call time so far in this job, including a call in flight.
+    fn host_time(&self) -> Duration {
+        self.lock().host_time(Instant::now())
+    }
+
+    /// Whether the current guest entry has spent its host-call cap.
+    fn over_cap(&self) -> bool {
+        let g = self.lock();
+        g.host_time(Instant::now()).saturating_sub(g.armed_host) >= g.cap
+    }
+
+    fn snapshot(&self) -> MeterSnapshot {
+        let g = self.lock();
+        MeterSnapshot {
+            host_time: g.host_time(Instant::now()),
+            host_calls: g.host_calls,
+            cap: g.cap,
+            fired: g.fired,
+        }
+    }
+
+    fn record_fired(&self, cause: TimeoutCause) {
+        let mut g = self.lock();
+        g.fired.get_or_insert(cause);
+    }
+
+    /// The epoch deadline was reached. Decide between trapping and giving the
+    /// guest the budget it has not yet used: the deadline is wall-clock, but
+    /// the budget is guest time, so time spent in host functions extends it.
+    fn on_deadline(&self) -> wasmtime::UpdateDeadline {
+        self.on_deadline_at(Instant::now())
+    }
+
+    fn on_deadline_at(&self, now: Instant) -> wasmtime::UpdateDeadline {
+        let mut g = self.lock();
+        let host_since_arm = g.host_time(now).saturating_sub(g.armed_host);
+        if host_since_arm >= g.cap {
+            g.fired.get_or_insert(TimeoutCause::HostCallCap);
+            return wasmtime::UpdateDeadline::Interrupt;
+        }
+        let guest_used = now
+            .saturating_duration_since(g.armed_at)
+            .saturating_sub(host_since_arm);
+        if guest_used >= g.armed_budget {
+            g.fired.get_or_insert(TimeoutCause::GuestBudget);
+            return wasmtime::UpdateDeadline::Interrupt;
+        }
+        // No `+ 1` phase margin here, unlike `epoch_deadline_ticks`: this check
+        // is exact, so a deadline that lands early only comes back here and is
+        // extended again. Without the margin the trap lands at most one tick
+        // past the remaining budget, which `WallBounds::guest` (one tick plus
+        // the backstop margin past the budget) covers; with it, it could land
+        // two ticks past and the backstop would win the race and discard the
+        // store.
+        let remaining = g.armed_budget - guest_used;
+        let ticks = (remaining.as_secs_f64() / EPOCH_TICK_PERIOD.as_secs_f64()).ceil() as u64;
+        wasmtime::UpdateDeadline::Continue(ticks.max(1))
+    }
+}
+
+/// The guest has spent its host-call cap; see [`HostCallGuard::enter`].
+struct HostCapSpent;
+
+/// Evaluates to a [`HostCallGuard`], or returns `$refused` from the host
+/// function when the guest has spent its host-call cap.
+macro_rules! metered {
+    ($caller:expr, $refused:expr) => {
+        match HostCallGuard::enter($caller) {
+            Ok(guard) => guard,
+            Err(HostCapSpent) => return $refused,
+        }
+    };
+}
+
+/// Held for the duration of one host function that can BLOCK on I/O or a lock
+/// (secret store, contract-state reads, delegate creation). Its time is not
+/// charged to the guest budget (river#1017) and is capped separately. These
+/// functions also do some CPU work, which is discounted with it; see the
+/// residual described at [`HOST_CALL_CAP_FACTOR`].
+///
+/// Host functions that only compute (log, rand, time, context copies,
+/// `fill_buffer`) must NOT take one: they can run for a long time at the
+/// guest's request (`rand_bytes` over the whole memory), so their time stays
+/// charged to the guest budget. Pinned by
+/// `host_function_metering_matches_its_class`.
+struct HostCallGuard {
+    meter: Arc<HostCallMeter>,
+    started: Instant,
+}
+
+impl HostCallGuard {
+    /// Begin a metered host call. If this entry has already spent its
+    /// host-call cap, also expire the epoch deadline, so the guest traps at its
+    /// next epoch check (see [`HostCallMeter::on_deadline`]) instead of
+    /// running on until the original deadline.
+    ///
+    /// REFUSES (`Err`) in that case: the host function must return an error
+    /// code WITHOUT running its side effect, since the guest is already over
+    /// its limit and is about to be trapped. The trap lands at the next wasm
+    /// function entry (wasmtime reloads a moved deadline there, not at a loop
+    /// back-edge inside the same frame); a guest that stays in one frame is
+    /// still ended by the epoch tick or, at the latest, by its guest budget,
+    /// so refused calls cannot extend a guest past `budget + cap`.
+    fn enter(caller: &mut Caller<'_, HostState>) -> Result<Self, HostCapSpent> {
+        let meter = Arc::clone(&caller.data().meter);
+        if meter.over_cap() {
+            meter.record_fired(TimeoutCause::HostCallCap);
+            caller.as_context_mut().set_epoch_deadline(0);
+            return Err(HostCapSpent);
+        }
+        Ok(Self::begin(meter))
+    }
+
+    fn begin(meter: Arc<HostCallMeter>) -> Self {
+        let started = Instant::now();
+        meter.lock().in_flight = Some(started);
+        Self { meter, started }
+    }
+}
+
+impl Drop for HostCallGuard {
+    fn drop(&mut self) {
+        let mut g = self.meter.lock();
+        g.host_total += self.started.elapsed();
+        g.host_calls += 1;
+        g.in_flight = None;
     }
 }
 
@@ -900,11 +1566,66 @@ impl ResourceLimiter for HostState {
     }
 }
 
+impl WasmtimeEngine {
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn engine_identity_for_tests(&self) -> u64 {
+        engine_compat_id(&self.engine)
+    }
+
+    /// Compile `code` of `kind`; see `compile_worker` for what `kind` changes.
+    fn compile_kind(&mut self, code: &[u8], kind: CodeKind) -> Result<Module, WasmError> {
+        if self.offload_compilation {
+            // PRODUCTION opt-in: ask to offload the Cranelift compile to a
+            // blocking thread. `compile_offloaded` itself decides whether that
+            // is actually safe and useful based on the live runtime flavor —
+            // it only offloads on a MULTI-THREAD runtime and otherwise compiles
+            // inline (a current_thread runtime would panic at block_in_place;
+            // a missing runtime has nowhere to offload). The wasmtime `Engine`
+            // is `Clone` (Arc internally), so the spawned closure compiles
+            // against the same backend and the resulting `Module` is valid in
+            // this engine's Stores. The per-hash coalescing mutex (a
+            // process-global map) still de-duplicates concurrent compiles of
+            // the same bytes across threads.
+            //
+            // What the offload buys (issue #4441's HANG): on a multi-thread
+            // runtime, `block_in_place` hands the current worker thread back to
+            // the scheduler so its OTHER tasks (the WS API, diagnostics, logging,
+            // connection handling) keep running while Cranelift compiles on a
+            // blocking thread. That cures the user-visible whole-node hang. It
+            // does NOT let the single-threaded `contract_handling` loop process
+            // the NEXT contract event during this compile — that loop is parked
+            // at its own block_on awaiting this call. Per-contract throughput
+            // parallelism is a separate, deferred change (B2).
+            let engine = self.engine.clone();
+            let code = code.to_vec();
+            compile_offloaded(
+                engine,
+                self.verdicts.clone(),
+                self.isolation.clone(),
+                kind,
+                code,
+            )
+        } else {
+            // SIMULATION / TEST: compile inline (synchronously) on the caller's
+            // thread. The direct sim runner is `current_thread` + paused-clock
+            // and pins event traces for determinism; `spawn_blocking` would
+            // introduce real-thread completion ordering that breaks those
+            // determinism assertions. Inline compile is deterministic.
+            compile_coalesced(&self.engine, &self.verdicts, &self.isolation, kind, code)
+        }
+    }
+}
+
 impl WasmEngine for WasmtimeEngine {
     type Module = Module;
 
     fn new(config: &RuntimeConfig, host_mem: bool) -> Result<Self, ContractError> {
         let (engine, max_fuel, enabled_metering) = Self::create_engine(config)?;
+        let verdicts = Arc::new(CompileVerdictCache::new(
+            Arc::new(InstantTimeSrc::new()),
+            engine_compat_id(&engine),
+        ));
+        let isolation = Self::create_isolation(config, &engine);
         let mut linker = Linker::new(&engine);
 
         // Register all host functions into the linker
@@ -912,7 +1633,13 @@ impl WasmEngine for WasmtimeEngine {
 
         // Create the store with HostState
         let epoch_deadline_ticks = epoch_deadline_ticks(config.max_execution_seconds);
-        let mut store = Store::new(&engine, HostState::new(DEFAULT_MAX_MEMORY_PAGES));
+        let mut store = Store::new(
+            &engine,
+            HostState::with_meter(
+                DEFAULT_MAX_MEMORY_PAGES,
+                HostCallMeter::new(host_call_cap_for(config.max_execution_seconds)),
+            ),
+        );
         store.limiter(|state| state); // Enable ResourceLimiter
         if enabled_metering {
             store.set_fuel(max_fuel).map_err(|e| anyhow::anyhow!(e))?;
@@ -947,6 +1674,8 @@ impl WasmEngine for WasmtimeEngine {
             last_cadence_warn: None,
             store_created_at: Instant::now(),
             offload_compilation: config.offload_compilation,
+            verdicts,
+            isolation,
         })
     }
 
@@ -960,43 +1689,29 @@ impl WasmEngine for WasmtimeEngine {
     }
 
     fn compile(&mut self, code: &[u8]) -> Result<Module, WasmError> {
-        if self.offload_compilation {
-            // PRODUCTION opt-in: ask to offload the Cranelift compile to a
-            // blocking thread. `compile_offloaded` itself decides whether that
-            // is actually safe and useful based on the live runtime flavor —
-            // it only offloads on a MULTI-THREAD runtime and otherwise compiles
-            // inline (a current_thread runtime would panic at block_in_place;
-            // a missing runtime has nowhere to offload). The wasmtime `Engine`
-            // is `Clone` (Arc internally), so the spawned closure compiles
-            // against the same backend and the resulting `Module` is valid in
-            // this engine's Stores. The per-hash coalescing mutex (a
-            // process-global map) still de-duplicates concurrent compiles of
-            // the same bytes across threads.
-            //
-            // What the offload buys (issue #4441's HANG): on a multi-thread
-            // runtime, `block_in_place` hands the current worker thread back to
-            // the scheduler so its OTHER tasks (the WS API, diagnostics, logging,
-            // connection handling) keep running while Cranelift compiles on a
-            // blocking thread. That cures the user-visible whole-node hang. It
-            // does NOT let the single-threaded `contract_handling` loop process
-            // the NEXT contract event during this compile — that loop is parked
-            // at its own block_on awaiting this call. Per-contract throughput
-            // parallelism is a separate, deferred change (B2).
-            let engine = self.engine.clone();
-            let code = code.to_vec();
-            compile_offloaded(engine, code)
-        } else {
-            // SIMULATION / TEST: compile inline (synchronously) on the caller's
-            // thread. The direct sim runner is `current_thread` + paused-clock
-            // and pins event traces for determinism; `spawn_blocking` would
-            // introduce real-thread completion ordering that breaks those
-            // determinism assertions. Inline compile is deterministic.
-            compile_coalesced(&self.engine, code)
-        }
+        self.compile_kind(code, CodeKind::Delegate)
+    }
+
+    fn compile_contract(&mut self, code: &[u8]) -> Result<Module, WasmError> {
+        self.compile_kind(code, CodeKind::Contract)
     }
 
     fn module_compiled_size(&self, module: &Module) -> usize {
         compiled_module_size(module)
+    }
+
+    fn module_declares_update_validates(&self, module: &Module) -> bool {
+        match module.get_export(super::UPDATE_VALIDATES_EXPORT) {
+            Some(wasmtime::ExternType::Func(ty)) => {
+                ty.params().len() == 0
+                    && ty.results().len() == 1
+                    && ty
+                        .results()
+                        .next()
+                        .is_some_and(|r| r.matches(&wasmtime::ValType::I32))
+            }
+            _ => false,
+        }
     }
 
     fn create_instance(
@@ -1035,6 +1750,8 @@ impl WasmEngine for WasmtimeEngine {
             .ok_or_else(|| WasmError::Other(anyhow::anyhow!("engine store not available")))?;
         let linker = Arc::clone(&self.linker);
         let module = module.clone();
+        let meter = Arc::clone(&store.data().meter);
+        meter.reset(host_call_cap_for(self.max_execution_seconds));
 
         // A module's start function and `__frnt_set_id` are guest code, so they
         // run off the calling thread under the wall-clock backstop, with a
@@ -1056,6 +1773,7 @@ impl WasmEngine for WasmtimeEngine {
             },
             WallBounds::for_entries(self.max_execution_seconds, INSTANCE_SETUP_GUEST_ENTRIES),
             self.max_execution_seconds,
+            Some(meter),
         );
         let outcome = match result {
             BlockingResult::Ok(Ok(instance), store) => {
@@ -1432,6 +2150,17 @@ impl WasmtimeEngine {
         // and the closure runs after this call has already returned.
         let live_guest = delegate_instance.map(LiveGuestRegistration::register);
 
+        // Captured HERE, on the calling thread before the guest runs, and never
+        // looked up again: the timeout path must not touch `DELEGATE_ENV`, where
+        // a stuck host call's shard `Ref` can have a writer queued behind it.
+        let delegate_label = delegate_instance.and_then(native_api::delegate_key_for_log);
+
+        // This job's host-call accounting starts from zero. The meter belongs to
+        // the store, so it is the one the guest's host functions write.
+        let meter = Arc::clone(&store.data().meter);
+        meter.reset(host_call_cap_for(self.max_execution_seconds));
+        let meter_for_wait = Arc::clone(&meter);
+
         let result = execute_wasm_blocking(
             move || {
                 // MOVED into the closure so it drops when the guest finishes,
@@ -1450,19 +2179,53 @@ impl WasmtimeEngine {
                 (r, store)
             },
             self.max_execution_seconds,
+            Some(meter_for_wait),
         );
 
+        let identity = |entry: &str| {
+            log_guest_timeout_identity(
+                handle.id,
+                delegate_label.as_deref(),
+                &meter,
+                self.max_execution_seconds,
+                entry,
+            );
+        };
         match result {
+            // A refused host call (host-call cap spent) returns an error code that
+            // the stdlib reads as "absent" or "not found", and the guest may
+            // return normally before it is trapped. Anything it computed after
+            // that is built on false answers, so the whole execution is a
+            // timeout, not a result (`HostCallGuard::enter`).
+            //
+            // Only here, for guest entries made through `call_typed_blocking`.
+            // `create_instance` (module start function, `__frnt_set_id`) does
+            // not convert: a start function that returns normally after a
+            // refused host call is accepted. The cap still ends a start
+            // function that keeps calling, by trap or backstop.
+            BlockingResult::Ok(_, store) if cap_was_spent(&meter) => {
+                identity(name);
+                self.store = Some(store);
+                Err(WasmError::Timeout)
+            }
             BlockingResult::Ok(value, store) => {
                 self.store = Some(store);
                 Ok(value)
             }
             BlockingResult::WasmError(err, mut store) => {
-                let wasm_err = classify(enabled_metering, &mut store, err);
+                let wasm_err = if cap_was_spent(&meter) {
+                    WasmError::Timeout
+                } else {
+                    classify(enabled_metering, &mut store, err)
+                };
+                if matches!(wasm_err, WasmError::Timeout) {
+                    identity(name);
+                }
                 self.store = Some(store);
                 Err(wasm_err)
             }
             BlockingResult::Timeout => {
+                identity(name);
                 self.recover_store();
                 Err(WasmError::Timeout)
             }
@@ -1522,16 +2285,78 @@ impl WasmtimeEngine {
     }
 
     /// Create a new backend engine that can be shared across multiple Runtime instances.
-    pub(crate) fn create_backend_engine(config: &RuntimeConfig) -> Result<Engine, ContractError> {
+    ///
+    /// `time` drives the expiry of the refusals the backend remembers; the
+    /// executors sharing the backend share that one cache.
+    pub(crate) fn create_backend_engine(
+        config: &RuntimeConfig,
+        time: DynTimeSource,
+    ) -> Result<SharedBackend, ContractError> {
         let (engine, _, _) = Self::create_engine(config)?;
-        Ok(engine)
+        let engine_id = engine_compat_id(&engine);
+        let isolation = Self::create_isolation(config, &engine);
+        Ok(SharedBackend {
+            engine,
+            verdicts: Arc::new(CompileVerdictCache::new(time, engine_id)),
+            isolation,
+        })
+    }
+
+    /// The compile worker setup for `config` (inert unless the mode is on).
+    #[cfg(target_os = "linux")]
+    fn create_isolation(config: &RuntimeConfig, engine: &Engine) -> Arc<Isolation> {
+        use super::compile_worker::{IsolationConfig, metrics::CompileMetrics};
+        let metrics = config
+            .compile_metrics
+            .clone()
+            .unwrap_or_else(|| Arc::new(CompileMetrics::default()));
+        // The accepted-modules file sits beside the wasmtime cache directory.
+        let accepted_dir = config
+            .wasmtime_cache_dir
+            .as_ref()
+            .and_then(|d| d.parent())
+            .map(|p| p.join("compile-accepted"));
+        #[cfg(test)]
+        let test_seam = config.compile_worker_test.clone();
+        #[cfg(not(test))]
+        let test_seam = None;
+        Arc::new(Isolation::for_node(
+            test_seam,
+            &IsolationConfig {
+                mode: config.compile_isolation,
+                isolate_delegates: config.compile_isolation_delegates,
+                accepted_dir,
+                consume_fuel: config.enable_metering,
+            },
+            engine_compat_id(engine),
+            metrics,
+        ))
+    }
+
+    /// Other platforms have no compile worker.
+    #[cfg(not(target_os = "linux"))]
+    fn create_isolation(config: &RuntimeConfig, _engine: &Engine) -> Arc<Isolation> {
+        use super::compile_worker::metrics::CompileMetrics;
+        let metrics = config
+            .compile_metrics
+            .clone()
+            .unwrap_or_else(|| Arc::new(CompileMetrics::default()));
+        Arc::new(Isolation::inert(
+            config.compile_isolation,
+            config.compile_isolation_delegates,
+            metrics,
+        ))
     }
 
     /// Clone the backend engine for sharing with other runtimes.
     ///
     /// Wasmtime's Engine is Arc-wrapped internally, so this is a cheap refcount bump.
-    pub(crate) fn clone_backend_engine(&self) -> Engine {
-        self.engine.clone()
+    pub(crate) fn clone_backend_engine(&self) -> SharedBackend {
+        SharedBackend {
+            engine: self.engine.clone(),
+            verdicts: self.verdicts.clone(),
+            isolation: self.isolation.clone(),
+        }
     }
 
     /// Create a new WasmtimeEngine using a shared backend engine.
@@ -1541,8 +2366,13 @@ impl WasmtimeEngine {
     pub(crate) fn new_with_shared_backend(
         config: &RuntimeConfig,
         host_mem: bool,
-        backend: Engine,
+        backend: SharedBackend,
     ) -> Result<Self, ContractError> {
+        let SharedBackend {
+            engine: backend,
+            verdicts,
+            isolation,
+        } = backend;
         let max_fuel = Self::compute_max_fuel(config);
         let enabled_metering = config.enable_metering;
 
@@ -1550,7 +2380,13 @@ impl WasmtimeEngine {
         Self::register_host_functions(&mut linker)?;
 
         let epoch_deadline_ticks = epoch_deadline_ticks(config.max_execution_seconds);
-        let mut store = Store::new(&backend, HostState::new(DEFAULT_MAX_MEMORY_PAGES));
+        let mut store = Store::new(
+            &backend,
+            HostState::with_meter(
+                DEFAULT_MAX_MEMORY_PAGES,
+                HostCallMeter::new(host_call_cap_for(config.max_execution_seconds)),
+            ),
+        );
         store.limiter(|state| state);
         if enabled_metering {
             store.set_fuel(max_fuel).map_err(|e| anyhow::anyhow!(e))?;
@@ -1582,10 +2418,15 @@ impl WasmtimeEngine {
             last_cadence_warn: None,
             store_created_at: Instant::now(),
             offload_compilation: config.offload_compilation,
+            verdicts,
+            isolation,
         })
     }
 
-    fn create_engine(config: &RuntimeConfig) -> Result<(Engine, u64, bool), ContractError> {
+    /// The wasmtime configuration every engine of this node uses, without the
+    /// compile cache. The compile worker builds its engine from the same function,
+    /// so a module the worker accepts is judged by the engine that compiles it.
+    pub(crate) fn base_wasmtime_config(config: &RuntimeConfig) -> Result<Config, ContractError> {
         let mut wasmtime_config = Config::new();
 
         // Backend. Pulley compiles to bytecode that wasmtime interprets, so no
@@ -1615,7 +2456,6 @@ impl WasmtimeEngine {
         }
 
         // Enable fuel metering if requested
-        let max_fuel = Self::compute_max_fuel(config);
         if config.enable_metering {
             wasmtime_config.consume_fuel(true);
         }
@@ -1629,6 +2469,25 @@ impl WasmtimeEngine {
         // part of the engine's compile-cache key, so enabling it recompiles
         // cached modules once on upgrade.
         wasmtime_config.epoch_interruption(true);
+
+        // Accept exactly the WebAssembly proposals the scan accepts (see
+        // `compile_limits::accepted_features`); every other proposal is refused
+        // as invalid, both by the scan and by this engine.
+        wasmtime_config
+            .wasm_exceptions(false)
+            .wasm_gc(false)
+            .wasm_function_references(false)
+            .wasm_tail_call(false)
+            .wasm_threads(false)
+            .wasm_shared_everything_threads(false)
+            .wasm_memory64(false)
+            .wasm_multi_memory(false)
+            .wasm_relaxed_simd(false)
+            .wasm_extended_const(false)
+            .wasm_wide_arithmetic(false)
+            .wasm_stack_switching(false)
+            .wasm_custom_page_sizes(false)
+            .wasm_component_model(false);
 
         // Set memory limits via config
         // async_stack_size must exceed max_wasm_stack
@@ -1715,6 +2574,26 @@ impl WasmtimeEngine {
         // from `Engine::new`), so leave it at its default there.
         #[cfg(not(target_os = "windows"))]
         wasmtime_config.native_unwind_info(false);
+
+        Ok(wasmtime_config)
+    }
+
+    /// The engine of the compile worker: the node's configuration without the
+    /// compile cache (the worker must not write the node's cache directory) and
+    /// without epoch registration (it never runs guest code).
+    #[cfg(target_os = "linux")]
+    pub(crate) fn create_worker_engine(enable_metering: bool) -> Result<Engine, String> {
+        let config = RuntimeConfig {
+            enable_metering,
+            ..RuntimeConfig::default()
+        };
+        let wasmtime_config = Self::base_wasmtime_config(&config).map_err(|e| e.to_string())?;
+        Engine::new(&wasmtime_config).map_err(|e| e.to_string())
+    }
+
+    fn create_engine(config: &RuntimeConfig) -> Result<(Engine, u64, bool), ContractError> {
+        let mut wasmtime_config = Self::base_wasmtime_config(config)?;
+        let max_fuel = Self::compute_max_fuel(config);
 
         // Enable disk-based compilation cache (#3456). Wasmtime caches compiled
         // modules keyed by (engine config + WASM bytes hash). On cache hit,
@@ -1837,7 +2716,15 @@ impl WasmtimeEngine {
     /// `lifetime_instances >= STORE_REFRESH_THRESHOLD` and no instances are live,
     /// and by `recover_store` after a timeout/panic.
     fn replace_store(&mut self) {
-        let mut store = Store::new(&self.engine, HostState::new(DEFAULT_MAX_MEMORY_PAGES));
+        // A fresh meter too: a guest abandoned by the backstop keeps writing to
+        // the OLD store's meter, which must not leak into this store's accounting.
+        let mut store = Store::new(
+            &self.engine,
+            HostState::with_meter(
+                DEFAULT_MAX_MEMORY_PAGES,
+                HostCallMeter::new(host_call_cap_for(self.max_execution_seconds)),
+            ),
+        );
         store.limiter(|state| state);
         if self.enabled_metering {
             if let Err(e) = store.set_fuel(self.max_fuel) {
@@ -2103,6 +2990,8 @@ impl WasmtimeEngine {
                  key_len: i32,
                  out_ptr: i64,
                  out_len: i32| {
+                    let _host_call =
+                        metered!(&mut caller, native_api::error_codes::ERR_STORAGE_FAILED);
                     if let Err(code) = delegate_caller(&mut caller) {
                         return code;
                     }
@@ -2116,6 +3005,8 @@ impl WasmtimeEngine {
                 "freenet_delegate_secrets",
                 "__frnt__delegate__get_secret_len",
                 |mut caller: Caller<'_, HostState>, key_ptr: i64, key_len: i32| {
+                    let _host_call =
+                        metered!(&mut caller, native_api::error_codes::ERR_STORAGE_FAILED);
                     if let Err(code) = delegate_caller(&mut caller) {
                         return code;
                     }
@@ -2133,6 +3024,8 @@ impl WasmtimeEngine {
                  key_len: i32,
                  val_ptr: i64,
                  val_len: i32| {
+                    let _host_call =
+                        metered!(&mut caller, native_api::error_codes::ERR_STORAGE_FAILED);
                     if let Err(code) = delegate_caller(&mut caller) {
                         return code;
                     }
@@ -2146,6 +3039,8 @@ impl WasmtimeEngine {
                 "freenet_delegate_secrets",
                 "__frnt__delegate__has_secret",
                 |mut caller: Caller<'_, HostState>, key_ptr: i64, key_len: i32| {
+                    let _host_call =
+                        metered!(&mut caller, native_api::error_codes::ERR_STORAGE_FAILED);
                     if let Err(code) = delegate_caller(&mut caller) {
                         return code;
                     }
@@ -2159,6 +3054,8 @@ impl WasmtimeEngine {
                 "freenet_delegate_secrets",
                 "__frnt__delegate__remove_secret",
                 |mut caller: Caller<'_, HostState>, key_ptr: i64, key_len: i32| {
+                    let _host_call =
+                        metered!(&mut caller, native_api::error_codes::ERR_STORAGE_FAILED);
                     if let Err(code) = delegate_caller(&mut caller) {
                         return code;
                     }
@@ -2172,6 +3069,8 @@ impl WasmtimeEngine {
                 "freenet_delegate_secrets",
                 "__frnt__delegate__list_secrets_len",
                 |mut caller: Caller<'_, HostState>, prefix_ptr: i64, prefix_len: i32| {
+                    let _host_call =
+                        metered!(&mut caller, native_api::error_codes::ERR_STORAGE_FAILED);
                     if let Err(code) = delegate_caller(&mut caller) {
                         return code;
                     }
@@ -2189,6 +3088,8 @@ impl WasmtimeEngine {
                  prefix_len: i32,
                  out_ptr: i64,
                  out_len: i32| {
+                    let _host_call =
+                        metered!(&mut caller, native_api::error_codes::ERR_STORAGE_FAILED);
                     if let Err(code) = delegate_caller(&mut caller) {
                         return code;
                     }
@@ -2223,6 +3124,10 @@ impl WasmtimeEngine {
                  out_ptr: i64,
                  out_len: i64|
                  -> i64 {
+                    let _host_call = metered!(
+                        &mut caller,
+                        i64::from(crate::wasm_runtime::delegate_api::contract_error_codes::ERR_STORE_ERROR)
+                    );
                     if let Err(code) = delegate_caller(&mut caller) {
                         return i64::from(code);
                     }
@@ -2238,6 +3143,10 @@ impl WasmtimeEngine {
                 "freenet_delegate_contracts",
                 "__frnt__delegate__get_contract_state_len",
                 |mut caller: Caller<'_, HostState>, id_ptr: i64, id_len: i32| -> i64 {
+                    let _host_call = metered!(
+                        &mut caller,
+                        i64::from(crate::wasm_runtime::delegate_api::contract_error_codes::ERR_STORE_ERROR)
+                    );
                     if let Err(code) = delegate_caller(&mut caller) {
                         return i64::from(code);
                     }
@@ -2275,8 +3184,16 @@ impl WasmtimeEngine {
                     out_key_ptr,
                     out_hash_ptr,
                 ): (i64, i64, i64, i64, i64, i64, i64, i64)| {
+                    // Metered (it hashes and stores a module, which is I/O); moved into the
+                    // future so it is held for the whole of the creation. `None`
+                    // means the host-call cap is spent: refuse, run nothing.
+                    let host_call = HostCallGuard::enter(&mut caller).ok();
                     let refused = delegate_caller(&mut caller).err();
                     Box::new(async move {
+                        if host_call.is_none() {
+                            return crate::wasm_runtime::delegate_api::delegate_mgmt_error_codes::ERR_STORE_FAILED;
+                        }
+                        let _host_call = host_call;
                         if let Some(code) = refused {
                             return code;
                         }
@@ -2392,7 +3309,14 @@ fn classify_runtime_error(
     // `BlockingResult::Timeout` path. Checked first because it is a timeout
     // regardless of whether metering is on.
     if is_epoch_interrupt(&error) {
-        tracing::warn!("WASM execution timed out (epoch deadline exceeded)");
+        let snap = store.data().meter.snapshot();
+        tracing::warn!(
+            cause = snap.fired.map_or("epoch", TimeoutCause::as_str),
+            host_call_ms = snap.host_time.as_millis(),
+            host_calls = snap.host_calls,
+            host_cap_ms = snap.cap.as_millis(),
+            "WASM execution timed out (epoch deadline exceeded)"
+        );
         return WasmError::Timeout;
     }
     if enabled_metering {
@@ -2513,6 +3437,11 @@ enum WallVerdict {
     /// — transient scheduler overload the guest never entered. NOT a contract
     /// fault; must not be charged to the contract.
     QueuedTooLong,
+    /// The guest spent its whole host-call cap inside host functions
+    /// (river#1017: host-call time is NOT charged to the guest budget, so it is
+    /// bounded separately). Raised by the waiter for a host call that cannot be
+    /// interrupted, where the epoch callback cannot run.
+    HostCapOverran,
 }
 
 /// Guest entries `instantiate_and_init` makes, each with its own freshly armed
@@ -2546,6 +3475,10 @@ struct WallBounds {
     /// How long a STARTED guest may run, measured from its own start, before
     /// the backstop abandons it.
     guest: Duration,
+    /// How long the guest may spend INSIDE host functions, in total, across the
+    /// job's guest entries. Host-call time is excluded from `guest`, so this is
+    /// what keeps total wall time bounded: `guest + host_cap` plus slack.
+    host_cap: Duration,
 }
 
 impl WallBounds {
@@ -2580,6 +3513,18 @@ impl WallBounds {
             queue,
             guest: queue
                 .max(epoch_window)
+                .saturating_mul(entries.max(1))
+                .saturating_add(WALL_BACKSTOP_MARGIN),
+            // The margin lets the in-guest check (see `HostCallGuard::enter`) end
+            // a guest that makes many short host calls cleanly, with its store
+            // kept. The backstop only decides WHEN the call is reported as a
+            // timeout. It does not stop a host call that never returns: a
+            // delegate host function holds a `DELEGATE_ENV` shard `Ref` for its
+            // whole body, and `DelegateEnvGuard::drop` waits on that shard for
+            // writing, so a stuck delegate host call still blocks the executor
+            // thread (see `native_api::LIVE_DELEGATE_GUESTS`). Do not read this
+            // cap as a bound on such a call.
+            host_cap: host_call_cap_for(max_execution_seconds)
                 .saturating_mul(entries.max(1))
                 .saturating_add(WALL_BACKSTOP_MARGIN),
         }
@@ -2663,6 +3608,8 @@ enum GuestWait<T = i64> {
     Ended,
     /// The guest ran past its budget: [`WallVerdict::GuestOverran`].
     GuestOverran,
+    /// The guest spent its host-call cap: [`WallVerdict::HostCapOverran`].
+    HostCapOverran,
     /// The job never left the queue: [`WallVerdict::QueuedTooLong`].
     QueuedTooLong,
 }
@@ -2685,25 +3632,45 @@ fn wait_for_guest<T>(
     start: std::time::Instant,
     bounds: WallBounds,
     read_started_at: &dyn Fn() -> Option<Duration>,
+    read_host_time: &dyn Fn() -> Duration,
 ) -> GuestWait<T> {
     use std::sync::mpsc::{RecvTimeoutError, TryRecvError};
     loop {
         let started_at = read_started_at();
+        // Time inside host functions (a call still in flight included) is not
+        // charged to the guest budget (river#1017), so classify on the elapsed
+        // time net of it. It has its own cap.
+        let host_time = read_host_time();
         let elapsed = start.elapsed();
-        match classify_wall_timeout(started_at, elapsed, bounds) {
+        let net_elapsed = elapsed.saturating_sub(host_time);
+        let verdict = if host_time >= bounds.host_cap {
+            WallVerdict::HostCapOverran
+        } else {
+            classify_wall_timeout(started_at, net_elapsed, bounds)
+        };
+        match verdict {
             WallVerdict::KeepWaiting => {}
-            verdict @ (WallVerdict::GuestOverran | WallVerdict::QueuedTooLong) => {
+            verdict @ (WallVerdict::GuestOverran
+            | WallVerdict::QueuedTooLong
+            | WallVerdict::HostCapOverran) => {
                 return match rx.try_recv() {
                     Ok(result) => GuestWait::Done(result),
                     Err(TryRecvError::Disconnected) => GuestWait::Ended,
-                    Err(TryRecvError::Empty) if verdict == WallVerdict::GuestOverran => {
-                        GuestWait::GuestOverran
-                    }
-                    Err(TryRecvError::Empty) => GuestWait::QueuedTooLong,
+                    Err(TryRecvError::Empty) => match verdict {
+                        WallVerdict::HostCapOverran => GuestWait::HostCapOverran,
+                        WallVerdict::GuestOverran => GuestWait::GuestOverran,
+                        WallVerdict::QueuedTooLong => GuestWait::QueuedTooLong,
+                        WallVerdict::KeepWaiting => unreachable!("handled by the arm above"),
+                    },
                 };
             }
         }
-        match rx.recv_timeout(time_to_next_wall_bound(started_at, elapsed, bounds)) {
+        // While a host call is in flight the guest bound stands still (host
+        // time grows as fast as the clock), so the host cap is the nearer one;
+        // otherwise the guest bound is. Waking early only re-evaluates.
+        let wait = time_to_next_wall_bound(started_at, net_elapsed, bounds)
+            .min(bounds.host_cap.saturating_sub(host_time));
+        match rx.recv_timeout(wait) {
             Ok(result) => return GuestWait::Done(result),
             Err(RecvTimeoutError::Disconnected) => return GuestWait::Ended,
             Err(RecvTimeoutError::Timeout) => {}
@@ -2711,9 +3678,70 @@ fn wait_for_guest<T>(
     }
 }
 
+/// Whether the guest spent its host-call cap, so some of its host calls may
+/// have been refused. See [`HostCallGuard::enter`].
+fn cap_was_spent(meter: &HostCallMeter) -> bool {
+    meter.snapshot().fired == Some(TimeoutCause::HostCallCap)
+}
+
+/// Log a wall-clock backstop timeout with the numbers needed to tell a runaway
+/// guest from a slow host (river#1017): the budget, the host-call time and the
+/// cap. Fields are milliseconds. `cause` is which limit the backstop applied.
+fn log_backstop_timeout(
+    cause: TimeoutCause,
+    budget_secs: f64,
+    wall: Duration,
+    meter: Option<&HostCallMeter>,
+    message: &str,
+) {
+    if let Some(m) = meter {
+        m.record_fired(cause);
+    }
+    let snap = meter.map(HostCallMeter::snapshot);
+    let host = snap.map_or(Duration::ZERO, |s| s.host_time);
+    tracing::warn!(
+        cause = cause.as_str(),
+        timeout_secs = budget_secs,
+        elapsed_ms = wall.as_millis(),
+        host_call_ms = host.as_millis(),
+        guest_ms = wall.saturating_sub(host).as_millis(),
+        host_calls = snap.map_or(0, |s| s.host_calls),
+        host_cap_ms = snap.map_or(0, |s| s.cap.as_millis()),
+        "{message}"
+    );
+}
+
+/// Log, once per timed-out guest entry that has an identity, WHO timed out and
+/// which limit fired (river#1017). Complements the anonymous warnings from the
+/// epoch callback and the backstop, which do not know the delegate key.
+fn log_guest_timeout_identity(
+    instance_id: i64,
+    delegate: Option<&str>,
+    meter: &HostCallMeter,
+    budget_secs: f64,
+    entry: &str,
+) {
+    let snap = meter.snapshot();
+    tracing::warn!(
+        instance_id,
+        delegate_key = delegate.unwrap_or("<contract or allocator>"),
+        entry,
+        budget_secs,
+        host_call_ms = snap.host_time.as_millis(),
+        host_calls = snap.host_calls,
+        host_cap_ms = snap.cap.as_millis(),
+        cause = snap.fired.map_or("backstop", TimeoutCause::as_str),
+        "WASM guest timed out"
+    );
+}
+
 /// Run a job that makes ONE guest entry under the wall-clock backstop for
 /// `max_execution_seconds` of budget. See [`execute_wasm_blocking_within`].
-fn execute_wasm_blocking<T, F>(f: F, max_execution_seconds: f64) -> BlockingResult<T>
+fn execute_wasm_blocking<T, F>(
+    f: F,
+    max_execution_seconds: f64,
+    meter: Option<Arc<HostCallMeter>>,
+) -> BlockingResult<T>
 where
     T: Send + 'static,
     F: FnOnce() -> WasmResult<T> + Send + 'static,
@@ -2722,6 +3750,7 @@ where
         f,
         WallBounds::for_budget(max_execution_seconds),
         max_execution_seconds,
+        meter,
     )
 }
 
@@ -2730,10 +3759,16 @@ where
 /// SEPARATELY — see `WallBounds` and `classify_wall_timeout`. A panic in `f`
 /// is returned as [`BlockingResult::Panic`]. `max_execution_seconds` is only
 /// reported in the timeout logs.
+///
+/// `meter` is the store's [`HostCallMeter`]: host-call time it reports is not
+/// charged to the guest's bound, and is bounded by `bounds.host_cap` instead.
+/// `None` (stub jobs in tests) means no host calls. The caller must have
+/// `reset` it before this call.
 fn execute_wasm_blocking_within<T, F>(
     f: F,
     bounds: WallBounds,
     max_execution_seconds: f64,
+    meter: Option<Arc<HostCallMeter>>,
 ) -> BlockingResult<T>
 where
     T: Send + 'static,
@@ -2798,6 +3833,8 @@ where
             .load(Ordering::SeqCst)
             .then(|| Duration::from_nanos(started_at_ns.load(Ordering::SeqCst)))
     };
+    // Host-call time so far, including a call still in flight (river#1017).
+    let read_host_time = || meter.as_ref().map_or(Duration::ZERO, |m| m.host_time());
 
     // `block_in_place` (in the multi-thread arm below) is only legal on a
     // multi-threaded runtime; it PANICS on a current_thread runtime. Route a
@@ -2813,7 +3850,7 @@ where
             // poll slept on the worker itself, outside `block_in_place`, and so
             // took the core out of service without telling the runtime.
             tokio::task::block_in_place(|| {
-                match wait_for_guest(&result_rx, start, bounds, &read_started_at) {
+                match wait_for_guest(&result_rx, start, bounds, &read_started_at, &read_host_time) {
                     GuestWait::Done((Ok(value), store)) => BlockingResult::Ok(value, store),
                     GuestWait::Done((Err(err), store)) => BlockingResult::WasmError(err, store),
                     // The task is finishing or finished; join it for the cause.
@@ -2839,10 +3876,23 @@ where
                     },
                     GuestWait::GuestOverran => {
                         task_handle.abort();
-                        tracing::warn!(
-                            timeout_secs = max_execution_seconds,
-                            elapsed_ms = start.elapsed().as_millis(),
-                            "WASM execution timed out (guest running past its budget; epoch backstop)"
+                        log_backstop_timeout(
+                            TimeoutCause::GuestBudget,
+                            max_execution_seconds,
+                            start.elapsed(),
+                            meter.as_deref(),
+                            "WASM execution timed out (guest running past its budget; epoch backstop)",
+                        );
+                        BlockingResult::Timeout
+                    }
+                    GuestWait::HostCapOverran => {
+                        task_handle.abort();
+                        log_backstop_timeout(
+                            TimeoutCause::HostCallCap,
+                            max_execution_seconds,
+                            start.elapsed(),
+                            meter.as_deref(),
+                            "WASM execution timed out (guest spent its host-call cap inside host functions; backstop)",
                         );
                         BlockingResult::Timeout
                     }
@@ -2867,7 +3917,7 @@ where
             // Same wait and the same started-flag classification as the
             // multi-thread arm. On a deadline the detached thread is left to
             // finish and drop the store on its own (as before).
-            match wait_for_guest(&result_rx, start, bounds, &read_started_at) {
+            match wait_for_guest(&result_rx, start, bounds, &read_started_at, &read_host_time) {
                 GuestWait::Done((Ok(value), store)) => {
                     let _join = thread_handle.join();
                     BlockingResult::Ok(value, store)
@@ -2886,10 +3936,22 @@ where
                     )),
                 },
                 GuestWait::GuestOverran => {
-                    tracing::warn!(
-                        timeout_secs = max_execution_seconds,
-                        elapsed_ms = start.elapsed().as_millis(),
-                        "WASM execution timed out (guest running past its budget; epoch backstop, no tokio runtime)"
+                    log_backstop_timeout(
+                        TimeoutCause::GuestBudget,
+                        max_execution_seconds,
+                        start.elapsed(),
+                        meter.as_deref(),
+                        "WASM execution timed out (guest running past its budget; epoch backstop, no tokio runtime)",
+                    );
+                    BlockingResult::Timeout
+                }
+                GuestWait::HostCapOverran => {
+                    log_backstop_timeout(
+                        TimeoutCause::HostCallCap,
+                        max_execution_seconds,
+                        start.elapsed(),
+                        meter.as_deref(),
+                        "WASM execution timed out (guest spent its host-call cap inside host functions; backstop, no tokio runtime)",
                     );
                     BlockingResult::Timeout
                 }
@@ -2934,8 +3996,638 @@ mod tests {
     #[test]
     fn test_wasmtime_engine_creation() {
         let config = RuntimeConfig::default();
-        let result = WasmtimeEngine::create_backend_engine(&config);
+        let result = WasmtimeEngine::create_backend_engine(
+            &config,
+            Arc::new(crate::util::time_source::InstantTimeSrc::new()),
+        );
         assert!(result.is_ok(), "Failed to create wasmtime engine");
+    }
+
+    fn module_new_calls() -> u64 {
+        MODULE_NEW_CALLS.with(|calls| calls.get())
+    }
+
+    /// A compile pool that did not start is an error for the compile, not a panic.
+    #[test]
+    fn a_compile_pool_that_did_not_start_is_a_compile_error() {
+        let failed: Result<rayon::ThreadPool, String> = Err("no threads".to_string());
+        let error = install_in(&failed, || 1).unwrap_err();
+        assert!(error.to_string().contains("no threads"));
+        assert_eq!(install_in(compile_pool(), || 7).unwrap(), 7);
+    }
+
+    /// The coarse acceptance check covers contract code on every node and
+    /// delegate code only on hosted nodes: a delegate over the size limit
+    /// compiles on a node that is not hosted, is refused on a hosted one, and a
+    /// contract of that size is refused on both.
+    #[test]
+    fn the_coarse_check_covers_delegates_only_on_hosted_nodes() {
+        use crate::wasm_runtime::engine::compile_limits::{
+            CompileRefusal, MAX_MODULE_BYTES, test_support::padded_to,
+        };
+        let big = padded_to(MAX_MODULE_BYTES + 1024);
+        let mut plain = WasmtimeEngine::new(&RuntimeConfig::default(), false).unwrap();
+        plain
+            .compile(&big)
+            .expect("a delegate on a node that is not hosted is not checked");
+        assert!(matches!(
+            plain.compile_contract(&big),
+            Err(WasmError::CompileRefused(
+                CompileRefusal::ModuleTooLarge { .. }
+            ))
+        ));
+        let hosted_config = RuntimeConfig {
+            compile_isolation_delegates: true,
+            ..RuntimeConfig::default()
+        };
+        let mut hosted = WasmtimeEngine::new(&hosted_config, false).unwrap();
+        assert!(matches!(
+            hosted.compile(&big),
+            Err(WasmError::CompileRefused(
+                CompileRefusal::ModuleTooLarge { .. }
+            ))
+        ));
+        assert!(matches!(
+            hosted.compile_contract(&big),
+            Err(WasmError::CompileRefused(
+                CompileRefusal::ModuleTooLarge { .. }
+            ))
+        ));
+    }
+
+    /// Every limit is enforced by `compile`: the module at the limit compiles and
+    /// the first one past it is refused with that limit's variant, without the
+    /// compiler being called for it.
+    #[test]
+    fn every_limit_is_enforced_through_engine_compile() {
+        use crate::wasm_runtime::engine::compile_limits::test_support::limit_cases;
+        let mut engine = WasmtimeEngine::new(&RuntimeConfig::default(), false).unwrap();
+        for case in limit_cases() {
+            let (name, at) = (case.name, case.at_limit());
+            let before = module_new_calls();
+            match &case.shadowed_by {
+                None => {
+                    engine
+                        .compile_contract(&(case.build)(at))
+                        .unwrap_or_else(|e| panic!("{name}: the limit itself must compile: {e}"));
+                    assert_eq!(module_new_calls(), before + 1, "{name}: compiled once");
+                }
+                Some(first) => {
+                    // Another limit refuses a module at this one first.
+                    match engine.compile_contract(&(case.build)(at)) {
+                        Err(WasmError::CompileRefused(got)) => assert_eq!(&got, first, "{name}"),
+                        other => panic!("{name}: expected a refusal, got {:?}", other.err()),
+                    }
+                    assert_eq!(module_new_calls(), before, "{name}: refused before compile");
+                }
+            }
+            let before = module_new_calls();
+            match engine.compile_contract(&(case.build)(at + 1)) {
+                Err(WasmError::CompileRefused(got)) => assert_eq!(got, case.refusal, "{name}"),
+                other => panic!("{name}: expected a refusal, got {:?}", other.err()),
+            }
+            assert_eq!(
+                module_new_calls(),
+                before,
+                "{name}: a refused module must not reach the compiler"
+            );
+        }
+    }
+
+    /// A remembered verdict is consulted before the scan: seeding the cache
+    /// for the hash of a valid module makes `compile` refuse it, and the compiler
+    /// is not called.
+    #[test]
+    fn a_remembered_refusal_is_returned_without_scanning_or_compiling() {
+        use crate::wasm_runtime::engine::compile_limits::CompileRefusal;
+        let mut engine = WasmtimeEngine::new(&RuntimeConfig::default(), false).unwrap();
+        let code = crate::wasm_runtime::engine::compile_limits::test_support::nested_blocks(3);
+        engine.verdicts.insert(
+            *blake3::hash(&code).as_bytes(),
+            CompileRefusal::NestingTooDeep { limit: 1 },
+        );
+        let before = module_new_calls();
+        assert!(matches!(
+            engine.compile_contract(&code),
+            Err(WasmError::CompileRefused(CompileRefusal::NestingTooDeep {
+                limit: 1
+            }))
+        ));
+        assert_eq!(module_new_calls(), before);
+    }
+
+    /// A refusal recorded for a contract compile of some bytes does not refuse
+    /// the same bytes compiled as a delegate on a node that is not hosted, which
+    /// does not check delegate code. On a hosted node the delegate is checked,
+    /// so the remembered refusal applies to it.
+    #[test]
+    fn a_contract_refusal_does_not_block_the_same_bytes_as_an_unchecked_delegate() {
+        use crate::wasm_runtime::engine::compile_limits::{
+            CompileRefusal, MAX_NESTING_DEPTH, test_support::nested_blocks,
+        };
+        let over = nested_blocks(MAX_NESTING_DEPTH as usize + 1);
+        let mut plain = WasmtimeEngine::new(&RuntimeConfig::default(), false).unwrap();
+        assert!(matches!(
+            plain.compile_contract(&over),
+            Err(WasmError::CompileRefused(
+                CompileRefusal::NestingTooDeep { .. }
+            ))
+        ));
+        plain.compile(&over).expect(
+            "a delegate on a node that is not hosted is not checked, cached refusal or not",
+        );
+        let hosted_config = RuntimeConfig {
+            compile_isolation_delegates: true,
+            ..RuntimeConfig::default()
+        };
+        let mut hosted = WasmtimeEngine::new(&hosted_config, false).unwrap();
+        assert!(matches!(
+            hosted.compile_contract(&over),
+            Err(WasmError::CompileRefused(_))
+        ));
+        assert!(matches!(
+            hosted.compile(&over),
+            Err(WasmError::CompileRefused(_))
+        ));
+    }
+
+    /// A module that passes the scan but is past half of some limit is reported
+    /// once per code hash; an ordinary module is not reported at all.
+    #[test]
+    fn a_module_near_a_limit_is_reported_once_and_an_ordinary_one_not() {
+        use crate::wasm_runtime::engine::compile_limits::test_support::nested_blocks;
+        let mut engine = WasmtimeEngine::new(&RuntimeConfig::default(), false).unwrap();
+        // 600 nested blocks is 59% of the nesting limit of 1,024.
+        let near = nested_blocks(600);
+        let near_hash = *blake3::hash(&near).as_bytes();
+        engine.compile_contract(&near).expect("inside every limit");
+        assert!(
+            !engine.verdicts.first_near_limit_report(&near_hash),
+            "compiling the module did not report it"
+        );
+        let ordinary = nested_blocks(3);
+        let ordinary_hash = *blake3::hash(&ordinary).as_bytes();
+        engine.compile_contract(&ordinary).expect("ordinary");
+        assert!(
+            engine.verdicts.first_near_limit_report(&ordinary_hash),
+            "an ordinary module was reported as near a limit"
+        );
+        // A second compile of the near module reports nothing new.
+        engine.compile_contract(&near).expect("inside every limit");
+        assert!(!engine.verdicts.first_near_limit_report(&near_hash));
+    }
+
+    /// A refusal is remembered, so the second request for the same bytes is
+    /// answered from the cache.
+    #[test]
+    fn a_refused_module_is_remembered() {
+        use crate::wasm_runtime::engine::compile_limits::test_support::nested_blocks;
+        let mut engine = WasmtimeEngine::new(&RuntimeConfig::default(), false).unwrap();
+        let code = nested_blocks(2_000);
+        let hash = *blake3::hash(&code).as_bytes();
+        assert!(engine.verdicts.get(&hash).is_none());
+        assert!(engine.compile_contract(&code).is_err());
+        assert!(
+            engine.verdicts.get(&hash).is_some(),
+            "the refusal was not remembered"
+        );
+    }
+
+    /// Repeated requests for refused bytes are counted, under the reason, not
+    /// only the first.
+    #[test]
+    fn repeated_requests_for_a_refused_module_are_counted() {
+        use crate::wasm_runtime::engine::compile_limits::test_support::nested_blocks;
+        let mut engine = WasmtimeEngine::new(&RuntimeConfig::default(), false).unwrap();
+        let code = nested_blocks(2_000);
+        let cached = |e: &WasmtimeEngine| {
+            let s = e.isolation.metrics().snapshot();
+            [
+                Outcome::CachedRefusedSize,
+                Outcome::CachedRefusedText,
+                Outcome::CachedRefusedFeature,
+                Outcome::CachedRefusedLimit,
+            ]
+            .iter()
+            .map(|o| s.outcome(*o))
+            .sum::<u64>()
+        };
+        assert!(engine.compile_contract(&code).is_err());
+        assert_eq!(cached(&engine), 0, "the first refusal is not a cached one");
+        for _ in 0..3 {
+            assert!(engine.compile_contract(&code).is_err());
+        }
+        assert_eq!(cached(&engine), 3);
+    }
+
+    /// A compile failure that is not a property of the bytes is reported but
+    /// never remembered, so valid code is not refused for the cache lifetime.
+    #[test]
+    fn a_transient_compile_failure_is_not_remembered() {
+        use crate::wasm_runtime::engine::compile_limits::test_support::nested_blocks;
+        let engine = WasmtimeEngine::new(&RuntimeConfig::default(), false).unwrap();
+        let code = nested_blocks(3);
+        let hash = *blake3::hash(&code).as_bytes();
+        let failing = |_: &Engine, _: &[u8]| -> wasmtime::Result<Module> {
+            Err(wasmtime::Error::msg("out of memory"))
+        };
+        let result = compile_coalesced_with(
+            &engine.engine,
+            &engine.verdicts,
+            &engine.isolation,
+            CodeKind::Contract,
+            &code,
+            &failing,
+        );
+        assert!(
+            matches!(result, Err(WasmError::Compile(_))),
+            "a failure of a valid module is a compile error, not a refusal"
+        );
+        assert!(
+            engine.verdicts.get(&hash).is_none(),
+            "a transient failure must not be remembered"
+        );
+        // The same bytes compile once the fault is gone.
+        let ok = |e: &Engine, c: &[u8]| Module::new(e, c);
+        assert!(
+            compile_coalesced_with(
+                &engine.engine,
+                &engine.verdicts,
+                &engine.isolation,
+                CodeKind::Contract,
+                &code,
+                &ok
+            )
+            .is_ok()
+        );
+    }
+
+    /// Only a module the engine finds invalid is classified as a refusal.
+    #[test]
+    fn compile_failures_are_classified_by_whether_the_module_is_invalid() {
+        use crate::wasm_runtime::engine::compile_limits::CompileRefusal;
+        let error = wasmtime::Error::msg("compile failed");
+        assert!(matches!(
+            classify_compile_failure(Err(wasmtime::Error::msg("bad function")), &error),
+            CompileFailure::Invalid(CompileRefusal::Malformed(_))
+        ));
+        assert!(matches!(
+            classify_compile_failure(Ok(()), &error),
+            CompileFailure::Other(_)
+        ));
+    }
+
+    /// The refusal text of a malformed text module is bounded whatever the input.
+    #[test]
+    fn a_huge_malformed_text_module_is_refused_with_a_small_message() {
+        let mut engine = WasmtimeEngine::new(&RuntimeConfig::default(), false).unwrap();
+        let input = format!("(module (x{}", "\t".repeat(1024 * 1024));
+        match engine.compile_contract(input.as_bytes()) {
+            Err(WasmError::CompileRefused(refusal)) => {
+                assert!(
+                    refusal.to_string().len() < 1024,
+                    "{}",
+                    refusal.to_string().len()
+                );
+            }
+            other => panic!("expected a refusal, got {:?}", other.err()),
+        }
+        let hash = *blake3::hash(input.as_bytes()).as_bytes();
+        let kept = engine
+            .verdicts
+            .get(&hash)
+            .expect("the refusal is remembered");
+        assert!(kept.to_string().len() < 1024);
+    }
+
+    /// A text module over a limit is refused after conversion through `compile`.
+    #[test]
+    fn a_text_module_over_a_limit_is_refused_by_compile() {
+        use crate::wasm_runtime::engine::compile_limits::{
+            CompileRefusal, MAX_FUNCTION_CONTROL_FRAMES, test_support::loops_text,
+        };
+        let mut engine = WasmtimeEngine::new(&RuntimeConfig::default(), false).unwrap();
+        let text = loops_text(MAX_FUNCTION_CONTROL_FRAMES as usize + 1);
+        assert!(matches!(
+            engine.compile_contract(&wat::parse_str(&text).unwrap()),
+            Err(WasmError::CompileRefused(
+                CompileRefusal::TooManyControlFrames { .. }
+            ))
+        ));
+    }
+
+    /// The offloaded compile path (multi-thread runtime, `spawn_blocking`)
+    /// refuses an over-limit module the same way, and remembers it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_over_limit_module_is_refused_on_the_offloaded_path() {
+        use crate::wasm_runtime::engine::compile_limits::{
+            CompileRefusal, test_support::nested_blocks,
+        };
+        let config = RuntimeConfig {
+            offload_compilation: true,
+            ..RuntimeConfig::default()
+        };
+        let mut engine = WasmtimeEngine::new(&config, false).unwrap();
+        assert!(engine.offload_compilation);
+        let code = nested_blocks(2_000);
+        assert!(matches!(
+            engine.compile_contract(&code),
+            Err(WasmError::CompileRefused(
+                CompileRefusal::NestingTooDeep { .. }
+            ))
+        ));
+        assert!(
+            engine
+                .verdicts
+                .get(blake3::hash(&code).as_bytes())
+                .is_some()
+        );
+    }
+
+    /// Executors built on one shared backend (the pool constructor) share one
+    /// cache: a refusal found by one is answered by the others, and each
+    /// refusal is held once however many executors there are.
+    #[test]
+    fn executors_on_a_shared_backend_share_one_verdict_cache() {
+        use crate::wasm_runtime::engine::compile_limits::{
+            CompileRefusal, test_support::nested_blocks,
+        };
+        let config = RuntimeConfig::default();
+        let backend = WasmtimeEngine::create_backend_engine(
+            &config,
+            Arc::new(crate::util::time_source::InstantTimeSrc::new()),
+        )
+        .unwrap();
+        let mut a =
+            WasmtimeEngine::new_with_shared_backend(&config, false, backend.clone()).unwrap();
+        let mut b = WasmtimeEngine::new_with_shared_backend(&config, false, backend).unwrap();
+        assert!(Arc::ptr_eq(&a.verdicts, &b.verdicts));
+        let code = nested_blocks(2_000);
+        assert!(matches!(
+            a.compile_contract(&code),
+            Err(WasmError::CompileRefused(
+                CompileRefusal::NestingTooDeep { .. }
+            ))
+        ));
+        let before = module_new_calls();
+        assert!(matches!(
+            b.compile_contract(&code),
+            Err(WasmError::CompileRefused(
+                CompileRefusal::NestingTooDeep { .. }
+            ))
+        ));
+        assert_eq!(module_new_calls(), before);
+        // A clone of an executor's backend carries the same cache.
+        assert!(Arc::ptr_eq(&a.clone_backend_engine().verdicts, &a.verdicts));
+    }
+
+    /// Remembered refusals expire on the clock the backend was built with.
+    #[test]
+    fn remembered_refusals_expire_on_the_injected_clock() {
+        use crate::util::time_source::SharedMockTimeSource;
+        use crate::wasm_runtime::engine::compile_limits::test_support::nested_blocks;
+        use crate::wasm_runtime::engine::compile_verdicts::VERDICT_TTL;
+        let config = RuntimeConfig::default();
+        let clock = SharedMockTimeSource::new();
+        let backend =
+            WasmtimeEngine::create_backend_engine(&config, Arc::new(clock.clone())).unwrap();
+        let mut engine = WasmtimeEngine::new_with_shared_backend(&config, false, backend).unwrap();
+        let code = nested_blocks(2_000);
+        let hash = *blake3::hash(&code).as_bytes();
+        assert!(engine.compile_contract(&code).is_err());
+        assert!(engine.verdicts.get(&hash).is_some());
+        clock.advance_time(VERDICT_TTL + Duration::from_secs(1));
+        assert!(
+            engine.verdicts.get(&hash).is_none(),
+            "the refusal must expire on the injected clock"
+        );
+    }
+
+    /// The engine identity that keys remembered refusals is stable for one
+    /// configuration and differs when the compiler configuration differs (the
+    /// same hash carries the wasmtime version, so a bump changes it too).
+    #[test]
+    fn the_engine_identity_follows_the_compiler_configuration() {
+        let a = RuntimeConfig::default();
+        let b = RuntimeConfig {
+            enable_metering: !a.enable_metering,
+            ..RuntimeConfig::default()
+        };
+        let id = |c: &RuntimeConfig| engine_compat_id(&WasmtimeEngine::create_engine(c).unwrap().0);
+        assert_eq!(id(&a), id(&a));
+        assert_ne!(id(&a), id(&b));
+    }
+
+    /// Text-format input is not accepted on the compile path: it is refused as
+    /// not binary before any conversion or compile, and remembered.
+    #[test]
+    fn text_format_input_is_refused_before_conversion() {
+        use crate::wasm_runtime::engine::compile_limits::CompileRefusal;
+        let mut engine = WasmtimeEngine::new(&RuntimeConfig::default(), false).unwrap();
+        let text = b"(module (func (export \"f\")))".to_vec();
+        let before = module_new_calls();
+        match engine.compile_contract(&text) {
+            Err(WasmError::CompileRefused(CompileRefusal::NotBinary(_))) => {}
+            other => panic!("expected a not-binary refusal, got {:?}", other.err()),
+        }
+        assert_eq!(module_new_calls(), before, "the compiler was called");
+        // The same module in binary form compiles.
+        let binary = wat::parse_bytes(&text).unwrap().into_owned();
+        engine
+            .compile_contract(&binary)
+            .expect("the binary form compiles");
+    }
+
+    /// The compile gate admits at most its capacity and releases a slot when a
+    /// permit is dropped.
+    #[test]
+    fn the_compile_gate_admits_only_its_capacity() {
+        let gate = CompileGate::new(2);
+        let a = gate.try_acquire().expect("first slot");
+        let b = gate.try_acquire().expect("second slot");
+        assert!(gate.try_acquire().is_none(), "a third slot was granted");
+        drop(a);
+        let c = gate.try_acquire().expect("the released slot");
+        assert!(gate.try_acquire().is_none());
+        drop((b, c));
+    }
+
+    /// A blocked `acquire` proceeds once a permit is dropped.
+    #[test]
+    fn a_waiting_compile_proceeds_when_a_permit_is_released() {
+        let gate = Arc::new(CompileGate::new(1));
+        let held = gate.try_acquire().expect("the only slot");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiter = {
+            let gate = gate.clone();
+            std::thread::spawn(move || {
+                let _permit = gate.acquire();
+                tx.send(()).unwrap();
+            })
+        };
+        assert!(
+            rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "acquire returned while the only slot was held"
+        );
+        drop(held);
+        rx.recv_timeout(Duration::from_secs(30))
+            .expect("acquire did not proceed after the release");
+        waiter.join().unwrap();
+    }
+
+    /// Many distinct modules compiled at once never run more compiles than the
+    /// node-wide gate allows.
+    #[test]
+    fn concurrent_compiles_never_exceed_the_gate() {
+        use std::sync::atomic::AtomicUsize;
+        let capacity = compile_concurrency();
+        let backend = WasmtimeEngine::new(&RuntimeConfig::default(), false).unwrap();
+        let (wt_engine, verdicts) = (backend.engine.clone(), backend.verdicts.clone());
+        let isolation = backend.isolation.clone();
+        let running = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let threads: Vec<_> = (0..(capacity * 3).max(6))
+            .map(|i| {
+                let (wt_engine, verdicts) = (wt_engine.clone(), verdicts.clone());
+                let isolation = isolation.clone();
+                let (running, peak) = (running.clone(), peak.clone());
+                std::thread::spawn(move || {
+                    // A distinct module per thread, so the compiles do not coalesce.
+                    let code = wat::parse_str(format!(
+                        "(module (func (export \"f\") (result i32) (i32.const {i})))"
+                    ))
+                    .unwrap();
+                    let result = compile_coalesced_with(
+                        &wt_engine,
+                        &verdicts,
+                        &isolation,
+                        CodeKind::Contract,
+                        &code,
+                        &|engine, code| {
+                            let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                            peak.fetch_max(now, Ordering::SeqCst);
+                            std::thread::sleep(Duration::from_millis(40));
+                            running.fetch_sub(1, Ordering::SeqCst);
+                            Module::new(engine, code)
+                        },
+                    );
+                    assert!(result.is_ok());
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        let peak = peak.load(Ordering::SeqCst);
+        assert!(peak >= 1);
+        assert!(
+            peak <= capacity,
+            "{peak} compiles ran at once, the gate allows {capacity}"
+        );
+    }
+
+    /// Compiles run on the bounded pool, not on one thread per core.
+    #[test]
+    fn compiles_run_on_the_bounded_pool() {
+        assert_eq!(
+            compile_threads(),
+            std::thread::available_parallelism()
+                .map_or(1, |n| n.get())
+                .clamp(1, 4)
+        );
+        assert_eq!(
+            run_in_compile_pool(rayon::current_num_threads).unwrap(),
+            compile_threads()
+        );
+        let backend = WasmtimeEngine::new(&RuntimeConfig::default(), false).unwrap();
+        let code = wat::parse_str("(module (func (export \"f\")))").unwrap();
+        POOL_THREADS_SEEN.store(0, Ordering::SeqCst);
+        compile_coalesced(
+            &backend.engine,
+            &backend.verdicts,
+            &backend.isolation,
+            CodeKind::Contract,
+            &code,
+        )
+        .expect("compiles");
+        assert_eq!(POOL_THREADS_SEEN.load(Ordering::SeqCst), compile_threads());
+    }
+
+    /// The capacity is a quarter of the cores, between 1 and 4.
+    #[test]
+    fn the_compile_capacity_is_a_quarter_of_the_cores_within_bounds() {
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+        assert_eq!(compile_concurrency(), (cores / 4).clamp(1, 4));
+    }
+
+    /// Every proposal the scan refuses is refused by the engine itself too, so
+    /// the engine's feature set cannot drift wider than the scan's.
+    #[test]
+    fn the_engine_refuses_the_proposals_the_scan_refuses() {
+        let config = RuntimeConfig::default();
+        let (engine, _, _) = WasmtimeEngine::create_engine(&config).unwrap();
+        for (name, text) in [
+            (
+                "tail calls",
+                "(module (func $g) (func (export \"f\") (return_call $g)))",
+            ),
+            (
+                "exceptions",
+                "(module (func (export \"f\") (try_table (nop))))",
+            ),
+            (
+                "GC",
+                "(module (type $s (struct (field i32))) (func (export \"f\") (drop (struct.new_default $s))))",
+            ),
+            (
+                "function references",
+                "(module (type $t (func)) (func $g) (elem declare func $g) (func (export \"f\") (call_ref $t (ref.func $g))))",
+            ),
+            (
+                "threads",
+                "(module (memory 1 1 shared) (func (export \"f\") (drop (i32.atomic.load (i32.const 0)))))",
+            ),
+            ("64-bit memory", "(module (memory i64 1))"),
+            ("multiple memories", "(module (memory 1) (memory 1))"),
+            (
+                "relaxed SIMD",
+                "(module (func (export \"f\") (param v128) (result v128) (i8x16.relaxed_swizzle (local.get 0) (local.get 0))))",
+            ),
+            (
+                "wide arithmetic",
+                "(module (func (export \"f\") (param i64 i64) (result i64 i64) (i64.add128 (local.get 0) (local.get 1) (local.get 0) (local.get 1))))",
+            ),
+            (
+                "extended constants",
+                "(module (global i32 (i32.add (i32.const 1) (i32.const 2))))",
+            ),
+        ] {
+            let binary = wat::parse_str(text).unwrap();
+            assert!(
+                Module::validate(&engine, &binary).is_err(),
+                "{name}: the engine accepts a proposal the scan refuses"
+            );
+        }
+    }
+
+    /// Modules shipped or built in this tree scan clean and compile on the
+    /// production engine, so the limits cannot lock out the node's own
+    /// contracts.
+    #[test]
+    fn in_tree_modules_scan_and_compile() {
+        use crate::wasm_runtime::engine::compile_limits::check_module;
+        let mut engine = WasmtimeEngine::new(&RuntimeConfig::default(), false).unwrap();
+        let website: &[u8] = include_bytes!("../../../../fdev/resources/website_contract.wasm");
+        let test_contract = crate::wasm_runtime::tests::get_test_module("test_contract_1").unwrap();
+        for (name, code) in [
+            ("website_contract", website),
+            ("test_contract_1", &test_contract[..]),
+        ] {
+            check_module(code).unwrap_or_else(|e| panic!("{name}: {e}"));
+            engine
+                .compile(code)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+        }
     }
 
     #[test]
@@ -3021,8 +4713,13 @@ mod tests {
             enable_metering: false,
             ..RuntimeConfig::default()
         };
-        let engine = WasmtimeEngine::create_backend_engine(&config).unwrap();
-        let module = Module::new(&engine, INFINITE_LOOP_WAT.as_bytes())
+        let engine = WasmtimeEngine::create_backend_engine(
+            &config,
+            Arc::new(crate::util::time_source::InstantTimeSrc::new()),
+        )
+        .unwrap()
+        .engine;
+        let module = Module::new(&engine, wat::parse_str(INFINITE_LOOP_WAT).unwrap())
             .expect("infinite-loop WAT must compile");
 
         let mut store = Store::new(&engine, HostState::new(DEFAULT_MAX_MEMORY_PAGES));
@@ -3137,7 +4834,8 @@ mod tests {
         // exports that `create_instance` requires of a real contract.
         let store = engine.store.as_mut().expect("engine store present");
         let eng = store.engine().clone();
-        let module = Module::new(&eng, INFINITE_LOOP_WAT.as_bytes()).expect("WAT must compile");
+        let module = Module::new(&eng, wat::parse_str(INFINITE_LOOP_WAT).unwrap())
+            .expect("WAT must compile");
         let instance = block_on_async(Linker::new(&eng).instantiate_async(&mut *store, &module))
             .expect("instantiation must succeed");
         engine.instances.insert(id, instance);
@@ -3232,7 +4930,8 @@ mod tests {
         const ID: i64 = i64::MAX - 54805;
         let store = engine.store.as_mut().expect("engine store present");
         let eng = store.engine().clone();
-        let module = Module::new(&eng, HOST_PANIC_WAT.as_bytes()).expect("WAT must compile");
+        let module =
+            Module::new(&eng, wat::parse_str(HOST_PANIC_WAT).unwrap()).expect("WAT must compile");
         let mut linker: Linker<HostState> = Linker::new(&eng);
         // A named fn, not a closure: a closure whose body diverges infers `!`
         // as its return type, and wasmtime's `IntoFunc` has no `WasmTy` impl for
@@ -3273,13 +4972,35 @@ mod tests {
     /// `freenet_test.boom`, which panics (a stand-in for any host-side panic).
     fn test_host_linker(engine: &Engine) -> Linker<HostState> {
         // Named fns for the reason given in `delegate_entry_captures_host_panic`.
+        // Spends the whole host-call cap at once, without sleeping: the waiter
+        // sees exactly `cap` of host time, below its cap + 50 ms bound, so no
+        // timing decides between the trap, the backstop and a normal return.
+        fn spend_cap(caller: Caller<'_, HostState>) {
+            let mut inner = caller.data().meter.lock();
+            let cap = inner.cap;
+            inner.host_total += cap;
+        }
         fn nap(_: Caller<'_, HostState>) {
             std::thread::sleep(NAP)
         }
         fn boom(_: Caller<'_, HostState>) {
             panic!("deliberate host-function panic (allocator / instance-setup test)");
         }
+        // A METERED host function, as every real one is: sleeps `ms`.
+        // Refuses, like the real blocking host functions, once the cap is spent.
+        fn nap_ms(mut caller: Caller<'_, HostState>, ms: i32) {
+            let Ok(_host_call) = HostCallGuard::enter(&mut caller) else {
+                return;
+            };
+            std::thread::sleep(Duration::from_millis(ms as u64))
+        }
         let mut linker: Linker<HostState> = Linker::new(engine);
+        linker
+            .func_wrap("freenet_test", "spend_cap", spend_cap)
+            .expect("registering spend_cap must succeed");
+        linker
+            .func_wrap("freenet_test", "nap_ms", nap_ms)
+            .expect("registering nap_ms must succeed");
         linker
             .func_wrap("freenet_test", "nap", nap)
             .expect("registering nap must succeed");
@@ -3308,7 +5029,7 @@ mod tests {
     fn insert_raw_instance(engine: &mut WasmtimeEngine, id: i64, wat: &str) {
         let store = engine.store.as_mut().expect("engine store present");
         let eng = store.engine().clone();
-        let module = Module::new(&eng, wat.as_bytes()).expect("WAT must compile");
+        let module = Module::new(&eng, wat::parse_str(wat).unwrap()).expect("WAT must compile");
         let instance =
             block_on_async(test_host_linker(&eng).instantiate_async(&mut *store, &module))
                 .expect("instantiation must succeed");
@@ -3479,7 +5200,9 @@ mod tests {
     /// Drive `create_instance` on `wat` and return the error, failing if it
     /// succeeded.
     fn create_instance_err(engine: &mut WasmtimeEngine, wat: &str) -> (WasmError, Duration) {
-        let module = engine.compile(wat.as_bytes()).expect("WAT must compile");
+        let module = engine
+            .compile(&wat::parse_str(wat).unwrap())
+            .expect("WAT must compile");
         let start = std::time::Instant::now();
         let result = engine.create_instance(&module, 0);
         let elapsed = start.elapsed();
@@ -3623,7 +5346,7 @@ mod tests {
             let budget = NAP.as_secs_f64() / 0.6;
             let mut engine = engine_with_test_host(budget, epoch_deadline_ticks(budget));
             let module = engine
-                .compile(SETUP_ONE_NAP_EACH_WAT.as_bytes())
+                .compile(&wat::parse_str(SETUP_ONE_NAP_EACH_WAT).unwrap())
                 .expect("WAT must compile");
             match engine.create_instance(&module, 0) {
                 Ok(handle) => engine.drop_instance(&handle),
@@ -3783,7 +5506,7 @@ mod tests {
         };
         let mut engine = WasmtimeEngine::new(&config, false).expect("engine creation");
         let module = engine
-            .compile(START_LOOP_WAT.as_bytes())
+            .compile(&wat::parse_str(START_LOOP_WAT).unwrap())
             .expect("compile start-loop module");
 
         let start = std::time::Instant::now();
@@ -4086,6 +5809,7 @@ mod tests {
         let budget = WallBounds {
             queue: Duration::from_millis(100),
             guest: Duration::from_millis(100),
+            host_cap: Duration::from_secs(60),
         };
 
         // Not started, under the queue bound → keep waiting.
@@ -4175,6 +5899,7 @@ mod tests {
         let bounds = WallBounds {
             queue: ms(100),
             guest: ms(170),
+            host_cap: Duration::from_secs(60),
         };
         let starts = [
             None,
@@ -4235,7 +5960,7 @@ mod tests {
         for started in [None, Some(Duration::ZERO)] {
             let (tx, rx) = std::sync::mpsc::sync_channel::<WasmResult>(1);
             tx.send((Ok(5), stub_store())).expect("receiver alive");
-            let outcome = wait_for_guest(&rx, long_ago, bounds, &|| started);
+            let outcome = wait_for_guest(&rx, long_ago, bounds, &|| started, &|| Duration::ZERO);
             assert!(
                 matches!(outcome, GuestWait::Done((Ok(5), _))),
                 "a waiting result must win the deadline (started {started:?})"
@@ -4245,11 +5970,13 @@ mod tests {
         // No result: the bound decides, by whether the guest started.
         let (_tx, rx) = std::sync::mpsc::sync_channel::<WasmResult>(1);
         assert!(matches!(
-            wait_for_guest(&rx, long_ago, bounds, &|| None),
+            wait_for_guest(&rx, long_ago, bounds, &|| None, &|| Duration::ZERO),
             GuestWait::QueuedTooLong
         ));
         assert!(matches!(
-            wait_for_guest(&rx, long_ago, bounds, &|| Some(Duration::ZERO)),
+            wait_for_guest(&rx, long_ago, bounds, &|| Some(Duration::ZERO), &|| {
+                Duration::ZERO
+            }),
             GuestWait::GuestOverran
         ));
 
@@ -4257,9 +5984,441 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::sync_channel::<WasmResult>(1);
         drop(tx);
         assert!(matches!(
-            wait_for_guest(&rx, long_ago, bounds, &|| None),
+            wait_for_guest(&rx, long_ago, bounds, &|| None, &|| Duration::ZERO),
             GuestWait::Ended
         ));
+    }
+
+    // -------------------------------------------------------------------------
+    // river#1017: host-call time is not guest time, and is capped separately.
+    // -------------------------------------------------------------------------
+
+    /// Allocator that makes `calls` blocking host calls of `ms` each, with a
+    /// short guest function call after each. The call is what gives an epoch
+    /// check that sees a deadline moved by a host function: wasmtime caches the
+    /// deadline in a register per wasm frame and reloads it at function entry,
+    /// not at a loop back-edge in the same frame. A real delegate calls
+    /// functions between host calls.
+    fn host_calls_wat(calls: u32, ms: u32) -> String {
+        format!(
+            r#"(module
+              (import "freenet_test" "nap_ms" (func $nap (param i32)))
+              (func $work (local $i i32)
+                (local.set $i (i32.const 20000))
+                (loop $spin
+                  (local.set $i (i32.sub (local.get $i) (i32.const 1)))
+                  (br_if $spin (local.get $i))))
+              (func (export "__frnt__initiate_buffer") (param i32) (result i64)
+                (local $n i32)
+                (loop $calls
+                  (call $nap (i32.const {ms}))
+                  (call $work)
+                  (local.set $n (i32.add (local.get $n) (i32.const 1)))
+                  (br_if $calls (i32.lt_u (local.get $n) (i32.const {calls}))))
+                (i64.const 7)))"#
+        )
+    }
+
+    /// Guest that never makes a host call and never returns.
+    const ALLOCATOR_PURE_SPIN_WAT: &str = r#"
+        (module
+          (func (export "__frnt__initiate_buffer") (param i32) (result i64)
+            (loop (br 0))
+            (i64.const 0)))
+    "#;
+
+    /// Budget 1.0 s (cap 1.5 s). Two 600 ms BLOCKING host calls take 1.2 s of
+    /// wall time, past the budget but 300 ms inside the cap: this must SUCCEED.
+    /// Before river#1017 the epoch deadline was wall-clock and trapped the guest
+    /// at its first epoch check after the budget, however it had spent the time.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn host_call_time_is_not_charged_to_the_guest_budget() {
+        let mut engine = engine_with_test_host(1.0, epoch_deadline_ticks(1.0));
+        const ID: i64 = i64::MAX - 54820;
+        insert_raw_instance(&mut engine, ID, &host_calls_wat(2, 600));
+
+        let start = std::time::Instant::now();
+        let result = engine.initiate_buffer(&InstanceHandle { id: ID }, 16);
+        let elapsed = start.elapsed();
+        assert!(
+            matches!(result, Ok(7)),
+            "1.2 s inside host calls must not exhaust a 1.0 s guest budget \
+             (cap 1.5 s); got {result:?} after {elapsed:?}"
+        );
+        assert!(elapsed >= Duration::from_millis(1200), "ran {elapsed:?}");
+        let snap = engine.store.as_ref().unwrap().data().meter.snapshot();
+        assert_eq!(snap.host_calls, 2);
+        assert!(snap.host_time >= Duration::from_millis(1200));
+    }
+
+    /// A guest that burns CPU with no host calls still times out at its budget,
+    /// by the epoch trap (the store survives), and the cause is the guest budget.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn guest_cpu_loop_still_times_out_at_the_guest_budget() {
+        let mut engine = engine_with_test_host(0.3, epoch_deadline_ticks(0.3));
+        const ID: i64 = i64::MAX - 54821;
+        insert_raw_instance(&mut engine, ID, ALLOCATOR_PURE_SPIN_WAT);
+        let meter = Arc::clone(&engine.store.as_ref().unwrap().data().meter);
+
+        let start = std::time::Instant::now();
+        let result = engine.initiate_buffer(&InstanceHandle { id: ID }, 16);
+        let elapsed = start.elapsed();
+        assert!(
+            matches!(result, Err(WasmError::Timeout)),
+            "a CPU loop must time out, got {result:?}"
+        );
+        assert!(elapsed < Duration::from_secs(2), "took {elapsed:?}");
+        assert_eq!(meter.snapshot().fired, Some(TimeoutCause::GuestBudget));
+    }
+
+    /// Host time followed by a CPU loop: the guest keeps only the budget it has
+    /// not used, and is ended by the epoch TRAP (store and instance kept), not
+    /// by the backstop. The extension must land inside the backstop's window
+    /// (codex P2: `ceil(rem/T) + 1` could land two ticks past it).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn host_call_then_cpu_loop_is_trapped_not_abandoned() {
+        const WAT: &str = r#"
+            (module
+              (import "freenet_test" "nap_ms" (func $nap (param i32)))
+              (func (export "__frnt__initiate_buffer") (param i32) (result i64)
+                (call $nap (i32.const 200))
+                (loop (br 0))
+                (i64.const 0)))
+        "#;
+        let mut engine = engine_with_test_host(0.3, epoch_deadline_ticks(0.3));
+        const ID: i64 = i64::MAX - 54824;
+        insert_raw_instance(&mut engine, ID, WAT);
+        let meter = Arc::clone(&engine.store.as_ref().unwrap().data().meter);
+
+        let result = engine.initiate_buffer(&InstanceHandle { id: ID }, 16);
+        assert!(matches!(result, Err(WasmError::Timeout)), "got {result:?}");
+        assert_eq!(meter.snapshot().fired, Some(TimeoutCause::GuestBudget));
+        assert!(
+            engine.instances.contains_key(&ID),
+            "the epoch trap must keep the store; the backstop would have \
+             replaced it and dropped the instance"
+        );
+    }
+
+    /// CPU-bound host functions (here the UNMETERED `nap`, standing in for
+    /// `rand_bytes` over a whole memory, context copies, ...) stay charged to the
+    /// guest budget: the guest cannot hide CPU inside them (review F1).
+    #[test]
+    fn cpu_bound_host_time_is_charged_to_the_guest_budget() {
+        run_abandoning_guest_test(|| {
+            let mut engine = engine_with_test_host(0.3, epoch_deadline_ticks(0.3));
+            const ID: i64 = i64::MAX - 54825;
+            insert_raw_instance(&mut engine, ID, ALLOCATOR_SLOW_HOST_CALLS_WAT);
+            let meter = Arc::clone(&engine.store.as_ref().unwrap().data().meter);
+
+            let start = std::time::Instant::now();
+            let result = engine.initiate_buffer(&InstanceHandle { id: ID }, 16);
+            let elapsed = start.elapsed();
+            assert!(matches!(result, Err(WasmError::Timeout)), "got {result:?}");
+            assert!(elapsed < Duration::from_secs(1), "took {elapsed:?}");
+            let snap = meter.snapshot();
+            assert_eq!(snap.fired, Some(TimeoutCause::GuestBudget));
+            assert_eq!(snap.host_calls, 0, "an unmetered call must not be metered");
+        });
+    }
+
+    /// Host-call time past the cap times out, however the guest budget stands:
+    /// total wall time per execution stays bounded (budget + cap + slack). The
+    /// guest here spends almost none of its budget (cap 0.45 s, calls of 20 ms).
+    /// The cause is asserted, not which mechanism ended it: the deterministic
+    /// trap-path test is `host_call_over_the_cap_is_refused_and_trapped`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn host_call_time_over_the_cap_times_out() {
+        let mut engine = engine_with_test_host(0.3, epoch_deadline_ticks(0.3));
+        const ID: i64 = i64::MAX - 54822;
+        // 1000 x 20 ms = 20 s if left alone.
+        insert_raw_instance(&mut engine, ID, &host_calls_wat(1000, 20));
+        let meter = Arc::clone(&engine.store.as_ref().unwrap().data().meter);
+
+        let start = std::time::Instant::now();
+        let result = engine.initiate_buffer(&InstanceHandle { id: ID }, 16);
+        let elapsed = start.elapsed();
+        assert!(
+            matches!(result, Err(WasmError::Timeout)),
+            "host-call time over the cap must time out, got {result:?}"
+        );
+        // cap = 1.5 x 0.3 s = 0.45 s; allow budget + cap + generous slack.
+        assert!(
+            elapsed >= Duration::from_millis(450) && elapsed < Duration::from_secs(5),
+            "took {elapsed:?}"
+        );
+        assert_eq!(meter.snapshot().fired, Some(TimeoutCause::HostCallCap));
+    }
+
+    /// Drives the guest DIRECTLY (no waiter, so no backstop to race): once the
+    /// cap is spent, `HostCallGuard::enter` refuses the next blocking host call
+    /// WITHOUT running it (review F4) and the guest is trapped at its next epoch
+    /// check, with the store kept.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn host_call_over_the_cap_is_refused_and_trapped() {
+        const WAT: &str = r#"
+            (module
+              (import "freenet_test" "nap_ms" (func $nap (param i32)))
+              (func (export "__frnt__initiate_buffer") (param i32) (result i64)
+                (call $nap (i32.const 150))
+                (call $nap (i32.const 10))
+                (loop (call $work) (br 0))
+                (i64.const 0))
+              (func $work))
+        "#;
+        let mut engine = engine_with_test_host(5.0, epoch_deadline_ticks(5.0));
+        const ID: i64 = i64::MAX - 54826;
+        insert_raw_instance(&mut engine, ID, WAT);
+        let store = engine.store.as_mut().expect("store");
+        let meter = Arc::clone(&store.data().meter);
+        meter.reset(Duration::from_millis(100));
+        let func = engine
+            .instances
+            .get(&ID)
+            .expect("instance")
+            .get_typed_func::<u32, i64>(&mut *store, "__frnt__initiate_buffer")
+            .expect("export");
+        arm_epoch_deadline(store, epoch_deadline_ticks(5.0), Some(ID));
+
+        let err = block_on_async(func.call_async(&mut *store, 16))
+            .expect_err("a guest over its host-call cap must be trapped");
+        assert!(is_epoch_interrupt(&err), "got {err:?}");
+        let snap = meter.snapshot();
+        assert_eq!(snap.fired, Some(TimeoutCause::HostCallCap));
+        assert_eq!(
+            snap.host_calls, 1,
+            "the over-cap call must be refused, not run"
+        );
+    }
+
+    /// A guest that keeps going after its blocking host calls were REFUSED (cap
+    /// spent) and then RETURNS NORMALLY must still be a timeout, not a result:
+    /// the refusals read as "absent" to the stdlib, so anything it computed or
+    /// sent after them is built on false answers. The guest stays in one wasm
+    /// frame, so it is not trapped before it returns.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn guest_returning_after_a_refused_host_call_is_a_timeout() {
+        const WAT: &str = r#"
+            (module
+              (import "freenet_test" "spend_cap" (func $spend))
+              (import "freenet_test" "nap_ms" (func $nap (param i32)))
+              (func (export "__frnt__initiate_buffer") (param i32) (result i64)
+                (call $spend)
+                (call $nap (i32.const 1))
+                (i64.const 7)))
+        "#;
+        // `spend_cap` uses the whole cap with no sleeping, so the next blocking
+        // call is refused and the guest returns 7 within microseconds, in one
+        // frame (no trap). The waiter sees host time == cap, under its
+        // cap + 50 ms bound, and the 1 s guest budget is nowhere near: nothing
+        // but the Ok-result check can turn this into a timeout.
+        let mut engine = engine_with_test_host(1.0, epoch_deadline_ticks(1.0));
+        const ID: i64 = i64::MAX - 54827;
+        insert_raw_instance(&mut engine, ID, WAT);
+        let meter = Arc::clone(&engine.store.as_ref().unwrap().data().meter);
+
+        let result = engine.initiate_buffer(&InstanceHandle { id: ID }, 16);
+        assert!(
+            matches!(result, Err(WasmError::Timeout)),
+            "a guest that returned after refused host calls must be a timeout, got {result:?}"
+        );
+        let snap = meter.snapshot();
+        assert_eq!(snap.fired, Some(TimeoutCause::HostCallCap));
+        assert_eq!(snap.host_calls, 0, "the refused call must not have run");
+        // Converted from a normal return, so the store is kept; the backstop
+        // would have replaced it.
+        assert!(engine.instances.contains_key(&ID));
+    }
+
+    /// A single host call that outlives the cap cannot be trapped; the backstop
+    /// reports it at the cap, with the host-call cause. (For a DELEGATE host
+    /// function this does not free the executor: see the note in
+    /// `WallBounds::for_entries`.)
+    #[test]
+    fn a_stuck_host_call_is_reported_by_the_backstop_at_the_cap() {
+        run_abandoning_guest_test(|| {
+            let mut engine = engine_with_test_host(0.3, epoch_deadline_ticks(0.3));
+            const ID: i64 = i64::MAX - 54823;
+            insert_raw_instance(&mut engine, ID, &host_calls_wat(1, 4000));
+            let meter = Arc::clone(&engine.store.as_ref().unwrap().data().meter);
+
+            let start = std::time::Instant::now();
+            let result = engine.initiate_buffer(&InstanceHandle { id: ID }, 16);
+            let elapsed = start.elapsed();
+            assert!(
+                matches!(result, Err(WasmError::Timeout)),
+                "got {result:?} after {elapsed:?}"
+            );
+            assert!(elapsed < Duration::from_secs(3), "took {elapsed:?}");
+            assert_eq!(meter.snapshot().fired, Some(TimeoutCause::HostCallCap));
+            assert_engine_still_usable(&mut engine, "a host-cap timeout");
+        });
+    }
+
+    /// The waiter discounts host time from the guest bound (including a call in
+    /// flight) and enforces the cap on host time itself. Deterministic: every
+    /// result is already in the channel and every bound is far from the clock.
+    #[test]
+    fn wait_for_guest_discounts_host_time_and_bounds_it() {
+        let long_ago = std::time::Instant::now()
+            .checked_sub(Duration::from_secs(60))
+            .expect("the monotonic clock is more than 60 s past its origin");
+        let bounds = WallBounds {
+            queue: Duration::from_secs(10),
+            guest: Duration::from_secs(10),
+            host_cap: Duration::from_secs(120),
+        };
+        // 60 s of wall time, all of it host time: guest time ~0 of a 10 s bound,
+        // so the waiter keeps waiting and returns the result sent later. (With
+        // the host time not discounted it would return `GuestOverran` at once.)
+        // The payload is built before the thread starts, so the send is quick
+        // whatever the load.
+        let (tx, rx) = std::sync::mpsc::sync_channel::<WasmResult>(1);
+        let payload = (Ok(1), stub_store());
+        let sender = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            tx.send(payload).expect("receiver alive");
+        });
+        let outcome = wait_for_guest(&rx, long_ago, bounds, &|| Some(Duration::ZERO), &|| {
+            Duration::from_secs(60)
+        });
+        sender.join().expect("sender");
+        assert!(
+            matches!(outcome, GuestWait::Done((Ok(1), _))),
+            "host time must be discounted"
+        );
+        // The same 60 s of wall time with NO host time is an overrun.
+        let (_tx, rx) = std::sync::mpsc::sync_channel::<WasmResult>(1);
+        assert!(matches!(
+            wait_for_guest(&rx, long_ago, bounds, &|| Some(Duration::ZERO), &|| {
+                Duration::ZERO
+            }),
+            GuestWait::GuestOverran
+        ));
+        // Host time at the cap is its own verdict.
+        assert!(matches!(
+            wait_for_guest(&rx, long_ago, bounds, &|| Some(Duration::ZERO), &|| {
+                Duration::from_secs(120)
+            }),
+            GuestWait::HostCapOverran
+        ));
+    }
+
+    /// `on_deadline`: extend by the guest budget not yet used; trap when the
+    /// guest budget or the host cap is spent. Time is injected, so nothing here
+    /// depends on the scheduler.
+    #[test]
+    fn deadline_callback_extends_for_host_time_and_traps_on_either_limit() {
+        let ms = Duration::from_millis;
+        let base = Instant::now();
+        let is_interrupt =
+            |u: wasmtime::UpdateDeadline| matches!(u, wasmtime::UpdateDeadline::Interrupt);
+        let continue_ticks = |u: wasmtime::UpdateDeadline| {
+            let wasmtime::UpdateDeadline::Continue(t) = u else {
+                panic!("expected the deadline to be extended");
+            };
+            t
+        };
+
+        // 150 ms of wall time, all in a completed host call: guest budget
+        // untouched (100 ms left of 100), extend by exactly one tick.
+        let meter = HostCallMeter::new(ms(1000));
+        meter.reset(ms(1000));
+        meter.arm_at(base, ms(100));
+        meter.lock().host_total = ms(150);
+        assert_eq!(continue_ticks(meter.on_deadline_at(base + ms(150))), 1);
+        // 250 ms of budget left rounds UP to 3 ticks, with no extra phase tick.
+        let meter2 = HostCallMeter::new(ms(1000));
+        meter2.reset(ms(1000));
+        meter2.arm_at(base, ms(250));
+        assert_eq!(continue_ticks(meter2.on_deadline_at(base)), 3);
+        // The guest then burns its budget outside host calls: trap, guest cause.
+        assert!(is_interrupt(meter.on_deadline_at(base + ms(270))));
+        assert_eq!(meter.snapshot().fired, Some(TimeoutCause::GuestBudget));
+
+        // Host time past the cap traps with the host cause, budget unspent.
+        let meter = HostCallMeter::new(ms(100));
+        meter.reset(ms(100));
+        meter.arm_at(base, ms(10_000));
+        meter.lock().host_total = ms(150);
+        assert!(meter.over_cap());
+        assert!(is_interrupt(meter.on_deadline_at(base + ms(150))));
+        assert_eq!(meter.snapshot().fired, Some(TimeoutCause::HostCallCap));
+
+        // A later guest entry (re-arm) starts its cap afresh within one job.
+        meter.arm_at(base + ms(200), ms(10_000));
+        assert!(!meter.over_cap());
+    }
+
+    /// Host-function metering matches each function's class (review F1): the
+    /// ones that BLOCK on I/O or a lock (secret store, contract-state reads,
+    /// delegate creation) are metered, with the over-cap refusal; the CPU-bound
+    /// ones (log, rand, time, context copies, `fill_buffer`) are not, so their
+    /// time stays charged to the guest. And no host function is registered
+    /// outside `register_host_functions`, where this pin could not see it.
+    /// FALSIFY: add or remove a `metered!` line, or register a function on a
+    /// linker elsewhere in production code.
+    #[test]
+    fn host_function_metering_matches_its_class() {
+        let src = include_str!("wasmtime_engine.rs");
+        let body = scrape_body(src, "fn register_host_functions(");
+        let (mut metered, mut cpu_bound) = (0, 0);
+        for block in body.split(".func_wrap").skip(1) {
+            let name = block
+                .split('"')
+                .find(|s| s.starts_with("__frnt"))
+                .unwrap_or("<unnamed>");
+            let code: String = block
+                .lines()
+                .map(|l| l.split_once("//").map_or(l, |(c, _)| c))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let blocks_on_io = [
+                "freenet_delegate_secrets",
+                "freenet_delegate_contracts",
+                "freenet_delegate_management",
+            ]
+            .iter()
+            .any(|ns| code.contains(&format!("\"{ns}\"")));
+            let squashed: String = code.split_whitespace().collect();
+            if blocks_on_io {
+                metered += 1;
+                assert!(
+                    squashed.contains("metered!(&mutcaller,")
+                        || squashed.contains("HostCallGuard::enter(&mutcaller).ok()"),
+                    "blocking host function {name} must be metered and must refuse \
+                     once the host-call cap is spent"
+                );
+            } else {
+                cpu_bound += 1;
+                assert!(
+                    !code.contains("metered!") && !code.contains("HostCallGuard"),
+                    "CPU-bound host function {name} must not be metered: its time \
+                     is CPU the guest uses, and stays charged to the guest budget"
+                );
+            }
+        }
+        assert!(
+            metered >= 10,
+            "found only {metered} blocking host functions"
+        );
+        assert!(
+            cpu_bound >= 7,
+            "found only {cpu_bound} CPU-bound host functions"
+        );
+
+        // Registered only here: every `.func_wrap` before the tests module is
+        // inside `register_host_functions`.
+        let production = src.split("\n#[cfg(test)]\nmod tests").next().unwrap();
+        let count = |text: &str| {
+            text.matches(".func_wrap(").count() + text.matches(".func_wrap_async(").count()
+        };
+        assert_eq!(
+            count(production),
+            count(body),
+            "a host function is registered outside `register_host_functions`, \
+             where its metering class is not checked"
+        );
     }
 
     // -------------------------------------------------------------------------
@@ -4299,7 +6458,7 @@ mod tests {
                 (Ok(42), store)
             };
             let start = std::time::Instant::now();
-            let BlockingResult::Ok(42, s) = execute_wasm_blocking(job, 5.0) else {
+            let BlockingResult::Ok(42, s) = execute_wasm_blocking(job, 5.0, None) else {
                 panic!("a short job must come back Ok(42)");
             };
             store = s;
@@ -4404,6 +6563,7 @@ mod tests {
                     (Ok(0), store)
                 },
                 0.2,
+                None,
             );
             let elapsed = start.elapsed();
             assert!(
@@ -4439,6 +6599,7 @@ mod tests {
                     (Ok(7), store)
                 },
                 0.3,
+                None,
             );
             assert!(
                 matches!(result, BlockingResult::Ok(7, _)),
@@ -4461,6 +6622,7 @@ mod tests {
                     (Ok(0), store)
                 },
                 0.15,
+                None,
             );
             let elapsed = start.elapsed();
             assert!(
@@ -4485,6 +6647,7 @@ mod tests {
                 (Ok(0), store)
             },
             0.15,
+            None,
         );
         let elapsed = start.elapsed();
         assert!(matches!(result, BlockingResult::Timeout));
@@ -4511,6 +6674,7 @@ mod tests {
                         panic!("stub job panic")
                     },
                     5.0,
+                    None,
                 )
             })
             .await
@@ -4525,6 +6689,7 @@ mod tests {
                 panic!("stub job panic (no runtime)")
             },
             5.0,
+            None,
         );
         assert!(matches!(no_runtime, BlockingResult::Panic(_)));
     }
@@ -4546,6 +6711,7 @@ mod tests {
                 (Ok(3), store)
             },
             0.1,
+            None,
         );
         assert!(matches!(result, BlockingResult::Ok(3, _)));
     }
@@ -4576,6 +6742,7 @@ mod tests {
                     (Ok(1), store)
                 },
                 5.0,
+                None,
             );
             assert!(matches!(result, BlockingResult::Ok(1, _)));
             dropped.load(Ordering::SeqCst)
@@ -4623,6 +6790,7 @@ mod tests {
                         (Ok(0), store)
                     },
                     0.2,
+                    None,
                 );
                 (result, start.elapsed())
             })
@@ -4674,6 +6842,7 @@ mod tests {
                         (Ok(7), store)
                     },
                     0.3,
+                    None,
                 )
             })
             .await
@@ -4721,7 +6890,8 @@ mod tests {
             let id: i64 = i64::MAX - 54806;
             let store = engine.store.as_mut().expect("engine store present");
             let eng = store.engine().clone();
-            let module = Module::new(&eng, INFINITE_LOOP_WAT.as_bytes()).expect("WAT must compile");
+            let module = Module::new(&eng, wat::parse_str(INFINITE_LOOP_WAT).unwrap())
+                .expect("WAT must compile");
             let instance =
                 block_on_async(Linker::new(&eng).instantiate_async(&mut *store, &module))
                     .expect("instantiation must succeed");
@@ -4952,10 +7122,10 @@ mod tests {
     fn compile_honors_offload_gate_in_source() {
         let src = include_str!("wasmtime_engine.rs");
         let body = src
-            .split("fn compile(&mut self, code: &[u8]) -> Result<Module, WasmError> {")
+            .split("fn compile_kind(&mut self, code: &[u8], kind: CodeKind) -> Result<Module, WasmError> {")
             .nth(1)
             .expect("compile must exist")
-            .split("\n    fn module_compiled_size(")
+            .split("\n}\n\nimpl WasmEngine for WasmtimeEngine")
             .next()
             .expect("end of compile");
         assert!(
@@ -4973,7 +7143,7 @@ mod tests {
 
         // And the offload helper actually uses spawn_blocking.
         let offload_body = src
-            .split("fn compile_offloaded(engine: Engine, code: Vec<u8>)")
+            .split("fn compile_offloaded(")
             .nth(1)
             .expect("compile_offloaded must exist")
             .split("\nfn compiled_module_size(")
@@ -5006,7 +7176,7 @@ mod tests {
         // signature and the next fn restricts the scrape to production code.
         let src = include_str!("wasmtime_engine.rs");
         let after_sig = src
-            .split("fn create_backend_engine(config: &RuntimeConfig) -> Result<Engine, ContractError> {")
+            .split("fn create_backend_engine(\n        config: &RuntimeConfig,\n        time: DynTimeSource,\n    ) -> Result<SharedBackend, ContractError> {")
             .nth(1)
             .expect("create_backend_engine must exist");
         // Truncate at the NEXT function so the scrape sees only production code,
@@ -5180,7 +7350,8 @@ mod tests {
         let mut linker = Linker::new(&engine);
         WasmtimeEngine::register_host_functions(&mut linker).expect("host function registration");
 
-        let module = Module::new(&engine, wat).expect("WAT compilation failed");
+        let module =
+            Module::new(&engine, wat::parse_str(wat).unwrap()).expect("WAT compilation failed");
         let mut store = Store::new(&engine, HostState::new(DEFAULT_MAX_MEMORY_PAGES));
 
         let result = block_on_async(linker.instantiate_async(&mut store, &module));
@@ -5205,7 +7376,7 @@ mod tests {
           (func (export "answer") (result i32) i32.const 42)
         )
         "#;
-        let module = Module::new(&engine, wat).unwrap();
+        let module = Module::new(&engine, wat::parse_str(wat).unwrap()).unwrap();
         let mut store = Store::new(&engine, HostState::new(DEFAULT_MAX_MEMORY_PAGES));
         let linker = Linker::new(&engine);
         let instance = block_on_async(linker.instantiate_async(&mut store, &module)).unwrap();
@@ -5360,7 +7531,7 @@ mod tests {
             call $local_state_len))
         "#;
 
-        let module = engine.compile(wat.as_bytes()).unwrap();
+        let module = engine.compile(&wat::parse_str(wat).unwrap()).unwrap();
         let handle = engine
             .create_instance(&module, 1024)
             .expect("create instance");
@@ -5416,11 +7587,11 @@ mod tests {
 
         let control = engine
             .compile(
-                module_importing(
+                &wat::parse_str(module_importing(
                     "__frnt__delegate__get_contract_state",
                     "(param i64 i32 i64 i64) (result i64)",
-                )
-                .as_bytes(),
+                ))
+                .unwrap(),
             )
             .unwrap();
         let handle = engine
@@ -5443,7 +7614,7 @@ mod tests {
             ),
         ] {
             let module = engine
-                .compile(module_importing(name, sig).as_bytes())
+                .compile(&wat::parse_str(module_importing(name, sig)).unwrap())
                 .unwrap();
             let result = engine.create_instance(&module, 1024);
             if let Ok(handle) = &result {
@@ -5571,7 +7742,7 @@ mod tests {
             i64.const 0))
         "#;
 
-        let module = engine.compile(wat.as_bytes()).unwrap();
+        let module = engine.compile(&wat::parse_str(wat).unwrap()).unwrap();
         let handle = engine
             .create_instance(&module, 1024)
             .expect("create instance");
@@ -5724,7 +7895,7 @@ mod tests {
             i64.const 0)
           (func (export "__frnt_set_id") (param i64)))
         "#;
-        let module = engine.compile(wat.as_bytes()).unwrap();
+        let module = engine.compile(&wat::parse_str(wat).unwrap()).unwrap();
         engine.set_arena_budget_for_test(1024 * 1024);
 
         for i in 0..12 {
@@ -6083,7 +8254,7 @@ mod tests {
           (func (export "validate_state") (param i64 i64 i64) (result i64)
             i64.const 0))
         "#;
-        let module = engine.compile(wat.as_bytes()).unwrap();
+        let module = engine.compile(&wat::parse_str(wat).unwrap()).unwrap();
         assert!(
             !engine.module_has_streaming_io(&module),
             "Legacy module should not have freenet_contract_io imports"
@@ -6104,7 +8275,7 @@ mod tests {
           (func (export "validate_state") (param i64 i64 i64) (result i64)
             i64.const 0))
         "#;
-        let module = engine.compile(wat.as_bytes()).unwrap();
+        let module = engine.compile(&wat::parse_str(wat).unwrap()).unwrap();
         assert!(
             engine.module_has_streaming_io(&module),
             "Module with freenet_contract_io import should be detected as streaming"
@@ -6149,7 +8320,7 @@ mod tests {
           (func (export "validate_state") (param i64 i64 i64) (result i64)
             i64.const 0))
         "#;
-        let module = engine.compile(wat.as_bytes()).unwrap();
+        let module = engine.compile(&wat::parse_str(wat).unwrap()).unwrap();
 
         let result = engine.create_instance(&module, 1024);
         assert!(
@@ -6391,7 +8562,9 @@ mod tests {
     fn host_functions_ignore_an_instance_id_naming_another_instance() {
         let config = RuntimeConfig::default();
         let mut engine = WasmtimeEngine::new(&config, false).unwrap();
-        let module = engine.compile(NAMES_OTHER_INSTANCE_WAT.as_bytes()).unwrap();
+        let module = engine
+            .compile(&wat::parse_str(NAMES_OTHER_INSTANCE_WAT).unwrap())
+            .unwrap();
         // Caller first, victim last: the store's last guest entry is the
         // victim's, so the caller's own entry has to record the caller.
         let caller = engine.create_instance(&module, 1024).unwrap();
@@ -6450,7 +8623,9 @@ mod tests {
 
         let config = RuntimeConfig::default();
         let mut engine = WasmtimeEngine::new(&config, false).unwrap();
-        let module = engine.compile(NAMES_OTHER_INSTANCE_WAT.as_bytes()).unwrap();
+        let module = engine
+            .compile(&wat::parse_str(NAMES_OTHER_INSTANCE_WAT).unwrap())
+            .unwrap();
         let caller = engine.create_instance(&module, 1024).unwrap();
         let victim = engine.create_instance(&module, 1024).unwrap();
         record_mem_addr(&mut engine, &caller);
@@ -6511,7 +8686,9 @@ mod tests {
 
         let config = RuntimeConfig::default();
         let mut engine = WasmtimeEngine::new(&config, false).unwrap();
-        let module = engine.compile(NAMES_OTHER_INSTANCE_WAT.as_bytes()).unwrap();
+        let module = engine
+            .compile(&wat::parse_str(NAMES_OTHER_INSTANCE_WAT).unwrap())
+            .unwrap();
         let caller = engine.create_instance(&module, 1024).unwrap();
         // Deliberately no MEM_ADDR record.
         CONTRACT_IO.insert(
@@ -6569,7 +8746,7 @@ mod tests {
             call $now)
           (start $start))
         "#;
-        let module = engine.compile(start_wat.as_bytes()).unwrap();
+        let module = engine.compile(&wat::parse_str(start_wat).unwrap()).unwrap();
         let handle = engine
             .create_instance(&module, 1024)
             .expect("a start function's host calls must not fail instantiation");
@@ -6585,7 +8762,9 @@ mod tests {
     fn every_guest_entry_records_its_own_instance() {
         let config = RuntimeConfig::default();
         let mut engine = WasmtimeEngine::new(&config, false).unwrap();
-        let module = engine.compile(NAMES_OTHER_INSTANCE_WAT.as_bytes()).unwrap();
+        let module = engine
+            .compile(&wat::parse_str(NAMES_OTHER_INSTANCE_WAT).unwrap())
+            .unwrap();
         let a = engine.create_instance(&module, 1024).unwrap();
         let a_mem = record_mem_addr(&mut engine, &a);
 
@@ -6603,7 +8782,7 @@ mod tests {
             call $rand)
           (start $start))
         "#;
-        let start_module = engine.compile(start_wat.as_bytes()).unwrap();
+        let start_module = engine.compile(&wat::parse_str(start_wat).unwrap()).unwrap();
         let s = engine.create_instance(&start_module, 1024).unwrap();
         assert_eq!(
             mem_addr_of(a.id),
@@ -6629,7 +8808,9 @@ mod tests {
             i32.const 8
             call $rand))
         "#;
-        let set_id_module = engine.compile(set_id_wat.as_bytes()).unwrap();
+        let set_id_module = engine
+            .compile(&wat::parse_str(set_id_wat).unwrap())
+            .unwrap();
         let s = engine.create_instance(&set_id_module, 1024).unwrap();
         assert_eq!(
             mem_addr_of(a.id),
@@ -6715,7 +8896,7 @@ mod tests {
             call $ctx_len
             i32.store))
         "#;
-        let module = engine.compile(wat.as_bytes()).unwrap();
+        let module = engine.compile(&wat::parse_str(wat).unwrap()).unwrap();
         let victim = engine.create_instance(&module, 1024).unwrap();
         let victim_mem = record_mem_addr(&mut engine, &victim);
 

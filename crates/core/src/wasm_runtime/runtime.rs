@@ -426,6 +426,13 @@ pub enum ContractExecError {
     /// difference matters to any caller that treats "could not judge" as benign.
     #[error("module is not a contract: missing required export(s): {missing}")]
     MissingContractExports { missing: String },
+
+    /// The module's code was refused before compilation (outside the shape
+    /// limits) or failed to compile. A property of the code, so permanent for
+    /// it. Produced only by the host's `classify_compile_result`; classification
+    /// is by typed provenance on `ExecutorError`, not by this text.
+    #[error("module rejected: {0}")]
+    InvalidModule(String),
 }
 
 pub struct RuntimeConfig {
@@ -472,6 +479,21 @@ pub struct RuntimeConfig {
     /// Backend that compiles and runs the Wasm. Defaults to the target's
     /// default, see [`crate::config::WasmBackend::default_for_target`].
     pub wasm_backend: crate::config::WasmBackend,
+    /// How the node bounds the compile of contract code (config
+    /// `compile-isolation`). Default `off`: the compile path is unchanged.
+    pub compile_isolation: crate::config::CompileIsolationMode,
+    /// Whether delegate code is covered too when enforcing (set on hosted nodes).
+    pub compile_isolation_delegates: bool,
+    /// Where the compile counters are published; `None` keeps them private to
+    /// the engine.
+    pub(crate) compile_metrics:
+        Option<std::sync::Arc<super::engine::compile_worker::metrics::CompileMetrics>>,
+    /// Test seam: the process that plays the worker.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) compile_worker_test: Option<(
+        super::engine::compile_worker::supervisor::Launcher,
+        super::engine::compile_worker::caps::Policy,
+    )>,
 }
 
 /// Lower clamp for the node-relative wasmtime **on-disk compile cache** soft
@@ -975,6 +997,11 @@ impl Default for RuntimeConfig {
             wasmtime_cache_dir: None,
             wasmtime_cache_size_bytes: None,
             wasm_backend: crate::config::WasmBackend::default_for_target(),
+            compile_isolation: crate::config::CompileIsolationMode::Off,
+            compile_isolation_delegates: false,
+            compile_metrics: None,
+            #[cfg(all(test, target_os = "linux"))]
+            compile_worker_test: None,
         }
     }
 }
@@ -1008,7 +1035,7 @@ pub struct Runtime {
     pub(crate) contract_store: ContractStore,
     /// LRU cache of compiled contract modules (shared across pool executors),
     /// keyed by the CODE hash rather than the contract instance — see
-    /// [`SharedModuleCache`] and `prepare_contract_call_inner`.
+    /// [`SharedModuleCache`] and `contract_module_inner`.
     pub(super) contract_modules: SharedModuleCache<CodeHash>,
 
     /// Optional state storage backend, read by the delegate
@@ -1545,6 +1572,16 @@ impl Runtime {
         self.prepare_contract_call_inner(key, parameters, req_bytes, Some(already_fetched))
     }
 
+    /// The compiled module for `key`'s code, from the shared cache or compiled
+    /// now. Does not create an instance.
+    pub(super) fn contract_module(
+        &mut self,
+        key: &ContractKey,
+        parameters: &Parameters,
+    ) -> RuntimeResult<<Engine as WasmEngine>::Module> {
+        self.contract_module_inner(key, parameters, None)
+    }
+
     fn prepare_contract_call_inner(
         &mut self,
         key: &ContractKey,
@@ -1552,6 +1589,21 @@ impl Runtime {
         req_bytes: usize,
         already_fetched: Option<&ContractContainer>,
     ) -> RuntimeResult<RunningInstance> {
+        let module = self.contract_module_inner(key, parameters, already_fetched)?;
+        RunningInstance::new(
+            &mut self.engine,
+            &module,
+            Key::Contract(*key.id()),
+            req_bytes,
+        )
+    }
+
+    fn contract_module_inner(
+        &mut self,
+        key: &ContractKey,
+        parameters: &Parameters,
+        already_fetched: Option<&ContractContainer>,
+    ) -> RuntimeResult<<Engine as WasmEngine>::Module> {
         // Resolve the CODE hash this instance runs, which is what the compiled
         // module is keyed by (issue #5268). Compilation only ever sees the WASM
         // code — parameters are written into linear memory at call time — so N
@@ -1631,7 +1683,7 @@ impl Runtime {
             // see `warn_on_host_clock_import` for why here and not
             // `store_contract`, and for the once-per-code-hash bound.
             warn_on_host_clock_import(key, &code_hash, &code);
-            let module = self.engine.compile(&code)?;
+            let module = super::classify_compile_result(self.engine.compile_contract(&code))?;
             let compiled_size = self.engine.module_compiled_size(&module);
             // Re-check cache: the lock was released before compilation, so
             // another executor may have compiled and cached this contract
@@ -1646,12 +1698,7 @@ impl Runtime {
                 module
             }
         };
-        RunningInstance::new(
-            &mut self.engine,
-            &module,
-            Key::Contract(*key.id()),
-            req_bytes,
-        )
+        Ok(module)
     }
 
     /// Refuse a run of `key` whose `params` do not derive it under
@@ -1714,7 +1761,7 @@ impl Runtime {
                 .fetch_delegate(key, params)
                 .ok_or_else(|| RuntimeInnerError::DelegateNotFound(key.clone()))?;
             let code = delegate.code().as_ref().to_vec();
-            let module = self.engine.compile(&code)?;
+            let module = super::classify_compile_result(self.engine.compile(&code))?;
             let compiled_size = self.engine.module_compiled_size(&module);
             // Re-check cache: the lock was released before compilation, so
             // another executor may have compiled and cached this delegate.
@@ -2891,7 +2938,7 @@ mod host_clock_warning_call_site_pin {
         out
     }
 
-    /// `prepare_contract_call_inner`'s body with whole-line comments stripped.
+    /// `contract_module_inner`'s body with whole-line comments stripped.
     ///
     /// Stripping is load-bearing: the call site carries a comment naming
     /// `warn_on_host_clock_import`, so a scrape over the raw body would be
@@ -2900,10 +2947,10 @@ mod host_clock_warning_call_site_pin {
     /// `fdev`'s `code_only`).
     fn call_site_code() -> String {
         let src = include_str!("runtime.rs");
-        let signature = "fn prepare_contract_call_inner(";
+        let signature = "fn contract_module_inner(";
         let start = src
             .find(signature)
-            .expect("prepare_contract_call_inner not found in runtime.rs");
+            .expect("contract_module_inner not found in runtime.rs");
         let first_test_mod = src
             .find("\n#[cfg(test)]")
             .expect("runtime.rs has no test module");
@@ -2964,8 +3011,8 @@ mod host_clock_warning_call_site_pin {
     fn the_scrape_sees_real_code() {
         let body = call_site_code();
         assert!(
-            body.contains("self.engine.compile(&code)?"),
-            "the scraped region is not prepare_contract_call_inner's body any more"
+            body.contains("self.engine.compile_contract(&code)"),
+            "the scraped region is not contract_module_inner's body any more"
         );
         assert!(
             !body.contains("// Deprecation notice for #5465"),

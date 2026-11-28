@@ -555,6 +555,11 @@ pub(crate) struct RouterSnapshotInfo {
     pub delegate_module_cache_total_bytes: Option<u64>,
     pub delegate_module_cache_budget_bytes: Option<u64>,
     pub delegate_module_cache_evictions_total: Option<u64>,
+    /// Counters and log2 histograms of the compile path (verdicts, worker wall,
+    /// CPU and memory, slot wait, accepted-set hits). Aggregates only: no code
+    /// hashes, no peer or contract identifiers, sizes in log2 buckets.
+    #[serde(default)]
+    pub compile: Option<crate::wasm_runtime::CompileTelemetry>,
     /// Capability-relative hosting-budget gauges (#4642 A2), populated by `Ring`
     /// from the `HostingManager` on the snapshot cadence. `hosting_budget_bytes`
     /// is the RAM-scaled default (or operator override); `hosting_current_bytes`
@@ -3269,6 +3274,37 @@ impl Router {
         RoutingDecisionInfo,
         Option<dataset::DecisionCapture<'a>>,
     ) {
+        self.select_k_best_peers_inner(peers, target_location, k, capture, routes, true)
+    }
+
+    /// A selection that updates NO router statistics (neither the selection
+    /// ranks nor the peer-selection counts) and captures nothing: the answer to
+    /// "what would the router pick", for a caller that may discard it. The PUT
+    /// stop rule probes the cost pick this way before deciding whether to
+    /// narrow the candidates; the selection it then uses is the recorded one.
+    pub(crate) fn select_k_best_peers_unrecorded<'a>(
+        &self,
+        peers: impl IntoIterator<Item = &'a PeerKeyLocation>,
+        target_location: Location,
+        k: usize,
+    ) -> Vec<&'a PeerKeyLocation> {
+        self.select_k_best_peers_inner(peers, target_location, k, false, false, false)
+            .0
+    }
+
+    fn select_k_best_peers_inner<'a>(
+        &self,
+        peers: impl IntoIterator<Item = &'a PeerKeyLocation>,
+        target_location: Location,
+        k: usize,
+        capture: bool,
+        routes: bool,
+        record_stats: bool,
+    ) -> (
+        Vec<&'a PeerKeyLocation>,
+        RoutingDecisionInfo,
+        Option<dataset::DecisionCapture<'a>>,
+    ) {
         let total_routing_events = self.failure_estimator.len();
 
         if k == 0 {
@@ -3420,7 +3456,7 @@ impl Router {
 
             // Record where the winner sat in distance order, so the cost of the
             // candidate-window truncation can be measured rather than guessed.
-            if let Some((distance_rank, winner, _, _)) = scored.first() {
+            if let (true, Some((distance_rank, winner, _, _))) = (record_stats, scored.first()) {
                 self.selection_ranks
                     .record(*distance_rank, closest.len(), candidates_available);
                 if routes {
@@ -3573,6 +3609,7 @@ impl Router {
             delegate_module_cache_total_bytes: None,
             delegate_module_cache_budget_bytes: None,
             delegate_module_cache_evictions_total: None,
+            compile: None,
             // Capability-relative hosting-budget gauges populated by Ring on the
             // snapshot cadence (#4642 A2).
             hosting_budget_bytes: None,

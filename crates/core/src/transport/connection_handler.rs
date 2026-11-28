@@ -465,15 +465,42 @@ pub(super) async fn bind_udp_listener<S: Socket>(
         }
     });
 
+    // A node whose QUIC endpoint cannot be built, with no UDP to fall back to
+    // (`breaker::UDP_FALLBACK` is true today, so this never fires), has no
+    // transport: it exits after the update check, so the release that fixes it
+    // is staged first (`quic::fatal_exit`, W-S6).
+    #[cfg(feature = "testing")]
+    let quic_endpoint =
+        if quic_endpoint.is_some() && std::env::var_os(TEST_QUIC_BIND_FAILS_ENV).is_some() {
+            tracing::warn!("Test build: the QUIC endpoint is treated as not built");
+            None
+        } else {
+            quic_endpoint
+        };
+    if quic_settings.is_some()
+        && quic_endpoint.is_none()
+        && super::quic::fatal_exit::bind_failure_is_fatal()
+    {
+        crate::node::exit_for_quic_bind_failure().await;
+    }
+
+    // Native joins carry application data at once, which `shadow` promises to
+    // keep on UDP, so only a node whose configured mode is `prefer` admits
+    // them (a shadow or off node is never native-ready, gateway joins included).
+    let admits_native = config
+        .quic_policy
+        .as_ref()
+        .is_some_and(|policy| policy.mode() == super::quic::QuicMode::Prefer);
     // Gateway admission of native joins from sources nobody named (#5940
-    // A7b), on the endpoint's clock. Dark: `admission::enabled_at` is false on
-    // every node until phase B (a test can turn it on for one listener), and
-    // with it off the only additions are an idle queue and its poll, one
-    // atomic load per datagram from a source not on the allow-set, and
-    // counters that stay 0.
+    // A7b), on the endpoint's clock. On for every gateway since the floor
+    // release (`admission::enabled_at`; a test can turn it off or on for one
+    // listener). On a non-gateway, or with admission off, the only additions
+    // are an idle queue and its poll, one atomic load per datagram from a
+    // source not on the allow-set, and counters that stay 0.
     admit_native_joins_if_on(
         quic_endpoint.as_ref(),
         is_gateway,
+        admits_native,
         bind_addr,
         quic_virtual_time.clone(),
     );
@@ -488,6 +515,7 @@ pub(super) async fn bind_udp_listener<S: Socket>(
                 bind_addr,
                 keypair.clone(),
                 is_gateway,
+                admits_native,
                 settings,
                 quic_virtual_time.clone(),
             )
@@ -529,14 +557,17 @@ pub(super) async fn bind_udp_listener<S: Socket>(
 }
 
 /// Admit native joins from sources nobody named on `endpoint`, on the
-/// endpoint's clock, when this gateway does (`quic::admission`).
+/// endpoint's clock, when this gateway does (`quic::admission`) and its mode is
+/// `prefer` (`prefer`): native joins carry application data, which `shadow`
+/// keeps on UDP.
 fn admit_native_joins_if_on(
     endpoint: Option<&super::quic::QuicEndpoint>,
     is_gateway: bool,
+    prefer: bool,
     bind_addr: SocketAddr,
     quic_virtual_time: Option<VirtualTime>,
 ) {
-    if let Some(endpoint) = endpoint {
+    if let Some(endpoint) = endpoint.filter(|_| prefer) {
         if super::quic::admission::enabled_at(is_gateway, bind_addr) {
             let enabled = match quic_virtual_time {
                 Some(time) => endpoint.enable_gateway_admission(time),
@@ -558,6 +589,7 @@ fn endpoint_rebuilder<S: Socket>(
     bind_addr: SocketAddr,
     keypair: TransportKeypair,
     is_gateway: bool,
+    prefer: bool,
     settings: super::quic::QuicSettings,
     quic_virtual_time: Option<VirtualTime>,
 ) -> super::quic::rebuild::EndpointFactory {
@@ -585,6 +617,7 @@ fn endpoint_rebuilder<S: Socket>(
         admit_native_joins_if_on(
             Some(&endpoint),
             is_gateway,
+            prefer,
             bind_addr,
             quic_virtual_time.clone(),
         );
@@ -916,6 +949,12 @@ pub(crate) async fn open_udp_transport<S: Socket>(
         restart,
     ))
 }
+
+/// Test builds only: when set, the QUIC endpoint is treated as not built, as
+/// a failed bind leaves it, so a real-process test can drive the node's
+/// reaction (`tests/graceful_shutdown_exit_code.rs`).
+#[cfg(feature = "testing")]
+const TEST_QUIC_BIND_FAILS_ENV: &str = "FREENET_TEST_QUIC_BIND_FAILS";
 
 /// The variable [`fail_endpoint_from_env`] reads: seconds after the bind.
 #[cfg(feature = "testing")]
@@ -3060,7 +3099,11 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                         // Failed gateway connection
                         Err((error, remote_addr)) => {
                             tracing::info!(error = %error, peer_addr = %remote_addr, "Failed to establish gateway connection");
-                            if matches!(error, TransportError::ProtocolVersionMismatch { .. }) {
+                            if matches!(
+                                error,
+                                TransportError::ProtocolVersionMismatch { .. }
+                                    | TransportError::PeerVersionOutdated { .. }
+                            ) {
                                 outdated_peer.insert(remote_addr, self.time_source.now_nanos());
                             }
                             self.connections.fail_gateway_handshake(&remote_addr);
@@ -3137,7 +3180,8 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                 &crate::transport::TRANSPORT_METRICS,
                             );
                             match &error {
-                                TransportError::ProtocolVersionMismatch { .. } => {
+                                TransportError::ProtocolVersionMismatch { .. }
+                                | TransportError::PeerVersionOutdated { .. } => {
                                     tracing::warn!(%error);
                                     crate::transport::TRANSPORT_METRICS
                                         .record_nat_traversal_failed_version();
@@ -4348,7 +4392,8 @@ fn classify_nat_failure(
         return NatFailureKind::VersionIncompatible;
     }
     match error {
-        TransportError::ProtocolVersionMismatch { .. } => NatFailureKind::VersionIncompatible,
+        TransportError::ProtocolVersionMismatch { .. }
+        | TransportError::PeerVersionOutdated { .. } => NatFailureKind::VersionIncompatible,
         TransportError::Udp(UdpError(UdpErrorKind::SendFailed(..))) => NatFailureKind::SendError,
         TransportError::ChannelClosed
         | TransportError::ConnectionClosed(_)
@@ -4624,6 +4669,13 @@ fn ack_ok_parts(
 fn handle_ack_connection_error(err: Cow<'static, str>) -> TransportError {
     if let Some(expected) = err.split("expected version").nth(1) {
         let remote_version_str = expected.trim();
+        // The version is echoed in logs and in a suggested install command,
+        // so only a well-formed version is ever carried forward.
+        if remote_version_str.len() > 64 || semver::Version::parse(remote_version_str).is_err() {
+            return TransportError::ConnectionEstablishmentFailure {
+                cause: Cow::Borrowed("remote reported an unrecognised protocol version"),
+            };
+        }
         // Check if this old peer's rejection actually means we need to update.
         // Old peers do strict exact-match. If they're compatible with our range
         // but just don't support range-checking, we should NOT self-update.
@@ -4633,11 +4685,12 @@ fn handle_ack_connection_error(err: Cow<'static, str>) -> TransportError {
         ) {
             tracing::info!(
                 remote_version = remote_version_str,
-                "Old peer rejected us (strict match) but is within our compatible range — not triggering self-update"
+                "Old peer rejected us (strict match) but is not newer than us — not triggering self-update"
             );
-            return TransportError::ProtocolVersionMismatch {
-                expected: remote_version_str.to_string(),
-                actual: PCK_VERSION.to_string(),
+            // The remote is the one that is out of date: record it as such so
+            // the dashboard never tells the user to install the remote's version.
+            return TransportError::PeerVersionOutdated {
+                peer_version: remote_version_str.to_string(),
             };
         }
         // Remote is genuinely newer — signal version mismatch
@@ -4647,7 +4700,13 @@ fn handle_ack_connection_error(err: Cow<'static, str>) -> TransportError {
             actual: PCK_VERSION.to_string(),
         }
     } else {
-        TransportError::ConnectionEstablishmentFailure { cause: err }
+        // Peer text is logged and displayed, so keep only a bounded prefix.
+        let cause = if err.chars().count() > 64 {
+            Cow::Owned(err.chars().take(64).collect::<String>())
+        } else {
+            err
+        };
+        TransportError::ConnectionEstablishmentFailure { cause }
     }
 }
 
@@ -4926,6 +4985,7 @@ pub mod mock_transport {
             TransportError::ChannelClosed
             | TransportError::ConnectionClosed(_)
             | TransportError::ConnectionEstablishmentFailure { .. }
+            | TransportError::PeerVersionOutdated { .. }
             | TransportError::Udp(UdpError(UdpErrorKind::SendFailed(..)))
             | TransportError::OutboundStreamFailed(_)
             | TransportError::OutboundStreamInvalidLength(..)
@@ -4939,6 +4999,51 @@ pub mod mock_transport {
             }
         }
 
+        // A refusal whose version is not a well-formed version is not carried
+        // into the mismatch error (which is rendered as an install command).
+        for bad in [
+            "expected version 1.2.3 --git https://example.invalid/x",
+            "expected version 1.2.3; echo hi",
+            "expected version <b>1.2.3</b>",
+            "expected version 1.2",
+            "expected version ",
+            "expected version 1.2.3-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ] {
+            let err = handle_ack_connection_error(bad.to_string().into());
+            assert!(
+                matches!(
+                    &err,
+                    TransportError::ConnectionEstablishmentFailure { cause }
+                        if !cause.contains("example.invalid") && !cause.contains("echo")
+                ),
+                "expected generic failure for {bad:?}, got {err:?}"
+            );
+        }
+
+        let ok = handle_ack_connection_error("expected version 1.2.3-rc.1+b5".to_string().into());
+        assert!(matches!(
+            &ok,
+            TransportError::ProtocolVersionMismatch { expected, .. } if expected == "1.2.3-rc.1+b5"
+        ));
+        // An OLDER peer refusing us is not a request for us to update: it must
+        // not be reported as a version mismatch (which drives the "update
+        // required" banner) and must not carry a downgrade install command.
+        let older = handle_ack_connection_error("expected version 0.2.117".to_string().into());
+        assert!(
+            matches!(
+                &older,
+                TransportError::PeerVersionOutdated { peer_version } if peer_version == "0.2.117"
+            ),
+            "older peer must not be a ProtocolVersionMismatch, got {older:?}"
+        );
+        assert!(!older.to_string().contains("cargo install"));
+        let long_other = "x".repeat(500);
+        let err = handle_ack_connection_error(long_other.into());
+        assert!(matches!(
+            &err,
+            TransportError::ConnectionEstablishmentFailure { cause } if cause.chars().count() == 64
+        ));
+
         let err_msg_no_version = "remote is using a different protocol version".to_string();
         match handle_ack_connection_error(err_msg_no_version.clone().into()) {
             TransportError::ConnectionEstablishmentFailure { cause } => {
@@ -4947,6 +5052,7 @@ pub mod mock_transport {
             TransportError::ChannelClosed
             | TransportError::ConnectionClosed(_)
             | TransportError::ProtocolVersionMismatch { .. }
+            | TransportError::PeerVersionOutdated { .. }
             | TransportError::Udp(UdpError(UdpErrorKind::SendFailed(..)))
             | TransportError::OutboundStreamFailed(_)
             | TransportError::OutboundStreamInvalidLength(..)

@@ -36,7 +36,7 @@ use tokio::time::Instant;
 use crate::message::{NetMessage, NetMessageV1, NodeEvent, Transaction};
 use crate::node::{OpManager, WaiterReply};
 use crate::operations::OpError;
-use crate::ring::{ConnectionFailureReason, Location, PeerKeyLocation};
+use crate::ring::{ConnectionFailureReason, Location, ObservedAddrOutcome, PeerKeyLocation};
 use crate::tracing::NetEventLog;
 
 use super::{
@@ -664,10 +664,8 @@ async fn drive_client_connect(
                 // queue allows: the queue's own, plus these fallbacks, plus
                 // the UDP dials to acceptors whose `Native` decision it
                 // refused (at most `refused_native_cap`, also outside the
-                // queue). A strike toward demotion is recorded when
-                // that UDP dial connects after a path failure (a rescue,
-                // below), or by the connection lifecycle when a UDP connection
-                // to the acceptor already exists as the setup fails.
+                // queue). A rescue is counted when
+                // that UDP dial connects after a path failure (below).
                 if transport.is_native() && !matches!(result, Some(Ok(_))) {
                     tracing::info!(
                         tx = %tx,
@@ -696,11 +694,6 @@ async fn drive_client_connect(
                     if connected && path_failed {
                         crate::transport::TRANSPORT_METRICS.record_connect_native_rescued_by_udp(
                             crate::transport::NativeConnectSide::Joiner,
-                        );
-                        super::record_native_rescue_strike(
-                            op_manager,
-                            crate::transport::NatAttemptOrigin::ConnectJoiner,
-                            &acceptor,
                         );
                     }
                     #[cfg(any(test, feature = "testing"))]
@@ -981,7 +974,7 @@ async fn drive_client_connect(
                 // `None` and `Udp` dial UDP as today; `Native` dials native
                 // when this node offered and can still dial. A `Native` this
                 // node cannot honour is counted by why. When the node offered
-                // and has since lost native (demoted, endpoint down), it dials
+                // and has since lost native (its endpoint went down), it dials
                 // the acceptor over UDP at the time the acceptor's own
                 // fallback starts, so the punches overlap
                 // (`native::refused_decision_plan`). A `Native` that answered
@@ -1193,21 +1186,27 @@ async fn drive_client_connect(
                 // diagnostics) and `own_location` (for routing).
                 // Only the first ObservedAddress per transaction is applied
                 // (see the guard arm above); repeats are ignored.
-                let location = Location::from_address(&address);
+                let connection_manager = &op_manager.ring.connection_manager;
                 // GLOBAL-ADDR-WRITE-OK: production. A real node learning its
                 // peer-observed address is exactly what the external_address
-                // mirror is for (#4918).
-                op_manager.ring.connection_manager.set_own_addr(address);
-                op_manager
-                    .ring
-                    .connection_manager
-                    .update_location(Some(location));
-                tracing::info!(
-                    tx = %tx,
-                    observed_address = %address,
-                    location = %location,
-                    "connect driver: updated own_addr and location from ObservedAddress"
-                );
+                // mirror is for (#4918). A private observation (a gateway
+                // behind our own NAT) never displaces a fresh public own_addr
+                // (#6378).
+                let outcome = connection_manager.apply_observed_address(address);
+                match outcome {
+                    ObservedAddrOutcome::Applied { location_changed } => tracing::info!(
+                        tx = %tx,
+                        observed_address = %address,
+                        location_changed,
+                        location = ?connection_manager.get_stored_location(),
+                        "connect driver: updated own_addr from ObservedAddress"
+                    ),
+                    ObservedAddrOutcome::Ignored => tracing::info!(
+                        tx = %tx,
+                        observed_address = %address,
+                        "connect driver: ignoring private ObservedAddress, a public own_addr is known"
+                    ),
+                }
             }
             other @ ConnectMsg::Request { .. } | other @ ConnectMsg::ConnectFailed { .. } => {
                 // Bypass at node.rs forwards Response/Rejected/
@@ -1297,12 +1296,12 @@ struct AcceptorDial {
 
 /// Whether a native dial's result says native does not work on the path:
 /// its setup timed out, failed its handshake or lost its Hello
-/// (`NativeSetupOutcome::counts_toward_demotion`). A UDP dial that connects
+/// (`NativeSetupOutcome::says_native_failed_on_path`). A UDP dial that connects
 /// after such a failure is a rescue (`connect_native_rescued_by_udp`); one
 /// after a local refusal (punch budget, setups full, too late) or any other
 /// failure is not, on either side (design note 10.2 item 16).
 pub(super) fn native_path_failed(result: &Option<crate::message::ConnectResult>) -> bool {
-    matches!(result, Some(Err(Some(outcome))) if outcome.counts_toward_demotion())
+    matches!(result, Some(Err(Some(outcome))) if outcome.says_native_failed_on_path())
 }
 
 /// The joiner's UDP dial to an acceptor that decided native, after a failed
@@ -1375,7 +1374,7 @@ enum AcceptorDialPlan {
 /// started it when it decided, a little before `answered_at`, so
 /// `answered_at + acceptor_window` is a late estimate of its end, which errs
 /// toward trying native. With less than `NATIVE_MIN_WINDOW_LEFT` of it left,
-/// a native attempt could only time out, count toward this node's demotion and
+/// a native attempt could only time out and
 /// push its UDP dial past the acceptor's, so the acceptor is dialled over UDP
 /// at the common fallback time instead (`answered_at + NATIVE_FALLBACK_AFTER`,
 /// now if it has passed). A native attempt's deadline is that fallback time,
@@ -2392,11 +2391,22 @@ mod tests {
             "the ignoring arm must precede the applying arm"
         );
         let body_end = SOURCE[apply..]
-            .find("set_own_addr(address)")
-            .expect("set_own_addr call");
+            .find("apply_observed_address(address)")
+            .expect("apply_observed_address call");
         assert!(
             body_end < 2000,
-            "set_own_addr must stay in the applying arm"
+            "apply_observed_address must stay in the applying arm"
+        );
+        // The outcome must be consumed, not dropped: the log says whether the
+        // address and location were really applied.
+        let after_call = &SOURCE[apply + body_end..];
+        let arm_end = after_call
+            .find("other @ ConnectMsg::Request")
+            .expect("arm after the ObservedAddress arm");
+        assert!(
+            after_call[..arm_end].contains("match outcome")
+                && after_call[..arm_end].contains("ObservedAddrOutcome::Ignored"),
+            "the apply outcome must be matched in the applying arm"
         );
     }
 
@@ -3857,7 +3867,7 @@ mod driver_timing_tests {
         for outcome in O::ALL {
             assert_eq!(
                 super::native_path_failed(&Some(Err(Some(outcome)))),
-                outcome.counts_toward_demotion(),
+                outcome.says_native_failed_on_path(),
                 "{outcome:?}"
             );
         }
@@ -3914,7 +3924,7 @@ mod driver_timing_tests {
     }
 
     /// A joiner that cannot use an acceptor's `Native` decision because it lost
-    /// native after offering (demoted, endpoint down) dials that acceptor over
+    /// native after offering (its endpoint went down) dials that acceptor over
     /// UDP at the fallback time instead of reporting it failed: otherwise the
     /// acceptor's UDP fallback punches alone and cannot pass a restricted NAT
     /// (`test_quic_native_blocked_pairs_connect_over_udp_behind_nats` failed
@@ -4539,7 +4549,7 @@ mod driver_timing_tests {
     /// 8 s, and its UDP fallback waits for the fallback time (12 s) outside
     /// the dial queue, so the queue moves on at once. The second native
     /// acceptor, a client whose window ended at 8 s, gets no native attempt (it
-    /// could only time out and count a strike): it waits for its own fallback
+    /// could only time out): it waits for its own fallback
     /// time too, also outside the queue. So the UDP acceptor queued behind
     /// them is dialled at 8 s, inside its punch window, not after the
     /// fallbacks.
@@ -4725,106 +4735,6 @@ mod driver_timing_tests {
         // Each side counts the rescue once (R5).
         tokio::time::sleep(Duration::from_millis(10)).await;
         assert_eq!(rescues_here(), (before.0 + 1, before.1 + 1));
-        // And each side's rescue is a strike in its own role's streak
-        // (`record_native_rescue_strike`): native failed on the path and UDP
-        // to the same peer then connected.
-        assert_eq!(
-            joiner_om
-                .ring
-                .connection_manager
-                .native_connect()
-                .joiner_streak(),
-            1,
-            "the joiner's rescue strikes its joiner streak"
-        );
-        let acceptor_native = acceptor_om.ring.connection_manager.native_connect();
-        assert_eq!(
-            acceptor_native.acceptor_streak(),
-            1,
-            "the acceptor's rescue strikes its acceptor streak"
-        );
-        assert_eq!(
-            acceptor_native.joiner_streak(),
-            0,
-            "and not its joiner streak"
-        );
-    }
-
-    /// A rescue against one of this node's configured gateways strikes no
-    /// streak, though the caller passes the CONNECT role (the driver passes
-    /// `ConnectJoiner` for every acceptor): the connection lifecycle labels a
-    /// dial to a configured gateway `Gateway`, which strikes nothing. A
-    /// rescue against an ordinary peer does strike.
-    #[tokio::test(start_paused = true)]
-    async fn a_rescue_against_a_configured_gateway_strikes_nothing() {
-        let (op_manager, _events, _endpoint) = native_joiner("rescue-gateway").await;
-        let native = op_manager.ring.connection_manager.native_connect();
-        let gateway = op_manager
-            .configured_gateways
-            .first()
-            .cloned()
-            .expect("premise: gateways configured");
-        for origin in [
-            crate::transport::NatAttemptOrigin::ConnectJoiner,
-            crate::transport::NatAttemptOrigin::ConnectAcceptor,
-        ] {
-            super::super::record_native_rescue_strike(&op_manager, origin, &gateway);
-            // Same address, key not the gateway's: matched by address too.
-            let same_addr = PeerKeyLocation::new(
-                TransportKeypair::new().public().clone(),
-                gateway.socket_addr().expect("addressed"),
-            );
-            super::super::record_native_rescue_strike(&op_manager, origin, &same_addr);
-        }
-        assert_eq!(
-            native.joiner_streak(),
-            0,
-            "no joiner strike against a gateway"
-        );
-        assert_eq!(native.acceptor_streak(), 0, "no acceptor strike either");
-        super::super::record_native_rescue_strike(
-            &op_manager,
-            crate::transport::NatAttemptOrigin::ConnectJoiner,
-            &peer(24889),
-        );
-        assert_eq!(
-            native.joiner_streak(),
-            1,
-            "premise: an ordinary peer strikes"
-        );
-    }
-
-    /// The node's relay context, which the CONNECT decision reads, is off
-    /// while the acceptor role is demoted (three rescue strikes with distinct
-    /// joiners), while the node's own offer as joiner stays on: the decision
-    /// reads `acceptor_readiness`, not `readiness`.
-    #[tokio::test(start_paused = true)]
-    async fn a_demoted_acceptor_decides_udp_through_the_relay_env() {
-        use super::super::RelayContext;
-        use super::super::native::{NativeDecision, NativeOffer, decide_native};
-        let (op_manager, _events, _endpoint) = native_joiner("demoted-relay-env").await;
-        let env = super::super::RelayEnv::new(&op_manager);
-        let offer = Some(NativeOffer::capable(100));
-        assert_eq!(
-            decide_native(offer, env.native_readiness(), 0, false),
-            NativeDecision::Native,
-            "premise: an undemoted acceptor decides native"
-        );
-        let native = op_manager.ring.connection_manager.native_connect();
-        for port in 0..super::super::native::ACCEPTOR_DEMOTION_FAILURES as u16 {
-            super::super::record_native_rescue_strike(
-                &op_manager,
-                crate::transport::NatAttemptOrigin::ConnectAcceptor,
-                &peer(24884 + port),
-            );
-        }
-        assert_eq!(native.acceptor_demotions(), 1);
-        assert_eq!(
-            decide_native(offer, env.native_readiness(), 0, false),
-            NativeDecision::Udp,
-            "a demoted acceptor decides UDP"
-        );
-        assert!(native.readiness().ready, "its own offer as joiner stays on");
     }
 
     /// A peer that already has a connection (#5858 leaves it unchanged):
@@ -5150,7 +5060,7 @@ mod driver_timing_tests {
     }
 
     /// A joiner that offered above 0 but cannot dial native when the `Native`
-    /// response comes (this test's node has no native dial, as a demoted one)
+    /// response comes (this test's node has no native dial, as one whose endpoint is down)
     /// counts it as unsupported and dials that acceptor over UDP at the
     /// fallback time, when the acceptor's own UDP fallback starts, instead of
     /// reporting it failed: a lone punch from the acceptor cannot pass a

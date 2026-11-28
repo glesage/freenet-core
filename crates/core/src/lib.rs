@@ -48,6 +48,10 @@ pub use transport::quic::breaker::{
     record_deliberate_stop as record_quic_breaker_deliberate_stop,
     wait_for_transport_open as wait_for_quic_transport_open,
 };
+pub use transport::quic::fatal_exit::{
+    FATAL_EXIT_UPDATE_CHECK_TIMEOUT, FatalExitCheckEnd, FatalExitUpdateCheck,
+    register_fatal_exit_update_check,
+};
 pub use transport::quic::liveness::{
     enable_gateway_quic_restarts, note_gateway_supervisor_unverified,
 };
@@ -112,6 +116,11 @@ mod build_vcs_info;
 pub fn mark_process_start() {
     node::network_status::mark_process_start();
 }
+
+#[cfg(target_os = "linux")]
+#[doc(hidden)]
+pub use wasm_runtime::engine::compile_worker::production_worker_accepts_for_tests;
+pub use wasm_runtime::engine::compile_worker::run_compile_worker_if_requested;
 
 /// Exports to build a running local node.
 pub mod local_node {
@@ -235,6 +244,8 @@ pub mod dev_tool {
     // benefit tests exercise the ON path at their sparse max_connections.
     // `set_nn_lattice_force_active` resets only the floor bypass (used by the
     // benefit-test cleanup guard). No-op in production builds (compiled out).
+    #[cfg(any(test, feature = "testing"))]
+    pub use ring::put_cost_pick_hook::PutCostPickGuard;
     #[cfg(any(test, feature = "testing"))]
     pub use ring::{set_nn_lattice_enabled, set_nn_lattice_force_active};
 

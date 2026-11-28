@@ -128,15 +128,22 @@ fn waits_for_a_stream_and_for_a_permit_are_counted() {
                 (unpermitted, unopened, held)
             })
             .await;
-        for outcome in [&unpermitted, &unopened] {
-            assert!(
-                matches!(
-                    outcome,
-                    BoundedSend::Failed(SendFailure::NotOpened(NotOpened::TimedOut))
-                ),
-                "{outcome:?}"
-            );
-        }
+        // A wait for this side's own permit is `TimedOut`; a wait for the peer's
+        // stream credit is `NoCredit`, the one a native path retries.
+        assert!(
+            matches!(
+                unpermitted,
+                BoundedSend::Failed(SendFailure::NotOpened(NotOpened::TimedOut))
+            ),
+            "{unpermitted:?}"
+        );
+        assert!(
+            matches!(
+                unopened,
+                BoundedSend::Failed(SendFailure::NotOpened(NotOpened::NoCredit))
+            ),
+            "{unopened:?}"
+        );
         let keys = keys(node);
         assert_eq!(keys["quic_streamed_sends"], 1);
         assert_eq!(keys["quic_stream_permit_waited"], 1);
@@ -208,5 +215,47 @@ fn an_overflow_to_udp_and_a_stall_close_reach_the_node() {
         let keys = keys(node);
         assert_eq!(keys["quic_data_event_short_overflow_udp"], 1);
         assert_eq!(keys["quic_data_event_stalled_closed"], 1);
+    });
+}
+
+/// A native path with no UDP fallback gives up a Short its route cannot queue,
+/// and counts why: a full queue is `queue_full`, a route whose worker has ended
+/// is `path_ended`. The two sum to the dropped Shorts.
+#[test]
+fn a_short_a_native_route_cannot_queue_is_dropped_with_its_cause() {
+    use crate::transport::metrics::ShortDropCause;
+    use crate::transport::quic::upgrade::data_route::{DataRoute, RouteNote, SHORT_QUEUE_CAPACITY};
+    use crate::transport::quic::upgrade::driver::PathClock;
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let p = paths_native("quic-short-drop-queue").await;
+        assert!(!p.a.udp_fallback());
+        p.a.enable_data();
+        let (route, worker) = DataRoute::new(
+            Arc::clone(&p.a),
+            PathClock::Virtual(p.time()),
+            Arc::new(NoUdp),
+            RouteNote::default(),
+        );
+        for i in 0..SHORT_QUEUE_CAPACITY {
+            route.queue_short(vec![i as u8]).expect("room");
+        }
+        // Taken as dropped: the caller sees it queued, nothing goes on UDP.
+        assert!(route.queue_short(vec![0]).is_ok());
+        let stats = p.a.stats();
+        assert_eq!(stats.short_drop_count(ShortDropCause::QueueFull), 1);
+        assert_eq!(stats.short_drop_count(ShortDropCause::PathEnded), 0);
+        drop(worker);
+        assert!(route.queue_short(vec![1]).is_ok());
+        assert_eq!(stats.short_drop_count(ShortDropCause::PathEnded), 1);
+        let causes: u64 = ShortDropCause::ALL
+            .iter()
+            .map(|c| stats.short_drop_count(*c))
+            .sum();
+        assert_eq!(causes, 2);
+        assert_eq!(
+            stats.send_count(SendKind::Short, QuicSendResult::Dropped),
+            2
+        );
     });
 }

@@ -1384,6 +1384,76 @@ pub(crate) trait ContractExecutor: Send + 'static {
 /// if corruption happens again later.
 pub(crate) type CorruptedStateRecoveryGuard = Arc<std::sync::Mutex<HashSet<ContractKey>>>;
 
+/// Records, per contract key, the hash of the stored state that this process
+/// has already checked with the contract's own `validate_state`, or that came
+/// out of an update the contract vouches for.
+///
+/// A contract that exports `__frnt__update_validates` has its stored state
+/// reused as a starting point without re-validating every incoming state and
+/// every result. That is only done for a stored state recorded here, so the
+/// stored state is validated at most once per (key, stored-state hash) instead
+/// of on every update. A changed stored state has a different hash and is
+/// verified again.
+///
+/// Bounded by entry count; each value is a fixed 32-byte hash, so the count is
+/// also a memory bound.
+pub(crate) struct StoredStateVerified {
+    verified: HashMap<ContractKey, [u8; 32]>,
+    capacity: usize,
+}
+
+impl Default for StoredStateVerified {
+    fn default() -> Self {
+        Self {
+            verified: HashMap::new(),
+            capacity: Self::MAX_ENTRIES,
+        }
+    }
+}
+
+impl StoredStateVerified {
+    /// Upper bound on the number of keys tracked.
+    pub(crate) const MAX_ENTRIES: usize = 8192;
+
+    pub(crate) fn is_verified(&self, key: &ContractKey, state_hash: &[u8; 32]) -> bool {
+        self.verified.get(key) == Some(state_hash)
+    }
+
+    pub(crate) fn record(&mut self, key: ContractKey, state_hash: [u8; 32]) {
+        if !self.verified.contains_key(&key) && self.verified.len() >= self.capacity {
+            if let Some(victim) = self.verified.keys().next().copied() {
+                self.verified.remove(&victim);
+            }
+        }
+        self.verified.insert(key, state_hash);
+    }
+
+    /// Forget `key`. Called when the stored state is replaced by a path that
+    /// did not go through an update the contract vouches for.
+    pub(crate) fn invalidate(&mut self, key: &ContractKey) {
+        self.verified.remove(key);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.verified.len()
+    }
+
+    /// A record that holds at most `capacity` keys, so tests can reach the
+    /// eviction branch without recording [`Self::MAX_ENTRIES`] keys.
+    #[cfg(test)]
+    pub(crate) fn with_capacity(capacity: usize) -> Self {
+        Self {
+            verified: HashMap::new(),
+            capacity,
+        }
+    }
+}
+
+/// Shared by every executor of a pool, so a stored state is verified once per
+/// process rather than once per executor.
+pub(crate) type SharedStoredStateVerified = Arc<std::sync::Mutex<StoredStateVerified>>;
+
 // Type alias for shared notification storage (used by RuntimePool).
 // Uses DashMap for fine-grained per-key locking instead of a global RwLock.
 type SharedNotifications =
@@ -1948,6 +2018,13 @@ pub struct Executor<R = Runtime, S: StateStorage = Storage> {
     /// Shared guard for corrupted-state recovery, preventing infinite recovery loops.
     /// See [`CorruptedStateRecoveryGuard`] for details.
     pub(crate) recovery_guard: CorruptedStateRecoveryGuard,
+    /// Stored states already verified for contracts that opt in to
+    /// `__frnt__update_validates`. See [`StoredStateVerified`].
+    pub(crate) stored_state_verified: SharedStoredStateVerified,
+    /// Test hook: replace the stored state with these bytes right after the
+    /// one-time check, to model a write between the check and the merge.
+    #[cfg(test)]
+    pub(crate) test_replace_stored_after_gate: Option<Vec<u8>>,
 
     /// Cache of contract summaries keyed by ContractKey, storing (state_hash, summary).
     /// Avoids redundant WASM instantiations during the 5-minute interest heartbeat
@@ -2032,6 +2109,9 @@ where
             shared_summaries: None,
             shared_client_counts: None,
             recovery_guard: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            stored_state_verified: Arc::new(std::sync::Mutex::new(StoredStateVerified::default())),
+            #[cfg(test)]
+            test_replace_stored_after_gate: None,
             summary_cache,
             delta_cache,
             delegate_notification_tx: None,
@@ -2067,6 +2147,35 @@ where
     /// tracking is consistent regardless of which executor handles a request.
     pub(crate) fn set_recovery_guard(&mut self, guard: CorruptedStateRecoveryGuard) {
         self.recovery_guard = guard;
+    }
+
+    /// Test hook: applies [`Self::test_replace_stored_after_gate`], if set.
+    #[cfg(test)]
+    pub(crate) async fn apply_test_replace_after_gate(
+        &mut self,
+        key: &ContractKey,
+    ) -> Result<(), ExecutorError> {
+        if let Some(bytes) = self.test_replace_stored_after_gate.take() {
+            self.state_store
+                .update(key, WrappedState::new(bytes))
+                .await
+                .map_err(ExecutorError::other)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(not(test))]
+    #[inline(always)]
+    pub(crate) async fn apply_test_replace_after_gate(
+        &mut self,
+        _key: &ContractKey,
+    ) -> Result<(), ExecutorError> {
+        Ok(())
+    }
+
+    /// Share the pool-wide record of verified stored states.
+    pub(crate) fn set_stored_state_verified(&mut self, shared: SharedStoredStateVerified) {
+        self.stored_state_verified = shared;
     }
 
     /// Point this executor at the pool's shared summary and delta caches
@@ -2669,6 +2778,18 @@ mod tests {
         const NOT_SUMMED: &[(&str, &str)] = &[
             // Clamps and fallbacks consumed INSIDE a summed budget function.
             // Summing them as well would double-count.
+            (
+                "ALLOWANCE_BYTES",
+                "rate limit on punch bytes sent per minute, not memory",
+            ),
+            (
+                "IP_ALLOWANCE_BYTES",
+                "rate limit on punch bytes sent per minute, not memory",
+            ),
+            (
+                "NODE_ALLOWANCE_BYTES",
+                "rate limit on punch bytes sent per minute, not memory",
+            ),
             ("SUMMARY_CACHE_MIN_BYTES", "clamp inside summary_budget_for"),
             ("SUMMARY_CACHE_MAX_BYTES", "clamp inside summary_budget_for"),
             (
@@ -2769,6 +2890,92 @@ mod tests {
             // operation, so they are not memory the node holds resident.
             ("MAX_EVIDENCE_INPUT_BYTES", "per-request input limit"),
             ("MAX_IMPORT_BUNDLE_BYTES", "per-request import limit"),
+            (
+                "MAX_MODULE_BYTES",
+                "input size limit on WASM code offered for compilation, not retained \
+                 memory; the compiled result is held in the module caches, which are \
+                 budgeted",
+            ),
+            (
+                "MAX_FUNCTION_BODY_BYTES",
+                "input shape limit on one function in WASM code offered for compilation, \
+                 not retained memory",
+            ),
+            (
+                "MAX_DIAGNOSTIC_BYTES",
+                "length cut applied to a parser or compiler error text before it is kept \
+                 or logged; it bounds the entries of the compile-refusal cache, whose \
+                 total is the next two rows",
+            ),
+            (
+                "VERDICT_ENTRY_MAX_BYTES",
+                "largest entry of the compile-refusal cache (key, expiry, refusal, cut \
+                 text); with the entry capacity it gives the row below",
+            ),
+            (
+                "VERDICT_CACHE_MAX_BYTES",
+                "the compile-refusal cache at its entry capacity, under 2 MiB at any \
+                 host size (4,096 entries, each cut to a few hundred bytes), so there is \
+                 no host-size scaling to sum; pinned by \
+                 the_largest_entry_fits_the_byte_bound",
+            ),
+            (
+                "LEGACY_RECORD_BYTES",
+                "size of one record in the previous format of the compile-accepted file, \
+                 used to read it; not memory held",
+            ),
+            (
+                "DEFAULT_DATA_FLOOR_BYTES",
+                "memory limit given to a separate compile-check process, not node memory; the node-side figure is reserved from the service memory limit, less the node's current resident memory and the other reservations, by compile_worker::budget, which keeps the whole service under 90% of it",
+            ),
+            (
+                "DEFAULT_DATA_CEILING_BYTES",
+                "the most memory one compile-check process is given; see DEFAULT_DATA_FLOOR_BYTES",
+            ),
+            (
+                "usable",
+                "90% of the service memory limit: the share that the node and the compile-check processes together may reach (compile_worker::caps); the memory term for the compile-check processes, held by separate processes and not by node caches",
+            ),
+            (
+                "available",
+                "what a new compile-check reservation can still take: usable, less the node's resident memory and the reservations held (compile_worker::caps, enforced by compile_worker::budget); not a node cache budget",
+            ),
+            (
+                "MAX_REASON_BYTES",
+                "length cap on the reason text in one compile-check reply, not a memory budget",
+            ),
+            (
+                "MAX_REQUEST_WASM_BYTES",
+                "the node's module size limit applied to one compile-check request, not a memory budget",
+            ),
+            (
+                "MAX_RESPONSE_BYTES",
+                "largest compile-check reply frame, not a memory budget",
+            ),
+            (
+                "REQUEST_HEADER_BYTES",
+                "fixed size of a compile-check request header, not a memory budget",
+            ),
+            (
+                "STDERR_TAIL_BYTES",
+                "last bytes kept of a compile-check process's error output, per run",
+            ),
+            (
+                "MAX_PREFIX_BYTES",
+                "bytes skipped before a reply in test launchers only",
+            ),
+            (
+                "HEADER_BYTES",
+                "fixed size of the accepted-modules file header, not a memory budget",
+            ),
+            (
+                "RECORD_BYTES",
+                "fixed size of one accepted-modules file record, not a memory budget",
+            ),
+            (
+                "MAX_FILE_BYTES",
+                "largest accepted-modules file that is read (about 2 MiB), an on-disk bound",
+            ),
             (
                 "MAX_HOP_REPLY_BYTES",
                 "size cap on one inter-delegate reply, held for one delegate \

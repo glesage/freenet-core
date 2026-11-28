@@ -2247,8 +2247,10 @@ impl SimNetwork {
 
     /// Sets `transport-quic` to `value`, as `config.toml` would (`"off"`,
     /// `"shadow"`, `"prefer"`), on every node. Without this call the harness
-    /// writes `off`, whatever the node default is. Call before the simulation
-    /// starts.
+    /// writes `prefer` at a 100% data share (see
+    /// [`Self::with_release_quic_data_share`] to read the release's own share
+    /// instead); `"off"` opts a test back to the legacy UDP transport. Call
+    /// before the simulation starts.
     ///
     /// # Panics
     /// On a value this binary does not know. A node would read it as off
@@ -2363,7 +2365,7 @@ impl SimNetwork {
 
     /// Turns QUIC-native connects on for every node, at `percent` (the share
     /// of joins an acceptor decides native), in place of this release's
-    /// `NATIVE_DIAL_READY` and `QUIC_NATIVE_PERCENT`, which are on (25) in
+    /// `NATIVE_DIAL_READY` and `QUIC_NATIVE_PERCENT`, which are on (100) in
     /// production. Pair it with [`Self::with_quic_native_floor`], since without the native wire
     /// variants no decision reaches a joiner, and with
     /// [`Self::with_transport_quic`], since a node without a QUIC endpoint
@@ -2378,7 +2380,7 @@ impl SimNetwork {
 
     /// Turns on admission of native joins (`transport::quic::admission`) at
     /// the gateway `label`'s QUIC listener, in place of this release's
-    /// `GATEWAY_NATIVE_ADMISSION`, which is off. A joiner reaches it with
+    /// `GATEWAY_NATIVE_ADMISSION`, which is on in production. A joiner reaches it with
     /// [`Self::with_native_gateway_join`] when the gateway is marked native.
     /// Call before the simulation starts.
     #[cfg(any(test, feature = "testing"))]
@@ -2389,6 +2391,22 @@ impl SimNetwork {
             .get(label)
             .expect("the gateway must have an address in this network");
         crate::transport::in_memory_socket::force_gateway_native_admission(&self.name, addr);
+        self
+    }
+
+    /// Turns admission of native joins OFF at the gateway `label`'s QUIC
+    /// listener, standing in for a gateway on a release before admission was
+    /// switched on (it is on in production). A joiner that finds it marked
+    /// native times out and falls back to the UDP join. Call before the
+    /// simulation starts.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn with_gateway_native_admission_off(&mut self, label: &NodeLabel) -> &mut Self {
+        assert!(label.is_gateway(), "only a gateway admits native joins");
+        let addr = *self
+            .node_addresses
+            .get(label)
+            .expect("the gateway must have an address in this network");
+        crate::transport::in_memory_socket::force_gateway_native_admission_off(&self.name, addr);
         self
     }
 
@@ -2409,8 +2427,8 @@ impl SimNetwork {
 
     /// Turns native gateway joins (phase B) on for every node, at `percent`
     /// (the share of joiner-gateway pairs that dial native first), in place of
-    /// `NATIVE_DIAL_READY` and `GATEWAY_NATIVE_JOIN_PERCENT`, which are off,
-    /// and marks every gateway each node knows native, as the published index
+    /// `NATIVE_DIAL_READY` and `GATEWAY_NATIVE_JOIN_PERCENT`, which are on (100)
+    /// in production, and marks every gateway each node knows native, as the published index
     /// does for a gateway that admits native joins. A joiner with a QUIC
     /// endpoint (see [`Self::with_transport_quic`]) then tries a native join
     /// first, and falls back to the UDP join when it fails. Call before the
@@ -2525,6 +2543,33 @@ impl SimNetwork {
     pub fn with_gateway_max_connections(&mut self, max: usize) -> &mut Self {
         for (builder, _) in &mut self.gateways {
             builder.config.max_number_of_connections(max);
+        }
+        self
+    }
+
+    /// Clears `quic-data-percent` on every node, so each reads the release's own
+    /// share (the ramp), instead of the simulation default of 100.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn with_release_quic_data_share(&mut self) -> &mut Self {
+        for label in self.pending_labels() {
+            let config = self.node_config_mut(&label);
+            Arc::make_mut(&mut config.config)
+                .network_api
+                .quic_data_percent = None;
+        }
+        self
+    }
+
+    /// Clears the native connect and native gateway join shares on every
+    /// node, so each runs this release's own (`QUIC_NATIVE_PERCENT`,
+    /// `GATEWAY_NATIVE_JOIN_PERCENT`) instead of the simulation default of 0%.
+    /// For a test of the shipped defaults. Call before the simulation starts.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn with_release_native_share(&mut self) -> &mut Self {
+        for label in self.pending_labels() {
+            let config = self.node_config_mut(&label);
+            config.native_connect_override = None;
+            config.native_gateway_join_override = None;
         }
         self
     }
@@ -2852,16 +2897,6 @@ impl QuicEndpointProbe {
                 (*node, labels)
             })
             .collect()
-    }
-
-    /// Whether the probe covered at least one node and every node refused
-    /// it as `not_allowed`, i.e. had a live QUIC endpoint.
-    pub fn every_node_has_a_live_endpoint(&self) -> bool {
-        let outcomes = self.outcomes();
-        !outcomes.is_empty()
-            && outcomes
-                .iter()
-                .all(|(_, labels)| labels.as_slice() == ["not_allowed"])
     }
 }
 
@@ -3973,10 +4008,12 @@ impl SimNetwork {
                     // Default to usize::MAX so tests don't trigger streaming unless
                     // explicitly opted in via with_streaming_threshold().
                     streaming_threshold: Some(self.streaming_threshold.unwrap_or(usize::MAX)),
-                    // QUIC is off in a simulation unless the test turns it on
-                    // (`with_transport_quic`), whatever the node default is, so a
-                    // change of that default leaves every other run's trace as it was.
-                    transport_quic: Some(crate::transport::quic::QuicMode::OFF.to_string()),
+                    // A simulation negotiates QUIC data with every pair unless the
+                    // test opts back into the legacy UDP transport with
+                    // `with_transport_quic("off")`. The values are pinned here so a
+                    // change of the node default does not move simulations.
+                    transport_quic: Some(crate::transport::quic::QuicMode::PREFER.to_string()),
+                    quic_data_percent: Some("100".to_string()),
                     ..Default::default()
                 },
                 ..Default::default()
@@ -4002,6 +4039,12 @@ impl SimNetwork {
                 config.transient_budget = budget;
             }
             config.connect_backoff_base = self.connect_backoff_base_override;
+            // Pinned, like the QUIC mode and data share above: a default
+            // simulation decides no connect native, whatever this release's
+            // `QUIC_NATIVE_PERCENT` and `GATEWAY_NATIVE_JOIN_PERCENT` are. A test
+            // turns native on with `with_native_connect` / `with_native_gateway_join`.
+            config.native_connect_override = Some(0);
+            config.native_gateway_join_override = Some(0);
             config.key_pair = keypair;
             config.network_listener_ip = ip.into();
             config.network_listener_port = port;
@@ -4085,10 +4128,12 @@ impl SimNetwork {
                     // Default to usize::MAX so tests don't trigger streaming unless
                     // explicitly opted in via with_streaming_threshold().
                     streaming_threshold: Some(self.streaming_threshold.unwrap_or(usize::MAX)),
-                    // QUIC is off in a simulation unless the test turns it on
-                    // (`with_transport_quic`), whatever the node default is, so a
-                    // change of that default leaves every other run's trace as it was.
-                    transport_quic: Some(crate::transport::quic::QuicMode::OFF.to_string()),
+                    // A simulation negotiates QUIC data with every pair unless the
+                    // test opts back into the legacy UDP transport with
+                    // `with_transport_quic("off")`. The values are pinned here so a
+                    // change of the node default does not move simulations.
+                    transport_quic: Some(crate::transport::quic::QuicMode::PREFER.to_string()),
+                    quic_data_percent: Some("100".to_string()),
                     ..Default::default()
                 },
                 ..Default::default()
@@ -4113,6 +4158,9 @@ impl SimNetwork {
                 config.transient_budget = budget;
             }
             config.connect_backoff_base = self.connect_backoff_base_override;
+            // Pinned like the gateway site above: no native connect by default.
+            config.native_connect_override = Some(0);
+            config.native_gateway_join_override = Some(0);
             for GatewayConfig {
                 peer_key_location,
                 location,
@@ -8788,8 +8836,12 @@ mod tests {
         for label in &labels {
             let config = sim.node_config_mut(label);
             assert!(
-                config.config.network_api.quic_settings().is_none(),
-                "QUIC is off in a simulation unless the test turns it on"
+                config.config.network_api.quic_settings().is_some(),
+                "QUIC is on (prefer, 100% data) in a simulation unless the test turns it off"
+            );
+            assert_eq!(
+                config.config.network_api.quic_data_percent.as_deref(),
+                Some("100")
             );
             assert_eq!(config.advertised_version_override, None);
             assert_eq!(config.quic_idle_timeout_override, None);
@@ -8978,25 +9030,59 @@ mod tests {
 
     /// In a running simulation a node with `transport-quic = "shadow"`
     /// has a QUIC ingress on its socket (a QUIC-class datagram from a
-    /// stranger is refused as not allowed), and a node left off has none.
+    /// stranger is refused as not allowed, or on a gateway, which admits
+    /// native joins from unknown sources, queued as forwarded), and a node
+    /// left off has none.
     #[tokio::test(flavor = "current_thread")]
     async fn transport_quic_builds_the_endpoint_of_a_running_simulated_node() {
+        quic_endpoint_of_a_running_simulated_node(
+            "shadow",
+            "quic-running-endpoint-e5a1",
+            crate::transport::metrics::QuicIngressOutcome::NotAllowed,
+        )
+        .await;
+    }
+
+    /// A `prefer` gateway admits native joins from unknown sources, so it
+    /// queues a stranger's datagram (`Forwarded`); the `shadow` gateway of the
+    /// test above, which keeps application data on UDP, does not.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_prefer_gateway_queues_a_strangers_datagram_for_admission() {
+        quic_endpoint_of_a_running_simulated_node(
+            "prefer",
+            "quic-running-endpoint-prefer-e5a2",
+            crate::transport::metrics::QuicIngressOutcome::Forwarded,
+        )
+        .await;
+    }
+
+    async fn quic_endpoint_of_a_running_simulated_node(
+        mode: &'static str,
+        network: &'static str,
+        gateway_outcome: crate::transport::metrics::QuicIngressOutcome,
+    ) {
         use crate::transport::in_memory_socket::deliver_packet_to_network;
         use crate::transport::metrics::{QuicIngressOutcome, TRANSPORT_METRICS};
-        const NETWORK: &str = "quic-running-endpoint-e5a1";
-        let mut sim = SimNetwork::new(NETWORK, 1, 1, 7, 3, 6, 1, 0x5940_E5A1_0012).await;
+        let mut sim = SimNetwork::new(network, 1, 1, 7, 3, 6, 1, 0x5940_E5A1_0012).await;
         let labels = labels_in_order(&sim);
-        sim.with_node_transport_quic(&labels[0], "shadow");
+        sim.with_node_transport_quic(&labels[0], mode);
+        // The second node must have no QUIC endpoint, which is no longer the
+        // simulation default.
+        sim.with_node_transport_quic(&labels[1], "off");
         let _handles = sim
             .start_with_rand_gen::<rand::rngs::SmallRng>(0x5940_E5A1_0012, 1, 1)
             .await;
+        // `labels[0]` is the gateway (one gateway, one node): a `prefer` one
+        // queues a stranger's datagram for admission, a `shadow` one refuses it.
+        assert!(labels[0].is_gateway(), "premise: labels[0] is the gateway");
         let targets: Vec<(SocketAddr, SocketAddr, QuicIngressOutcome)> = [
-            (&labels[0], 1, QuicIngressOutcome::NotAllowed),
+            (&labels[0], 1, gateway_outcome),
             (&labels[1], 2, QuicIngressOutcome::NoIngress),
         ]
         .into_iter()
         .map(|(label, port, expected)| {
-            let stranger = SocketAddr::from(([10, 201, 39, 1], port));
+            let stranger =
+                SocketAddr::from(([10, 201, if mode == "prefer" { 40 } else { 39 }, 1], port));
             (sim.all_node_addresses()[label], stranger, expected)
         })
         .collect();
@@ -9012,7 +9098,7 @@ mod tests {
                     tokio::time::Instant::now() < deadline,
                     "{target} never read the datagram"
                 );
-                deliver_packet_to_network(NETWORK, target, initial.clone(), stranger);
+                deliver_packet_to_network(network, target, initial.clone(), stranger);
                 sim.advance_time(Duration::from_millis(100));
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }

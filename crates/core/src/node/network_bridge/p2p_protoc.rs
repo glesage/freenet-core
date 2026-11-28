@@ -1382,7 +1382,7 @@ impl P2pConnManager {
         // Initialize our peer identity before any connection attempts so join requests can
         // reference the correct address.
         // Note: For peers behind NAT, this initial address is a fallback - the correct
-        // external address is learned via ObservedAddress and updated via set_own_addr().
+        // external address is learned via ObservedAddress and updated via ConnectionManager::apply_observed_address().
         // The ring location should be computed from the observed external address,
         // not from this initial fallback.
         let advertised_addr = {
@@ -1979,6 +1979,10 @@ impl P2pConnManager {
             // for a frame (`HeldNative`); a no-op when none is held.
             ctx.expire_held_native(Instant::now());
 
+            // How long this event holds the loop, for tests: nothing else the
+            // node receives is handled until it ends.
+            #[cfg(any(test, feature = "testing"))]
+            let _event_timer = EventLoopTimer(tokio::time::Instant::now());
             match event {
                 EventResult::Continue => continue,
                 EventResult::Event(event) => {
@@ -4483,6 +4487,20 @@ fn extract_sender_from_message_mut(msg: &mut NetMessage) -> Option<&mut PeerKeyL
 }
 
 // TODO: add testing for the network loop, now it should be possible to do since we don't depend upon having real connections
+
+/// Records, when dropped, how long the event loop spent on one event
+/// (`GlobalTestMetrics::longest_event_loop_event`).
+/// Reads `tokio::time::Instant` on purpose, not `TimeSource`: the simulation
+/// runs on tokio's virtual clock, and that is the time a held loop is measured in.
+#[cfg(any(test, feature = "testing"))]
+struct EventLoopTimer(tokio::time::Instant);
+
+#[cfg(any(test, feature = "testing"))]
+impl Drop for EventLoopTimer {
+    fn drop(&mut self) {
+        crate::config::GlobalTestMetrics::record_event_loop_event(self.0.elapsed());
+    }
+}
 
 #[cfg(test)]
 mod ring_transport_desync_tests {

@@ -34,10 +34,12 @@
 //! | `quic_carried_dark_episode_<label>` | the same, for the episodes of paths that carried data when the episode ended: a subset of `quic_dark_episode_<label>`, counted by the same decision |
 //! | `quic_dark_episode_<label>` | dark episodes on QUIC paths (`recycle::AckWatch`: packets outstanding, nothing acknowledged and nothing heard) by how they ended: `recovered_lt_5s`, `lt_10s`, `lt_30s`, `lt_120s`, `recovered_ge_120s`, `unrecovered` (the path closed, or nothing was outstanding any more), `cap_held` (the egress cap held this side's sends, so darkness could no longer be told), `closed_at_window` (the dark-path rule closed a path that carries data and has no UDP session, a native path). A path that carries no data, and since 0.2.159 a data path with a UDP session (`recycle::DARK_CLOSES_WITH_UDP`), is never closed by that rule, so its episodes run to their end (a data path with a UDP session counts the close the rule would have made in `quic_stall_would_close_dark`); read at the watch's 2 s ticks |
 //! | `quic_ack_wait_expired_<label>` | sends whose wait for the acknowledgement of their end ran out and whose stream was reset, by kind: `stream` (a send with an ack wait: a Stream, or a Short past one packet), `short` (a one-packet Short, past its 150 s bound) or `control` (a control frame, bounded as a one-packet Short); only those that count as strikes (`path::StrikeCheck`: evidence the end went out and the peer is alive). An honest peer acknowledges an end within a few round trips, so this should be 0 on every honest path (`recycle::ACK_WAIT_EXPIRY_LIMIT` in `ACK_WAIT_EXPIRY_WINDOW` closes a path with no UDP session and counts a would-close on one with a UDP session, `recycle::ACK_WAITS_EXPIRED_CLOSES_WITH_UDP`) |
-//! | `quic_late_end_<label>` | sends whose end was acknowledged late, or not at all, though the peer had wholly acknowledged enough data-stream bytes since the end to have carried it (`path::LateEndCheck`), by the same kinds as `quic_ack_wait_expired_<label>`; expected 0 on every honest path. Each time `recycle::ACK_WAIT_EXPIRY_LIMIT` come within `ACK_WAIT_EXPIRY_WINDOW` a would-close is counted under `late_ends` (observe-only, `recycle::LATE_ENDS_CLOSE`) |
-//! | `quic_stall_close_<label>` | paths the acknowledgement watch closed, by why: `not_acknowledging`, `dark`, `credit_starved`, `stream_credit_withheld`, `ack_waits_expired`, `late_ends` (`recycle::Stall`; `late_ends` never closes, `recycle::LATE_ENDS_CLOSE`) |
-//! | `quic_stall_would_close_<label>` | times a rule that only observes would have closed a path, by the same labels; each count starts the rule's window afresh. Three rules observe today. `ack_waits_expired` counts, on a path with a UDP session (`recycle::ACK_WAITS_EXPIRED_CLOSES_WITH_UDP` is false; a native path is closed), each time `ACK_WAIT_EXPIRY_LIMIT` strikes came within `ACK_WAIT_EXPIRY_WINDOW`, for calibrating the rule before UDP removal (#6205). `dark` counts once per episode on a data path with a UDP session, where the dark rule does not close (`recycle::DARK_CLOSES_WITH_UDP` is false); the episode is counted to its end in `quic_carried_dark_episode_<label>`. `late_ends` counts on every path (`recycle::LATE_ENDS_CLOSE` is false) each time `ACK_WAIT_EXPIRY_LIMIT` late ends came within `ACK_WAIT_EXPIRY_WINDOW` (`quic_late_end_<label>`) |
+//! | `quic_late_end_<label>` | sends whose end was acknowledged late, or not at all, though the peer had wholly acknowledged enough data-stream bytes since the end to have carried it (`path::LateEndCheck`), by the same kinds as `quic_ack_wait_expired_<label>`; expected 0 on every honest path. Each time `recycle::ACK_WAIT_EXPIRY_LIMIT` separate episodes (late ends within `recycle::LATE_END_EPISODE_GAP` of the last counted one are one episode) come within `ACK_WAIT_EXPIRY_WINDOW` a would-close is counted on every path (`quic_stall_would_close_late_ends`); a path with no UDP session (a native one) is closed under `late_ends` only once `recycle::LATE_ENDS_CLOSE_NATIVE` is set (false: dark until the D-3 flag day), a path with a UDP session never (`recycle::LATE_ENDS_CLOSES_WITH_UDP`) |
+//! | `quic_late_end_judged_<label>` | sends whose end reached the proof point of the late-end check (`path::LateEndCheck`: the peer wholly acknowledged enough later data-stream bytes that an honest peer would have acknowledged the end), by the same kinds; the denominator of `quic_late_end_<label>`, counted once per end. A `quic_late_end_<label>` of 0 says little where this is also near 0 |
+//! | `quic_stall_close_<label>` | paths the acknowledgement watch closed, by why: `not_acknowledging`, `dark`, `credit_starved`, `stream_credit_withheld`, `ack_waits_expired`, `late_ends` (`recycle::Stall`; `late_ends` closes a native path only once `recycle::LATE_ENDS_CLOSE_NATIVE` is set, `recycle::LATE_ENDS_CLOSES_WITH_UDP`) |
+//! | `quic_stall_would_close_<label>` | times a rule that only observes would have closed a path, by the same labels; each count starts the rule's window afresh. Three rules observe today. `ack_waits_expired` counts, on a path with a UDP session (`recycle::ACK_WAITS_EXPIRED_CLOSES_WITH_UDP` is false; a native path is closed), each time `ACK_WAIT_EXPIRY_LIMIT` strikes came within `ACK_WAIT_EXPIRY_WINDOW`, for calibrating the rule before UDP removal (#6205). `dark` counts once per episode on a data path with a UDP session, where the dark rule does not close (`recycle::DARK_CLOSES_WITH_UDP` is false); the episode is counted to its end in `quic_carried_dark_episode_<label>`. `late_ends` counts, on every path (`recycle::LATE_ENDS_CLOSES_WITH_UDP` and `recycle::LATE_ENDS_CLOSE_NATIVE` are false), each time `ACK_WAIT_EXPIRY_LIMIT` late-end episodes came within `ACK_WAIT_EXPIRY_WINDOW` (`quic_late_end_<label>`) |
 //! | `quic_pipe_source_<label>` | pipes (an inbound stream forwarded on a path, `quic_data_send_pipe_*`) that ended `sent` or `dropped`, by what fed the inbound stream: `quic_fed_sent`, `quic_fed_dropped`, `udp_fed_sent`, `udp_fed_dropped`; each sums to its `quic_data_send_pipe_<result>` |
+//! | `quic_short_dropped_<label>` | the Shorts counted in `quic_data_send_short_dropped`, by cause: `not_opened_exhausted` (no stream opened within the deadline: the peer's stream credit after the native retries were used up, or a wait on this side's own resources, which is not retried), `timed_out`, `paced`, `connection_lost` (connection lost or path closed mid-send), `peer_refused_data` (stop `NOT_ACCEPTING_DATA`, or the path no longer sends data), `budget_refused` (stop `BUDGET_REFUSED`), `stopped_other` (any other stop code), `invalid_frame`, `source_error`, `queue_full` (native queue full), `path_ended` (path ended, no UDP fallback), `no_udp_session`; sums to `quic_data_send_short_dropped` |
 //! | `quic_pipe_dropped_<label>` | the same dropped pipes by cause: `source_error` (the inbound stream failed or delivered the wrong length), `source_stall_timeout` (a deadline ran out while the pipe waited for its source), `own_path` (anything else: this path timed out, was lost, or the peer stopped the stream); sums to `quic_data_send_pipe_dropped` |
 //! | `quic_send_resets`, `quic_path_ms` | sends a path reset on this side, and the time QUIC paths were up, shadow paths included, up to each path's last tick: resets per connection-hour is their ratio |
 //! | `quic_budget_bytes`, `quic_budget_charged_bytes`, `quic_budget_charged_peak_bytes` | the node's QUIC buffer budget, what its data paths' windows have grown above their floor grants now (the floor grants are each path's fixed charge, not the budget's, so a node with every path at the floor reports 0 and uploads nothing; gauges, not reset, uploaded when not 0), and the most charged at once in the period (`quic::budget`) |
@@ -249,6 +251,75 @@ pub(crate) enum PipeDropCause {
     SourceStallTimeout,
     /// Anything else: the path timed out or was lost, or the peer stopped it.
     OwnPath,
+}
+
+/// `quic_short_dropped_<label>`: why a Short was dropped ([`ShortDropCause`]).
+pub(crate) const SHORT_DROP_LABELS: [&str; 12] = [
+    "not_opened_exhausted",
+    "timed_out",
+    "paced",
+    "connection_lost",
+    "peer_refused_data",
+    "budget_refused",
+    "stopped_other",
+    "invalid_frame",
+    "source_error",
+    "queue_full",
+    "path_ended",
+    "no_udp_session",
+];
+
+/// Why a Short was dropped, in the order of [`SHORT_DROP_LABELS`]. Chosen where
+/// the drop is decided (`QuicPath::settle`, `DataRoute::queue_short`,
+/// `send_elsewhere`), never worked out from other counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ShortDropCause {
+    /// No stream opened within the deadline: the peer's stream credit, after the
+    /// native retries were used up, or a wait on this side's own resources
+    /// (`NotOpened::TimedOut`), which is not retried.
+    NotOpenedExhausted = 0,
+    /// The send's deadline ran out.
+    TimedOut = 1,
+    /// The bandwidth pacer refused the send.
+    Paced = 2,
+    /// The connection was lost or the path closed during the send.
+    ConnectionLost = 3,
+    /// The peer stopped the stream with `NOT_ACCEPTING_DATA`, or the route
+    /// found the path no longer sending data.
+    PeerRefusedData = 4,
+    /// The peer stopped the stream with `BUDGET_REFUSED`.
+    BudgetRefused = 5,
+    /// The peer stopped the stream with another code.
+    StoppedOther = 6,
+    /// The frame was invalid.
+    InvalidFrame = 7,
+    /// The send's source failed or delivered the wrong length.
+    SourceError = 8,
+    /// The native route's queue was full and the path has no UDP fallback.
+    QueueFull = 9,
+    /// The path had ended, with no UDP fallback to take the message.
+    PathEnded = 10,
+    /// The route had no UDP session to hand the message to.
+    NoUdpSession = 11,
+}
+
+impl ShortDropCause {
+    /// Every cause, in the order of [`SHORT_DROP_LABELS`].
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) const ALL: [Self; SHORT_DROP_LABELS.len()] = [
+        Self::NotOpenedExhausted,
+        Self::TimedOut,
+        Self::Paced,
+        Self::ConnectionLost,
+        Self::PeerRefusedData,
+        Self::BudgetRefused,
+        Self::StoppedOther,
+        Self::InvalidFrame,
+        Self::SourceError,
+        Self::QueueFull,
+        Self::PathEnded,
+        Self::NoUdpSession,
+    ];
 }
 
 /// What kind of send's ack wait ran out, for `quic_ack_wait_expired_<label>`.
@@ -585,10 +656,12 @@ pub(crate) struct QuicDataCounters {
     share: Mutex<Option<ShareSource>>,
     ack_wait_expired: [AtomicU64; ACK_WAIT_EXPIRED_LABELS.len()],
     late_end: [AtomicU64; ACK_WAIT_EXPIRED_LABELS.len()],
+    late_end_judged: [AtomicU64; ACK_WAIT_EXPIRED_LABELS.len()],
     stall_closes: [AtomicU64; STALL_CLOSE_LABELS.len()],
     stall_would_close: [AtomicU64; STALL_CLOSE_LABELS.len()],
     pipe_source: [AtomicU64; PIPE_SOURCE_LABELS.len()],
     pipe_dropped: [AtomicU64; PIPE_DROP_LABELS.len()],
+    short_dropped: [AtomicU64; SHORT_DROP_LABELS.len()],
 }
 
 impl QuicDataCounters {
@@ -627,10 +700,12 @@ impl QuicDataCounters {
             share: Mutex::new(None),
             ack_wait_expired: std::array::from_fn(|_| zero()),
             late_end: std::array::from_fn(|_| zero()),
+            late_end_judged: std::array::from_fn(|_| zero()),
             stall_closes: std::array::from_fn(|_| zero()),
             stall_would_close: std::array::from_fn(|_| zero()),
             pipe_source: std::array::from_fn(|_| zero()),
             pipe_dropped: std::array::from_fn(|_| zero()),
+            short_dropped: std::array::from_fn(|_| zero()),
         }
     }
 
@@ -652,6 +727,13 @@ impl QuicDataCounters {
     /// `quic_ramp_share_pct`.
     pub(crate) fn set_share(&self, share: Option<ShareSource>) {
         *self.share.lock() = share;
+    }
+
+    /// The cause of a Short counted as `short_dropped`. Called only by
+    /// `QuicPathStats::record_short_dropped`, which also counts the send, so the
+    /// causes sum to `quic_data_send_short_dropped`.
+    pub(crate) fn record_short_drop_cause(&self, cause: ShortDropCause) {
+        self.short_dropped[cause as usize].fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn record_send(&self, kind: SendKind, result: QuicSendResult) {
@@ -911,6 +993,14 @@ impl QuicDataCounters {
         self.late_end[kind as usize].fetch_add(1, Ordering::Relaxed);
     }
 
+    /// A send's end reached the proof point of the late-end check
+    /// (`path::LateEndCheck`): enough later data was acknowledged that an
+    /// honest peer would have acknowledged it. The denominator of
+    /// `quic_late_end_<label>`.
+    pub(crate) fn record_late_end_judged(&self, kind: AckWaitKind) {
+        self.late_end_judged[kind as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
     /// A send's wait for the acknowledgement of its end ran out.
     pub(crate) fn record_ack_wait_expired(&self, kind: AckWaitKind) {
         self.ack_wait_expired[kind as usize].fetch_add(1, Ordering::Relaxed);
@@ -1055,10 +1145,12 @@ impl QuicDataCounters {
             ramp_share_pct: self.share.lock().as_ref().map_or(0, ShareSource::percent),
             ack_wait_expired: self.ack_wait_expired.iter().map(get).collect(),
             late_end: self.late_end.iter().map(get).collect(),
+            late_end_judged: self.late_end_judged.iter().map(get).collect(),
             stall_closes: self.stall_closes.iter().map(get).collect(),
             stall_would_close: self.stall_would_close.iter().map(get).collect(),
             pipe_source: self.pipe_source.iter().map(get).collect(),
             pipe_dropped: self.pipe_dropped.iter().map(get).collect(),
+            short_dropped: self.short_dropped.iter().map(get).collect(),
         }
     }
 }
@@ -1184,10 +1276,18 @@ pub struct QuicDataSnapshot {
     /// Pipes dropped in the period, by `PIPE_DROP_LABELS`.
     #[serde(default)]
     pub pipe_dropped: Vec<u64>,
+    /// Shorts dropped in the period, by `SHORT_DROP_LABELS`; sums to
+    /// `quic_data_send_short_dropped`.
+    #[serde(default)]
+    pub short_dropped: Vec<u64>,
     /// Sends whose end was late in the period (`path::LateEndCheck`), by
     /// `ACK_WAIT_EXPIRED_LABELS`.
     #[serde(default)]
     pub late_end: Vec<u64>,
+    /// Ends that reached the late-end proof point in the period, by
+    /// `ACK_WAIT_EXPIRED_LABELS`: the denominator of `late_end`.
+    #[serde(default)]
+    pub late_end_judged: Vec<u64>,
 }
 
 impl QuicDataSnapshot {
@@ -1258,7 +1358,9 @@ impl QuicDataSnapshot {
             stall_would_close,
             pipe_source,
             pipe_dropped,
+            short_dropped,
             late_end,
+            late_end_judged,
         } = self;
         let mut keys = Vec::new();
         let mut family = |prefix: &'static str, labels: Vec<String>, values: Vec<u64>| {
@@ -1408,12 +1510,25 @@ impl QuicDataSnapshot {
             pipe_dropped.clone(),
         );
         family(
+            "quic_short_dropped_",
+            SHORT_DROP_LABELS.iter().map(|l| l.to_string()).collect(),
+            short_dropped.clone(),
+        );
+        family(
             "quic_late_end_",
             ACK_WAIT_EXPIRED_LABELS
                 .iter()
                 .map(|l| l.to_string())
                 .collect(),
             late_end.clone(),
+        );
+        family(
+            "quic_late_end_judged_",
+            ACK_WAIT_EXPIRED_LABELS
+                .iter()
+                .map(|l| l.to_string())
+                .collect(),
+            late_end_judged.clone(),
         );
         for (key, value) in [
             ("quic_enabled_data_paths", *data_enabled),
@@ -1532,7 +1647,9 @@ impl QuicDataSnapshot {
             stall_would_close,
             pipe_source,
             pipe_dropped,
+            short_dropped,
             late_end,
+            late_end_judged,
         } = self;
         let any = |values: &[u64]| values.iter().any(|n| *n != 0);
         any(sends)
@@ -1552,7 +1669,9 @@ impl QuicDataSnapshot {
             || any(stall_would_close)
             || any(pipe_source)
             || any(pipe_dropped)
+            || any(short_dropped)
             || any(late_end)
+            || any(late_end_judged)
             || [
                 *data_enabled,
                 *sends_opened,
@@ -1584,6 +1703,32 @@ impl QuicDataSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Each Short drop cause reaches `quic_short_dropped_<its label>`, in the
+    /// order of the labels.
+    #[test]
+    fn each_short_drop_cause_reaches_its_key() {
+        let counters = QuicDataCounters::new();
+        assert!(
+            counters
+                .snapshot(true)
+                .keys()
+                .iter()
+                .filter(|(k, _)| k.starts_with("quic_short_dropped_"))
+                .all(|(_, n)| *n == 0),
+            "nothing counted"
+        );
+        for (i, cause) in ShortDropCause::ALL.iter().enumerate() {
+            for _ in 0..=i {
+                counters.record_short_drop_cause(*cause);
+            }
+        }
+        let keys: std::collections::BTreeMap<_, _> =
+            counters.snapshot(true).keys().into_iter().collect();
+        for (i, label) in SHORT_DROP_LABELS.iter().enumerate() {
+            assert_eq!(keys[&format!("quic_short_dropped_{label}")], i as u64 + 1);
+        }
+    }
 
     /// Each family is counted where it is recorded, read back under its own keys
     /// with its own values, and reset by the snapshot, except the gauge.

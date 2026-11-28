@@ -188,14 +188,17 @@ async fn backends_refuse_each_others_artifacts() -> Result<(), Box<dyn std::erro
     let engines = backends
         .iter()
         .map(|backend| {
-            Engine::create_backend_engine(&RuntimeConfig {
-                wasm_backend: *backend,
-                ..Default::default()
-            })
+            Engine::create_backend_engine(
+                &RuntimeConfig {
+                    wasm_backend: *backend,
+                    ..Default::default()
+                },
+                std::sync::Arc::new(crate::util::time_source::InstantTimeSrc::new()),
+            )
         })
         .collect::<Result<Vec<_>, _>>()?;
     for (from, from_engine) in backends.iter().zip(&engines) {
-        let artifact = wasmtime::Module::new(from_engine, &wasm)?.serialize()?;
+        let artifact = wasmtime::Module::new(from_engine.engine(), &wasm)?.serialize()?;
         for (to, to_engine) in backends.iter().zip(&engines) {
             if from == to {
                 continue;
@@ -203,7 +206,7 @@ async fn backends_refuse_each_others_artifacts() -> Result<(), Box<dyn std::erro
             // SAFETY: the bytes come from `Module::serialize` in this process,
             // so they are a well-formed wasmtime artifact. The call must refuse
             // them because they target another backend.
-            let loaded = unsafe { wasmtime::Module::deserialize(to_engine, &artifact) };
+            let loaded = unsafe { wasmtime::Module::deserialize(to_engine.engine(), &artifact) };
             assert!(
                 loaded.is_err(),
                 "{to} loaded an artifact compiled for {from}"

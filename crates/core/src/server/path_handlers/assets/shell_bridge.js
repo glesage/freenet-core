@@ -282,7 +282,15 @@ function freenetBridge(authToken, userToken, hostedMode) {
     // match than CONTRACT_PREFIX_RE (which is anchored), which is fine because
     // `location.pathname` is server-controlled and can't contain `?`/`#`.
     var m = location.pathname.match(/\/v[12]\/contract\/web\/([^/?#]+)/);
-    return m ? 'freenet_notify:' + m[1] : null;
+    if (!m) return null;
+    // Canonicalise: percent-encoded spellings of one key (`%41` vs `A`) must
+    // share one consent / rate / snooze entry. Fall back to the raw segment
+    // when it is not valid percent-encoding.
+    var seg = m[1];
+    try {
+      seg = decodeURIComponent(seg);
+    } catch (_) {}
+    return 'freenet_notify:' + seg;
   }
 
   function contractSnoozeKey() {
@@ -709,7 +717,7 @@ function freenetBridge(authToken, userToken, hostedMode) {
     enable.textContent = 'Enable';
     enable.style.cssText =
       'cursor:pointer;border:none;border-radius:6px;padding:6px 12px;' +
-      'background:#007FFF;color:#fff;font:inherit;font-weight:600;';
+      'background:#2e65a0;color:#fff;font:inherit;font-weight:600;';
     var dismiss = document.createElement('button');
     dismiss.textContent = 'Not now';
     dismiss.style.cssText =

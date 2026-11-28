@@ -6,6 +6,7 @@ pub(crate) mod delegate_interest;
 mod delegate_store;
 pub(crate) mod delegate_subscriptions;
 pub(crate) mod engine;
+pub use engine::compile_worker::metrics::CompileTelemetry;
 mod error;
 mod guest_mem;
 pub(crate) mod mock_state_storage;
@@ -20,6 +21,9 @@ mod secrets_store;
 // chmod-ed afterwards), and the conformance focus salt needs it too. Widening the
 // whole module for one helper would expose the secrets store's internals crate-wide
 // for convenience.
+#[cfg(test)]
+pub(crate) use secrets_store::read_failures::FailureKind;
+pub(crate) use secrets_store::read_failures::{SECRET_READ_FAILURES, SecretReadFailures};
 pub(crate) use secrets_store::sweep::create_owner_only;
 pub(crate) mod simulation_runtime;
 mod state_store;
@@ -27,7 +31,8 @@ mod state_store;
 pub(crate) mod tests;
 
 pub(crate) use contract::{
-    ContractRuntimeBridge, ContractRuntimeInterface, ContractStoreBridge, classify_result,
+    ContractRuntimeBridge, ContractRuntimeInterface, ContractStoreBridge, classify_compile_result,
+    classify_result,
 };
 pub use contract_store::{ContractStore, SharedCodeCache, SharedContractIndex};
 #[cfg(test)]

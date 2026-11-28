@@ -68,8 +68,9 @@ show_help() {
     echo
     echo "Options:"
     echo "  --version X.Y.Z           Target version (required)"
-    echo "  --min-compatible X.Y.Z    Minimum compatible version for range-based"
-    echo "                            version checking (default: previous release)"
+    echo "  --min-compatible X.Y.Z    Refused. This script never changes the"
+    echo "                            handshake floor; raise it in its own reviewed"
+    echo "                            PR (docs/RELEASING.md)"
     echo "  --skip-tests              Skip pre-release tests"
     echo "  --dry-run                 Show what would be done without executing"
     echo "  --help                    Show this help"
@@ -99,9 +100,12 @@ while [[ $# -gt 0 ]]; do
             echo "      Gateways are now updated automatically after binaries are available."
             shift
             ;;
-        --min-compatible)
-            MIN_COMPATIBLE="$2"
-            shift 2
+        --min-compatible|--min-compatible=*)
+            # Refused on sight, in any spelling, with or without a value (#5833).
+            echo "Error: --min-compatible is no longer supported. This script never changes"
+            echo "       the handshake floor; raise min-compatible-version in"
+            echo "       crates/core/Cargo.toml in its own reviewed PR (docs/RELEASING.md)."
+            exit 1
             ;;
         --skip-tests)
             SKIP_TESTS=true
@@ -123,6 +127,20 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# This driver cuts through a `build: release X` PR merged into main and tags
+# the merge commit. release.yml no longer does: it ships an exact soaked
+# commit (`ship_sha`) plus a version bump on `release/vX`, gated by that
+# branch's push CI, and syncs main afterwards (release-sync.yml). A live cut
+# from here would put a bump on main that release-sync.yml and the next
+# release.yml pre-flight do not expect, so only a dry run is allowed.
+if [[ "$DRY_RUN" != "true" ]]; then
+    echo "Error: scripts/release.sh no longer cuts live releases. Its PR-and-merge-commit"
+    echo "flow does not match the pipeline. Cut through the freenet:release skill, which"
+    echo "dispatches .github/workflows/release.yml with the soaked commit as ship_sha"
+    echo "(docs/RELEASING.md). --dry-run still works here."
+    exit 1
+fi
+
 if [[ -z "$VERSION" ]]; then
     echo "Error: --version is required"
     show_help
@@ -135,15 +153,34 @@ if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
     exit 1
 fi
 
-# Default min-compatible to the current version in Cargo.toml (the version before the bump).
-# This means gateways running the new version will still accept peers on the previous version.
-if [[ -z "$MIN_COMPATIBLE" ]]; then
-    MIN_COMPATIBLE=$(grep "^version" "$PROJECT_ROOT/crates/core/Cargo.toml" 2>/dev/null | head -1 | cut -d'"' -f2)
-    echo "Min-compatible version: $MIN_COMPATIBLE (defaulting to current version before bump)"
-else
-    echo "Min-compatible version: $MIN_COMPATIBLE (explicitly set)"
+# current_min_compatible <Cargo.toml> -- print the handshake floor committed in
+# `package.metadata.freenet.min-compatible-version`, or return 1 if it is
+# missing or not X.Y.Z.
+current_min_compatible() {
+    local value
+    value=$(grep -E '^min-compatible-version[[:space:]]*=' "$1" 2>/dev/null | head -1 | cut -d'"' -f2)
+    if [[ ! "$value" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        return 1
+    fi
+    printf '%s\n' "$value"
+}
+
+# The handshake floor ships exactly as committed, as it does from release.yml
+# (#5833). This script used to default it to the previous release and write
+# that into the bump, which would make every updated peer refuse every peer
+# that had not updated yet: a network split on an ordinary release. Raising the
+# floor is its own reviewed PR (docs/RELEASING.md), so --min-compatible is
+# refused during argument parsing rather than written into a release bump.
+#
+# A committed floor that cannot be read is refused too: build.rs would then
+# fall back to the package version, the same split. The env override is
+# cleared so a value left in the caller's shell cannot reach the builds.
+if ! MIN_COMPATIBLE=$(current_min_compatible "$PROJECT_ROOT/crates/core/Cargo.toml"); then
+    echo "Error: could not read an X.Y.Z min-compatible-version from crates/core/Cargo.toml."
+    exit 1
 fi
-export FREENET_MIN_COMPATIBLE_VERSION="$MIN_COMPATIBLE"
+echo "Handshake floor (min-compatible-version): $MIN_COMPATIBLE (unchanged, shipped as committed)"
+unset FREENET_MIN_COMPATIBLE_VERSION
 
 # Get the most recently published version from crates.io (most authoritative source).
 #
@@ -154,7 +191,10 @@ export FREENET_MIN_COMPATIBLE_VERSION="$MIN_COMPATIBLE"
 # question is "is version X published?", which is why
 # crate_version_on_crates_io() below uses the per-version endpoint instead.
 echo -n "Checking latest published version on crates.io... "
-PUBLISHED_VERSION=$(cargo search freenet --limit 1 2>/dev/null | grep "^freenet =" | head -1 | cut -d'"' -f2)
+# `|| true`: under pipefail a failed search (or a first hit that is not
+# `freenet =`) fails grep and would kill the script here, silently, instead of
+# reaching the fallback below.
+PUBLISHED_VERSION=$(cargo search freenet --limit 1 2>/dev/null | grep "^freenet =" | head -1 | cut -d'"' -f2 || true)
 if [[ -z "$PUBLISHED_VERSION" ]]; then
     echo "⚠️  Could not query crates.io"
     echo "Warning: Unable to verify against published version"
@@ -647,7 +687,12 @@ check_prerequisites() {
             # carries more (42 on 2026-11-03), so checks past the first page
             # were never looked at. Scheduled runs (nightly sims, the cache
             # warm) keep adding to HEAD while main sits still.
-            check_runs_json=$(gh api "repos/freenet/freenet-core/commits/main/check-runs?per_page=100" 2>/dev/null || echo "{}")
+            if ! check_runs_json=$(gh api "repos/freenet/freenet-core/commits/main/check-runs?per_page=100" 2>/dev/null); then
+                echo "✗"
+                echo "  ✗ Could not read main's CI status from GitHub; refusing rather than"
+                echo "     releasing on an unchecked main. Check 'gh auth status' and retry."
+                exit 1
+            fi
 
             # Exclude scheduled workflows and their cascade notifiers from the
             # release pre-flight check. These run on a cron (not on commit
@@ -682,10 +727,10 @@ check_prerequisites() {
             failed_count=$(echo "$check_runs_json" | jq '[.check_runs[] | select(.status == "completed" and .conclusion != "success" and .conclusion != "skipped" and .name != "Dependabot" and (.name | startswith("Build for") | not) and (.name | startswith("Warm cache:") | not) and .name != "claude" and .name != "Large Scale Simulation" and .name != "Simulation Tests (Nightly)" and .name != "Notify Matrix on Failure" and .name != "mirror / mirror")] | length')
 
             if [[ "$total_checks" == "0" ]]; then
-                echo "⚠️  (no checks found)"
-                echo "  ⚠️  Could not find any CI checks for main branch"
-                echo "     Proceeding anyway - verify CI manually if needed"
-                break
+                echo "✗ (no checks found)"
+                echo "  ✗ main's HEAD has no CI checks yet (just pushed?). Refusing to"
+                echo "     release an unchecked commit; retry once CI has started."
+                exit 1
             elif [[ "$in_progress_count" -gt 0 ]]; then
                 if [[ $ci_elapsed -ge $ci_max_wait ]]; then
                     echo "⚠️  (still pending after ${ci_max_wait}s)"
@@ -803,11 +848,8 @@ update_versions() {
     sed_inplace "s/^version = \".*\"/version = \"$VERSION\"/" "$PROJECT_ROOT/crates/core/Cargo.toml"
     echo "✓"
 
-    # Update min-compatible-version in Cargo.toml metadata so cross-compile CI
-    # builds (which don't have the env var) get the correct min-compatible version.
-    echo -n "  Setting min-compatible-version to $MIN_COMPATIBLE... "
-    sed_inplace "s/^min-compatible-version = \".*\"/min-compatible-version = \"$MIN_COMPATIBLE\"/" "$PROJECT_ROOT/crates/core/Cargo.toml"
-    echo "✓"
+    # min-compatible-version is deliberately left alone (#5833): the
+    # committed floor ships unchanged.
 
     # Update fdev version and its freenet dependency
     echo -n "  Updating fdev to $FDEV_VERSION... "
@@ -957,7 +999,8 @@ create_release_pr() {
         run_cmd "Pushing branch" git push origin "$branch_name"
 
         echo -n "  Creating auto-merge PR... "
-        pr_number=$(gh pr create \
+        local pr_url
+        if ! pr_url=$(gh pr create \
             --title "build: release $VERSION" \
             --body "**Automated release PR**
 
@@ -968,7 +1011,18 @@ This PR will auto-merge once GitHub CI passes.
 Generated by: \`scripts/release.sh\`" \
             --base main \
             --head "$branch_name" \
-            --assignee @me 2>/dev/null | grep -o '[0-9]\+$')
+            --assignee @me 2>&1); then
+            echo "✗"
+            echo "  ✗ gh pr create failed:"
+            printf '     %s\n' "$pr_url"
+            exit 1
+        fi
+        pr_number="${pr_url##*/}"
+        if [[ ! "$pr_number" =~ ^[0-9]+$ ]]; then
+            echo "✗"
+            echo "  ✗ Could not read a PR number from gh's output: $pr_url"
+            exit 1
+        fi
         echo "✓ (#$pr_number)"
         mark_completed "PR_CREATED"
     fi
@@ -978,10 +1032,41 @@ Generated by: \`scripts/release.sh\`" \
         exit 1
     fi
 
-    # Idempotent — gh treats re-enabling auto-merge as a no-op.
+    # Idempotent — gh treats re-enabling auto-merge as a no-op. No --squash:
+    # the merge queue owns the strategy and REJECTS an explicit one, which is
+    # what broke v0.2.93 in release.yml (#4729). Here the rejection used to be
+    # swallowed by `|| true`, so auto-merge silently never turned on and the
+    # wait below ran into its timeout.
     echo -n "  Enabling auto-merge... "
-    gh pr merge "$pr_number" --squash --auto >/dev/null 2>&1 || true
-    echo "✓"
+    local merge_out merge_state
+    # On a resume the PR may already have auto-merge on, be in the queue, or
+    # have merged; skip rather than rely on gh treating those as no-ops.
+    # A PR already IN the merge queue has consumed its auto-merge request, so
+    # it reads autoMergeRequest == null; count the queue as "already" too.
+    # GraphQL, not `gh pr view --json`: gh (2.86) has no isInMergeQueue field
+    # and rejects the whole query when asked for one. An unreadable state is
+    # reported and the merge is attempted (its own failure then exits 1).
+    # shellcheck disable=SC2016  # GraphQL variables, not shell expansions
+    local merge_query='query($o:String!,$r:String!,$n:Int!){repository(owner:$o,name:$r){pullRequest(number:$n){state isInMergeQueue autoMergeRequest{enabledAt}}}}'
+    # stderr kept apart so a notice on a successful call cannot spoil the value.
+    local merge_err
+    merge_err=$(mktemp)
+    if ! merge_state=$(gh api graphql -f query="$merge_query" -f o=freenet -f r=freenet-core -F n="$pr_number" \
+            --jq '.data.repository.pullRequest | "\(.state)|\(.autoMergeRequest != null or .isInMergeQueue)"' 2>"$merge_err"); then
+        echo -n "(could not read PR state: $(cat "$merge_err")) "
+        merge_state=""
+    fi
+    rm -f "$merge_err"
+    if [[ "$merge_state" == MERGED\|* || "$merge_state" == OPEN\|true ]]; then
+        echo "✓ (already $merge_state)"
+    elif ! merge_out=$(gh pr merge "$pr_number" --auto 2>&1); then
+        echo "✗"
+        echo "  ✗ Could not enable auto-merge on #$pr_number:"
+        printf '     %s\n' "$merge_out"
+        exit 1
+    else
+        echo "✓"
+    fi
 
     echo "  ⏳ Waiting for GitHub CI and auto-merge..."
     echo "     You can monitor at: https://github.com/freenet/freenet-core/pull/$pr_number"
@@ -995,19 +1080,17 @@ Generated by: \`scripts/release.sh\`" \
 
     while true; do
         if [[ $total_wait -gt $max_total ]]; then
-            echo "  ⚠️  Timeout waiting for PR to merge after 30 minutes"
-            echo "    The PR may still merge. Check: https://github.com/freenet/freenet-core/pull/$pr_number"
-            echo "    If the PR merged, you can continue the release manually with:"
-            echo "      git checkout main && git pull origin main"
-            echo "      git tag -a 'v$VERSION' -m 'Release v$VERSION' && git push origin 'v$VERSION'"
-            echo "      gh release create 'v$VERSION' --title 'v$VERSION' --notes 'Release $VERSION' --draft"
-            echo "    Then let cross-compile.yml (fired by the tag) attach the binaries, run"
-            echo "    the blocking pre-flight canary, publish to crates.io and un-draft."
-            echo "    Do NOT 'cargo publish' by hand first: the publish is downstream of the"
-            echo "    canary on purpose, and doing it early is what cost v0.2.124 its version"
-            echo "    number. See scripts/RELEASE_RECOVERY.md."
-            # Don't exit with error - the PR might have merged
-            return 0
+            echo "  ✗ Timeout waiting for PR #$pr_number to merge after 30 minutes"
+            echo "    The PR may still merge: https://github.com/freenet/freenet-core/pull/$pr_number"
+            echo "    Once it has, re-run this script with the same --version; it detects the"
+            echo "    merge and tags the PR's MERGE COMMIT. Do not tag by hand from local main,"
+            echo "    which may hold commits merged after the bump (#5233), and do NOT"
+            echo "    'cargo publish' by hand: the publish is downstream of the canary on"
+            echo "    purpose. See scripts/RELEASE_RECOVERY.md."
+            # Exit non-zero. This returned 0, and the next step then tagged HEAD,
+            # which at that point is the UNMERGED release branch: a tag on a
+            # commit the merge queue never checked, which starts cross-compile.
+            exit 1
         fi
         
         pr_state=$(gh pr view "$pr_number" --json state --jq '.state')
@@ -1314,16 +1397,55 @@ create_github_release() {
         echo "no"
     fi
 
-    # Check if tag already exists
+    # The commit to tag is the bump PR's MERGE COMMIT, never local HEAD. HEAD
+    # after `git pull` includes anything merged since the bump (the #5233 bug
+    # release.yml fixed), and after a PR-wait timeout it was the unmerged
+    # release branch. (release.yml no longer uses a bump PR: it tags the
+    # exact release commit on `release/vX`; see docs/RELEASING.md.)
+    local release_sha
+    release_sha=$(gh pr list --head "release/v$VERSION" --state merged --limit 1 \
+        --json mergeCommit --jq '.[0].mergeCommit.oid // empty' 2>/dev/null || echo "")
+    if [[ ! "$release_sha" =~ ^[0-9a-f]{40}$ ]]; then
+        echo "  ✗ No merged release/v$VERSION PR found, so there is no validated commit to tag."
+        echo "     If main already carries $VERSION without a bump PR (a re-cut), this"
+        echo "     script cannot tag it safely; see scripts/RELEASE_RECOVERY.md."
+        exit 1
+    fi
+    run_cmd "Fetching release commit ${release_sha:0:9}" git fetch origin "$release_sha"
+    local tagged_version
+    tagged_version=$(git show "$release_sha:crates/core/Cargo.toml" 2>/dev/null \
+        | awk '/^\[package\]/ {p = 1; next} /^\[/ {p = 0} p && /^version *=/ {gsub(/.*= *"|".*/, ""); print; exit}' || true)
+    if [[ "$tagged_version" != "$VERSION" ]]; then
+        echo "  ✗ The bump PR's merge commit $release_sha carries version '${tagged_version:-?}', not $VERSION."
+        exit 1
+    fi
+
+    # An existing tag (local or remote) is accepted only on that commit.
+    local existing
     if [[ -n "$(git tag -l "v$VERSION")" ]]; then
-        echo "  ℹ️  Tag v$VERSION already exists locally"
+        existing=$(git rev-parse "v$VERSION^{commit}")
+        if [[ "$existing" != "$release_sha" ]]; then
+            echo "  ✗ Local tag v$VERSION points at $existing, not the release commit $release_sha."
+            echo "     Delete it (git tag -d v$VERSION) if it is stale, then re-run."
+            exit 1
+        fi
+        echo "  ℹ️  Tag v$VERSION already exists locally on the release commit"
         mark_completed "TAG_CREATED"
     else
-        run_cmd "Creating tag v$VERSION" git tag -a "v$VERSION" -m "Release v$VERSION"
+        run_cmd "Creating tag v$VERSION on ${release_sha:0:9}" git tag -a "v$VERSION" -m "Release v$VERSION" "$release_sha"
     fi
 
     # Check if tag exists on remote
-    if [[ -n "$(git ls-remote --tags origin "refs/tags/v$VERSION" 2>/dev/null)" ]]; then
+    local remote_refs remote_sha
+    remote_refs=$(git ls-remote --tags origin "refs/tags/v$VERSION" "refs/tags/v$VERSION^{}" 2>/dev/null || true)
+    remote_sha=$(awk -F'\t' -v r="refs/tags/v$VERSION^{}" '$2 == r {print $1}' <<<"$remote_refs")
+    [[ -n "$remote_sha" ]] || remote_sha=$(awk -F'\t' -v r="refs/tags/v$VERSION" '$2 == r {print $1}' <<<"$remote_refs")
+    if [[ -n "$remote_sha" ]]; then
+        if [[ "$remote_sha" != "$release_sha" ]]; then
+            echo "  ✗ Tag v$VERSION on origin points at $remote_sha, not the release commit $release_sha."
+            echo "     See scripts/RELEASE_RECOVERY.md."
+            exit 1
+        fi
         echo "  ℹ️  Tag v$VERSION already exists on remote"
         mark_completed "TAG_CREATED"
     else
@@ -1648,8 +1770,10 @@ wait_for_binaries() {
 
     echo "  Workflow run ID: $run_id"
 
-    # Wait up to 20 minutes for workflow to complete
-    local max_wait=1200
+    # 60 minutes. The attach job waits for every build, macOS notarization and
+    # Gate A, about 25 minutes after the tag on a good day; the old 20-minute
+    # cap failed the driver on an ordinary release.
+    local max_wait=3600
     local elapsed=0
     local interval=30
 
@@ -1726,7 +1850,7 @@ wait_for_binaries() {
     done
 
     echo
-    echo "  ✗ Timeout waiting for cross-compile workflow after ${max_wait}s"
+    echo "  ✗ Timeout waiting for cross-compile workflow after ${max_wait}s (re-run this script to keep waiting)"
     echo "     Binaries may not be available for auto-update."
     echo "     Check: https://github.com/freenet/freenet-core/actions/runs/$run_id"
     return 1
